@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Request, Uri};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, Uri};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -21,12 +21,12 @@ use crate::{
     health, latency_diagnostic, list_nodes, list_snapshots, list_store_index,
     list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
     placement_for_key, put_object, reconcile_from_node, redeem_client_bootstrap_claim,
-    rename_object_path, replication, replication_plan, require_client_auth,
+    rename_object_path, replication, replication_plan, request_has_admin_auth, require_client_auth,
     require_client_or_admin_auth, require_internal_caller, restore_snapshot_path, run_cleanup,
     run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
     start_upload_session, storage_stats_current, storage_stats_history,
     transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
-    wait_for_store_index_change,
+    validate_client_auth_request, wait_for_store_index_change,
 };
 
 #[derive(Clone)]
@@ -60,7 +60,7 @@ pub(super) async fn execute_buffered_transport_request(
     scope: &TransportExecutionScope,
     request: &BufferedTransportRequest,
 ) -> Result<BufferedTransportResponse> {
-    if let Some(response) = try_execute_direct_transport_request(state, request).await? {
+    if let Some(response) = try_execute_direct_transport_request(state, scope, request).await? {
         return Ok(response);
     }
 
@@ -69,6 +69,7 @@ pub(super) async fn execute_buffered_transport_request(
 
 async fn try_execute_direct_transport_request(
     state: &ServerState,
+    scope: &TransportExecutionScope,
     request: &BufferedTransportRequest,
 ) -> Result<Option<BufferedTransportResponse>> {
     let method = request.method.trim();
@@ -84,22 +85,89 @@ async fn try_execute_direct_transport_request(
     let response = match (method, path_only) {
         ("GET", "/health") => Some(health(State(state.clone())).await.into_response()),
         ("GET", "/cluster/status") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::ClientOrAdmin,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             Some(cluster_status(State(state.clone())).await.into_response())
         }
-        ("GET", "/cluster/nodes") => Some(list_nodes(State(state.clone())).await.into_response()),
+        ("GET", "/cluster/nodes") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::ClientOrAdmin,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
+            Some(list_nodes(State(state.clone())).await.into_response())
+        }
         ("GET", "/diagnostics/latency") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let query = parse_query::<crate::LatencyDiagnosticQuery>(raw_path).map_err(|err| {
                 anyhow::anyhow!("failed parsing latency diagnostic query {raw_path}: {err}")
             })?;
             Some(latency_diagnostic(State(state.clone()), Query(query)).await)
         }
         ("GET", "/store/index") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let query = parse_query::<StoreIndexQuery>(&normalized_raw_path).map_err(|err| {
                 anyhow::anyhow!("failed parsing store index query {raw_path}: {err}")
             })?;
             Some(list_store_index_response(state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await)
         }
         ("GET", "/store/index/changes/wait") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let query =
                 parse_query::<StoreIndexChangeWaitQuery>(&normalized_raw_path).map_err(|err| {
                     anyhow::anyhow!(
@@ -113,6 +181,19 @@ async fn try_execute_direct_transport_request(
             )
         }
         ("GET", "/media/thumbnail") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let query =
                 parse_query::<crate::MediaThumbnailQuery>(&normalized_raw_path).map_err(|err| {
                     anyhow::anyhow!("failed parsing media thumbnail query {raw_path}: {err}")
@@ -120,6 +201,19 @@ async fn try_execute_direct_transport_request(
             Some(get_media_thumbnail_response(state, query).await)
         }
         ("GET", path) if path.starts_with("/store/uploads/") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let upload_id = decode_route_tail(path, "/store/uploads/")?;
             Some(
                 get_upload_session(State(state.clone()), headers.clone(), Path(upload_id))
@@ -128,12 +222,38 @@ async fn try_execute_direct_transport_request(
             )
         }
         ("GET", path) if path.starts_with("/store/") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let query = parse_query::<crate::ObjectGetQuery>(&normalized_raw_path)
                 .map_err(|err| anyhow::anyhow!("failed parsing object query {raw_path}: {err}"))?;
             let key = decode_route_tail(path, "/store/")?;
             Some(get_object_response(state, &key, query, &headers, false).await)
         }
         ("HEAD", path) if path.starts_with("/store/") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let query =
                 parse_query::<crate::ObjectGetQuery>(&normalized_raw_path).map_err(|err| {
                     anyhow::anyhow!("failed parsing object HEAD query {raw_path}: {err}")
@@ -142,6 +262,19 @@ async fn try_execute_direct_transport_request(
             Some(get_object_response(state, &key, query, &headers, true).await)
         }
         ("GET", path) if path.starts_with("/versions/") => {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
             let key = decode_route_tail(path, "/versions/")?;
             Some(list_versions_response(state, &key).await)
         }
@@ -154,6 +287,52 @@ async fn try_execute_direct_transport_request(
     Ok(Some(
         buffered_response_from_axum_response(request.request_id.clone(), response).await?,
     ))
+}
+
+#[derive(Clone, Copy)]
+enum DirectAuthPolicy {
+    Client,
+    ClientOrAdmin,
+}
+
+async fn authorize_direct_transport_fast_path(
+    state: &ServerState,
+    scope: &TransportExecutionScope,
+    request_id: &str,
+    headers: &HeaderMap,
+    method: &str,
+    raw_path: &str,
+    policy: DirectAuthPolicy,
+) -> Result<Option<BufferedTransportResponse>> {
+    let authorized: std::result::Result<(), StatusCode> = match scope {
+        TransportExecutionScope::Internal(_) => Ok(()),
+        TransportExecutionScope::Public => match policy {
+            DirectAuthPolicy::Client => {
+                if state.client_auth_control.require_client_auth {
+                    validate_client_auth_request(state, headers, method, raw_path).await
+                } else {
+                    Ok(())
+                }
+            }
+            DirectAuthPolicy::ClientOrAdmin => {
+                if request_has_admin_auth(state, headers).await
+                    || !state.client_auth_control.require_client_auth
+                {
+                    Ok(())
+                } else {
+                    validate_client_auth_request(state, headers, method, raw_path).await
+                }
+            }
+        },
+    };
+
+    match authorized {
+        Ok(()) => Ok(None),
+        Err(status) => Ok(Some(
+            buffered_response_from_axum_response(request_id.to_string(), status.into_response())
+                .await?,
+        )),
+    }
 }
 
 async fn execute_fallback_local_router_request(

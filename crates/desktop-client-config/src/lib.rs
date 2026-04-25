@@ -618,9 +618,9 @@ pub struct StopOutcome {
 pub fn default_instance_store_path() -> PathBuf {
     #[cfg(windows)]
     {
-        return local_appdata_root()
+        local_appdata_root()
             .join(CONFIG_SUBDIR)
-            .join(INSTANCE_STORE_FILE_NAME);
+            .join(INSTANCE_STORE_FILE_NAME)
     }
 
     #[cfg(not(windows))]
@@ -634,9 +634,9 @@ pub fn default_instance_store_path() -> PathBuf {
 pub fn default_launch_report_path() -> PathBuf {
     #[cfg(windows)]
     {
-        return local_appdata_root()
+        local_appdata_root()
             .join(CONFIG_SUBDIR)
-            .join(LAST_LAUNCH_REPORT_FILE_NAME);
+            .join(LAST_LAUNCH_REPORT_FILE_NAME)
     }
 
     #[cfg(not(windows))]
@@ -650,9 +650,9 @@ pub fn default_launch_report_path() -> PathBuf {
 pub fn default_service_log_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        return local_appdata_root()
+        local_appdata_root()
             .join(CONFIG_SUBDIR)
-            .join(SERVICE_LOG_SUBDIR);
+            .join(SERVICE_LOG_SUBDIR)
     }
 
     #[cfg(not(windows))]
@@ -1047,8 +1047,8 @@ fn spawn_instance(
         }
     };
 
-    if let Some(file) = log_handle.as_mut() {
-        if let Err(error) = write_launch_log_header(
+    if let Some(file) = log_handle.as_mut()
+        && let Err(error) = write_launch_log_header(
             file,
             launched_at_unix_ms,
             instance_kind,
@@ -1056,12 +1056,12 @@ fn spawn_instance(
             label,
             &executable_candidate_display,
             &command_line,
-        ) {
-            log_setup_error = Some(format!(
-                "failed writing service log header {}: {error}",
-                log_file_path.display()
-            ));
-        }
+        )
+    {
+        log_setup_error = Some(format!(
+            "failed writing service log header {}: {error}",
+            log_file_path.display()
+        ));
     }
 
     let mut spawn_errors = Vec::new();
@@ -1141,15 +1141,16 @@ fn spawn_instance(
     }
 }
 
+#[cfg(windows)]
 fn configure_background_service_command(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
+    use std::os::windows::process::CommandExt;
 
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
 }
+
+#[cfg(not(windows))]
+fn configure_background_service_command(_command: &mut Command) {}
 
 fn service_log_stdio_pair(file: Option<&fs::File>) -> Result<(Stdio, Stdio), String> {
     let Some(file) = file else {
@@ -1178,12 +1179,11 @@ fn service_executable_candidates(package_root: &Path, executable_name: &str) -> 
     let direct = package_root.join(executable_name);
     #[cfg(windows)]
     {
-        if is_windows_apps_package_root(package_root) {
-            if let Some(alias_path) = windows_app_execution_alias_path(executable_name) {
-                if alias_path != direct {
-                    return vec![alias_path, direct];
-                }
-            }
+        if is_windows_apps_package_root(package_root)
+            && let Some(alias_path) = windows_app_execution_alias_path(executable_name)
+            && alias_path != direct
+        {
+            return vec![alias_path, direct];
         }
     }
     vec![direct]

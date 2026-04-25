@@ -2545,7 +2545,7 @@ mod tests {
             assert_eq!(thumbnail.remote_key, "gallery/cat.png");
             assert_eq!(
                 thumbnail.request_path,
-                "/media/thumbnail?key=gallery%2Fcat.png"
+                "/api/v1/media/thumbnail?key=gallery%2Fcat.png"
             );
             assert_eq!(thumbnail.bootstrap_path, local_appdata_bootstrap);
             assert_eq!(

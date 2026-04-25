@@ -147,6 +147,7 @@ const PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/media/thumbnail";
 const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thumbnail";
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
+const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -1520,6 +1521,13 @@ fn env_flag_enabled(name: &str) -> bool {
         .ok()
         .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
         .unwrap_or(false)
+}
+
+fn parse_require_client_auth_env(allow_unauthenticated_clients: bool) -> bool {
+    std::env::var(REQUIRE_CLIENT_AUTH_ENV)
+        .ok()
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
+        .unwrap_or(!allow_unauthenticated_clients)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2912,6 +2920,7 @@ impl ServerNodeConfig {
         let mode = ServerNodeMode::Cluster;
         let allow_insecure_public_http = env_flag_enabled(ALLOW_INSECURE_PUBLIC_HTTP_ENV);
         let allow_unauthenticated_clients = env_flag_enabled(ALLOW_UNAUTHENTICATED_CLIENTS_ENV);
+        let require_client_auth = parse_require_client_auth_env(allow_unauthenticated_clients);
         let bind_addr: SocketAddr = bootstrap
             .bind_addr
             .parse()
@@ -3074,7 +3083,7 @@ impl ServerNodeConfig {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             admin_password_hash: None,
-            require_client_auth: !allow_unauthenticated_clients,
+            require_client_auth,
         })
     }
 
@@ -3098,6 +3107,7 @@ impl ServerNodeConfig {
         let mode = ServerNodeMode::Cluster;
         let allow_insecure_public_http = env_flag_enabled(ALLOW_INSECURE_PUBLIC_HTTP_ENV);
         let allow_unauthenticated_clients = env_flag_enabled(ALLOW_UNAUTHENTICATED_CLIENTS_ENV);
+        let require_client_auth = parse_require_client_auth_env(allow_unauthenticated_clients);
 
         let node_id = std::env::var("IRONMESH_NODE_ID")
             .ok()
@@ -3352,7 +3362,7 @@ impl ServerNodeConfig {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             admin_password_hash: None,
-            require_client_auth: !allow_unauthenticated_clients,
+            require_client_auth,
         })
     }
 

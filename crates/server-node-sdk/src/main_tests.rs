@@ -4685,6 +4685,36 @@ run_on_main_metadata_backends!(
     multiplex_transport_wait_for_store_index_change_routes_to_handler_turso
 );
 
+async fn multiplex_transport_public_fast_path_requires_client_auth_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.client_auth_control.require_client_auth = true;
+
+    let request = transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        "GET",
+        "/api/v1/media/thumbnail?key=gallery%2Fcat.png",
+        Vec::new(),
+        Vec::new(),
+    );
+    let response = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &super::transport_service::TransportExecutionScope::Public,
+        &request,
+    )
+    .await
+    .expect("transport thumbnail request should execute");
+
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED.as_u16());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    multiplex_transport_public_fast_path_requires_client_auth_impl,
+    multiplex_transport_public_fast_path_requires_client_auth,
+    multiplex_transport_public_fast_path_requires_client_auth_turso
+);
+
 async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let upload_id = "transport-upload-session-route".to_string();

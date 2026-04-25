@@ -750,7 +750,7 @@ mod tests {
             .expect("relay request should be captured");
         assert_eq!(source, transport_sdk::PeerIdentity::Device(device_id));
         assert_eq!(request.kind, transport_sdk::TransportStreamKind::Rpc);
-        assert_eq!(request.path, "/store/index?depth=1");
+        assert_eq!(request.path, "/api/v1/store/index?depth=1");
 
         acceptor_handle.abort();
         let _ = acceptor_handle.await;
@@ -1227,6 +1227,7 @@ mod tests {
         })
         .expect("cluster bootstrap config should build");
         config.require_client_auth = false;
+        config.allow_insecure_public_http = true;
         config
     }
 
