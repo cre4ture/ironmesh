@@ -1081,6 +1081,7 @@ fn spawn_instance(
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);
+        configure_background_service_command(&mut command);
 
         if let Some(file) = log_handle.as_mut() {
             let _ = writeln!(file, "spawn attempt executable={}", executable);
@@ -1137,6 +1138,16 @@ fn spawn_instance(
         log_file,
         pid: None,
         error: Some(error),
+    }
+}
+
+fn configure_background_service_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
 }
 
