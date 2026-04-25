@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +52,7 @@ const CONFIG_SUBDIR: &str = "desktop-client-config";
 const LEGACY_WINDOWS_CONFIG_SUBDIR: &str = "windows-client-config";
 const INSTANCE_STORE_FILE_NAME: &str = "instances.json";
 const LAST_LAUNCH_REPORT_FILE_NAME: &str = "last-launch-report.json";
+const SERVICE_LOG_SUBDIR: &str = "service-logs";
 const MANAGED_INSTANCE_STORE_VERSION: u32 = 1;
 const LAUNCH_REPORT_VERSION: u32 = 1;
 
@@ -58,6 +60,8 @@ const LAUNCH_REPORT_VERSION: u32 = 1;
 pub struct ManagedInstanceStore {
     #[serde(default = "managed_instance_store_version")]
     pub version: u32,
+    #[serde(default)]
+    pub client_identities: Vec<ClientIdentityConfig>,
     #[serde(default)]
     pub os_integration_instances: Vec<OsIntegrationInstance>,
     #[serde(default)]
@@ -68,6 +72,7 @@ impl Default for ManagedInstanceStore {
     fn default() -> Self {
         Self {
             version: MANAGED_INSTANCE_STORE_VERSION,
+            client_identities: Vec::new(),
             os_integration_instances: Vec::new(),
             folder_agent_instances: Vec::new(),
         }
@@ -127,6 +132,19 @@ impl ManagedInstanceStore {
         self.sort();
     }
 
+    pub fn upsert_client_identity(&mut self, identity: ClientIdentityConfig) {
+        if let Some(existing) = self
+            .client_identities
+            .iter_mut()
+            .find(|candidate| candidate.id == identity.id)
+        {
+            *existing = identity;
+        } else {
+            self.client_identities.push(identity);
+        }
+        self.sort();
+    }
+
     pub fn upsert_folder_agent(&mut self, instance: FolderAgentInstance) {
         if let Some(existing) = self
             .folder_agent_instances
@@ -138,6 +156,19 @@ impl ManagedInstanceStore {
             self.folder_agent_instances.push(instance);
         }
         self.sort();
+    }
+
+    pub fn client_identity(&self, id: &str) -> Option<&ClientIdentityConfig> {
+        self.client_identities
+            .iter()
+            .find(|candidate| candidate.id == id)
+    }
+
+    pub fn remove_client_identity(&mut self, id: &str) -> bool {
+        let initial_len = self.client_identities.len();
+        self.client_identities
+            .retain(|candidate| candidate.id != id);
+        initial_len != self.client_identities.len()
     }
 
     pub fn remove_os_integration(&mut self, id: &str) -> bool {
@@ -155,6 +186,12 @@ impl ManagedInstanceStore {
     }
 
     fn sort(&mut self) {
+        self.client_identities.sort_by(|left, right| {
+            left.label
+                .to_ascii_lowercase()
+                .cmp(&right.label.to_ascii_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
         self.os_integration_instances.sort_by(|left, right| {
             left.label
                 .to_ascii_lowercase()
@@ -167,6 +204,46 @@ impl ManagedInstanceStore {
                 .cmp(&right.label.to_ascii_lowercase())
                 .then_with(|| left.id.cmp(&right.id))
         });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientIdentityConfig {
+    pub id: String,
+    pub label: String,
+    pub bootstrap_file: String,
+    pub client_identity_file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ca_pem_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_enrolled_at_unix_ms: Option<u64>,
+}
+
+impl ClientIdentityConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() {
+            bail!("client identity id must not be empty");
+        }
+        if self.label.trim().is_empty() {
+            bail!("client identity label must not be empty");
+        }
+        if self.bootstrap_file.trim().is_empty() {
+            bail!("client identity bootstrap_file must not be empty");
+        }
+        if self.client_identity_file.trim().is_empty() {
+            bail!("client identity client_identity_file must not be empty");
+        }
+        Ok(())
     }
 }
 
@@ -187,6 +264,8 @@ pub struct OsIntegrationInstance {
     pub prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_identity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,6 +498,8 @@ pub struct FolderAgentInstance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_ca_pem_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_identity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_identity_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -503,6 +584,8 @@ pub struct LaunchOutcome {
     pub label: String,
     pub executable: String,
     pub command_line: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<String>,
     pub pid: Option<u32>,
     pub error: Option<String>,
 }
@@ -536,6 +619,22 @@ pub fn default_launch_report_path() -> PathBuf {
         state_home_root()
             .join(CONFIG_SUBDIR)
             .join(LAST_LAUNCH_REPORT_FILE_NAME)
+    }
+}
+
+pub fn default_service_log_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        return local_appdata_root()
+            .join(CONFIG_SUBDIR)
+            .join(SERVICE_LOG_SUBDIR);
+    }
+
+    #[cfg(not(windows))]
+    {
+        state_home_root()
+            .join(CONFIG_SUBDIR)
+            .join(SERVICE_LOG_SUBDIR)
     }
 }
 
@@ -592,6 +691,8 @@ pub fn generate_instance_id(prefix: &str) -> String {
 
 pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Path) -> LaunchReport {
     let mut outcomes = Vec::new();
+    let launched_at_unix_ms = unix_ts_ms();
+    let service_log_dir = default_service_log_dir();
 
     for instance in &store.os_integration_instances {
         if !instance.enabled {
@@ -603,8 +704,10 @@ pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Pat
                 "os-integration",
                 &instance.id,
                 &instance.label,
-                package_root.join(OS_INTEGRATION_EXE),
+                service_executable_candidates(package_root, OS_INTEGRATION_EXE),
                 instance.command_args(),
+                &service_log_dir,
+                launched_at_unix_ms,
             ));
         }
 
@@ -628,14 +731,16 @@ pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Pat
             "folder-agent",
             &instance.id,
             &instance.label,
-            package_root.join(FOLDER_AGENT_EXE),
+            service_executable_candidates(package_root, FOLDER_AGENT_EXE),
             instance.command_args(),
+            &service_log_dir,
+            launched_at_unix_ms,
         ));
     }
 
     LaunchReport {
         version: LAUNCH_REPORT_VERSION,
-        launched_at_unix_ms: unix_ts_ms(),
+        launched_at_unix_ms,
         package_root: package_root.display().to_string(),
         total_enabled: outcomes.len(),
         outcomes,
@@ -656,6 +761,7 @@ fn unsupported_instance(
         label: label.to_string(),
         executable: executable_path.display().to_string(),
         command_line: Vec::new(),
+        log_file: None,
         pid: None,
         error: Some(message.to_string()),
     }
@@ -665,37 +771,246 @@ fn spawn_instance(
     instance_kind: &str,
     id: &str,
     label: &str,
-    executable_path: PathBuf,
+    executable_candidates: Vec<PathBuf>,
     command_line: Vec<String>,
+    service_log_dir: &Path,
+    launched_at_unix_ms: u64,
 ) -> LaunchOutcome {
-    let executable = executable_path.display().to_string();
-    let mut command = Command::new(&executable_path);
-    command
-        .args(&command_line)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let executable_candidates = if executable_candidates.is_empty() {
+        vec![PathBuf::from(instance_kind)]
+    } else {
+        executable_candidates
+    };
+    let executable_candidate_display = executable_candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let mut executable = executable_candidate_display
+        .first()
+        .cloned()
+        .unwrap_or_else(|| instance_kind.to_string());
+    let log_file_path = service_log_file_path(service_log_dir, instance_kind, id);
+    let log_file = Some(log_file_path.display().to_string());
+    let mut log_setup_error = None;
+    let mut log_handle = match open_service_log_file(&log_file_path) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            log_setup_error = Some(format!(
+                "failed preparing service log file {}: {error}",
+                log_file_path.display()
+            ));
+            None
+        }
+    };
 
-    match command.spawn() {
-        Ok(child) => LaunchOutcome {
-            instance_kind: instance_kind.to_string(),
-            id: id.to_string(),
-            label: label.to_string(),
-            executable,
-            command_line,
-            pid: Some(child.id()),
-            error: None,
-        },
-        Err(error) => LaunchOutcome {
-            instance_kind: instance_kind.to_string(),
-            id: id.to_string(),
-            label: label.to_string(),
-            executable,
-            command_line,
-            pid: None,
-            error: Some(error.to_string()),
-        },
+    if let Some(file) = log_handle.as_mut() {
+        if let Err(error) = write_launch_log_header(
+            file,
+            launched_at_unix_ms,
+            instance_kind,
+            id,
+            label,
+            &executable_candidate_display,
+            &command_line,
+        ) {
+            log_setup_error = Some(format!(
+                "failed writing service log header {}: {error}",
+                log_file_path.display()
+            ));
+        }
     }
+
+    let mut spawn_errors = Vec::new();
+    for executable_path in &executable_candidates {
+        executable = executable_path.display().to_string();
+        let (stdout, stderr) = match service_log_stdio_pair(log_handle.as_ref()) {
+            Ok(stdio) => stdio,
+            Err(error) => {
+                log_setup_error = Some(error);
+                (Stdio::null(), Stdio::null())
+            }
+        };
+
+        let mut command = Command::new(executable_path);
+        command
+            .args(&command_line)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
+
+        if let Some(file) = log_handle.as_mut() {
+            let _ = writeln!(file, "spawn attempt executable={}", executable);
+            let _ = file.flush();
+        }
+
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                if let Some(file) = log_handle.as_mut() {
+                    let _ = writeln!(file, "spawned pid={pid} executable={}", executable);
+                    let _ = file.flush();
+                }
+                return LaunchOutcome {
+                    instance_kind: instance_kind.to_string(),
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    executable,
+                    command_line,
+                    log_file,
+                    pid: Some(pid),
+                    error: log_setup_error,
+                };
+            }
+            Err(error) => {
+                if let Some(file) = log_handle.as_mut() {
+                    let _ = writeln!(
+                        file,
+                        "spawn attempt failed executable={} error={error}",
+                        executable
+                    );
+                    let _ = file.flush();
+                }
+                spawn_errors.push(format!("{}: {error}", executable));
+            }
+        }
+    }
+
+    let spawn_error = if spawn_errors.is_empty() {
+        "no executable candidates were available".to_string()
+    } else {
+        spawn_errors.join("; ")
+    };
+    let error = match log_setup_error {
+        Some(log_setup_error) => format!("{spawn_error}; {log_setup_error}"),
+        None => spawn_error,
+    };
+    LaunchOutcome {
+        instance_kind: instance_kind.to_string(),
+        id: id.to_string(),
+        label: label.to_string(),
+        executable,
+        command_line,
+        log_file,
+        pid: None,
+        error: Some(error),
+    }
+}
+
+fn service_log_stdio_pair(file: Option<&fs::File>) -> Result<(Stdio, Stdio), String> {
+    let Some(file) = file else {
+        return Ok((Stdio::null(), Stdio::null()));
+    };
+    match (file.try_clone(), file.try_clone()) {
+        (Ok(stdout), Ok(stderr)) => Ok((Stdio::from(stdout), Stdio::from(stderr))),
+        (stdout_result, stderr_result) => {
+            let stdout_error = stdout_result.err();
+            let stderr_error = stderr_result.err();
+            let error = match (stdout_error, stderr_error) {
+                (Some(stdout_error), Some(stderr_error)) => {
+                    format!("failed cloning service log handles: {stdout_error}; {stderr_error}")
+                }
+                (Some(error), None) | (None, Some(error)) => {
+                    format!("failed cloning service log handle: {error}")
+                }
+                (None, None) => "failed cloning service log handles".to_string(),
+            };
+            Err(error)
+        }
+    }
+}
+
+fn service_executable_candidates(package_root: &Path, executable_name: &str) -> Vec<PathBuf> {
+    let direct = package_root.join(executable_name);
+    #[cfg(windows)]
+    {
+        if is_windows_apps_package_root(package_root) {
+            if let Some(alias_path) = windows_app_execution_alias_path(executable_name) {
+                if alias_path != direct {
+                    return vec![alias_path, direct];
+                }
+            }
+        }
+    }
+    vec![direct]
+}
+
+#[cfg(windows)]
+fn is_windows_apps_package_root(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("WindowsApps")
+    })
+}
+
+#[cfg(windows)]
+fn windows_app_execution_alias_path(executable_name: &str) -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            path.join("Microsoft")
+                .join("WindowsApps")
+                .join(executable_name)
+        })
+}
+
+fn service_log_file_path(service_log_dir: &Path, instance_kind: &str, id: &str) -> PathBuf {
+    service_log_dir.join(format!(
+        "{}-{}.log",
+        sanitize_log_file_component(instance_kind),
+        sanitize_log_file_component(id)
+    ))
+}
+
+fn sanitize_log_file_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('.').trim_matches('_');
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn open_service_log_file(path: &Path) -> Result<fs::File> {
+    ensure_parent_dir(path)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed opening service log file {}", path.display()))
+}
+
+fn write_launch_log_header(
+    file: &mut fs::File,
+    launched_at_unix_ms: u64,
+    instance_kind: &str,
+    id: &str,
+    label: &str,
+    executable_candidates: &[String],
+    command_line: &[String],
+) -> Result<()> {
+    writeln!(file)?;
+    writeln!(file, "=== IronMesh service launch ===")?;
+    writeln!(file, "launched_at_unix_ms={launched_at_unix_ms}")?;
+    writeln!(file, "instance_kind={instance_kind}")?;
+    writeln!(file, "id={id}")?;
+    writeln!(file, "label={label}")?;
+    writeln!(file, "executable_candidates={executable_candidates:?}")?;
+    writeln!(file, "args={command_line:?}")?;
+    file.flush()?;
+    Ok(())
 }
 
 fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
@@ -875,6 +1190,7 @@ mod tests {
                 server_base_url: Some("https://node.example".to_string()),
                 prefix: None,
                 bootstrap_file: None,
+                client_identity_id: None,
                 snapshot_file: None,
                 client_identity_file: None,
                 server_ca_path: None,
@@ -962,6 +1278,7 @@ mod tests {
                 label: "Folder".to_string(),
                 executable: "/opt/ironmesh/ironmesh-folder-agent".to_string(),
                 command_line: vec!["--root-dir".to_string(), "/tmp/folder".to_string()],
+                log_file: Some("/tmp/ironmesh/folder-agent-folder-1.log".to_string()),
                 pid: Some(42),
                 error: None,
             }],
@@ -984,6 +1301,66 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn spawn_instance_records_log_file_and_spawn_failure() {
+        let path = temp_path("service-log-spawn-error");
+        let dir = path.parent().expect("temp path should have parent");
+        let log_dir = dir.join("logs");
+        let missing_executable = dir.join(FOLDER_AGENT_EXE);
+
+        let outcome = spawn_instance(
+            "folder-agent",
+            "folder/one",
+            "Folder One",
+            vec![missing_executable],
+            vec!["--root-dir".to_string(), "/tmp/folder".to_string()],
+            &log_dir,
+            123,
+        );
+
+        assert_eq!(outcome.instance_kind, "folder-agent");
+        assert_eq!(outcome.id, "folder/one");
+        assert!(outcome.pid.is_none());
+        assert!(outcome.error.is_some());
+        let log_file = outcome.log_file.expect("log file should be reported");
+        assert!(
+            log_file.ends_with("folder-agent-folder_one.log"),
+            "unexpected log file path: {log_file}"
+        );
+        let log = std::fs::read_to_string(&log_file).expect("log file should be readable");
+        assert!(log.contains("=== IronMesh service launch ==="));
+        assert!(log.contains("instance_kind=folder-agent"));
+        assert!(log.contains("id=folder/one"));
+        assert!(log.contains("spawn attempt failed executable="));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_apps_package_root_prefers_app_execution_alias() {
+        let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let package_root = PathBuf::from(
+            r"C:\Program Files\WindowsApps\UlrichHornung.IronMesh_1.0.2.1_neutral__bnh81bg69mtt8",
+        );
+
+        let candidates = service_executable_candidates(&package_root, OS_INTEGRATION_EXE);
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from(local_appdata)
+                    .join("Microsoft")
+                    .join("WindowsApps")
+                    .join(OS_INTEGRATION_EXE),
+                package_root.join(OS_INTEGRATION_EXE),
+            ]
+        );
     }
 
     #[test]

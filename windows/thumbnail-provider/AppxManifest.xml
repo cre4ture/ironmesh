@@ -3,13 +3,14 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
   xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   xmlns:cloudfiles2="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10/2"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap mp desktop desktop3 desktop4 com cloudfiles2 rescap">
+  IgnorableNamespaces="uap uap3 mp desktop desktop3 desktop4 com cloudfiles2 rescap">
   <Identity
     Name="UlrichHornung.IronMesh"
     Publisher="CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21"
@@ -65,6 +66,14 @@
         Square44x44Logo="Assets\SmallLogo.png"
         AppListEntry="none" />
       <Extensions>
+        <uap3:Extension
+          Category="windows.appExecutionAlias"
+          Executable="ironmesh-os-integration.exe"
+          EntryPoint="Windows.FullTrustApplication">
+          <uap3:AppExecutionAlias>
+            <desktop:ExecutionAlias Alias="ironmesh-os-integration.exe" />
+          </uap3:AppExecutionAlias>
+        </uap3:Extension>
         <com:Extension Category="windows.comServer">
           <com:ComServer>
             <com:SurrogateServer DisplayName="Ironmesh Thumbnail Provider">
@@ -125,6 +134,16 @@
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png"
         AppListEntry="none" />
+      <Extensions>
+        <uap3:Extension
+          Category="windows.appExecutionAlias"
+          Executable="ironmesh-folder-agent.exe"
+          EntryPoint="Windows.FullTrustApplication">
+          <uap3:AppExecutionAlias>
+            <desktop:ExecutionAlias Alias="ironmesh-folder-agent.exe" />
+          </uap3:AppExecutionAlias>
+        </uap3:Extension>
+      </Extensions>
     </Application>
   </Applications>
 </Package>

@@ -1,24 +1,26 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use client_sdk::enroll_connection_input_blocking;
 use desktop_client_config::{
-    FolderAgentInstance, LaunchReport, ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED,
-    OsIntegrationInstance, PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE,
-    STARTUP_INTEGRATION_VALUE, default_instance_store_path, default_launch_report_path,
+    ClientIdentityConfig, FolderAgentInstance, LaunchReport, ManagedInstanceStore,
+    OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance, PLATFORM_KIND,
+    STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
+    default_instance_store_path, default_launch_report_path, default_service_log_dir,
     generate_instance_id, launch_enabled_instances, load_last_launch_report,
     migrate_legacy_state_paths, package_root_from_current_exe, save_launch_report,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
@@ -47,12 +49,90 @@ struct ConfigResponse {
     supports_os_integration: bool,
     config_path: String,
     launch_report_path: String,
+    service_log_dir: String,
     package_root: String,
     startup_integration_label: &'static str,
     startup_integration_value: &'static str,
     startup_integration_note: &'static str,
     store: ManagedInstanceStore,
     last_launch_report: Option<LaunchReport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertClientIdentityRequest {
+    id: Option<String>,
+    bootstrap_content: String,
+    #[serde(default)]
+    enroll: bool,
+}
+
+impl UpsertClientIdentityRequest {
+    fn into_identity(
+        self,
+        existing: Option<&ClientIdentityConfig>,
+        instance_store_path: &Path,
+    ) -> Result<(ClientIdentityConfig, Option<String>, bool), ApiError> {
+        let id = normalize_optional_string(self.id)
+            .unwrap_or_else(|| generate_instance_id("client-identity"));
+        let bootstrap_content = normalize_optional_string(Some(self.bootstrap_content));
+        if bootstrap_content.is_none() && existing.is_none() {
+            return Err(ApiError::bad_request(
+                "bootstrap content must not be empty when creating a client identity",
+            ));
+        }
+        let bootstrap_file = existing
+            .map(|identity| identity.bootstrap_file.to_string())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_managed_client_bootstrap_path(instance_store_path, &id));
+        let client_identity_file = existing
+            .map(|identity| identity.client_identity_file.to_string())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_managed_client_identity_path(instance_store_path, &id));
+        let label = bootstrap_content
+            .as_deref()
+            .map(client_identity_label_from_bootstrap_content)
+            .transpose()?
+            .or_else(|| existing.map(|identity| identity.label.to_string()))
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "bootstrap content must include device_label so the identity name can be derived",
+                )
+            })?;
+        let identity = ClientIdentityConfig {
+            id,
+            label,
+            bootstrap_file,
+            client_identity_file,
+            server_ca_pem_file: existing.and_then(|identity| identity.server_ca_pem_file.clone()),
+            cluster_id: existing.and_then(|identity| identity.cluster_id.clone()),
+            device_id: existing.and_then(|identity| identity.device_id.clone()),
+            device_label: existing.and_then(|identity| identity.device_label.clone()),
+            issued_at_unix: existing.and_then(|identity| identity.issued_at_unix),
+            expires_at_unix: existing.and_then(|identity| identity.expires_at_unix),
+            last_enrolled_at_unix_ms: existing
+                .and_then(|identity| identity.last_enrolled_at_unix_ms),
+        };
+        identity
+            .validate()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        Ok((identity, bootstrap_content, self.enroll))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UpsertClientIdentityResponse {
+    config: ConfigResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrollment: Option<ClientIdentityEnrollmentReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientIdentityEnrollmentReport {
+    identity_file: String,
+    cluster_id: String,
+    device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +147,7 @@ struct UpsertOsIntegrationInstanceRequest {
     server_base_url: Option<String>,
     prefix: Option<String>,
     bootstrap_file: Option<String>,
+    client_identity_id: Option<String>,
     snapshot_file: Option<String>,
     client_identity_file: Option<String>,
     server_ca_path: Option<String>,
@@ -86,7 +167,24 @@ impl UpsertOsIntegrationInstanceRequest {
     fn into_instance(
         self,
         _existing: Option<&OsIntegrationInstance>,
+        store: &ManagedInstanceStore,
     ) -> Result<OsIntegrationInstance, ApiError> {
+        let client_identity_id = normalize_optional_string(self.client_identity_id);
+        let managed_identity = resolve_client_identity(store, client_identity_id.as_deref())?;
+        let bootstrap_file = managed_identity
+            .map(|identity| identity.bootstrap_file.clone())
+            .or_else(|| normalize_optional_string(self.bootstrap_file));
+        let client_identity_file = managed_identity
+            .map(|identity| identity.client_identity_file.clone())
+            .or_else(|| normalize_optional_string(self.client_identity_file));
+        let server_ca_path = managed_identity
+            .and_then(|identity| identity.server_ca_pem_file.clone())
+            .or_else(|| normalize_optional_string(self.server_ca_path));
+        let server_base_url = if managed_identity.is_some() {
+            None
+        } else {
+            normalize_optional_string(self.server_base_url)
+        };
         let instance = OsIntegrationInstance {
             id: normalize_optional_string(self.id)
                 .unwrap_or_else(|| generate_instance_id("os-integration")),
@@ -95,12 +193,13 @@ impl UpsertOsIntegrationInstanceRequest {
             sync_root_id: normalize_optional_string(self.sync_root_id),
             display_name: normalize_optional_string(self.display_name),
             root_path: required_field("root_path", self.root_path)?,
-            server_base_url: normalize_optional_string(self.server_base_url),
+            server_base_url,
             prefix: normalize_optional_string(self.prefix),
-            bootstrap_file: normalize_optional_string(self.bootstrap_file),
+            bootstrap_file,
+            client_identity_id,
             snapshot_file: normalize_optional_string(self.snapshot_file),
-            client_identity_file: normalize_optional_string(self.client_identity_file),
-            server_ca_path: normalize_optional_string(self.server_ca_path),
+            client_identity_file,
+            server_ca_path,
             client_edge_state_dir: normalize_optional_string(self.client_edge_state_dir),
             fs_name: normalize_optional_string(self.fs_name),
             allow_other: self.allow_other,
@@ -137,6 +236,8 @@ struct UpsertFolderAgentInstanceRequest {
     #[serde(default)]
     server_ca_pem_file: Option<Option<String>>,
     #[serde(default)]
+    client_identity_id: Option<String>,
+    #[serde(default)]
     client_identity_file: Option<Option<String>>,
     prefix: Option<String>,
     ui_bind: Option<String>,
@@ -150,7 +251,37 @@ impl UpsertFolderAgentInstanceRequest {
     fn into_instance(
         self,
         existing: Option<&FolderAgentInstance>,
+        store: &ManagedInstanceStore,
     ) -> Result<FolderAgentInstance, ApiError> {
+        let client_identity_id = normalize_optional_string(self.client_identity_id);
+        let managed_identity = resolve_client_identity(store, client_identity_id.as_deref())?;
+        let bootstrap_file = managed_identity
+            .map(|identity| identity.bootstrap_file.clone())
+            .or_else(|| normalize_optional_string(self.bootstrap_file));
+        let server_base_url = if managed_identity.is_some() {
+            None
+        } else {
+            resolve_hidden_optional_string(
+                self.server_base_url,
+                existing.and_then(|candidate| candidate.server_base_url.as_deref()),
+            )
+        };
+        let server_ca_pem_file = managed_identity
+            .and_then(|identity| identity.server_ca_pem_file.clone())
+            .or_else(|| {
+                resolve_hidden_optional_string(
+                    self.server_ca_pem_file,
+                    existing.and_then(|candidate| candidate.server_ca_pem_file.as_deref()),
+                )
+            });
+        let client_identity_file = managed_identity
+            .map(|identity| identity.client_identity_file.clone())
+            .or_else(|| {
+                resolve_hidden_optional_string(
+                    self.client_identity_file,
+                    existing.and_then(|candidate| candidate.client_identity_file.as_deref()),
+                )
+            });
         let instance = FolderAgentInstance {
             id: normalize_optional_string(self.id)
                 .unwrap_or_else(|| generate_instance_id("folder-agent")),
@@ -158,19 +289,11 @@ impl UpsertFolderAgentInstanceRequest {
             enabled: self.enabled,
             root_dir: required_field("root_dir", self.root_dir)?,
             state_root_dir: normalize_optional_string(self.state_root_dir),
-            server_base_url: resolve_hidden_optional_string(
-                self.server_base_url,
-                existing.and_then(|candidate| candidate.server_base_url.as_deref()),
-            ),
-            bootstrap_file: normalize_optional_string(self.bootstrap_file),
-            server_ca_pem_file: resolve_hidden_optional_string(
-                self.server_ca_pem_file,
-                existing.and_then(|candidate| candidate.server_ca_pem_file.as_deref()),
-            ),
-            client_identity_file: resolve_hidden_optional_string(
-                self.client_identity_file,
-                existing.and_then(|candidate| candidate.client_identity_file.as_deref()),
-            ),
+            server_base_url,
+            bootstrap_file,
+            server_ca_pem_file,
+            client_identity_id,
+            client_identity_file,
             prefix: normalize_optional_string(self.prefix),
             ui_bind: normalize_optional_string(self.ui_bind),
             run_once: self.run_once,
@@ -230,6 +353,7 @@ async fn main() -> Result<()> {
         .route("/app.css", get(app_css))
         .route("/app.js", get(app_js))
         .route("/api/config", get(get_config))
+        .route("/api/client-identities", post(upsert_client_identity))
         .route(
             "/api/os-integration-instances",
             post(upsert_os_integration_instance),
@@ -245,6 +369,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/folder-agent-instances/{id}",
             delete(delete_folder_agent_instance),
+        )
+        .route(
+            "/api/client-identities/{id}",
+            delete(delete_client_identity),
         )
         .route("/api/launch-enabled", post(launch_enabled_now))
         .route("/api/shutdown", post(shutdown_app))
@@ -292,6 +420,43 @@ async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse
     Ok(Json(payload))
 }
 
+async fn upsert_client_identity(
+    State(state): State<AppState>,
+    Json(request): Json<UpsertClientIdentityRequest>,
+) -> Result<Json<UpsertClientIdentityResponse>, ApiError> {
+    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+    let existing = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .and_then(|id| store.client_identity(id));
+    let (mut identity, bootstrap_content, enroll) =
+        request.into_identity(existing, &state.instance_store_path)?;
+    if let Some(bootstrap_content) = bootstrap_content.as_deref() {
+        write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
+    }
+    let enrollment = if enroll {
+        let report = enroll_client_identity(identity.clone()).await?;
+        refresh_client_identity_metadata(&mut identity);
+        identity.last_enrolled_at_unix_ms = Some(unix_ts_ms());
+        Some(report)
+    } else {
+        refresh_client_identity_metadata(&mut identity);
+        None
+    };
+
+    store.upsert_client_identity(identity);
+    store
+        .save(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+    Ok(Json(UpsertClientIdentityResponse {
+        config: load_config_response(&state).map_err(ApiError::internal)?,
+        enrollment,
+    }))
+}
+
 async fn upsert_os_integration_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertOsIntegrationInstanceRequest>,
@@ -309,7 +474,7 @@ async fn upsert_os_integration_instance(
                 .iter()
                 .find(|candidate| candidate.id == id)
         });
-    let instance = request.into_instance(existing)?;
+    let instance = request.into_instance(existing, &store)?;
     store.upsert_os_integration(instance);
     store
         .save(&state.instance_store_path)
@@ -336,7 +501,7 @@ async fn upsert_folder_agent_instance(
                 .iter()
                 .find(|candidate| candidate.id == id)
         });
-    let instance = request.into_instance(existing)?;
+    let instance = request.into_instance(existing, &store)?;
     store.upsert_folder_agent(instance);
     store
         .save(&state.instance_store_path)
@@ -347,7 +512,7 @@ async fn upsert_folder_agent_instance(
 }
 
 async fn delete_os_integration_instance(
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
     let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
@@ -367,7 +532,7 @@ async fn delete_os_integration_instance(
 }
 
 async fn delete_folder_agent_instance(
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
     let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
@@ -375,6 +540,26 @@ async fn delete_folder_agent_instance(
     if !store.remove_folder_agent(&id) {
         return Err(ApiError::bad_request(format!(
             "folder-agent instance '{}' was not found",
+            id
+        )));
+    }
+    store
+        .save(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        load_config_response(&state).map_err(ApiError::internal)?,
+    ))
+}
+
+async fn delete_client_identity(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ConfigResponse>, ApiError> {
+    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+    if !store.remove_client_identity(&id) {
+        return Err(ApiError::bad_request(format!(
+            "client identity '{}' was not found",
             id
         )));
     }
@@ -411,6 +596,7 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
         supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
         config_path: state.instance_store_path.display().to_string(),
         launch_report_path: state.launch_report_path.display().to_string(),
+        service_log_dir: default_service_log_dir().display().to_string(),
         package_root: state.package_root.display().to_string(),
         startup_integration_label: STARTUP_INTEGRATION_LABEL,
         startup_integration_value: STARTUP_INTEGRATION_VALUE,
@@ -418,6 +604,167 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
         store,
         last_launch_report,
     })
+}
+
+async fn enroll_client_identity(
+    identity: ClientIdentityConfig,
+) -> Result<ClientIdentityEnrollmentReport, ApiError> {
+    tokio::task::spawn_blocking(move || enroll_client_identity_blocking(&identity))
+        .await
+        .map_err(|error| ApiError::internal(anyhow::anyhow!("enrollment task panicked: {error}")))?
+}
+
+fn enroll_client_identity_blocking(
+    identity: &ClientIdentityConfig,
+) -> Result<ClientIdentityEnrollmentReport, ApiError> {
+    let bootstrap_content = std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
+        ApiError::internal(anyhow::anyhow!(
+            "failed reading managed bootstrap file {}: {error}",
+            identity.bootstrap_file
+        ))
+    })?;
+    let enrolled =
+        enroll_connection_input_blocking(&bootstrap_content, None, Some(identity.label.as_str()))
+            .map_err(|error| {
+            ApiError::bad_request(format!("client identity enrollment failed: {error}"))
+        })?;
+    let material = enrolled.client_identity_material().map_err(|error| {
+        ApiError::internal(error.context("failed building client identity material"))
+    })?;
+    material
+        .write_to_path(Path::new(&identity.client_identity_file))
+        .map_err(|error| {
+            ApiError::internal(error.context(format!(
+                "failed writing client identity {}",
+                identity.client_identity_file
+            )))
+        })?;
+
+    Ok(ClientIdentityEnrollmentReport {
+        identity_file: identity.client_identity_file.clone(),
+        cluster_id: material.cluster_id.to_string(),
+        device_id: material.device_id.to_string(),
+        server_base_url: enrolled.server_base_url,
+    })
+}
+
+fn refresh_client_identity_metadata(identity: &mut ClientIdentityConfig) {
+    let Ok(raw) = std::fs::read_to_string(&identity.client_identity_file) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+
+    identity.cluster_id = json_string_field(&value, "cluster_id").or(identity.cluster_id.clone());
+    identity.device_id = json_string_field(&value, "device_id").or(identity.device_id.clone());
+    identity.device_label = json_string_field(&value, "label").or(identity.device_label.clone());
+    identity.issued_at_unix = json_u64_field(&value, "issued_at_unix").or(identity.issued_at_unix);
+    identity.expires_at_unix =
+        json_u64_field(&value, "expires_at_unix").or(identity.expires_at_unix);
+}
+
+fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, ApiError> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
+        ApiError::bad_request(format!("bootstrap content must be valid JSON: {error}"))
+    })?;
+    for path in [
+        &["device_label"][..],
+        &["label"][..],
+        &["bootstrap", "device_label"][..],
+        &["bootstrap", "label"][..],
+        &["bootstrap_bundle", "device_label"][..],
+        &["bootstrap_bundle", "label"][..],
+    ] {
+        if let Some(label) = json_string_path(&value, path) {
+            return Ok(label);
+        }
+    }
+
+    Err(ApiError::bad_request(
+        "bootstrap content must include device_label so the identity name can be derived",
+    ))
+}
+
+fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn json_string_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn json_u64_field(value: &serde_json::Value, field: &str) -> Option<u64> {
+    value.get(field).and_then(serde_json::Value::as_u64)
+}
+
+fn resolve_client_identity<'a>(
+    store: &'a ManagedInstanceStore,
+    id: Option<&str>,
+) -> Result<Option<&'a ClientIdentityConfig>, ApiError> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    store
+        .client_identity(id)
+        .map(Some)
+        .ok_or_else(|| ApiError::bad_request(format!("client identity '{}' was not found", id)))
+}
+
+fn write_managed_text_file(path: &str, content: &str) -> Result<(), ApiError> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ApiError::internal(anyhow::anyhow!(
+                "failed creating managed client identity directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let payload = if content.ends_with('\n') {
+        content.to_string()
+    } else {
+        format!("{content}\n")
+    };
+    std::fs::write(path, payload).map_err(|error| {
+        ApiError::internal(anyhow::anyhow!(
+            "failed writing managed bootstrap file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn default_managed_client_bootstrap_path(instance_store_path: &Path, id: &str) -> String {
+    instance_store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("client-identities")
+        .join(format!("{id}.bootstrap.json"))
+        .display()
+        .to_string()
+}
+
+fn default_managed_client_identity_path(instance_store_path: &Path, id: &str) -> String {
+    instance_store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("client-identities")
+        .join(format!("{id}.client-identity.json"))
+        .display()
+        .to_string()
 }
 
 fn required_field(field_name: &str, value: String) -> Result<String, ApiError> {
@@ -477,6 +824,15 @@ fn resolve_hidden_optional_string(
 
 fn default_enabled() -> bool {
     true
+}
+
+fn unix_ts_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn open_browser(url: &str) -> Result<()> {
@@ -605,6 +961,10 @@ const APP_HTML: &str = r###"<!doctype html>
             <span class="nav-title">Runtime</span>
             <span class="nav-description">Package paths, startup integration, and the last recorded launcher run.</span>
           </a>
+          <a class="shell-nav-link" href="#identity-panel">
+            <span class="nav-title">Client Identities</span>
+            <span class="nav-description">Enroll and manage reusable device identities for sync profiles.</span>
+          </a>
           <a id="os-nav-link" class="shell-nav-link" href="#os-panel">
             <span id="os-nav-title" class="nav-title">OS Integration</span>
             <span id="os-nav-description" class="nav-description">Configure platform-specific filesystem integration instances.</span>
@@ -629,6 +989,10 @@ const APP_HTML: &str = r###"<!doctype html>
               <p class="lede">Define managed background services, review launcher output, and restart enabled instances from the same desktop configuration surface on Windows and Linux.</p>
             </div>
             <div class="page-summary">
+              <div class="summary-chip">
+                <span class="summary-label">Client Identities</span>
+                <strong id="identity-count">0</strong>
+              </div>
               <div id="os-summary-chip" class="summary-chip">
                 <span id="os-summary-label" class="summary-label">OS Integration</span>
                 <strong id="os-instance-count">0</strong>
@@ -650,11 +1014,42 @@ const APP_HTML: &str = r###"<!doctype html>
             <dl class="meta-grid">
               <div><dt>Config Store</dt><dd id="config-path">Loading...</dd></div>
               <div><dt>Launch Report</dt><dd id="launch-report-path">Loading...</dd></div>
+              <div><dt>Service Logs</dt><dd id="service-log-dir">Loading...</dd></div>
               <div><dt>Package Root</dt><dd id="package-root">Loading...</dd></div>
               <div><dt id="startup-integration-label">Startup Integration</dt><dd id="startup-integration-value">Loading...</dd></div>
             </dl>
             <p id="startup-integration-note" class="panel-note">Loading...</p>
             <pre id="launch-report">No launcher run recorded yet.</pre>
+          </section>
+
+          <section id="identity-panel" class="panel panel-split">
+            <div class="panel-column">
+              <div class="panel-header">
+                <div>
+                  <h2>Client Identities</h2>
+                  <p>Reusable bootstrap and device identity files for authenticated sync profiles.</p>
+                </div>
+                <button id="clear-identity-form" class="secondary">New Identity</button>
+              </div>
+              <div id="identity-list" class="instance-list"></div>
+            </div>
+            <form id="identity-form" class="instance-form panel-form">
+              <h3>Configure Client Identity</h3>
+              <input type="hidden" id="identity-id" />
+              <label class="wide-field">
+                <span class="field-label">Bootstrap File</span>
+                <span class="field-help">Paste the bootstrap JSON from the server. The identity name is derived from its device_label.</span>
+                <textarea id="identity-bootstrap-content" spellcheck="false"></textarea>
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="identity-enroll" checked />
+                <span class="checkbox-copy">
+                  <span class="field-label">Enroll using this bootstrap file</span>
+                  <span class="field-help">Enrolls this device identity and writes the managed client identity file.</span>
+                </span>
+              </label>
+              <button type="submit">Save Client Identity</button>
+            </form>
           </section>
 
           <section id="os-panel" class="panel panel-split">
@@ -715,15 +1110,12 @@ const APP_HTML: &str = r###"<!doctype html>
                   <input id="os-bootstrap-file" />
                 </label>
                 <label>
-                  <span class="field-label">Client Identity File</span>
-                  <span class="field-help">Optional client identity JSON used for authenticated live mounts.</span>
-                  <input id="os-client-identity-file" />
+                  <span class="field-label">Managed Client Identity</span>
+                  <span class="field-help">Select a saved identity to fill the bootstrap and identity file paths for this profile.</span>
+                  <select id="os-client-identity-id"></select>
                 </label>
-                <label>
-                  <span id="os-server-ca-label" class="field-label">Server CA File</span>
-                  <span id="os-server-ca-help" class="field-help">Optional trust anchor used for remote TLS connections.</span>
-                  <input id="os-server-ca-path" />
-                </label>
+                <input type="hidden" id="os-client-identity-file" />
+                <input type="hidden" id="os-server-ca-path" />
                 <label>
                   <span class="field-label">Remote Folder Prefix</span>
                   <span class="field-help">Optional remote subfolder or namespace prefix for this instance.</span>
@@ -828,10 +1220,17 @@ const APP_HTML: &str = r###"<!doctype html>
                 <input id="folder-prefix" />
               </label>
               <label>
+                <span class="field-label">Managed Client Identity</span>
+                <span class="field-help">Select a saved identity to use its bootstrap and client identity files.</span>
+                <select id="folder-client-identity-id"></select>
+              </label>
+              <label>
                 <span class="field-label">Initial Setup File</span>
                 <span class="field-help">Optional bootstrap JSON file used for first-time setup.</span>
                 <input id="folder-bootstrap-file" />
               </label>
+              <input type="hidden" id="folder-client-identity-file" />
+              <input type="hidden" id="folder-server-ca-pem-file" />
               <label>
                 <span class="field-label">Local Status UI Address</span>
                 <span class="field-help">Optional local address for the agent status UI, for example 127.0.0.1:3030.</span>
@@ -1185,7 +1584,7 @@ button.secondary {
 
 .page-summary {
   display: grid;
-  grid-template-columns: repeat(2, minmax(150px, 1fr));
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
   gap: 12px;
   min-width: 320px;
 }
@@ -1301,6 +1700,7 @@ dd {
 
 .instance-form > h3,
 .instance-form > .panel-note,
+.instance-form > .wide-field,
 .instance-form > .form-section,
 .instance-form > button {
   grid-column: 1 / -1;
@@ -1348,7 +1748,9 @@ dd {
   line-height: 1.45;
 }
 
-.instance-form input {
+.instance-form input,
+.instance-form select,
+.instance-form textarea {
   width: 100%;
   padding: 12px 14px;
   border-radius: var(--radius-input);
@@ -1358,7 +1760,20 @@ dd {
   transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
 }
 
-.instance-form input:focus {
+.instance-form textarea {
+  min-height: 180px;
+  resize: vertical;
+  font-family: "Cascadia Code", "Aptos Mono", monospace;
+  line-height: 1.5;
+}
+
+.instance-form select {
+  min-height: 45px;
+}
+
+.instance-form input:focus,
+.instance-form select:focus,
+.instance-form textarea:focus {
   outline: none;
   border-color: var(--input-border-focus);
   box-shadow: 0 0 0 4px var(--accent-soft);
@@ -1553,13 +1968,87 @@ function renderLaunchReport(report) {
   target.textContent = JSON.stringify(report, null, 2);
 }
 
+function clientIdentities() {
+  return currentConfig?.store?.client_identities || [];
+}
+
+function findClientIdentity(id) {
+  return clientIdentities().find((identity) => identity.id === id);
+}
+
+function identityLabelForProfile(instance) {
+  const identity = instance.client_identity_id ? findClientIdentity(instance.client_identity_id) : null;
+  if (identity) {
+    return identity.label;
+  }
+  return instance.client_identity_file || '';
+}
+
+function renderIdentityOptions(selectId, selectedId) {
+  const target = document.getElementById(selectId);
+  const options = ['<option value="">Manual or no managed identity</option>'];
+  for (const identity of clientIdentities()) {
+    const selected = identity.id === selectedId ? ' selected' : '';
+    options.push(`<option value="${escapeHtml(identity.id)}"${selected}>${escapeHtml(identity.label)}</option>`);
+  }
+  target.innerHTML = options.join('');
+}
+
+function resolveProfileIdentityId(instance) {
+  if (instance.client_identity_id && findClientIdentity(instance.client_identity_id)) {
+    return instance.client_identity_id;
+  }
+  const match = clientIdentities().find((identity) =>
+    identity.client_identity_file && identity.client_identity_file === instance.client_identity_file
+  );
+  return match?.id || '';
+}
+
+function applySelectedIdentityToProfile(kind) {
+  const identity = findClientIdentity(document.getElementById(`${kind}-client-identity-id`).value);
+  if (!identity) return;
+  document.getElementById(`${kind}-bootstrap-file`).value = identity.bootstrap_file || '';
+  if (kind === 'os') {
+    document.getElementById('os-client-identity-file').value = identity.client_identity_file || '';
+    document.getElementById('os-server-ca-path').value = identity.server_ca_pem_file || '';
+    document.getElementById('os-server-base-url').value = '';
+  } else if (kind === 'folder') {
+    document.getElementById('folder-client-identity-file').value = identity.client_identity_file || '';
+    document.getElementById('folder-server-ca-pem-file').value = identity.server_ca_pem_file || '';
+  }
+}
+
+function renderClientIdentityCard(identity) {
+  const details = [
+    ['Bootstrap File', identity.bootstrap_file],
+    ['Cluster ID', identity.cluster_id || ''],
+  ];
+  return `
+    <article class="instance-card">
+      <div class="actions">
+        <div>
+          <strong>${escapeHtml(identity.label)}</strong>
+          <div class="instance-meta">${escapeHtml(identity.device_label || 'Managed client identity')}</div>
+        </div>
+        <div class="actions">
+          <button type="button" class="secondary" onclick="editClientIdentity('${encodeURIComponent(identity.id)}')">Edit</button>
+          <button type="button" class="secondary" onclick="deleteClientIdentity('${encodeURIComponent(identity.id)}')">Delete</button>
+        </div>
+      </div>
+      <dl class="instance-meta">
+        ${details.map(([label, value]) => `<div><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value || '-')}</div>`).join('')}
+      </dl>
+    </article>
+  `;
+}
+
 function renderInstanceCard(instance, kind, onEdit, onDelete) {
   const details = kind === 'os'
     ? currentConfig?.platform === 'linux'
       ? [
           ['Mountpoint', instance.root_path],
           ['Connection Source', instance.snapshot_file || instance.bootstrap_file || instance.server_base_url || ''],
-          ['Client Identity File', instance.client_identity_file || ''],
+          ['Client Identity', identityLabelForProfile(instance)],
           ['Remote Folder Prefix', instance.prefix || ''],
           ['GNOME Status Publishing', instance.publish_gnome_status ? 'Enabled' : 'Disabled'],
         ]
@@ -1568,12 +2057,14 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
           ['Folder Name in Explorer', instance.display_name],
           ['Local Folder Location', instance.root_path],
           ['Initial Setup File', instance.bootstrap_file || ''],
+          ['Client Identity', identityLabelForProfile(instance)],
           ['Remote Folder Prefix', instance.prefix || ''],
         ]
     : [
         ['Folder to Sync', instance.root_dir],
         ['Local State Storage', instance.state_root_dir || ''],
         ['Initial Setup File', instance.bootstrap_file || ''],
+        ['Client Identity', identityLabelForProfile(instance)],
         ['Local Status UI Address', instance.ui_bind || ''],
       ];
 
@@ -1639,10 +2130,6 @@ function applyOsPlatformUi(platform) {
   document.getElementById('os-root-path-help').textContent = isWindows
     ? 'Local folder path where this sync root is mounted.'
     : 'Directory where the IronMesh FUSE filesystem should be mounted.';
-  document.getElementById('os-server-ca-label').textContent = isWindows ? 'Server CA Certificate' : 'Server CA PEM File';
-  document.getElementById('os-server-ca-help').textContent = isWindows
-    ? 'Optional certificate path used to trust the remote server for Explorer sync-root sessions.'
-    : 'Optional PEM path used to trust the remote server for live FUSE mounts.';
   document.getElementById('os-submit-button').textContent = isWindows
     ? 'Save Explorer Sync Root'
     : isLinux
@@ -1661,14 +2148,23 @@ function renderConfig(config) {
       : 'IronMesh Desktop Config';
   document.getElementById('config-path').textContent = config.config_path;
   document.getElementById('launch-report-path').textContent = config.launch_report_path;
+  document.getElementById('service-log-dir').textContent = config.service_log_dir;
   document.getElementById('package-root').textContent = config.package_root;
   document.getElementById('startup-integration-label').textContent = config.startup_integration_label;
   document.getElementById('startup-integration-value').textContent = config.startup_integration_value;
   document.getElementById('startup-integration-note').textContent = config.startup_integration_note;
+  document.getElementById('identity-count').textContent = String(config.store.client_identities.length);
   document.getElementById('os-instance-count').textContent = String(config.store.os_integration_instances.length);
   document.getElementById('folder-instance-count').textContent = String(config.store.folder_agent_instances.length);
   renderLaunchReport(config.last_launch_report);
   applyOsPlatformUi(config.platform);
+  renderIdentityOptions('os-client-identity-id', document.getElementById('os-client-identity-id')?.value || '');
+  renderIdentityOptions('folder-client-identity-id', document.getElementById('folder-client-identity-id')?.value || '');
+
+  const identityTarget = document.getElementById('identity-list');
+  identityTarget.innerHTML = config.store.client_identities.length
+    ? config.store.client_identities.map(renderClientIdentityCard).join('')
+    : '<p class="empty">No client identities configured yet.</p>';
 
   const supportsOsIntegration = !!config.supports_os_integration;
   document.getElementById('os-nav-link').hidden = !supportsOsIntegration;
@@ -1696,6 +2192,12 @@ async function refreshConfig() {
   showStatus('Loaded configuration store.');
 }
 
+function clearIdentityForm() {
+  document.getElementById('identity-id').value = '';
+  document.getElementById('identity-bootstrap-content').value = '';
+  document.getElementById('identity-enroll').checked = true;
+}
+
 function clearOsForm() {
   document.getElementById('os-id').value = '';
   document.getElementById('os-label').value = '';
@@ -1706,6 +2208,7 @@ function clearOsForm() {
   document.getElementById('os-server-base-url').value = '';
   document.getElementById('os-prefix').value = '';
   document.getElementById('os-bootstrap-file').value = '';
+  renderIdentityOptions('os-client-identity-id', '');
   document.getElementById('os-snapshot-file').value = '';
   document.getElementById('os-client-identity-file').value = '';
   document.getElementById('os-server-ca-path').value = '';
@@ -1727,6 +2230,9 @@ function clearFolderForm() {
   document.getElementById('folder-state-root-dir').value = '';
   document.getElementById('folder-prefix').value = '';
   document.getElementById('folder-bootstrap-file').value = '';
+  renderIdentityOptions('folder-client-identity-id', '');
+  document.getElementById('folder-client-identity-file').value = '';
+  document.getElementById('folder-server-ca-pem-file').value = '';
   document.getElementById('folder-ui-bind').value = '';
   document.getElementById('folder-run-once').checked = false;
   document.getElementById('folder-no-watch-local').checked = false;
@@ -1740,6 +2246,14 @@ function findFolderInstance(id) {
   return currentConfig?.store?.folder_agent_instances?.find((instance) => instance.id === id);
 }
 
+window.editClientIdentity = function(encodedId) {
+  const identity = findClientIdentity(decodeURIComponent(encodedId));
+  if (!identity) return;
+  document.getElementById('identity-id').value = identity.id;
+  document.getElementById('identity-bootstrap-content').value = '';
+  document.getElementById('identity-enroll').checked = false;
+};
+
 window.editOsInstance = function(encodedId) {
   const instance = findOsInstance(decodeURIComponent(encodedId));
   if (!instance) return;
@@ -1752,6 +2266,7 @@ window.editOsInstance = function(encodedId) {
   document.getElementById('os-server-base-url').value = instance.server_base_url || '';
   document.getElementById('os-prefix').value = instance.prefix || '';
   document.getElementById('os-bootstrap-file').value = instance.bootstrap_file || '';
+  renderIdentityOptions('os-client-identity-id', resolveProfileIdentityId(instance));
   document.getElementById('os-snapshot-file').value = instance.snapshot_file || '';
   document.getElementById('os-client-identity-file').value = instance.client_identity_file || '';
   document.getElementById('os-server-ca-path').value = instance.server_ca_path || '';
@@ -1775,9 +2290,21 @@ window.editFolderInstance = function(encodedId) {
   document.getElementById('folder-state-root-dir').value = instance.state_root_dir || '';
   document.getElementById('folder-prefix').value = instance.prefix || '';
   document.getElementById('folder-bootstrap-file').value = instance.bootstrap_file || '';
+  renderIdentityOptions('folder-client-identity-id', resolveProfileIdentityId(instance));
+  document.getElementById('folder-client-identity-file').value = instance.client_identity_file || '';
+  document.getElementById('folder-server-ca-pem-file').value = instance.server_ca_pem_file || '';
   document.getElementById('folder-ui-bind').value = instance.ui_bind || '';
   document.getElementById('folder-run-once').checked = !!instance.run_once;
   document.getElementById('folder-no-watch-local').checked = !!instance.no_watch_local;
+};
+
+window.deleteClientIdentity = async function(encodedId) {
+  const id = decodeURIComponent(encodedId);
+  if (!confirm(`Delete client identity ${id}?`)) return;
+  const payload = await fetchJson(`/api/client-identities/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  renderConfig(payload);
+  clearIdentityForm();
+  showStatus(`Deleted client identity ${id}.`);
 };
 
 window.deleteOsInstance = async function(encodedId) {
@@ -1798,6 +2325,23 @@ window.deleteFolderInstance = async function(encodedId) {
   showStatus(`Deleted folder-agent instance ${id}.`);
 };
 
+async function submitIdentityForm(event) {
+  event.preventDefault();
+  const payload = {
+    id: document.getElementById('identity-id').value || null,
+    bootstrap_content: document.getElementById('identity-bootstrap-content').value,
+    enroll: document.getElementById('identity-enroll').checked,
+  };
+  const response = await fetchJson('/api/client-identities', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  renderConfig(response.config);
+  clearIdentityForm();
+  showStatus(response.enrollment ? response.enrollment : 'Saved client identity.');
+}
+
 async function submitOsForm(event) {
   event.preventDefault();
   const payload = {
@@ -1810,6 +2354,7 @@ async function submitOsForm(event) {
     server_base_url: document.getElementById('os-server-base-url').value,
     prefix: document.getElementById('os-prefix').value,
     bootstrap_file: document.getElementById('os-bootstrap-file').value,
+    client_identity_id: document.getElementById('os-client-identity-id').value,
     snapshot_file: document.getElementById('os-snapshot-file').value,
     client_identity_file: document.getElementById('os-client-identity-file').value,
     server_ca_path: document.getElementById('os-server-ca-path').value,
@@ -1842,6 +2387,9 @@ async function submitFolderForm(event) {
     state_root_dir: document.getElementById('folder-state-root-dir').value,
     prefix: document.getElementById('folder-prefix').value,
     bootstrap_file: document.getElementById('folder-bootstrap-file').value,
+    client_identity_id: document.getElementById('folder-client-identity-id').value,
+    client_identity_file: document.getElementById('folder-client-identity-file').value,
+    server_ca_pem_file: document.getElementById('folder-server-ca-pem-file').value,
     ui_bind: document.getElementById('folder-ui-bind').value,
     run_once: document.getElementById('folder-run-once').checked,
     no_watch_local: document.getElementById('folder-no-watch-local').checked,
@@ -1882,6 +2430,9 @@ window.addEventListener('DOMContentLoaded', async () => {
       updateColorSchemeControls();
     }
   });
+  document.getElementById('identity-form').addEventListener('submit', (event) => {
+    submitIdentityForm(event).catch((error) => showStatus({ error: error.message }));
+  });
   document.getElementById('os-form').addEventListener('submit', (event) => {
     submitOsForm(event).catch((error) => showStatus({ error: error.message }));
   });
@@ -1897,8 +2448,16 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('shutdown-button').addEventListener('click', () => {
     shutdownApp().catch((error) => showStatus({ error: error.message }));
   });
+  document.getElementById('clear-identity-form').addEventListener('click', clearIdentityForm);
   document.getElementById('clear-os-form').addEventListener('click', clearOsForm);
   document.getElementById('clear-folder-form').addEventListener('click', clearFolderForm);
+  document.getElementById('os-client-identity-id').addEventListener('change', () => {
+    applySelectedIdentityToProfile('os');
+  });
+  document.getElementById('folder-client-identity-id').addEventListener('change', () => {
+    applySelectedIdentityToProfile('folder');
+  });
+  clearIdentityForm();
   clearOsForm();
   clearFolderForm();
   try {

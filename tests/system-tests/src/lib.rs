@@ -2,6 +2,7 @@
 
 mod client_sdk_test;
 mod cluster_test;
+mod config_app_test;
 mod framework;
 #[path = "web-ui-backend_test.rs"]
 mod web_ui_backend_test;

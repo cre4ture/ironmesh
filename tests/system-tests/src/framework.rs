@@ -1295,6 +1295,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     let override_key = match name {
         "server-node" => "IRONMESH_SERVER_BIN",
         "cli-client" => "IRONMESH_CLI_BIN",
+        "config-app" => "IRONMESH_CONFIG_APP_BIN",
         "os-integration" => "IRONMESH_OS_INTEGRATION_BIN",
         "ironmesh-folder-agent" => "IRONMESH_FOLDER_AGENT_BIN",
         "rendezvous-service" => "IRONMESH_RENDEZVOUS_BIN",
@@ -1317,6 +1318,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     let artifact_path = match name {
         "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_ironmesh-server-node"),
         "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_ironmesh"),
+        "config-app" => option_env!("CARGO_BIN_FILE_IRONMESH_CONFIG_APP_ironmesh-config-app"),
         "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_ironmesh-os-integration"),
         "ironmesh-folder-agent" => {
             option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_ironmesh-folder-agent")
@@ -1335,6 +1337,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     let executable_name = match name {
         "server-node" => "ironmesh-server-node",
         "cli-client" => "ironmesh",
+        "config-app" => "ironmesh-config-app",
         "os-integration" => "ironmesh-os-integration",
         "rendezvous-service" => "ironmesh-rendezvous-service",
         _ => name,
@@ -1346,10 +1349,11 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
 
     if !path.exists() {
         bail!(
-            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{}/{}/{} overrides)",
+            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{}/{}/{}/{} overrides)",
             path.display(),
             "IRONMESH_SERVER_BIN",
             "IRONMESH_CLI_BIN",
+            "IRONMESH_CONFIG_APP_BIN",
             "IRONMESH_OS_INTEGRATION_BIN",
             "IRONMESH_FOLDER_AGENT_BIN",
             "IRONMESH_RENDEZVOUS_BIN"
