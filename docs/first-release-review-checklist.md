@@ -361,10 +361,10 @@ Working evidence log:
    - Linux mutable client state stays under XDG `Ironmesh` roots, while server and rendezvous packages keep operator-edited config in `/etc/ironmesh/*.env` and runtime state in systemd `StateDirectory` roots under `/var/lib`; package upgrades should not rewrite those paths.
    - Debian packaging installs but does not auto-enable or auto-start `ironmesh-server-node.service` or `ironmesh-rendezvous-service.service`; operators must fill in the matching env file and run `systemctl enable --now ...` explicitly.
    - The client package ships GNOME extension assets, but GNOME Shell integration remains optional and per-user. The package does not auto-enable the extension; `ironmesh-os-integration gnome install-extension` or `ironmesh-folder-agent gnome install-extension` still performs the user install step.
-   - Linux `Run Enabled Services` works from the config app, but login autostart is not wired yet, so Linux background behavior is intentionally below Windows startup-task parity for the first release.
+   - Linux `Run Enabled Services` works from the config app, and the Debian client package ships an XDG autostart entry for `ironmesh-config-app --background` so the config app can relaunch enabled managed services after graphical sign-in.
 - Findings:
    - `decision`: [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) should treat Launchpad PPA plus `apt` as the supported Ubuntu install and update contract for the first release; no custom in-app updater is needed on Ubuntu.
-   - `minor`: [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs) still reports that Linux login autostart is not configured, so release docs must describe Linux background relaunch as manual-on-demand rather than automatic at sign-in.
+   - `minor`: Linux autostart is now package-driven through XDG Autostart rather than a user-level systemd service, so release docs should describe how users can disable the autostart entry if they do not want background desktop status.
    - `minor`: [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs) installs the GNOME extension into `~/.local/share/gnome-shell/extensions/...`, which keeps the extension per-user and update-safe but means the Debian package alone does not finish desktop integration.
 - Missing tests or docs:
    - Validate the real `add-apt-repository` plus `apt install` and `apt upgrade` flow against a fresh supported Ubuntu series once the production PPA name exists.
@@ -372,7 +372,7 @@ Working evidence log:
    - Keep Launchpad PPA as the Ubuntu consumer channel and document the final end-user install and update commands with the real PPA name.
    - Keep Linux service enablement and GNOME extension enablement as explicit opt-in steps unless a deliberate packaging hook is added later.
 - Deferred post-release items:
-   - Add Linux login autostart only after the XDG autostart behavior is intentionally designed and tested.
+   - Add user-facing enable/disable controls for desktop background autostart after the packaged XDG autostart behavior is tested.
 
 Exit criteria:
 

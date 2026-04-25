@@ -28,10 +28,14 @@ pub struct DesktopStatusDocument {
     pub profile_label: String,
     pub root_dir: String,
     pub connection_target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui_url: Option<String>,
     pub overall: StatusFacet,
     pub connection: StatusFacet,
     pub sync: StatusFacet,
     pub replication: StatusFacet,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<DesktopServiceStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +64,19 @@ impl StatusFacet {
             updated_unix_ms: now_unix_ms(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopServiceStatus {
+    pub instance_kind: String,
+    pub id: String,
+    pub label: String,
+    pub state: String,
+    pub summary: String,
+    pub detail: String,
+    pub icon_name: String,
+    pub updated_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,11 +169,20 @@ pub fn build_status_document(
         profile_label: profile_label.into(),
         root_dir: root_dir.display().to_string(),
         connection_target: connection_target.into(),
+        web_ui_url: None,
         overall: overall_status_facet(snapshot),
         connection: snapshot.connection.clone(),
         sync: snapshot.sync.clone(),
         replication: snapshot.replication.clone(),
+        services: Vec::new(),
     }
+}
+
+pub fn read_status_document(path: &Path) -> Result<DesktopStatusDocument> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read desktop status JSON {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse desktop status JSON {}", path.display()))
 }
 
 pub fn write_status_document(path: &Path, document: &DesktopStatusDocument) -> Result<()> {

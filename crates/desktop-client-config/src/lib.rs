@@ -39,12 +39,12 @@ pub const STARTUP_INTEGRATION_LABEL: &str = if cfg!(windows) {
 pub const STARTUP_INTEGRATION_VALUE: &str = if cfg!(windows) {
     STARTUP_TASK_ID
 } else {
-    "Not configured"
+    "ironmesh-config-app-background.desktop"
 };
 pub const STARTUP_INTEGRATION_NOTE: &str = if cfg!(windows) {
     "Enabled services can restart after sign-in through the packaged startup task."
 } else {
-    "Run Enabled Services works on Linux, but login autostart is not wired yet."
+    "Packaged Linux installs can start the background config app after graphical sign-in through XDG Autostart. Run ironmesh-config-app --background to start it in the current session."
 };
 pub const OS_INTEGRATION_MANAGEMENT_SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 
@@ -55,6 +55,7 @@ const LEGACY_WINDOWS_CONFIG_SUBDIR: &str = "windows-client-config";
 const INSTANCE_STORE_FILE_NAME: &str = "instances.json";
 const LAST_LAUNCH_REPORT_FILE_NAME: &str = "last-launch-report.json";
 const SERVICE_LOG_SUBDIR: &str = "service-logs";
+const SERVICE_DESKTOP_STATUS_SUBDIR: &str = "service-status";
 const MANAGED_INSTANCE_STORE_VERSION: u32 = 1;
 const LAUNCH_REPORT_VERSION: u32 = 1;
 
@@ -663,6 +664,30 @@ pub fn default_service_log_dir() -> PathBuf {
     }
 }
 
+pub fn default_service_desktop_status_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        local_appdata_root()
+            .join(CONFIG_SUBDIR)
+            .join(SERVICE_DESKTOP_STATUS_SUBDIR)
+    }
+
+    #[cfg(not(windows))]
+    {
+        state_home_root()
+            .join(CONFIG_SUBDIR)
+            .join(SERVICE_DESKTOP_STATUS_SUBDIR)
+    }
+}
+
+pub fn service_desktop_status_file_path(instance_kind: &str, id: &str) -> PathBuf {
+    default_service_desktop_status_dir().join(format!(
+        "{}-{}.json",
+        sanitize_log_file_component(instance_kind),
+        sanitize_log_file_component(id)
+    ))
+}
+
 pub fn migrate_legacy_state_paths() -> Result<()> {
     #[cfg(windows)]
     {
@@ -730,7 +755,11 @@ pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Pat
                 &instance.id,
                 &instance.label,
                 service_executable_candidates(package_root, OS_INTEGRATION_EXE),
-                instance.command_args(),
+                with_managed_desktop_status_args(
+                    instance.command_args(),
+                    "os-integration",
+                    &instance.id,
+                ),
                 &service_log_dir,
                 launched_at_unix_ms,
             ));
@@ -757,7 +786,7 @@ pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Pat
             &instance.id,
             &instance.label,
             service_executable_candidates(package_root, FOLDER_AGENT_EXE),
-            instance.command_args(),
+            with_managed_desktop_status_args(instance.command_args(), "folder-agent", &instance.id),
             &service_log_dir,
             launched_at_unix_ms,
         ));
@@ -784,7 +813,11 @@ pub fn launch_os_integration_instance(
             &instance.id,
             &instance.label,
             service_executable_candidates(package_root, OS_INTEGRATION_EXE),
-            instance.command_args(),
+            with_managed_desktop_status_args(
+                instance.command_args(),
+                "os-integration",
+                &instance.id,
+            ),
             &default_service_log_dir(),
             launched_at_unix_ms,
         )
@@ -811,10 +844,54 @@ pub fn launch_folder_agent_instance(
         &instance.id,
         &instance.label,
         service_executable_candidates(package_root, FOLDER_AGENT_EXE),
-        instance.command_args(),
+        with_managed_desktop_status_args(instance.command_args(), "folder-agent", &instance.id),
         &default_service_log_dir(),
         unix_ts_ms(),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn with_managed_desktop_status_args(
+    mut args: Vec<String>,
+    instance_kind: &str,
+    id: &str,
+) -> Vec<String> {
+    remove_flag(&mut args, "--publish-gnome-status", false);
+    remove_flag(&mut args, "--gnome-status-file", true);
+
+    args.push("--publish-gnome-status".to_string());
+    args.push("--gnome-status-file".to_string());
+    args.push(
+        service_desktop_status_file_path(instance_kind, id)
+            .display()
+            .to_string(),
+    );
+    args
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_managed_desktop_status_args(
+    args: Vec<String>,
+    _instance_kind: &str,
+    _id: &str,
+) -> Vec<String> {
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn remove_flag(args: &mut Vec<String>, flag: &str, has_value: bool) {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] != flag {
+            index += 1;
+            continue;
+        }
+
+        args.remove(index);
+        if has_value && index < args.len() {
+            args.remove(index);
+        }
+    }
 }
 
 pub fn service_runtime_statuses(

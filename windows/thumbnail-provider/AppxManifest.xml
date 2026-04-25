@@ -43,6 +43,14 @@
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png" />
       <Extensions>
+        <uap3:Extension
+          Category="windows.appExecutionAlias"
+          Executable="ironmesh-config-app.exe"
+          EntryPoint="Windows.FullTrustApplication">
+          <uap3:AppExecutionAlias>
+            <desktop:ExecutionAlias Alias="ironmesh-config-app.exe" />
+          </uap3:AppExecutionAlias>
+        </uap3:Extension>
         <desktop:Extension
           Category="windows.startupTask"
           Executable="ironmesh-background-launcher.exe"
@@ -52,6 +60,28 @@
             Enabled="true"
             DisplayName="IronMesh background services" />
         </desktop:Extension>
+      </Extensions>
+    </Application>
+    <Application
+      Id="IronmeshBackgroundLauncher"
+      Executable="ironmesh-background-launcher.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="IronMesh Background Launcher"
+        Description="Packaged background startup helper for IronMesh"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\StoreLogo.png"
+        Square44x44Logo="Assets\SmallLogo.png"
+        AppListEntry="none" />
+      <Extensions>
+        <uap3:Extension
+          Category="windows.appExecutionAlias"
+          Executable="ironmesh-background-launcher.exe"
+          EntryPoint="Windows.FullTrustApplication">
+          <uap3:AppExecutionAlias>
+            <desktop:ExecutionAlias Alias="ironmesh-background-launcher.exe" />
+          </uap3:AppExecutionAlias>
+        </uap3:Extension>
       </Extensions>
     </Application>
     <Application

@@ -116,6 +116,9 @@ override_dh_auto_install:
 	install -d $(CURDIR)/debian/ironmesh-client/usr/share/applications
 	install -m0644 debian/ironmesh-config-app.desktop \
 		$(CURDIR)/debian/ironmesh-client/usr/share/applications/ironmesh-config-app.desktop
+	install -d $(CURDIR)/debian/ironmesh-client/etc/xdg/autostart
+	install -m0644 debian/ironmesh-config-app-background.desktop \
+		$(CURDIR)/debian/ironmesh-client/etc/xdg/autostart/ironmesh-config-app-background.desktop
 
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start

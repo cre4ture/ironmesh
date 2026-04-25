@@ -114,6 +114,7 @@ The helper will:
   - generate an `.msix`
   - sign it
   - optionally install it with `Add-AppxPackage -ForceApplicationShutdown`
+  - after `-Install`, start the packaged background launcher once so the config app owns desktop status immediately
 
 Notes:
 
@@ -122,6 +123,7 @@ Notes:
 - by default the helper derives the package version from `[workspace.package].version` in the repo-root `Cargo.toml` as `major.minor.patch.0`
 - full `.msix` packing and signing now work on a machine with the Windows SDK tools available
 - `-Install` is optional and may require both the usual Windows developer/sideloading settings and an elevated PowerShell so the self-signed cert can be imported into `Cert:\LocalMachine\TrustedPeople`
+- pass `-NoStartAfterInstall` with `-Install` if you want to install the package without starting the background config app immediately
 
 ## Store upload helper
 
@@ -163,7 +165,7 @@ Use this when iterating on the thumbnail provider DLL, the manifest, or the pack
 
 1. Build, pack, sign, and install from an elevated PowerShell:
    - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install`
-2. Start the packaged host from the installed package location:
+2. The helper starts the packaged background launcher after install. To inspect or start the Explorer host manually from the installed package location:
    - `$pkg = Get-AppxPackage UlrichHornung.IronMesh`
    - `$exe = Join-Path $pkg.InstallLocation 'ironmesh-os-integration.exe'`
    - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`

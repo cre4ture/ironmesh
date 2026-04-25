@@ -67,6 +67,7 @@ mod tests {
             .arg("--bind")
             .arg(bind)
             .arg("--no-browser")
+            .arg("--no-desktop-status")
             .env("LOCALAPPDATA", config_root)
             .env("XDG_CONFIG_HOME", config_root)
             .env("XDG_STATE_HOME", config_root)

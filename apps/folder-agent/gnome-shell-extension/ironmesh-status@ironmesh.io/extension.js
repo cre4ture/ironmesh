@@ -24,6 +24,7 @@ class IronmeshIndicator extends PanelMenu.Button {
         this._statusFile = Gio.File.new_for_path(STATUS_FILE_PATH);
         this._statusFileMonitor = null;
         this._pollTimeoutId = null;
+        this._webUiUrl = null;
 
         this._icon = new St.Icon({
             icon_name: 'dialog-question-symbolic',
@@ -50,6 +51,14 @@ class IronmeshIndicator extends PanelMenu.Button {
         this._connectionRow = this._addStatusRow('Connection');
         this._syncRow = this._addStatusRow('Local Sync');
         this._replicationRow = this._addStatusRow('Replication');
+        this._servicesRow = this._addStatusRow('Services');
+
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        this._openConfigItem = new PopupMenu.PopupMenuItem('Open IronMesh Config');
+        this._openConfigItem.connect('activate', () => this._openConfigApp());
+        this._openConfigItem.setSensitive(false);
+        this.menu.addMenuItem(this._openConfigItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -123,7 +132,7 @@ class IronmeshIndicator extends PanelMenu.Button {
         try {
             const [ok, contents] = this._statusFile.load_contents(null);
             if (!ok) {
-                this._applyMissingState('Waiting for IronMesh agent', 'Status file could not be loaded');
+                this._applyMissingState('Waiting for IronMesh config app', 'Status file could not be loaded');
                 return;
             }
 
@@ -140,7 +149,7 @@ class IronmeshIndicator extends PanelMenu.Button {
             this._applyPayload(payload);
         } catch (error) {
             if (error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
-                this._applyMissingState('Waiting for IronMesh agent', 'Start ironmesh-folder-agent with --publish-gnome-status');
+                this._applyMissingState('Waiting for IronMesh config app', 'Start ironmesh-config-app to publish desktop status');
                 return;
             }
 
@@ -163,6 +172,10 @@ class IronmeshIndicator extends PanelMenu.Button {
         this._applyFacet(this._connectionRow, payload?.connection);
         this._applyFacet(this._syncRow, payload?.sync);
         this._applyFacet(this._replicationRow, payload?.replication);
+        this._applyServices(payload?.services ?? []);
+
+        this._webUiUrl = payload?.webUiUrl ?? null;
+        this._openConfigItem.setSensitive(!!this._webUiUrl);
 
         this._targetRow.valueLabel.text = payload?.profileLabel ?? 'IronMesh';
         this._targetRow.detailLabel.text = payload?.connectionTarget ?? 'No connection target reported';
@@ -194,8 +207,44 @@ class IronmeshIndicator extends PanelMenu.Button {
         }
     }
 
+    _applyServices(services) {
+        if (!services.length) {
+            this._servicesRow.valueLabel.text = 'No managed service details';
+            this._servicesRow.detailLabel.text = 'Open the config app to configure background services';
+            return;
+        }
+
+        const running = services.filter(service =>
+            ['running', 'syncing', 'starting'].includes(service?.state)
+        ).length;
+        const errors = services.filter(service => service?.state === 'error').length;
+        this._servicesRow.valueLabel.text = errors > 0
+            ? `${errors} need attention`
+            : `${running} of ${services.length} active`;
+        this._servicesRow.detailLabel.text = services
+            .slice(0, 6)
+            .map(service => `${service.label ?? service.id}: ${service.summary ?? service.state ?? 'Unknown'}`)
+            .join('\n');
+    }
+
+    _openConfigApp() {
+        if (!this._webUiUrl)
+            return;
+
+        try {
+            Gio.AppInfo.launch_default_for_uri(
+                this._webUiUrl,
+                global.create_app_launch_context(0, -1)
+            );
+        } catch (error) {
+            logError(error, 'IronMesh Status: failed to open config app');
+        }
+    }
+
     _applyMissingState(summary, detail) {
         this._icon.icon_name = 'dialog-question-symbolic';
+        this._webUiUrl = null;
+        this._openConfigItem.setSensitive(false);
 
         this._applyFacet(this._summaryRow, {
             summary,
@@ -204,12 +253,12 @@ class IronmeshIndicator extends PanelMenu.Button {
         });
         this._applyFacet(this._connectionRow, {
             summary: 'No live connection data',
-            detail: 'Waiting for the IronMesh agent status publisher',
+            detail: 'Waiting for the IronMesh config app status publisher',
             state: 'unknown',
         });
         this._applyFacet(this._syncRow, {
-            summary: 'Local sync not publishing',
-            detail: 'Start ironmesh-folder-agent with --publish-gnome-status',
+            summary: 'Desktop status not publishing',
+            detail: 'Start ironmesh-config-app to publish merged service status',
             state: 'unknown',
         });
         this._applyFacet(this._replicationRow, {
@@ -217,6 +266,7 @@ class IronmeshIndicator extends PanelMenu.Button {
             detail: 'Replication details appear once the agent can reach the server',
             state: 'unknown',
         });
+        this._applyServices([]);
 
         this._targetRow.valueLabel.text = 'IronMesh';
         this._targetRow.detailLabel.text = STATUS_FILE_PATH;

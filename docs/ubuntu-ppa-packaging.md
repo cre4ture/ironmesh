@@ -38,6 +38,9 @@ Package-specific notes:
 - `ironmesh-client` installs the public `ironmesh` CLI and the packaged desktop
   helpers `ironmesh-config-app`, `ironmesh-folder-agent`,
   `ironmesh-os-integration`, and `ironmesh-background-launcher`.
+- `ironmesh-client` also installs an XDG autostart entry for
+  `ironmesh-config-app --background` so the config app can own merged desktop
+  status and launch enabled managed services after graphical sign-in.
 - Package upgrades replace binaries inside the package payload, while XDG user
   state, `/etc/ironmesh/*.env`, and systemd-managed service state stay outside
   the package and should survive upgrades.

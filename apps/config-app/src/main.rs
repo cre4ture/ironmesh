@@ -7,7 +7,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use client_sdk::enroll_connection_input_blocking;
 use desktop_client_config::{
     ClientIdentityConfig, FolderAgentInstance, LaunchOutcome, LaunchReport, ManagedInstanceStore,
@@ -17,25 +17,58 @@ use desktop_client_config::{
     default_service_log_dir, generate_instance_id, launch_enabled_instances,
     launch_folder_agent_instance, launch_os_integration_instance,
     launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
-    package_root_from_current_exe, save_launch_report, service_runtime_statuses,
-    stop_service_from_report,
+    package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
+    service_runtime_statuses, stop_service_from_report,
+};
+use desktop_status::{
+    DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
+    build_status_document, default_gnome_status_file_path, install_gnome_extension_from,
+    overall_status_facet, read_status_document, write_status_document,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-config-app")]
 #[command(about = "Local configuration UI for packaged IronMesh background services")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(long, default_value = "127.0.0.1:0")]
     bind: String,
     #[arg(long, default_value_t = false)]
     no_browser: bool,
+    #[arg(long, default_value_t = false)]
+    background: bool,
+    #[arg(long, default_value_t = false)]
+    launch_enabled_on_start: bool,
+    #[arg(long, default_value_t = false)]
+    no_desktop_status: bool,
+    #[arg(long, global = true)]
+    desktop_status_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Install or inspect the native GNOME Shell indicator integration.
+    Gnome {
+        #[command(subcommand)]
+        command: GnomeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GnomeCommand {
+    /// Copy the GNOME Shell extension into ~/.local/share/gnome-shell/extensions and try to enable it.
+    InstallExtension,
+    /// Print the JSON path consumed by the GNOME Shell extension.
+    PrintStatusPath,
 }
 
 #[derive(Clone)]
@@ -44,6 +77,12 @@ struct AppState {
     launch_report_path: PathBuf,
     package_root: PathBuf,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+struct ServiceStatusTelemetry {
+    instance_kind: String,
+    id: String,
+    document: DesktopStatusDocument,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,6 +389,10 @@ impl IntoResponse for ApiError {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(command) = cli.command.as_ref() {
+        return run_command(&cli, command);
+    }
+
     let bind_addr: SocketAddr = cli.bind.parse().context("failed parsing --bind address")?;
     let package_root = package_root_from_current_exe()?;
     migrate_legacy_state_paths()?;
@@ -360,6 +403,14 @@ async fn main() -> Result<()> {
         package_root,
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
+
+    if cli.background || cli.launch_enabled_on_start {
+        let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+            .context("failed loading managed instances before launch")?;
+        let report = launch_enabled_instances(&store, &state.package_root);
+        save_launch_report(&state.launch_report_path, &report)
+            .context("failed saving launch report before config app startup")?;
+    }
 
     let app = Router::new()
         .route("/", get(index_html))
@@ -411,8 +462,14 @@ async fn main() -> Result<()> {
         .context("failed reading local listener address")?;
     let local_url = format!("http://127.0.0.1:{}/", local_addr.port());
 
-    if !cli.no_browser {
+    if !cli.no_browser && !cli.background {
         let _ = open_browser(&local_url);
+    }
+
+    if !cli.no_desktop_status
+        && let Some(status_file) = resolve_desktop_status_file(&cli)
+    {
+        spawn_desktop_status_task(state.clone(), local_url.clone(), status_file);
     }
 
     axum::serve(listener, app)
@@ -423,6 +480,450 @@ async fn main() -> Result<()> {
         .context("config UI server exited with error")?;
 
     Ok(())
+}
+
+fn run_command(cli: &Cli, command: &Command) -> Result<()> {
+    match command {
+        Command::Gnome { command } => run_gnome_command(cli, command),
+    }
+}
+
+fn run_gnome_command(cli: &Cli, command: &GnomeCommand) -> Result<()> {
+    match command {
+        GnomeCommand::InstallExtension => {
+            let outcome = install_gnome_extension_from(&extension_source_dir(), true)?;
+            println!(
+                "gnome: installed extension {} to {}",
+                GNOME_EXTENSION_UUID,
+                outcome.install_dir.display()
+            );
+            if let Some(note) = outcome.enable_note {
+                println!("gnome: {note}");
+            }
+            Ok(())
+        }
+        GnomeCommand::PrintStatusPath => {
+            let path = cli
+                .desktop_status_file
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(default_gnome_status_file_path)?;
+            println!("{}", path.display());
+            Ok(())
+        }
+    }
+}
+
+fn resolve_desktop_status_file(cli: &Cli) -> Option<PathBuf> {
+    cli.desktop_status_file
+        .clone()
+        .or_else(|| default_gnome_status_file_path().ok())
+}
+
+fn spawn_desktop_status_task(state: AppState, web_ui_url: String, status_file: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) =
+                publish_config_app_desktop_status(&state, web_ui_url.as_str(), &status_file)
+            {
+                eprintln!("desktop-status: failed to publish config app status: {error:#}");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+fn publish_config_app_desktop_status(
+    state: &AppState,
+    web_ui_url: &str,
+    status_file: &Path,
+) -> Result<()> {
+    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
+    let last_launch_report = load_last_launch_report(&state.launch_report_path)?;
+    let runtime_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
+    let service_documents = load_service_status_documents(&runtime_statuses);
+    let services = merged_service_statuses(&store, &runtime_statuses, service_documents.as_slice());
+    let snapshot = StatusSnapshot {
+        connection: aggregate_facet(
+            service_documents
+                .iter()
+                .map(|telemetry| &telemetry.document.connection),
+            "Connection status pending",
+            "Waiting for service telemetry from managed services",
+            "network-transmit-receive-symbolic",
+            "connected",
+            "network-transmit-receive-symbolic",
+        ),
+        sync: aggregate_service_sync_facet(services.as_slice()),
+        replication: aggregate_facet(
+            service_documents
+                .iter()
+                .map(|telemetry| &telemetry.document.replication),
+            "Replication status pending",
+            "Waiting for service telemetry from managed services",
+            "dialog-question-symbolic",
+            "running",
+            "emblem-ok-symbolic",
+        ),
+    };
+    let mut document = build_status_document(
+        "IronMesh",
+        &state.instance_store_path,
+        web_ui_url.to_string(),
+        &snapshot,
+    );
+    document.web_ui_url = Some(web_ui_url.to_string());
+    document.services = services;
+    document.overall = overall_status_facet(&snapshot);
+    write_status_document(status_file, &document)
+}
+
+fn load_service_status_documents(
+    runtime_statuses: &[ServiceRuntimeStatus],
+) -> Vec<ServiceStatusTelemetry> {
+    runtime_statuses
+        .iter()
+        .filter(|status| status.running)
+        .filter_map(|status| {
+            let path = service_desktop_status_file_path(&status.instance_kind, &status.id);
+            let document = read_status_document(&path).ok()?;
+            (!desktop_status_document_is_stale(&document)).then_some(ServiceStatusTelemetry {
+                instance_kind: status.instance_kind.clone(),
+                id: status.id.clone(),
+                document,
+            })
+        })
+        .collect()
+}
+
+fn merged_service_statuses(
+    store: &ManagedInstanceStore,
+    runtime_statuses: &[ServiceRuntimeStatus],
+    service_documents: &[ServiceStatusTelemetry],
+) -> Vec<DesktopServiceStatus> {
+    let mut services = Vec::new();
+    for instance in &store.os_integration_instances {
+        services.push(merged_service_status(
+            "os-integration",
+            &instance.id,
+            &instance.label,
+            instance.enabled,
+            runtime_statuses,
+            service_documents,
+        ));
+    }
+    for instance in &store.folder_agent_instances {
+        services.push(merged_service_status(
+            "folder-agent",
+            &instance.id,
+            &instance.label,
+            instance.enabled,
+            runtime_statuses,
+            service_documents,
+        ));
+    }
+    services
+}
+
+fn merged_service_status(
+    instance_kind: &str,
+    id: &str,
+    label: &str,
+    enabled: bool,
+    runtime_statuses: &[ServiceRuntimeStatus],
+    service_documents: &[ServiceStatusTelemetry],
+) -> DesktopServiceStatus {
+    let runtime = runtime_statuses
+        .iter()
+        .find(|status| status.instance_kind == instance_kind && status.id == id);
+    let running = runtime.is_some_and(|status| status.running);
+
+    if running
+        && let Some(telemetry) = service_documents
+            .iter()
+            .find(|telemetry| telemetry.instance_kind == instance_kind && telemetry.id == id)
+    {
+        let document = &telemetry.document;
+        let overall = &document.overall;
+        return DesktopServiceStatus {
+            instance_kind: instance_kind.to_string(),
+            id: id.to_string(),
+            label: label.to_string(),
+            state: overall.state.clone(),
+            summary: overall.summary.clone(),
+            detail: overall.detail.clone(),
+            icon_name: overall.icon_name.clone(),
+            updated_unix_ms: document.generated_unix_ms,
+        };
+    }
+
+    if !enabled && !running {
+        return desktop_service_status(
+            instance_kind,
+            id,
+            label,
+            "disabled",
+            "Service disabled",
+            "This service is configured but not enabled for background launch",
+            "media-playback-stop-symbolic",
+        );
+    }
+
+    if let Some(error) = runtime
+        .and_then(|status| status.last_launch.as_ref())
+        .and_then(|launch| launch.error.as_deref())
+    {
+        return desktop_service_status(
+            instance_kind,
+            id,
+            label,
+            "error",
+            "Launch failed",
+            error,
+            "network-error-symbolic",
+        );
+    }
+
+    if running {
+        return desktop_service_status(
+            instance_kind,
+            id,
+            label,
+            "running",
+            "Process running",
+            "Waiting for detailed service telemetry",
+            "emblem-ok-symbolic",
+        );
+    }
+
+    desktop_service_status(
+        instance_kind,
+        id,
+        label,
+        "stopped",
+        "Service stopped",
+        "The service is enabled but no running process is recorded",
+        "media-playback-stop-symbolic",
+    )
+}
+
+fn desktop_service_status(
+    instance_kind: &str,
+    id: &str,
+    label: &str,
+    state: &str,
+    summary: &str,
+    detail: &str,
+    icon_name: &str,
+) -> DesktopServiceStatus {
+    DesktopServiceStatus {
+        instance_kind: instance_kind.to_string(),
+        id: id.to_string(),
+        label: label.to_string(),
+        state: state.to_string(),
+        summary: summary.to_string(),
+        detail: detail.to_string(),
+        icon_name: icon_name.to_string(),
+        updated_unix_ms: unix_ts_ms(),
+    }
+}
+
+fn aggregate_facet<'a>(
+    facets: impl Iterator<Item = &'a StatusFacet>,
+    empty_summary: &str,
+    empty_detail: &str,
+    empty_icon: &str,
+    healthy_state: &str,
+    healthy_icon: &str,
+) -> StatusFacet {
+    let facets = facets.collect::<Vec<_>>();
+    if facets.is_empty() {
+        return StatusFacet::new("unknown", empty_summary, empty_detail, empty_icon);
+    }
+
+    let error_count = facets.iter().filter(|facet| facet.state == "error").count();
+    if error_count > 0 {
+        return StatusFacet::new(
+            "error",
+            format!("{error_count} service(s) need attention"),
+            facets
+                .iter()
+                .filter(|facet| facet.state == "error")
+                .map(|facet| facet.summary.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            "network-error-symbolic",
+        );
+    }
+
+    let warning_count = facets
+        .iter()
+        .filter(|facet| facet.state == "warning")
+        .count();
+    if warning_count > 0 {
+        return StatusFacet::new(
+            "warning",
+            format!("{warning_count} service(s) degraded"),
+            facets
+                .iter()
+                .filter(|facet| facet.state == "warning")
+                .map(|facet| facet.summary.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            "dialog-warning-symbolic",
+        );
+    }
+
+    let connected_count = facets
+        .iter()
+        .filter(|facet| matches!(facet.state.as_str(), "connected" | "running"))
+        .count();
+    if connected_count > 0 {
+        return StatusFacet::new(
+            healthy_state,
+            format!("{connected_count} service(s) reporting healthy"),
+            facets
+                .iter()
+                .map(|facet| facet.detail.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            healthy_icon,
+        );
+    }
+
+    StatusFacet::new(
+        "unknown",
+        "Service status pending",
+        "Managed services have not published a detailed status yet",
+        "dialog-question-symbolic",
+    )
+}
+
+fn aggregate_service_sync_facet(services: &[DesktopServiceStatus]) -> StatusFacet {
+    if services.is_empty() {
+        return StatusFacet::new(
+            "stopped",
+            "No managed services",
+            "Add a background service in the config app to start publishing status",
+            "media-playback-stop-symbolic",
+        );
+    }
+
+    let enabled_services = services
+        .iter()
+        .filter(|service| service.state != "disabled")
+        .collect::<Vec<_>>();
+    if enabled_services.is_empty() {
+        return StatusFacet::new(
+            "stopped",
+            "No enabled services",
+            "Configured services are disabled",
+            "media-playback-stop-symbolic",
+        );
+    }
+
+    let error_count = enabled_services
+        .iter()
+        .filter(|service| service.state == "error")
+        .count();
+    if error_count > 0 {
+        return StatusFacet::new(
+            "error",
+            format!("{error_count} service(s) need attention"),
+            enabled_services
+                .iter()
+                .filter(|service| service.state == "error")
+                .map(|service| format!("{}: {}", service.label, service.summary))
+                .collect::<Vec<_>>()
+                .join("; "),
+            "network-error-symbolic",
+        );
+    }
+
+    let stopped_count = enabled_services
+        .iter()
+        .filter(|service| service.state == "stopped")
+        .count();
+    if stopped_count > 0 {
+        return StatusFacet::new(
+            "warning",
+            format!("{stopped_count} enabled service(s) stopped"),
+            enabled_services
+                .iter()
+                .filter(|service| service.state == "stopped")
+                .map(|service| service.label.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            "dialog-warning-symbolic",
+        );
+    }
+
+    let active_count = enabled_services
+        .iter()
+        .filter(|service| matches!(service.state.as_str(), "running" | "syncing" | "starting"))
+        .count();
+    let syncing_count = enabled_services
+        .iter()
+        .filter(|service| matches!(service.state.as_str(), "syncing" | "starting"))
+        .count();
+    if syncing_count > 0 {
+        return StatusFacet::new(
+            "syncing",
+            format!("{syncing_count} service(s) active"),
+            format!(
+                "{active_count} of {} enabled service(s) are running",
+                enabled_services.len()
+            ),
+            "view-refresh-symbolic",
+        );
+    }
+
+    if active_count == enabled_services.len() {
+        return StatusFacet::new(
+            "running",
+            "Managed services running",
+            format!("{active_count} enabled service(s) are running"),
+            "emblem-ok-symbolic",
+        );
+    }
+
+    StatusFacet::new(
+        "unknown",
+        "Waiting for managed services",
+        format!(
+            "{active_count} of {} enabled service(s) are running",
+            enabled_services.len()
+        ),
+        "dialog-question-symbolic",
+    )
+}
+
+fn desktop_status_document_is_stale(document: &DesktopStatusDocument) -> bool {
+    let generated = document.generated_unix_ms;
+    generated == 0 || unix_ts_ms().saturating_sub(generated) > 30_000
+}
+
+fn extension_source_dir() -> PathBuf {
+    if let Some(package_dir) = packaged_extension_source_dir() {
+        return package_dir;
+    }
+
+    source_tree_extension_source_dir()
+}
+
+fn packaged_extension_source_dir() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let package_root = current_exe.parent()?;
+    let candidate = package_root
+        .join("gnome-shell-extension")
+        .join(GNOME_EXTENSION_UUID);
+    candidate.is_dir().then_some(candidate)
+}
+
+fn source_tree_extension_source_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../apps/folder-agent/gnome-shell-extension")
+        .join(GNOME_EXTENSION_UUID)
 }
 
 async fn index_html() -> Html<&'static str> {
@@ -1008,21 +1509,21 @@ fn unix_ts_ms() -> u64 {
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(windows)]
     let mut command = {
-        let mut command = Command::new("explorer.exe");
+        let mut command = ProcessCommand::new("explorer.exe");
         command.arg(url);
         command
     };
 
     #[cfg(target_os = "linux")]
     let mut command = {
-        let mut command = Command::new("xdg-open");
+        let mut command = ProcessCommand::new("xdg-open");
         command.arg(url);
         command
     };
 
     #[cfg(not(any(windows, target_os = "linux")))]
     let mut command = {
-        let mut command = Command::new("open");
+        let mut command = ProcessCommand::new("open");
         command.arg(url);
         command
     };
@@ -1321,12 +1822,12 @@ const APP_HTML: &str = r###"<!doctype html>
                 </label>
                 <label>
                   <span class="field-label">GNOME Status File Override</span>
-                  <span class="field-help">Optional override for the JSON status file consumed by the GNOME Shell extension.</span>
+                  <span class="field-help">Legacy direct-publisher override. Managed launches publish per-service telemetry for the config app.</span>
                   <input id="os-gnome-status-file" />
                 </label>
                 <label>
                   <span class="field-label">GNOME Status Poll Interval (ms)</span>
-                  <span class="field-help">Optional poll interval for desktop connection and replication status updates.</span>
+                  <span class="field-help">Optional poll interval for service connection and replication telemetry.</span>
                   <input id="os-remote-status-poll-interval-ms" type="number" min="1" placeholder="3000" />
                 </label>
                 <label class="checkbox checkbox-field">
@@ -1339,8 +1840,8 @@ const APP_HTML: &str = r###"<!doctype html>
                 <label class="checkbox checkbox-field">
                   <input type="checkbox" id="os-publish-gnome-status" />
                   <span class="checkbox-copy">
-                    <span class="field-label">Publish GNOME status</span>
-                    <span class="field-help">Writes desktop status updates for the packaged GNOME Shell extension while the mount is running.</span>
+                    <span class="field-label">Legacy direct GNOME status</span>
+                    <span class="field-help">Managed launches ignore this and let the config app publish the merged indicator status.</span>
                   </span>
                 </label>
               </div>
@@ -2260,7 +2761,7 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
           ['Connection Source', instance.snapshot_file || instance.bootstrap_file || instance.server_base_url || ''],
           ['Client Identity', identityLabelForProfile(instance)],
           ['Remote Folder Prefix', instance.prefix || ''],
-          ['GNOME Status Publishing', instance.publish_gnome_status ? 'Enabled' : 'Disabled'],
+          ['Desktop Status', 'Collected by config app'],
         ]
       : [
           ['Sync Root Identifier', instance.sync_root_id],

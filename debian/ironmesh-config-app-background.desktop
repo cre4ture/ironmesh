@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ironmesh Background Config App
+Comment=Keep Ironmesh desktop status and managed background services running
+Exec=ironmesh-config-app --background
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

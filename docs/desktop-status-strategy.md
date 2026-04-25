@@ -67,18 +67,22 @@ Why this is first:
 Implementation shape:
 
 - GNOME Shell extension in the top bar.
-- IronMesh publishes a small JSON status document under
+- The config app publishes a small merged JSON status document under
   `$XDG_RUNTIME_DIR/ironmesh/gnome-status.json`.
 - The extension monitors that file and renders:
   - a single top-bar icon,
   - a menu with connection, sync, and replication rows,
-  - stale / missing status handling when the agent is not running.
+  - a service summary row,
+  - a menu action that opens the config app web UI,
+  - stale / missing status handling when the config app is not running.
 
 Current repo implementation:
 
 - `crates/desktop-status/src/gnome.rs`
-- `apps/folder-agent/src/gnome.rs`
-- `crates/adapter-linux-fuse/src/gnome.rs`
+- `apps/config-app/src/main.rs`
+- `apps/background-launcher/src/main.rs`
+- `apps/folder-agent/src/gnome.rs` as folder-agent telemetry publishing
+- `crates/adapter-linux-fuse/src/gnome.rs` as Linux FUSE telemetry publishing
 - `apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/`
 
 ### 2. Windows
@@ -132,9 +136,11 @@ interaction.
 
 ### Data sources
 
-The GNOME publisher combines two sources:
+The config app owns the shared GNOME status document and combines three sources:
 
-- local runtime state from the active desktop runtime:
+- local process state from managed config-app services:
+  - launch reports and live process checks from `desktop-client-config`,
+- detailed telemetry documents from active desktop runtimes:
   - `sync-agent-core::run_folder_agent_with_control` status callbacks for folder sync,
   - Linux FUSE mount lifecycle state from `adapter-linux-fuse`,
 - authenticated remote status from existing IronMesh client JSON endpoints:
@@ -146,44 +152,48 @@ This gives us:
 
 - local engine or mount state without inventing a second desktop-side status service,
 - server / cluster visibility without requiring a second desktop-side service.
+- one indicator owner even when several configured services are running in parallel.
 
 ### Current scope
 
-The first GNOME slice is intentionally single-profile on desktop:
+The GNOME Shell extension consumes one merged config-app status document:
 
-- one active desktop runtime (`ironmesh-folder-agent` or Linux FUSE mount),
-- one top-bar indicator,
-- one aggregated profile label.
+- the config app writes `$XDG_RUNTIME_DIR/ironmesh/gnome-status.json`,
+- managed services write per-instance telemetry files under the desktop client state directory,
+- the indicator derives one icon from the merged connection, sync, and replication facets,
+- the indicator menu can open the config app web UI.
 
-The JSON schema and the Rust publisher are shaped so we can expand to multiple profiles later
-without redesigning the extension.
+The low-level `--publish-gnome-status` flags remain available for direct runtime debugging, but the
+packaged managed flow treats those files as service telemetry rather than the top-level indicator
+owner.
 
 ## Operational flow
 
 Recommended GNOME workflow today:
 
 1. Install the extension:
-  - `cargo run -p ironmesh-folder-agent -- --root-dir /tmp/placeholder gnome install-extension`
-  - or `cargo run -p os-integration -- --mountpoint /tmp/placeholder gnome install-extension`
-2. Start a desktop runtime with GNOME status publishing:
-  - folder agent: `cargo run -p ironmesh-folder-agent -- --root-dir <dir> --server-base-url <url> --client-identity-file <file> --publish-gnome-status`
-  - Linux FUSE: `cargo run -p os-integration -- --server-base-url <url> --client-identity-file <file> --mountpoint <dir> --publish-gnome-status`
-3. Let the extension read the shared status file from the runtime directory.
+  - `cargo run -p ironmesh-config-app -- gnome install-extension`
+2. Start the config app:
+  - foreground web UI: `cargo run -p ironmesh-config-app`
+  - background managed-services owner: `cargo run -p ironmesh-config-app -- --background`
+3. Define and start managed services in the config app. The config app publishes the merged status
+   file, and service runtimes publish per-instance telemetry files for the aggregator.
 
 Notes:
 
 - `gnome print-status-path` prints the exact JSON path the extension watches.
-- `--gnome-status-file` lets development environments override the default runtime path.
+- `--desktop-status-file` lets development environments override the config-app status path.
+- Debian client installs ship an XDG autostart entry for `ironmesh-config-app --background`.
+- The Windows prototype installer starts the packaged background launcher after `-Install`; the
+  MSIX manifest also keeps the packaged startup task for later sign-ins.
 - On GNOME Wayland, a newly copied user extension may not be discoverable until the next session.
   The installer now queues IronMesh in `org.gnome.shell enabled-extensions`, but initial activation
   can still require logging out and back in.
-- Linux FUSE snapshot mode can also publish GNOME status, but its connection and replication rows
-  remain intentionally static/unknown because no live server polling is active.
+- Linux FUSE snapshot mode can publish per-service telemetry, but its connection and replication
+  rows remain intentionally static/unknown because no live server polling is active.
 
 ## Follow-up backlog
 
-- Add an autostart installer for the GNOME runtime path.
-- Add an optional local web UI launcher from the indicator menu.
-- Expand the GNOME publisher from single-profile to multi-profile aggregation.
+- Add user-facing controls for enabling or disabling background autostart.
 - Add a D-Bus transport if the indicator needs richer live actions.
 - Add a generic `StatusNotifierItem` fallback implementation for non-GNOME Linux desktops.

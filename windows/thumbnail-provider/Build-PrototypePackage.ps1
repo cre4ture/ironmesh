@@ -24,7 +24,7 @@ Notes:
 - Rust/Cargo must be available.
 - Full packing and signing require Windows SDK tools such as MakeAppx.exe and SignTool.exe.
 - -Install may require an elevated PowerShell session so the development certificate can be imported into LocalMachine\TrustedPeople.
-- After installation, launch the packaged IronMesh config app from the Start menu for the normal packaged-client flow.
+- After installation, the helper starts the packaged IronMesh background launcher once so the config app can own desktop status immediately.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -StageOnly
@@ -47,6 +47,7 @@ param(
     [string]$PackageVersion,
     [switch]$StageOnly,
     [switch]$Install,
+    [switch]$NoStartAfterInstall,
     [string]$CertificateSubject = "CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21",
     [string]$CertificatePassword = "ironmesh-dev"
 )
@@ -141,6 +142,36 @@ function Save-StagedManifest {
     finally {
         $writer.Dispose()
     }
+}
+
+function Start-InstalledBackgroundConfigApp {
+    Write-Step "Starting packaged IronMesh background config app"
+
+    $aliasPath = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\ironmesh-background-launcher.exe"
+    $candidates = @()
+    if (Test-Path $aliasPath) {
+        $candidates += $aliasPath
+    }
+    $command = Get-Command "ironmesh-background-launcher.exe" -ErrorAction SilentlyContinue
+    if ($command -and $command.Source -and ($candidates -notcontains $command.Source)) {
+        $candidates += $command.Source
+    }
+    if ($candidates.Count -eq 0) {
+        $candidates += "ironmesh-background-launcher.exe"
+    }
+
+    $errors = @()
+    foreach ($candidate in $candidates) {
+        try {
+            Start-Process -FilePath $candidate -WindowStyle Hidden
+            return
+        }
+        catch {
+            $errors += ("{0}: {1}" -f $candidate, $_.Exception.Message)
+        }
+    }
+
+    Write-Warning "The package was installed, but the background config app could not be started through its app execution alias. Try signing out and back in, or run 'ironmesh-background-launcher.exe' after Windows refreshes app aliases. Attempted: $($errors -join '; ')"
 }
 
 function Find-WindowsSdkTool {
@@ -370,6 +401,10 @@ if ($Install) {
 
     Write-Step "Installing package"
     Add-AppxPackage -Path $packagePath -ForceApplicationShutdown
+
+    if (-not $NoStartAfterInstall) {
+        Start-InstalledBackgroundConfigApp
+    }
 }
 
 Write-Host ""
