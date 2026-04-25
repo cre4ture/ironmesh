@@ -54,6 +54,7 @@ const CONFIG_SUBDIR: &str = "desktop-client-config";
 const LEGACY_WINDOWS_CONFIG_SUBDIR: &str = "windows-client-config";
 const INSTANCE_STORE_FILE_NAME: &str = "instances.json";
 const LAST_LAUNCH_REPORT_FILE_NAME: &str = "last-launch-report.json";
+const DESKTOP_STATUS_FILE_NAME: &str = "desktop-status.json";
 const SERVICE_LOG_SUBDIR: &str = "service-logs";
 const SERVICE_DESKTOP_STATUS_SUBDIR: &str = "service-status";
 const MANAGED_INSTANCE_STORE_VERSION: u32 = 1;
@@ -661,6 +662,22 @@ pub fn default_service_log_dir() -> PathBuf {
         state_home_root()
             .join(CONFIG_SUBDIR)
             .join(SERVICE_LOG_SUBDIR)
+    }
+}
+
+pub fn default_desktop_status_file_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        local_appdata_root()
+            .join(CONFIG_SUBDIR)
+            .join(DESKTOP_STATUS_FILE_NAME)
+    }
+
+    #[cfg(not(windows))]
+    {
+        state_home_root()
+            .join(CONFIG_SUBDIR)
+            .join(DESKTOP_STATUS_FILE_NAME)
     }
 }
 

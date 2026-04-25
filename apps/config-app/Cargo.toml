@@ -20,5 +20,14 @@ desktop-client-config = { path = "../../crates/desktop-client-config" }
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [lints]
 workspace = true

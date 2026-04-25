@@ -1,5 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod windows_tray;
+
 use anyhow::{Context, Result};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -13,12 +16,12 @@ use desktop_client_config::{
     ClientIdentityConfig, FolderAgentInstance, LaunchOutcome, LaunchReport, ManagedInstanceStore,
     OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance, PLATFORM_KIND,
     STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
-    ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
-    default_service_log_dir, generate_instance_id, launch_enabled_instances,
-    launch_folder_agent_instance, launch_os_integration_instance,
-    launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
-    package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
-    service_runtime_statuses, stop_service_from_report,
+    ServiceRuntimeStatus, StopOutcome, default_desktop_status_file_path,
+    default_instance_store_path, default_launch_report_path, default_service_log_dir,
+    generate_instance_id, launch_enabled_instances, launch_folder_agent_instance,
+    launch_os_integration_instance, launch_report_with_updated_outcome, load_last_launch_report,
+    migrate_legacy_state_paths, package_root_from_current_exe, save_launch_report,
+    service_desktop_status_file_path, service_runtime_statuses, stop_service_from_report,
 };
 use desktop_status::{
     DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
@@ -466,10 +469,37 @@ async fn main() -> Result<()> {
         let _ = open_browser(&local_url);
     }
 
+    let _tray_handle;
     if !cli.no_desktop_status
         && let Some(status_file) = resolve_desktop_status_file(&cli)
     {
-        spawn_desktop_status_task(state.clone(), local_url.clone(), status_file);
+        spawn_desktop_status_task(state.clone(), local_url.clone(), status_file.clone());
+        #[cfg(windows)]
+        {
+            _tray_handle = match windows_tray::WindowsConfigTrayHandle::spawn(
+                status_file,
+                local_url.clone(),
+            ) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    eprintln!("windows-tray: failed to start config app tray icon: {error:#}");
+                    None
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            _tray_handle = None::<()>;
+        }
+    } else {
+        #[cfg(windows)]
+        {
+            _tray_handle = None::<windows_tray::WindowsConfigTrayHandle>;
+        }
+        #[cfg(not(windows))]
+        {
+            _tray_handle = None::<()>;
+        }
     }
 
     axum::serve(listener, app)
@@ -515,9 +545,19 @@ fn run_gnome_command(cli: &Cli, command: &GnomeCommand) -> Result<()> {
 }
 
 fn resolve_desktop_status_file(cli: &Cli) -> Option<PathBuf> {
-    cli.desktop_status_file
-        .clone()
-        .or_else(|| default_gnome_status_file_path().ok())
+    if let Some(path) = cli.desktop_status_file.clone() {
+        return Some(path);
+    }
+
+    #[cfg(windows)]
+    {
+        Some(default_desktop_status_file_path())
+    }
+
+    #[cfg(not(windows))]
+    {
+        default_gnome_status_file_path().ok()
+    }
 }
 
 fn spawn_desktop_status_task(state: AppState, web_ui_url: String, status_file: PathBuf) {
