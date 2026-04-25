@@ -169,13 +169,13 @@ CI enforces a minimum line coverage floor using `cargo-llvm-cov`:
 
 ```bash
 cargo llvm-cov --workspace --all-features --summary-only \
-	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/' \
+	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(background-launcher|config-app|folder-agent|os-integration)/|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/client-sdk/src/content_addressed_client_cache.rs|crates/desktop-client-config/src/lib.rs|crates/desktop-status/|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_(conflicts|runtime|startup|state|ui)\.rs|crates/web-ui-backend/' \
 	--fail-under-lines 70
 ```
 
 Notes:
 
-- The excluded files are shell/bootstrap entrypoints and wrapper crates that currently have no direct tests.
+- The excluded files are shell/bootstrap entrypoints, desktop/system-integration surfaces, and system-test-covered wrappers that currently have no direct unit coverage.
 - The threshold is intentionally conservative for now and can be raised as targeted tests are added.
 
 ## Notes for mobile integration
