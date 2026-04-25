@@ -5,6 +5,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CONFIG_APP_EXE: &str = if cfg!(windows) {
@@ -590,6 +592,29 @@ pub struct LaunchOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceRuntimeStatus {
+    pub instance_kind: String,
+    pub id: String,
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_launch: Option<LaunchOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopOutcome {
+    pub instance_kind: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub was_running: bool,
+    pub stopped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 pub fn default_instance_store_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -744,6 +769,225 @@ pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Pat
         package_root: package_root.display().to_string(),
         total_enabled: outcomes.len(),
         outcomes,
+    }
+}
+
+pub fn launch_os_integration_instance(
+    instance: &OsIntegrationInstance,
+    package_root: &Path,
+) -> LaunchOutcome {
+    let launched_at_unix_ms = unix_ts_ms();
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        spawn_instance(
+            "os-integration",
+            &instance.id,
+            &instance.label,
+            service_executable_candidates(package_root, OS_INTEGRATION_EXE),
+            instance.command_args(),
+            &default_service_log_dir(),
+            launched_at_unix_ms,
+        )
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        unsupported_instance(
+            "os-integration",
+            &instance.id,
+            &instance.label,
+            package_root.join(OS_INTEGRATION_EXE),
+            "os-integration instances are currently managed only on Windows",
+        )
+    }
+}
+
+pub fn launch_folder_agent_instance(
+    instance: &FolderAgentInstance,
+    package_root: &Path,
+) -> LaunchOutcome {
+    spawn_instance(
+        "folder-agent",
+        &instance.id,
+        &instance.label,
+        service_executable_candidates(package_root, FOLDER_AGENT_EXE),
+        instance.command_args(),
+        &default_service_log_dir(),
+        unix_ts_ms(),
+    )
+}
+
+pub fn service_runtime_statuses(
+    store: &ManagedInstanceStore,
+    report: Option<&LaunchReport>,
+) -> Vec<ServiceRuntimeStatus> {
+    let mut statuses = Vec::new();
+
+    for instance in &store.os_integration_instances {
+        statuses.push(service_runtime_status(
+            "os-integration",
+            &instance.id,
+            report.and_then(|report| last_launch_outcome(report, "os-integration", &instance.id)),
+        ));
+    }
+
+    for instance in &store.folder_agent_instances {
+        statuses.push(service_runtime_status(
+            "folder-agent",
+            &instance.id,
+            report.and_then(|report| last_launch_outcome(report, "folder-agent", &instance.id)),
+        ));
+    }
+
+    statuses
+}
+
+pub fn launch_report_with_updated_outcome(
+    existing: Option<LaunchReport>,
+    package_root: &Path,
+    outcome: LaunchOutcome,
+) -> LaunchReport {
+    let mut report = existing.unwrap_or_else(|| LaunchReport {
+        version: LAUNCH_REPORT_VERSION,
+        launched_at_unix_ms: unix_ts_ms(),
+        package_root: package_root.display().to_string(),
+        total_enabled: 0,
+        outcomes: Vec::new(),
+    });
+    report.version = LAUNCH_REPORT_VERSION;
+    report.launched_at_unix_ms = unix_ts_ms();
+    report.package_root = package_root.display().to_string();
+    report.outcomes.retain(|candidate| {
+        candidate.instance_kind != outcome.instance_kind || candidate.id != outcome.id
+    });
+    report.outcomes.push(outcome);
+    report.total_enabled = report.outcomes.len();
+    report
+}
+
+pub fn stop_service_from_report(
+    report: Option<&LaunchReport>,
+    instance_kind: &str,
+    id: &str,
+) -> StopOutcome {
+    let Some(outcome) = report.and_then(|report| last_launch_outcome(report, instance_kind, id))
+    else {
+        return StopOutcome {
+            instance_kind: instance_kind.to_string(),
+            id: id.to_string(),
+            pid: None,
+            was_running: false,
+            stopped: false,
+            error: None,
+        };
+    };
+    let Some(pid) = outcome.pid else {
+        return StopOutcome {
+            instance_kind: instance_kind.to_string(),
+            id: id.to_string(),
+            pid: None,
+            was_running: false,
+            stopped: false,
+            error: None,
+        };
+    };
+
+    if !process_is_running(pid) {
+        return StopOutcome {
+            instance_kind: instance_kind.to_string(),
+            id: id.to_string(),
+            pid: Some(pid),
+            was_running: false,
+            stopped: false,
+            error: None,
+        };
+    }
+
+    match terminate_process(pid) {
+        Ok(()) => {
+            let stopped = wait_for_process_exit(pid, Duration::from_secs(2));
+            StopOutcome {
+                instance_kind: instance_kind.to_string(),
+                id: id.to_string(),
+                pid: Some(pid),
+                was_running: true,
+                stopped,
+                error: if stopped {
+                    None
+                } else {
+                    Some(format!("process {pid} did not exit within the timeout"))
+                },
+            }
+        }
+        Err(error) => StopOutcome {
+            instance_kind: instance_kind.to_string(),
+            id: id.to_string(),
+            pid: Some(pid),
+            was_running: true,
+            stopped: false,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn service_runtime_status(
+    instance_kind: &str,
+    id: &str,
+    last_launch: Option<&LaunchOutcome>,
+) -> ServiceRuntimeStatus {
+    let running_pid = last_launch
+        .and_then(|outcome| outcome.pid)
+        .filter(|pid| process_is_running(*pid));
+    ServiceRuntimeStatus {
+        instance_kind: instance_kind.to_string(),
+        id: id.to_string(),
+        running: running_pid.is_some(),
+        pid: running_pid,
+        last_launch: last_launch.cloned(),
+    }
+}
+
+fn last_launch_outcome<'a>(
+    report: &'a LaunchReport,
+    instance_kind: &str,
+    id: &str,
+) -> Option<&'a LaunchOutcome> {
+    report
+        .outcomes
+        .iter()
+        .rev()
+        .find(|outcome| outcome.instance_kind == instance_kind && outcome.id == id)
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let started_at = std::time::Instant::now();
+    while started_at.elapsed() < timeout {
+        if !process_is_running(pid) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    !process_is_running(pid)
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let mut system = sysinfo::System::new();
+    let pids = [sysinfo::Pid::from_u32(pid)];
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+    system.process(pids[0]).is_some()
+}
+
+fn terminate_process(pid: u32) -> Result<()> {
+    let mut system = sysinfo::System::new();
+    let pids = [sysinfo::Pid::from_u32(pid)];
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+    let Some(process) = system.process(pids[0]) else {
+        return Ok(());
+    };
+    if process.kill() {
+        Ok(())
+    } else {
+        bail!("failed terminating process {pid}")
     }
 }
 
@@ -1301,6 +1545,128 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn service_runtime_statuses_report_current_process_running() {
+        let store = ManagedInstanceStore {
+            folder_agent_instances: vec![FolderAgentInstance {
+                id: "folder-1".to_string(),
+                label: "Folder".to_string(),
+                enabled: true,
+                root_dir: "/tmp/folder".to_string(),
+                state_root_dir: None,
+                server_base_url: None,
+                bootstrap_file: None,
+                server_ca_pem_file: None,
+                client_identity_id: None,
+                client_identity_file: None,
+                prefix: None,
+                ui_bind: None,
+                run_once: false,
+                no_watch_local: false,
+            }],
+            ..ManagedInstanceStore::default()
+        };
+        let report = LaunchReport {
+            version: LAUNCH_REPORT_VERSION,
+            launched_at_unix_ms: 1,
+            package_root: "/opt/ironmesh".to_string(),
+            total_enabled: 1,
+            outcomes: vec![LaunchOutcome {
+                instance_kind: "folder-agent".to_string(),
+                id: "folder-1".to_string(),
+                label: "Folder".to_string(),
+                executable: std::env::current_exe()
+                    .expect("current exe should resolve")
+                    .display()
+                    .to_string(),
+                command_line: Vec::new(),
+                log_file: None,
+                pid: Some(std::process::id()),
+                error: None,
+            }],
+        };
+
+        let statuses = service_runtime_statuses(&store, Some(&report));
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].instance_kind, "folder-agent");
+        assert_eq!(statuses[0].id, "folder-1");
+        assert!(statuses[0].running);
+        assert_eq!(statuses[0].pid, Some(std::process::id()));
+        assert!(statuses[0].last_launch.is_some());
+    }
+
+    #[test]
+    fn launch_report_with_updated_outcome_replaces_existing_service_outcome() {
+        let old_outcome = LaunchOutcome {
+            instance_kind: "folder-agent".to_string(),
+            id: "folder-1".to_string(),
+            label: "Old".to_string(),
+            executable: "old".to_string(),
+            command_line: Vec::new(),
+            log_file: None,
+            pid: Some(1),
+            error: None,
+        };
+        let existing = LaunchReport {
+            version: LAUNCH_REPORT_VERSION,
+            launched_at_unix_ms: 1,
+            package_root: "/old".to_string(),
+            total_enabled: 1,
+            outcomes: vec![old_outcome],
+        };
+        let new_outcome = LaunchOutcome {
+            instance_kind: "folder-agent".to_string(),
+            id: "folder-1".to_string(),
+            label: "New".to_string(),
+            executable: "new".to_string(),
+            command_line: vec!["--root-dir".to_string(), "/tmp/folder".to_string()],
+            log_file: Some("/tmp/log".to_string()),
+            pid: Some(2),
+            error: None,
+        };
+
+        let report = launch_report_with_updated_outcome(
+            Some(existing),
+            std::path::Path::new("package-root"),
+            new_outcome.clone(),
+        );
+
+        assert_eq!(report.package_root, "package-root");
+        assert_eq!(report.total_enabled, 1);
+        assert_eq!(report.outcomes, vec![new_outcome]);
+    }
+
+    #[test]
+    fn stop_service_from_report_ignores_missing_pid() {
+        let outcome = LaunchOutcome {
+            instance_kind: "folder-agent".to_string(),
+            id: "folder-1".to_string(),
+            label: "Folder".to_string(),
+            executable: "missing".to_string(),
+            command_line: Vec::new(),
+            log_file: None,
+            pid: None,
+            error: Some("failed".to_string()),
+        };
+        let report = LaunchReport {
+            version: LAUNCH_REPORT_VERSION,
+            launched_at_unix_ms: 1,
+            package_root: "/package".to_string(),
+            total_enabled: 1,
+            outcomes: vec![outcome],
+        };
+
+        let outcome = stop_service_from_report(Some(&report), "folder-agent", "folder-1");
+
+        assert_eq!(outcome.instance_kind, "folder-agent");
+        assert_eq!(outcome.id, "folder-1");
+        assert_eq!(outcome.pid, None);
+        assert!(!outcome.was_running);
+        assert!(!outcome.stopped);
+        assert_eq!(outcome.error, None);
     }
 
     #[test]

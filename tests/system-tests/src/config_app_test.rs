@@ -240,27 +240,56 @@ mod tests {
                 bail!("config-app folder-agent save returned {status}: {body}");
             }
 
-            let response = http
-                .post(format!("{config_base}/api/launch-enabled"))
+            let config: serde_json::Value = http
+                .get(format!("{config_base}/api/config"))
                 .send()
                 .await
-                .context("failed launching enabled services through config-app")?;
+                .context("failed fetching config before service start")?
+                .json()
+                .await
+                .context("failed decoding config before service start")?;
+            let service_status = config
+                .get("service_statuses")
+                .and_then(|value| value.as_array())
+                .and_then(|statuses| {
+                    statuses.iter().find(|status| {
+                        status
+                            .get("instance_kind")
+                            .and_then(|value| value.as_str())
+                            == Some("folder-agent")
+                            && status.get("id").and_then(|value| value.as_str())
+                                == Some("folder-log-test")
+                    })
+                })
+                .context("config response missing folder-agent service status")?;
+            assert_eq!(
+                service_status
+                    .get("running")
+                    .and_then(|value| value.as_bool()),
+                Some(false)
+            );
+
+            let response = http
+                .post(format!(
+                    "{config_base}/api/services/folder-agent/folder-log-test/start"
+                ))
+                .send()
+                .await
+                .context("failed starting folder-agent service through config-app")?;
             let status = response.status();
             let body = response
                 .text()
                 .await
-                .context("failed reading launch-enabled response")?;
+                .context("failed reading service start response")?;
             if !status.is_success() {
-                bail!("config-app launch-enabled returned {status}: {body}");
+                bail!("config-app service start returned {status}: {body}");
             }
 
-            let report: serde_json::Value =
-                serde_json::from_str(&body).context("failed decoding launch report")?;
-            let outcome = report
-                .get("outcomes")
-                .and_then(|value| value.as_array())
-                .and_then(|values| values.first())
-                .context("launch report missing first outcome")?;
+            let action_response: serde_json::Value =
+                serde_json::from_str(&body).context("failed decoding service start response")?;
+            let outcome = action_response
+                .get("launch")
+                .context("service start response missing launch outcome")?;
             assert_eq!(
                 outcome.get("instance_kind").and_then(|value| value.as_str()),
                 Some("folder-agent")
@@ -291,6 +320,24 @@ mod tests {
             assert!(log.contains("id=folder-log-test"));
             assert!(log.contains("spawn attempt failed executable="));
 
+            let stop_response: serde_json::Value = http
+                .post(format!(
+                    "{config_base}/api/services/folder-agent/folder-log-test/stop"
+                ))
+                .send()
+                .await
+                .context("failed stopping folder-agent service through config-app")?
+                .json()
+                .await
+                .context("failed decoding service stop response")?;
+            assert_eq!(
+                stop_response
+                    .get("stop")
+                    .and_then(|value| value.get("was_running"))
+                    .and_then(|value| value.as_bool()),
+                Some(false)
+            );
+
             let config: serde_json::Value = http
                 .get(format!("{config_base}/api/config"))
                 .send()
@@ -308,6 +355,26 @@ mod tests {
                 "log file {} should be under service log dir {}",
                 log_file.display(),
                 service_log_dir
+            );
+            let service_status = config
+                .get("service_statuses")
+                .and_then(|value| value.as_array())
+                .and_then(|statuses| {
+                    statuses.iter().find(|status| {
+                        status
+                            .get("instance_kind")
+                            .and_then(|value| value.as_str())
+                            == Some("folder-agent")
+                            && status.get("id").and_then(|value| value.as_str())
+                                == Some("folder-log-test")
+                    })
+                })
+                .context("config response missing folder-agent service status after stop")?;
+            assert_eq!(
+                service_status
+                    .get("running")
+                    .and_then(|value| value.as_bool()),
+                Some(false)
             );
 
             Ok::<(), anyhow::Error>(())

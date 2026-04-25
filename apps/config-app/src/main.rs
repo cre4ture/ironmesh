@@ -10,12 +10,15 @@ use axum::{Json, Router};
 use clap::Parser;
 use client_sdk::enroll_connection_input_blocking;
 use desktop_client_config::{
-    ClientIdentityConfig, FolderAgentInstance, LaunchReport, ManagedInstanceStore,
+    ClientIdentityConfig, FolderAgentInstance, LaunchOutcome, LaunchReport, ManagedInstanceStore,
     OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance, PLATFORM_KIND,
     STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
-    default_instance_store_path, default_launch_report_path, default_service_log_dir,
-    generate_instance_id, launch_enabled_instances, load_last_launch_report,
-    migrate_legacy_state_paths, package_root_from_current_exe, save_launch_report,
+    ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
+    default_service_log_dir, generate_instance_id, launch_enabled_instances,
+    launch_folder_agent_instance, launch_os_integration_instance,
+    launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
+    package_root_from_current_exe, save_launch_report, service_runtime_statuses,
+    stop_service_from_report,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -55,6 +58,7 @@ struct ConfigResponse {
     startup_integration_value: &'static str,
     startup_integration_note: &'static str,
     store: ManagedInstanceStore,
+    service_statuses: Vec<ServiceRuntimeStatus>,
     last_launch_report: Option<LaunchReport>,
 }
 
@@ -133,6 +137,15 @@ struct ClientIdentityEnrollmentReport {
     device_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceActionResponse {
+    config: ConfigResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch: Option<LaunchOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<StopOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +387,18 @@ async fn main() -> Result<()> {
             "/api/client-identities/{id}",
             delete(delete_client_identity),
         )
+        .route(
+            "/api/services/{kind}/{id}/start",
+            post(start_service_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/stop",
+            post(stop_service_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/restart",
+            post(restart_service_instance),
+        )
         .route("/api/launch-enabled", post(launch_enabled_now))
         .route("/api/shutdown", post(shutdown_app))
         .with_state(state.clone());
@@ -571,6 +596,89 @@ async fn delete_client_identity(
     ))
 }
 
+async fn start_service_instance(
+    AxumPath((kind, id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let kind = normalize_service_kind(&kind)?;
+    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+    ensure_service_instance_exists(&store, kind, &id)?;
+    let existing_report =
+        load_last_launch_report(&state.launch_report_path).map_err(ApiError::internal)?;
+    let already_running = service_runtime_statuses(&store, existing_report.as_ref())
+        .iter()
+        .any(|status| status.instance_kind == kind && status.id == id && status.running);
+    if already_running {
+        return Ok(Json(ServiceActionResponse {
+            config: load_config_response(&state).map_err(ApiError::internal)?,
+            launch: None,
+            stop: None,
+        }));
+    }
+
+    let launch = launch_configured_service(&store, kind, &id, &state.package_root)?;
+    let updated_report =
+        launch_report_with_updated_outcome(existing_report, &state.package_root, launch.clone());
+    save_launch_report(&state.launch_report_path, &updated_report).map_err(ApiError::internal)?;
+
+    Ok(Json(ServiceActionResponse {
+        config: load_config_response(&state).map_err(ApiError::internal)?,
+        launch: Some(launch),
+        stop: None,
+    }))
+}
+
+async fn stop_service_instance(
+    AxumPath((kind, id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let kind = normalize_service_kind(&kind)?;
+    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+    ensure_service_instance_exists(&store, kind, &id)?;
+    let report = load_last_launch_report(&state.launch_report_path).map_err(ApiError::internal)?;
+    let stop = stop_service_from_report(report.as_ref(), kind, &id);
+
+    Ok(Json(ServiceActionResponse {
+        config: load_config_response(&state).map_err(ApiError::internal)?,
+        launch: None,
+        stop: Some(stop),
+    }))
+}
+
+async fn restart_service_instance(
+    AxumPath((kind, id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let kind = normalize_service_kind(&kind)?;
+    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
+    ensure_service_instance_exists(&store, kind, &id)?;
+    let existing_report =
+        load_last_launch_report(&state.launch_report_path).map_err(ApiError::internal)?;
+    let stop = stop_service_from_report(existing_report.as_ref(), kind, &id);
+    let launch = if stop.was_running && !stop.stopped {
+        None
+    } else {
+        let launch = launch_configured_service(&store, kind, &id, &state.package_root)?;
+        let updated_report = launch_report_with_updated_outcome(
+            existing_report,
+            &state.package_root,
+            launch.clone(),
+        );
+        save_launch_report(&state.launch_report_path, &updated_report)
+            .map_err(ApiError::internal)?;
+        Some(launch)
+    };
+
+    Ok(Json(ServiceActionResponse {
+        config: load_config_response(&state).map_err(ApiError::internal)?,
+        launch,
+        stop: Some(stop),
+    }))
+}
+
 async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<LaunchReport>, ApiError> {
     let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
         .map_err(ApiError::internal)?;
@@ -591,6 +699,7 @@ async fn shutdown_app(State(state): State<AppState>) -> Result<Json<serde_json::
 fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
     let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
     let last_launch_report = load_last_launch_report(&state.launch_report_path)?;
+    let service_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
     Ok(ConfigResponse {
         platform: PLATFORM_KIND,
         supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
@@ -602,8 +711,69 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
         startup_integration_value: STARTUP_INTEGRATION_VALUE,
         startup_integration_note: STARTUP_INTEGRATION_NOTE,
         store,
+        service_statuses,
         last_launch_report,
     })
+}
+
+fn normalize_service_kind(kind: &str) -> Result<&'static str, ApiError> {
+    match kind.trim() {
+        "os" | "os-integration" => Ok("os-integration"),
+        "folder" | "folder-agent" => Ok("folder-agent"),
+        other => Err(ApiError::bad_request(format!(
+            "unsupported service kind '{other}'"
+        ))),
+    }
+}
+
+fn ensure_service_instance_exists(
+    store: &ManagedInstanceStore,
+    kind: &str,
+    id: &str,
+) -> Result<(), ApiError> {
+    let exists = match kind {
+        "os-integration" => store
+            .os_integration_instances
+            .iter()
+            .any(|candidate| candidate.id == id),
+        "folder-agent" => store
+            .folder_agent_instances
+            .iter()
+            .any(|candidate| candidate.id == id),
+        _ => false,
+    };
+    if exists {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "{kind} instance '{id}' was not found"
+        )))
+    }
+}
+
+fn launch_configured_service(
+    store: &ManagedInstanceStore,
+    kind: &str,
+    id: &str,
+    package_root: &Path,
+) -> Result<LaunchOutcome, ApiError> {
+    match kind {
+        "os-integration" => store
+            .os_integration_instances
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .map(|instance| launch_os_integration_instance(instance, package_root))
+            .ok_or_else(|| ApiError::bad_request(format!("{kind} instance '{id}' was not found"))),
+        "folder-agent" => store
+            .folder_agent_instances
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .map(|instance| launch_folder_agent_instance(instance, package_root))
+            .ok_or_else(|| ApiError::bad_request(format!("{kind} instance '{id}' was not found"))),
+        _ => Err(ApiError::bad_request(format!(
+            "unsupported service kind '{kind}'"
+        ))),
+    }
 }
 
 async fn enroll_client_identity(
@@ -1477,6 +1647,13 @@ button:hover {
   transform: translateY(-1px);
 }
 
+button:disabled,
+button:disabled:hover {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
 button.secondary {
   background: var(--secondary-button-background);
   color: var(--text);
@@ -1807,6 +1984,20 @@ dd {
   font-size: 14px;
 }
 
+.runtime-pill {
+  width: fit-content;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  color: var(--muted);
+}
+
+.runtime-pill[data-running="true"] {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+  background: var(--accent-soft);
+}
+
 pre {
   margin: 0;
   overflow: auto;
@@ -1984,6 +2175,21 @@ function identityLabelForProfile(instance) {
   return instance.client_identity_file || '';
 }
 
+function serviceStatuses() {
+  return currentConfig?.service_statuses || [];
+}
+
+function serviceStatusFor(instanceKind, id) {
+  return serviceStatuses().find((status) => status.instance_kind === instanceKind && status.id === id);
+}
+
+function runtimeLabel(status) {
+  if (!status?.running) {
+    return 'Stopped';
+  }
+  return status.pid ? `Running · PID ${status.pid}` : 'Running';
+}
+
 function renderIdentityOptions(selectId, selectedId) {
   const target = document.getElementById(selectId);
   const options = ['<option value="">Manual or no managed identity</option>'];
@@ -2043,6 +2249,10 @@ function renderClientIdentityCard(identity) {
 }
 
 function renderInstanceCard(instance, kind, onEdit, onDelete) {
+  const serviceKind = kind === 'os' ? 'os-integration' : 'folder-agent';
+  const runtime = serviceStatusFor(serviceKind, instance.id);
+  const running = !!runtime?.running;
+  const encodedId = encodeURIComponent(instance.id);
   const details = kind === 'os'
     ? currentConfig?.platform === 'linux'
       ? [
@@ -2067,17 +2277,26 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
         ['Client Identity', identityLabelForProfile(instance)],
         ['Local Status UI Address', instance.ui_bind || ''],
       ];
+  if (runtime?.last_launch?.error) {
+    details.push(['Last Launch Error', runtime.last_launch.error]);
+  }
 
   return `
     <article class="instance-card">
       <div class="actions">
         <div>
           <strong>${escapeHtml(instance.label)}</strong>
-          <div class="instance-meta">${instance.enabled ? 'Enabled' : 'Disabled'}</div>
+          <div class="instance-meta">
+            <span>${instance.enabled ? 'Enabled' : 'Disabled'}</span>
+            <span class="runtime-pill" data-running="${running ? 'true' : 'false'}">${escapeHtml(runtimeLabel(runtime))}</span>
+          </div>
         </div>
         <div class="actions">
-          <button type="button" class="secondary" onclick="${onEdit}('${encodeURIComponent(instance.id)}')">Edit</button>
-          <button type="button" class="secondary" onclick="${onDelete}('${encodeURIComponent(instance.id)}')">Delete</button>
+          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'start')" ${running ? 'disabled' : ''}>Start</button>
+          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'stop')" ${running ? '' : 'disabled'}>Stop</button>
+          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'restart')">Restart</button>
+          <button type="button" class="secondary" onclick="${onEdit}('${encodedId}')">Edit</button>
+          <button type="button" class="secondary" onclick="${onDelete}('${encodedId}')">Delete</button>
         </div>
       </div>
       <dl class="instance-meta">
@@ -2325,6 +2544,22 @@ window.deleteFolderInstance = async function(encodedId) {
   showStatus(`Deleted folder-agent instance ${id}.`);
 };
 
+window.controlService = async function(serviceKind, encodedId, action) {
+  const id = decodeURIComponent(encodedId);
+  const response = await fetchJson(
+    `/api/services/${encodeURIComponent(serviceKind)}/${encodeURIComponent(id)}/${action}`,
+    { method: 'POST' }
+  );
+  renderConfig(response.config);
+  showStatus({
+    action,
+    service: serviceKind,
+    id,
+    launch: response.launch || null,
+    stop: response.stop || null,
+  });
+};
+
 async function submitIdentityForm(event) {
   event.preventDefault();
   const payload = {
@@ -2406,6 +2641,8 @@ async function submitFolderForm(event) {
 
 async function launchEnabledNow() {
   const report = await fetchJson('/api/launch-enabled', { method: 'POST' });
+  const config = await fetchJson('/api/config');
+  renderConfig(config);
   renderLaunchReport(report);
   showStatus(report);
 }
