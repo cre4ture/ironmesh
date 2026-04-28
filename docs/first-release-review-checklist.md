@@ -1,6 +1,7 @@
 # First Release Review Checklist
 
-Status: Draft working checklist for a repository-wide release-readiness review.
+Status: Active release-readiness checklist for the `1.0.0-beta.1` Ubuntu
+`noble` PPA candidate.
 
 ## Goal
 
@@ -16,6 +17,18 @@ The main contracts to freeze, or deliberately change before release, are:
 - security, migration, observability, and release gates
 
 Active compatibility shims and aliases should be tracked in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) so cleanup decisions can be made entry by entry.
+
+## Current Release Snapshot
+
+Last updated: 2026-04-28.
+
+- Current release candidate commit: `f989fc8` (`Prepare 1.0.0 beta release`), pushed to `main` and `origin/main`.
+- Workspace package version: `1.0.0-beta.1`.
+- Debian package version and target series: `1.0.0~beta.1-1~ppa1~ubuntu24.04.1` for Ubuntu `noble`.
+- PPA target selected for upload: `ppa:ulrich-hornung/ironmesh`.
+- GitHub CI on `f989fc8` is green for `Workspace Check`, `Coverage`, `Security`, `System Tests`, and `CodeQL`.
+- No `v1.0.0-beta.1` tag currently exists. The tag should be created only after final release sign-off.
+- The matching `../ironmesh_1.0.0~beta.1-1~ppa1~ubuntu24.04.1_source.changes` source upload artifact has not been built or uploaded yet.
 
 ## Review Rules
 
@@ -93,8 +106,8 @@ Checklist:
 
 - [x] Build a contract table with package name, built binary name, user-facing command name, documented name, and supported platforms.
 - [x] Mark each binary or command as `public stable`, `stable internal`, `experimental`, or `private implementation`.
-- [ ] Inventory release-visible env vars and classify which ones are part of the supported contract versus debug-only or internal knobs.
-- [ ] Inventory release-visible persisted files and classify which ones are part of the supported contract versus implementation details.
+- [x] Inventory release-visible env vars and classify which ones are part of the supported contract versus debug-only or internal knobs.
+- [x] Inventory release-visible persisted files and classify which ones are part of the supported contract versus implementation details.
 - [x] Record every naming mismatch that could confuse users, packaging, automation, or docs.
 
 Working evidence log:
@@ -132,8 +145,7 @@ Working evidence log:
    - `minor`: the package-name versus command-name split is intentional for `cli-client`, `server-node`, `rendezvous-service`, and `os-integration`; support docs should keep spelling out that `cargo run -p ...` uses Cargo package names while released binaries use the `ironmesh-*` command names above.
    - `question`: the table above is enough to freeze names and classifications, but Pass 6 still needs to decide the final first-release artifact scope per platform.
 - Missing tests or docs:
-   - Release-visible env vars still need a single inventory and classification pass.
-   - Release-visible persisted files still need a stable-vs-internal matrix.
+   - No Pass 1 inventory gap remains. The release-visible runtime env contract is captured in [README.md](../README.md), and the persisted file stable-vs-internal matrix is captured in Pass 5 below.
 - Proposed pre-release actions:
    - Keep the table above as the naming source of truth and update it when Pass 6 trims or expands the shipped artifact set.
    - Keep adding explicit package-name versus binary-name notes anywhere user docs show `cargo run -p ...` examples.
@@ -142,7 +154,7 @@ Working evidence log:
 
 Exit criteria:
 
-- [ ] A reviewer can answer "what names and paths are safe for users and scripts to depend on?" without reading the source again.
+- [x] A reviewer can answer "what names and paths are safe for users and scripts to depend on?" without reading the source again.
 
 ## Pass 2. Review Server-Node To Server-Node Compatibility
 
@@ -158,15 +170,76 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Inventory inter-node HTTP routes, payloads, query parameters, and headers that participate in replication, reconcile, heartbeat, enrollment, repair, or failover.
-- [ ] Verify that authenticated peer identity comes from TLS material rather than caller-controlled request fields.
-- [ ] Review bootstrap, certificate renewal, membership checks, and failover package handling for backward and forward compatibility risk.
-- [ ] Review rendezvous and relay dependencies that affect inter-node behavior, especially where bootstrap metadata and runtime identity have to stay aligned.
-- [ ] Decide which inter-node routes, payload fields, and identity assumptions are part of the first release contract and which are still allowed to move.
+- [x] Inventory inter-node HTTP routes, payloads, query parameters, and headers that participate in replication, reconcile, heartbeat, enrollment, repair, or failover.
+- [x] Verify that authenticated peer identity comes from TLS material rather than caller-controlled request fields.
+- [x] Review bootstrap, certificate renewal, membership checks, and failover package handling for backward and forward compatibility risk.
+- [x] Review rendezvous and relay dependencies that affect inter-node behavior, especially where bootstrap metadata and runtime identity have to stay aligned.
+- [x] Decide which inter-node routes, payload fields, and identity assumptions are part of the first release contract and which are still allowed to move.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs)
+   - [crates/server-node-sdk/src/replication.rs](../crates/server-node-sdk/src/replication.rs)
+   - [crates/server-node-sdk/src/transport_service.rs](../crates/server-node-sdk/src/transport_service.rs)
+   - [crates/transport-sdk/src/rendezvous.rs](../crates/transport-sdk/src/rendezvous.rs)
+   - [crates/transport-sdk/src/relay.rs](../crates/transport-sdk/src/relay.rs)
+   - [crates/transport-sdk/src/relay_tunnel.rs](../crates/transport-sdk/src/relay_tunnel.rs)
+   - [crates/transport-sdk/src/peer.rs](../crates/transport-sdk/src/peer.rs)
+   - [crates/rendezvous-server/src/lib.rs](../crates/rendezvous-server/src/lib.rs)
+   - [crates/rendezvous-server/src/auth.rs](../crates/rendezvous-server/src/auth.rs)
+   - [docs/security-architecture.md](security-architecture.md)
+   - [docs/node-certificate-renewal-model-decision.md](node-certificate-renewal-model-decision.md)
+   - [docs/peer-identity-reachability-proposal.md](peer-identity-reachability-proposal.md)
+- First-beta inter-node contract statement:
+   - These are the inter-node routes and payloads frozen for the first beta. These identity assumptions are stable. The remaining reachability and public-peer-listener details are intentionally experimental until the dedicated peer-listener and rendezvous-candidate design is completed.
+- Confirmed stable internal peer routes:
+
+   | Method | Route | Stable request shape | Stable response shape |
+   | --- | --- | --- | --- |
+   | `POST` | `/cluster/nodes/{node_id}/heartbeat` | path `node_id`; JSON `NodeHeartbeatRequest` with optional `free_bytes`, `capacity_bytes`, `storage_stats`, and `labels` | `204` when accepted; `403` if path identity does not match caller; `404` if node is unknown |
+   | `POST` | `/cluster/node-enrollments/renew` | JSON `NodeEnrollmentRenewRequest` with optional `current_public_tls_cert_pem` | `201` JSON `NodeEnrollmentRenewResponse` with `cluster_id`, `node_id`, `trust_roots`, optional `enrollment_issuer_url`, optional `public_tls_material`, and required `internal_tls_material` |
+   | `GET` | `/cluster/availability/subjects/local` | none | JSON `LocalAvailableSubjectsResponse` with `node_id`, `subject_count`, `generated_at_unix`, and `subjects` |
+   | `GET` | `/cluster/metadata/subjects/local` | none | JSON `LocalMetadataSubjectsResponse` with `node_id`, `subject_count`, `generated_at_unix`, and `subjects` |
+   | `GET` | `/cluster/replication/export` | query `key`, optional `version_id` | JSON replication export bundle, or `404` when unavailable |
+   | `GET` | `/cluster/metadata/export` | query `key`, optional `version_id` | JSON metadata export bundle, or `404` when unavailable |
+   | `GET` | `/cluster/replication/chunk/{hash}` | path `hash` | raw chunk bytes, or `404` when unavailable |
+   | `POST` | `/cluster/replication/push/chunk/{hash}` | path `hash`; raw chunk bytes | JSON `{ "stored": bool }` |
+   | `POST` | `/cluster/replication/push/manifest` | query `key`, `state`, `manifest_hash`, optional `version_id`, optional `parent_version_ids_json`; raw manifest bytes | JSON `{ "version_id": string }` |
+   | `PUT` | `/store/{key}` for internal replication | query `state`, optional `version_id`, `internal_replication=true`; raw object bytes | standard object write response used by the storage API |
+   | `POST` | `/cluster/replication/drop` | query `key`, optional `version_id` | JSON `{ "dropped": bool }` |
+   | `POST` | `/cluster/replication/repair` | query optional `batch_size`, optional `scope` (`local` or `cluster`) | JSON repair report shape used by local and cluster repair |
+   | `GET` | `/cluster/reconcile/export/provisional` | none | JSON array of provisional reconcile entries |
+- Stable inter-node header behavior:
+   - Binary chunk, manifest, and inline object transfer requests use `content-type: application/octet-stream`.
+   - Relay transport preserves peer HTTP headers through `RelayHttpHeader { name, value }`; no caller-provided identity header is part of the internal peer-auth contract.
+- Confirmed stable identity and authorization assumptions:
+   - Internal peer routes require node-to-node authentication through mTLS on direct peer transport, or through the relay multiplex handshake bound to `PeerIdentity::Node`.
+   - The authenticated node identity comes from the peer certificate SAN `urn:ironmesh:node:<uuid>` and cluster binding SAN `urn:ironmesh:cluster:<cluster_uuid>`; caller-controlled headers such as `x-ironmesh-node-id` are not trusted for internal caller identity.
+   - Any internal route that carries `{node_id}` in the path must compare that path value to the authenticated peer identity. The heartbeat route currently enforces this with `403` on mismatch.
+   - Routine node enrollment renewal preserves the stable logical `node_id`, requires matching `cluster_id`, and is authorized by current cluster membership. Removal from current membership is the first-beta denial mechanism for renewal.
+- Confirmed stable rendezvous and relay dependencies:
+   - Rendezvous presence uses `PresenceRegistration` with `cluster_id`, `identity`, optional `public_api_url`, optional `peer_api_url`, `direct_candidates`, `labels`, capacity/free storage fields, `capabilities`, `relay_mode`, and `connected_at_unix`.
+   - Relay ticketing uses `RelayTicketRequest` and `RelayTicket` with `cluster_id`, source/target `PeerIdentity`, `session_kind`, session id, relay URLs, and issue/expiry timestamps.
+   - Relay tunnel setup uses `RelayTunnelControlMessage` values `connect_source`, `accept_target`, `paired`, `close_write`, and `error`, with beta node-to-node HTTP carried over the multiplex transport session.
+- Confirmed bootstrap, membership, and failover decisions:
+   - Node bootstrap and enrollment material may publish public and peer reachability metadata, but peer identity stays tied to certificate SANs rather than mutable addresses.
+   - Managed rendezvous failover packages are operator/control-plane artifacts, not an automatic node-to-node runtime route. The package fields already listed in the contract-candidate table remain the beta shape.
+- Findings:
+   - `decision`: the listed internal peer routes and payload shapes are stable enough for `1.0.0-beta.1`.
+   - `decision`: peer certificate logical identity and cluster binding are stable beta assumptions.
+   - `question`: direct peer reachability still uses current candidate/public-peer behavior until the explicit peer-listener design is completed.
+- Missing tests or docs:
+   - No additional CI blocker is known for the beta. Existing unit and system tests cover representative direct, relay, replication, renewal, and reconnect behavior, but this checklist is the only single written route inventory for Pass 2.
+- Proposed pre-release actions:
+   - Do not rename or remove the listed internal peer routes before the beta.
+   - Treat `public_peer_api_enabled`, public listener exposure of peer routes, and mutable peer-candidate publication as experimental implementation details for the beta.
+- Deferred post-release items:
+   - Complete the dedicated peer-listener and rendezvous-candidate design, then remove the public peer route exposure after a migration path is defined.
 
 Exit criteria:
 
-- [ ] There is a written inter-node contract list plus an explicit list of anything still experimental.
+- [x] There is a written inter-node contract list plus an explicit list of anything still experimental.
 
 ## Pass 3. Review Client-Facing API And SDK Stability
 
@@ -231,15 +304,38 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Confirm the final user-visible binary and command names for all shipped artifacts.
-- [ ] Resolve the `cli-client` package name versus `ironmesh` command-name split in docs, packaging, and support language.
-- [ ] Decide whether `os-integration` is the only supported user-facing entrypoint for filesystem integration, with adapter-specific names treated as implementation details.
-- [ ] Review all code that assumes packaged sibling executables live under one package root.
-- [ ] Review OS-level names that become hard to change later, including startup-task IDs and package-root assumptions.
+- [x] Confirm the final user-visible binary and command names for all shipped artifacts.
+- [x] Resolve the `cli-client` package name versus `ironmesh` command-name split in docs, packaging, and support language.
+- [x] Decide whether `os-integration` is the only supported user-facing entrypoint for filesystem integration, with adapter-specific names treated as implementation details.
+- [x] Review all code that assumes packaged sibling executables live under one package root.
+- [x] Review OS-level names that become hard to change later, including startup-task IDs and package-root assumptions.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [README.md](../README.md)
+   - [Cargo.toml](../Cargo.toml)
+   - [debian/control](../debian/control)
+   - [debian/rules](../debian/rules)
+   - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md)
+   - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
+   - [apps/*/tests/version.rs](../apps)
+- Confirmed stable contracts:
+   - Installed user-facing command names are `ironmesh`, `ironmesh-server-node`, `ironmesh-rendezvous-service`, `ironmesh-os-integration`, and `ironmesh-folder-agent`.
+   - `cli-client`, `server-node`, `rendezvous-service`, and `os-integration` remain Cargo package names for source-checkout workflows only.
+   - The Ubuntu `ironmesh-client` package keeps desktop helper binaries together under one package root and exposes the documented commands through `/usr/bin` symlinks.
+   - Filesystem integration is documented through `ironmesh-os-integration`; adapter crate names remain implementation details.
+- Findings:
+   - `resolved`: README now explicitly separates Cargo package names from installed command names.
+   - `resolved`: Debian packaging installs the final command set and keeps package-root sibling assumptions intact for the config app/background launcher path.
+- Missing tests or docs:
+   - No current naming or install-layout gap is known.
+- Proposed pre-release actions:
+   - Recheck this pass only if the package payload or installed command set changes.
 
 Exit criteria:
 
-- [ ] Docs, tests, packaging, and code agree on what a user or automation system is expected to run.
+- [x] Docs, tests, packaging, and code agree on what a user or automation system is expected to run.
 
 ## Pass 5. Review Config, State, Naming, And Migration Behavior
 
@@ -335,8 +431,12 @@ Working evidence log:
    - [docs/windows-msix-release-update-strategy.md](windows-msix-release-update-strategy.md)
    - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md)
    - [debian/README.source](../debian/README.source)
+   - [debian/changelog](../debian/changelog)
    - [debian/control](../debian/control)
    - [debian/rules](../debian/rules)
+   - [scripts/build-ppa-source.sh](../scripts/build-ppa-source.sh)
+   - [scripts/build-local-debs.sh](../scripts/build-local-debs.sh)
+   - [scripts/prepare-ppa-source.sh](../scripts/prepare-ppa-source.sh)
    - [debian/ironmesh-server-node.service](../debian/ironmesh-server-node.service)
    - [debian/ironmesh-rendezvous-service.service](../debian/ironmesh-rendezvous-service.service)
    - [debian/ironmesh-server-node.env](../debian/ironmesh-server-node.env)
@@ -351,11 +451,12 @@ Working evidence log:
   | Platform | Artifact / install channel | Classification | Update path | Notes |
   | --- | --- | --- | --- | --- |
   | Windows | Store-submitted `.msixupload` / MSIX package | `public stable` | Microsoft Store | Package identity is fixed; installed package root is ephemeral; mutable runtime state must stay outside the package |
-  | Ubuntu Linux | Launchpad PPA packages `ironmesh-client`, `ironmesh-server-node`, and `ironmesh-rendezvous-service` | `public stable` | `apt upgrade`, Update Manager, or unattended-upgrades | No custom self-updater; Launchpad builds per-series binaries from the Debian source package |
+  | Ubuntu Linux | Launchpad PPA packages `ironmesh-client`, `ironmesh-server-node`, and `ironmesh-rendezvous-service` | `public stable` | `apt upgrade`, Update Manager, or unattended-upgrades | Target PPA is `ppa:ulrich-hornung/ironmesh`; Launchpad builds per-series binaries from the Debian source package |
   | Android and iOS shells | Workspace code only | `out of scope for first release` | n/a | No first-release packaging or update channel is defined yet |
 - Confirmed packaging and update behavior:
    - Windows first release stays on Microsoft Store delivery; direct sideload packaging remains a development-only path.
    - Ubuntu first release should use a Launchpad PPA as the supported install and update channel. Users add the PPA once, install the package they need with `apt`, and receive updates through normal Ubuntu package management rather than an Ironmesh self-updater.
+   - The current Ubuntu beta package target is `1.0.0~beta.1-1~ppa1~ubuntu24.04.1` for `noble`.
    - `ironmesh-client` installs the public `ironmesh` CLI and the packaged helpers `ironmesh-config-app`, `ironmesh-folder-agent`, `ironmesh-os-integration`, and `ironmesh-background-launcher` under one package root, with `/usr/bin` symlinks for the documented commands.
    - Linux background launching resolves sibling binaries from `current_exe().parent()`, so keeping the client helpers together under one package root is part of the update contract for `apt`-delivered upgrades.
    - Linux mutable client state stays under XDG `Ironmesh` roots, while server and rendezvous packages keep operator-edited config in `/etc/ironmesh/*.env` and runtime state in systemd `StateDirectory` roots under `/var/lib`; package upgrades should not rewrite those paths.
@@ -367,9 +468,12 @@ Working evidence log:
    - `minor`: Linux autostart is now package-driven through XDG Autostart rather than a user-level systemd service, so release docs should describe how users can disable the autostart entry if they do not want background desktop status.
    - `minor`: [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs) installs the GNOME extension into `~/.local/share/gnome-shell/extensions/...`, which keeps the extension per-user and update-safe but means the Debian package alone does not finish desktop integration.
 - Missing tests or docs:
-   - Validate the real `add-apt-repository` plus `apt install` and `apt upgrade` flow against a fresh supported Ubuntu series once the production PPA name exists.
+   - The production PPA target is now known, but the beta source upload artifact has not been built or uploaded yet.
+   - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) still uses placeholder install and upload examples instead of the concrete `ppa:ulrich-hornung/ironmesh` target.
+   - Validate the real `add-apt-repository`, `apt install`, and `apt upgrade` flow against a fresh supported Ubuntu series after Launchpad publishes the packages.
 - Proposed pre-release actions:
-   - Keep Launchpad PPA as the Ubuntu consumer channel and document the final end-user install and update commands with the real PPA name.
+   - Build the signed source package with `./scripts/build-ppa-source.sh`, upload it with `dput ppa:ulrich-hornung/ironmesh ../ironmesh_1.0.0~beta.1-1~ppa1~ubuntu24.04.1_source.changes`, and wait for Launchpad build success.
+   - Document the final end-user install and update commands with the real PPA name.
    - Keep Linux service enablement and GNOME extension enablement as explicit opt-in steps unless a deliberate packaging hook is added later.
 - Deferred post-release items:
    - Add user-facing enable/disable controls for desktop background autostart after the packaged XDG autostart behavior is tested.
@@ -458,6 +562,9 @@ Exit criteria:
 
 Working evidence log:
 
+- Current pushed-commit evidence:
+   - Commit `f989fc8` on `main` is green in GitHub Actions for `Workspace Check`, `Coverage`, `Security`, `System Tests`, and `CodeQL`.
+   - The individual checks reported success for `rustfmt`, `workspace-check`, `clippy`, `unit-tests`, `fuse-mount-build`, `windows-cfapi-check`, `android-build`, `android-instrumentation-tests`, `coverage`, `system-tests (ubuntu-latest)`, `system-tests (windows-latest)`, `cargo-audit`, `cargo-deny`, and CodeQL `actions`, `javascript-typescript`, `rust`, and `swift`.
 - Automated gate evidence:
    - Branch-protected CI lanes are defined explicitly in `.github/workflows/check.yml`, `.github/workflows/coverage.yml`, and `.github/workflows/system-tests.yml` under the exact status names `workspace-check`, `rustfmt`, `clippy`, `unit-tests`, `coverage`, and `system-tests`.
    - `justfile` now mirrors the stable CI split correctly: stable unit tests use `cargo test --workspace` without the old redundant `--exclude system-tests` warning, `ci-stable` includes `fmt-check`, and `ci-required` provides one local entry point for the required gate set.
@@ -513,6 +620,7 @@ Working evidence log:
 
 - Reviewed paths:
    - [README.md](../README.md)
+   - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md)
    - [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md)
    - [docs/manual-windows-sync-root-restart-test.md](manual-windows-sync-root-restart-test.md)
    - [start_node.sh](../start_node.sh)
@@ -528,10 +636,12 @@ Working evidence log:
    - `resolved`: [docs/manual-windows-sync-root-restart-test.md](manual-windows-sync-root-restart-test.md) no longer exposes the internal `os-integration` label as if it were the public Windows runtime name; the guide now talks about the OS integration instance generically while keeping the packaged binary name `ironmesh-os-integration` explicit where it matters.
    - `resolved`: README now distinguishes what is stable for the first release from what is still expected to evolve, especially around packaged command names, bootstrap naming, mobile shells, Apple filesystem integration, and non-contract tuning envs.
 - Missing tests or docs:
-   - The remaining gap is not naming or path drift inside the repo; it is independent human validation of the doc flows, especially the packaged Windows restart guide.
+   - The remaining gap is not naming or path drift inside the repo; it is independent human validation of the doc flows, especially the packaged Windows restart guide and the PPA install/upgrade flow after Launchpad publication.
+   - The Ubuntu packaging doc still has placeholder PPA examples even though the target PPA is now known.
 - Proposed pre-release actions:
    - Run the new packaged Windows restart guide once on a real packaged build and record the result.
    - Do one fresh-reader dry run of the README plus Linux FUSE instructions to validate the exit criterion.
+   - Replace placeholder PPA examples with `ppa:ulrich-hornung/ironmesh` once the first beta upload is accepted.
 
 ## Pass 10. Final Sign-Off And Backlog Split
 
@@ -547,11 +657,15 @@ Exit criteria:
 
 - [ ] There is a clear release decision record and a short list of what the next AI reviewer should work on first.
 
-## Recommended First Work Items
+## Current Open Work Items
 
-If this checklist is used immediately, the highest-value first steps are:
+No CI blocker is known for the current beta candidate. The open work is release
+sign-off and publication work:
 
-1. Build the binary and command-name contract table from Pass 1.
-2. Build the persisted file and path matrix from Pass 5.
-3. Build the client-facing and inter-node API contract lists from Passes 2 and 3.
-4. Resolve naming mismatches before wider packaging and documentation cleanup.
+1. Finish Pass 3 by writing the stable client-facing route catalog, deciding whether `web-ui-backend` routes are public or bundled-tool internal, and mapping every stable route to test coverage.
+2. Build and upload the `1.0.0-beta.1` Ubuntu `noble` source package to `ppa:ulrich-hornung/ironmesh`, then record Launchpad build results.
+3. Validate the real PPA install and update flow on a fresh Ubuntu 24.04 environment.
+4. Run and record the packaged Windows sync-root restart manual test.
+5. Do a fresh-reader dry run of README plus Linux FUSE instructions.
+6. Replace remaining placeholder PPA examples with the real PPA target once the beta upload is accepted.
+7. Complete Pass 10 by producing the final v1 contract list, classifying every remaining finding as release-blocking, documentation-only, or post-release backlog, then create the release tag after sign-off.
