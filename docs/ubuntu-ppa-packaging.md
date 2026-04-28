@@ -82,6 +82,44 @@ The helper script below prepares both:
 ./scripts/prepare-ppa-source.sh
 ```
 
+## Local binary package builds
+
+When you want installable local `.deb` files from the current checkout rather
+than a Launchpad source upload, use:
+
+```bash
+./scripts/build-local-debs.sh
+```
+
+That helper:
+
+- runs `./scripts/prepare-ppa-source.sh` by default,
+- builds unsigned local binary packages with `dpkg-buildpackage -b -us -uc`,
+- emits the `.deb`, `.changes`, and `.buildinfo` artifacts in the parent
+  directory of the repo checkout.
+
+Optional flags:
+
+- `--no-prepare` skips the web/vendoring preparation step when you already ran
+  it.
+- `--lintian` runs `lintian` on the generated `.changes` file after a
+  successful build.
+- `-- <args>` passes additional flags through to `dpkg-buildpackage`.
+
+Example:
+
+```bash
+./scripts/build-local-debs.sh -- -jauto
+sudo apt install \
+  ../ironmesh-client_0.1.0-1_amd64.deb \
+  ../ironmesh-server-node_0.1.0-1_amd64.deb \
+  ../ironmesh-rendezvous-service_0.1.0-1_amd64.deb
+```
+
+Like the PPA source-package path, the Debian package build itself skips the
+repo's long-running test suites. Run the workspace checks before packaging when
+you want local verification too.
+
 ## Typical upload flow
 
 1. Prepare vendored crates and prebuilt web assets:

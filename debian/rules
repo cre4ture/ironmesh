@@ -24,6 +24,9 @@ CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-s
 %:
 	dh $@
 
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
 override_dh_auto_configure:
 	test -f $(CURDIR)/debian/prebuilt-web/server-admin/index.html || \
 		(echo "missing prebuilt server-admin assets; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)

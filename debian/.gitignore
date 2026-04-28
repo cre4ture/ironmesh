@@ -6,6 +6,7 @@
 /files
 /source/include-binaries
 /*.debhelper.log
+/*.debhelper
 /*.substvars
 /ironmesh-client/
 /ironmesh-rendezvous-service/
