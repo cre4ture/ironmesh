@@ -111,9 +111,9 @@ Example:
 ```bash
 ./scripts/build-local-debs.sh -- -jauto
 sudo apt install \
-  ../ironmesh-client_0.1.0-1_amd64.deb \
-  ../ironmesh-server-node_0.1.0-1_amd64.deb \
-  ../ironmesh-rendezvous-service_0.1.0-1_amd64.deb
+  ../ironmesh-client_1.0.0~beta.1-1_amd64.deb \
+  ../ironmesh-server-node_1.0.0~beta.1-1_amd64.deb \
+  ../ironmesh-rendezvous-service_1.0.0~beta.1-1_amd64.deb
 ```
 
 Like the PPA source-package path, the Debian package build itself skips the
@@ -132,7 +132,7 @@ you want local verification too.
    Example for Ubuntu 24.04 LTS (`noble`):
 
    ```bash
-   dch -D noble -v 0.1.0-1~ppa1~ubuntu24.04.1 "PPA build"
+   dch -D noble -v 1.0.0~beta.1-1~ppa1~ubuntu24.04.1 "PPA build"
    ```
 
 3. Build the signed Debian source package:
@@ -148,7 +148,7 @@ you want local verification too.
 4. Upload the resulting source changes file:
 
    ```bash
-   dput ppa:<launchpad-user>/<ppa-name> ../ironmesh_0.1.0-1~ppa1~ubuntu24.04.1_source.changes
+   dput ppa:<launchpad-user>/<ppa-name> ../ironmesh_1.0.0~beta.1-1~ppa1~ubuntu24.04.1_source.changes
    ```
 
 ## Notes
