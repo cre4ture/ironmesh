@@ -27,7 +27,7 @@ exclude = ["tests/system-tests"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0-beta.1"
+version = "1.0.3"
 edition = "2024"
 license = "MIT"
 authors = ["ironmesh contributors"]
