@@ -1,3 +1,10 @@
+ironmesh (1.0.0~beta.1-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Run ironmesh-server-node under a dedicated system user created at install
+    time.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 01 May 2026 15:09:41 +0200
+
 ironmesh (1.0.0~beta.1-1~ppa2~ubuntu24.04.1) noble; urgency=medium
 
   * Preserve vendored Cargo checksum files in Launchpad source builds.

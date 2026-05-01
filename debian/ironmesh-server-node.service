@@ -5,8 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=ironmesh-server-node
+Group=ironmesh-server-node
 EnvironmentFile=-/etc/ironmesh/server-node.env
 StateDirectory=ironmesh-server-node
+StateDirectoryMode=0750
 WorkingDirectory=/var/lib/ironmesh-server-node
 ExecStart=/usr/bin/ironmesh-server-node
 Restart=on-failure

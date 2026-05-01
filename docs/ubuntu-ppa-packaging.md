@@ -12,6 +12,10 @@ single source package that builds three installable packages:
 For Ubuntu, the first-release distribution path should be a Launchpad PPA backed
 by the source package in this repository.
 
+If Launchpad is unavailable or too slow for a release, Ironmesh can also be
+published from a static signed apt repository. See
+`docs/self-hosted-apt-repository.md` for the `creax.de` flow.
+
 That means:
 
 - end users install Ironmesh through `apt`, not from ad-hoc tarballs or a
@@ -47,6 +51,9 @@ Package-specific notes:
 - `ironmesh-server-node` and `ironmesh-rendezvous-service` install systemd
   units plus sample `/etc/ironmesh/*.env` files, but the units remain disabled
   until an operator fills in configuration and runs `systemctl enable --now`.
+- `ironmesh-server-node` creates and runs as a dedicated
+  `ironmesh-server-node` system user. Its systemd state directory is
+  `/var/lib/ironmesh-server-node`.
 - GNOME Shell integration stays optional. The client package ships the
   extension assets, but a user still installs or enables them through the CLI
   helper.

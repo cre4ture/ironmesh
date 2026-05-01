@@ -40,3 +40,6 @@ Notes:
     `ironmesh-rendezvous-service` are installed but not enabled or started
     automatically. Fill in the matching `/etc/ironmesh/*.env` file and enable
     the service manually after installation.
+  * `ironmesh-server-node` uses a systemd sysusers file so the
+    `ironmesh-server-node` system user is created automatically at package
+    installation time.

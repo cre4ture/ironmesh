@@ -22,7 +22,7 @@ CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/ironmesh-client/usr/lib/ironmesh-client
 CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
 
 %:
-	dh $@
+	dh $@ --with installsysusers
 
 override_dh_clean:
 	dh_clean -XCargo.toml.orig
