@@ -132,7 +132,7 @@ you want local verification too.
    Example for Ubuntu 24.04 LTS (`noble`):
 
    ```bash
-   dch -D noble -v 1.0.0~beta.1-1~ppa1~ubuntu24.04.1 "PPA build"
+   dch -D noble -v 1.0.0~beta.1-1~ppa2~ubuntu24.04.1 "PPA build"
    ```
 
 3. Build the signed Debian source package:
@@ -148,7 +148,7 @@ you want local verification too.
 4. Upload the resulting source changes file:
 
    ```bash
-   dput ppa:<launchpad-user>/<ppa-name> ../ironmesh_1.0.0~beta.1-1~ppa1~ubuntu24.04.1_source.changes
+   dput ppa:<launchpad-user>/<ppa-name> ../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes
    ```
 
 ## Notes

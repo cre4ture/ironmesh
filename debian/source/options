@@ -1,1 +1,2 @@
 extend-diff-ignore = "(^|/)(target|data|map|target-codex-check|web/node_modules|web/.*/node_modules|web/.*/dist|web/.turbo|web/playwright-report|web/test-results)(/|$)"
+tar-ignore = .ironmesh-dpkg-source-keep-vendor-dotfiles

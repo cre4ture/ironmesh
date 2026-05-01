@@ -47,11 +47,29 @@ create_orig_tarball() {
   log "wrote ${orig_path}"
 }
 
+clean_debian_build_outputs() {
+  log "removing stale Debian binary build outputs"
+  rm -rf \
+    "${ROOT_DIR}/debian/.debhelper" \
+    "${ROOT_DIR}/debian/cargo-home" \
+    "${ROOT_DIR}/debian/tmp" \
+    "${ROOT_DIR}/debian/ironmesh-client" \
+    "${ROOT_DIR}/debian/ironmesh-rendezvous-service" \
+    "${ROOT_DIR}/debian/ironmesh-server-node"
+  rm -f \
+    "${ROOT_DIR}/debian/debhelper-build-stamp" \
+    "${ROOT_DIR}/debian/files" \
+    "${ROOT_DIR}"/debian/*.debhelper \
+    "${ROOT_DIR}"/debian/*.debhelper.log \
+    "${ROOT_DIR}"/debian/*.substvars
+}
+
 if ! command -v debuild >/dev/null 2>&1; then
   printf 'debuild is required; install devscripts first\n' >&2
   exit 1
 fi
 
+clean_debian_build_outputs
 "${ROOT_DIR}/scripts/prepare-ppa-source.sh"
 create_orig_tarball
 

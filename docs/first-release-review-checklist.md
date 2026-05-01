@@ -20,15 +20,15 @@ Active compatibility shims and aliases should be tracked in [backwards-compatibi
 
 ## Current Release Snapshot
 
-Last updated: 2026-04-28.
+Last updated: 2026-05-01.
 
-- Current release candidate commit: `f989fc8` (`Prepare 1.0.0 beta release`), pushed to `main` and `origin/main`.
+- Release tag `v1.0.0-beta.1` exists and points at `17a8451` (`Document first beta inter-node contract`).
 - Workspace package version: `1.0.0-beta.1`.
-- Debian package version and target series: `1.0.0~beta.1-1~ppa1~ubuntu24.04.1` for Ubuntu `noble`.
+- Debian package version and target series: `1.0.0~beta.1-1~ppa2~ubuntu24.04.1` for Ubuntu `noble`.
 - PPA target selected for upload: `ppa:ulrich-hornung/ironmesh`.
-- GitHub CI on `f989fc8` is green for `Workspace Check`, `Coverage`, `Security`, `System Tests`, and `CodeQL`.
-- No `v1.0.0-beta.1` tag currently exists. The tag should be created only after final release sign-off.
-- The matching `../ironmesh_1.0.0~beta.1-1~ppa1~ubuntu24.04.1_source.changes` source upload artifact has not been built or uploaded yet.
+- GitHub CI on the tagged beta code was green for `Workspace Check`, `Coverage`, `Security`, `System Tests`, and `CodeQL`.
+- The `ppa1` source upload was accepted, but the Launchpad binary build failed because `dpkg-source` stripped vendored Cargo dotfiles that Cargo checksums still referenced.
+- The matching `../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes` source upload artifact has been built locally unsigned for validation; build it signed before upload.
 
 ## Review Rules
 
@@ -456,7 +456,7 @@ Working evidence log:
 - Confirmed packaging and update behavior:
    - Windows first release stays on Microsoft Store delivery; direct sideload packaging remains a development-only path.
    - Ubuntu first release should use a Launchpad PPA as the supported install and update channel. Users add the PPA once, install the package they need with `apt`, and receive updates through normal Ubuntu package management rather than an Ironmesh self-updater.
-   - The current Ubuntu beta package target is `1.0.0~beta.1-1~ppa1~ubuntu24.04.1` for `noble`.
+   - The current Ubuntu beta package target is `1.0.0~beta.1-1~ppa2~ubuntu24.04.1` for `noble`.
    - `ironmesh-client` installs the public `ironmesh` CLI and the packaged helpers `ironmesh-config-app`, `ironmesh-folder-agent`, `ironmesh-os-integration`, and `ironmesh-background-launcher` under one package root, with `/usr/bin` symlinks for the documented commands.
    - Linux background launching resolves sibling binaries from `current_exe().parent()`, so keeping the client helpers together under one package root is part of the update contract for `apt`-delivered upgrades.
    - Linux mutable client state stays under XDG `Ironmesh` roots, while server and rendezvous packages keep operator-edited config in `/etc/ironmesh/*.env` and runtime state in systemd `StateDirectory` roots under `/var/lib`; package upgrades should not rewrite those paths.
@@ -468,11 +468,11 @@ Working evidence log:
    - `minor`: Linux autostart is now package-driven through XDG Autostart rather than a user-level systemd service, so release docs should describe how users can disable the autostart entry if they do not want background desktop status.
    - `minor`: [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs) installs the GNOME extension into `~/.local/share/gnome-shell/extensions/...`, which keeps the extension per-user and update-safe but means the Debian package alone does not finish desktop integration.
 - Missing tests or docs:
-   - The production PPA target is now known, but the beta source upload artifact has not been built or uploaded yet.
+   - The production PPA target is known. The `ppa1` upload was accepted but failed to build on Launchpad; the `ppa2` source artifact has been built locally unsigned for validation and still needs a signed upload.
    - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) still uses placeholder install and upload examples instead of the concrete `ppa:ulrich-hornung/ironmesh` target.
    - Validate the real `add-apt-repository`, `apt install`, and `apt upgrade` flow against a fresh supported Ubuntu series after Launchpad publishes the packages.
 - Proposed pre-release actions:
-   - Build the signed source package with `./scripts/build-ppa-source.sh`, upload it with `dput ppa:ulrich-hornung/ironmesh ../ironmesh_1.0.0~beta.1-1~ppa1~ubuntu24.04.1_source.changes`, and wait for Launchpad build success.
+   - Build the signed source package with `./scripts/build-ppa-source.sh`, upload it with `dput ppa:ulrich-hornung/ironmesh ../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes`, and wait for Launchpad build success.
    - Document the final end-user install and update commands with the real PPA name.
    - Keep Linux service enablement and GNOME extension enablement as explicit opt-in steps unless a deliberate packaging hook is added later.
 - Deferred post-release items:
