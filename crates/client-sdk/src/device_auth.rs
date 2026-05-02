@@ -145,7 +145,10 @@ pub fn enroll_device_blocking_from_pem(
 
 fn parse_enrollment_response(status: StatusCode, body: String) -> Result<DeviceEnrollmentResponse> {
     if !status.is_success() {
-        bail!("device enrollment failed with HTTP {status}: {body}");
+        bail!(
+            "device enrollment failed with HTTP {status}: {}",
+            response_error_message(&body)
+        );
     }
 
     let enrolled = serde_json::from_str::<DeviceEnrollmentResponse>(&body)
@@ -164,6 +167,18 @@ fn parse_enrollment_response(status: StatusCode, body: String) -> Result<DeviceE
         ));
     }
     Ok(enrolled)
+}
+
+fn response_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| body.to_string())
 }
 
 #[cfg(test)]
@@ -218,6 +233,18 @@ mod tests {
                 .to_string()
                 .contains("device enrollment failed with HTTP 403 Forbidden: denied")
         );
+    }
+
+    #[test]
+    fn parse_enrollment_response_extracts_json_error_messages() {
+        let error = parse_enrollment_response(
+            StatusCode::PRECONDITION_FAILED,
+            r#"{"error":"signer material is missing"}"#.to_string(),
+        )
+        .expect_err("HTTP errors should fail");
+        assert!(error.to_string().contains(
+            "device enrollment failed with HTTP 412 Precondition Failed: signer material is missing"
+        ));
     }
 
     #[test]

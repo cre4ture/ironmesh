@@ -1093,6 +1093,39 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
 }
 
 #[tokio::test]
+async fn enroll_client_device_returns_json_error_when_rendezvous_mtls_signing_is_unavailable() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.rendezvous_mtls_required = true;
+
+    let response = super::enroll_client_device(
+        State(state.clone()),
+        Json(super::ClientDeviceEnrollRequest {
+            cluster_id: state.cluster_id,
+            pairing_token: "pair-secret".to_string(),
+            device_id: Some(Uuid::now_v7().to_string()),
+            label: Some("Laptop".to_string()),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
+                .to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload.get("error").and_then(|value| value.as_str()),
+        Some(
+            "client enrollment issuance is unavailable on this node: rendezvous mTLS client identity issuance requires internal_ca_key_pem"
+        )
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());

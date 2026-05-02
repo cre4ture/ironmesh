@@ -160,6 +160,33 @@ Notes:
 - `-IncludePdbSymbols` packages raw PDBs into `.appxsym`; use that only if you are comfortable uploading private symbol information
 - the script prepares the upload artifact only; Partner Center metadata, screenshots, age ratings, privacy policy, and certification notes still have to be filled manually
 
+## Installing a locally signed MSIX on another PC
+
+Packages produced by the prototype and Store upload helpers are signed with a local development certificate unless you replace the signing certificate. A new client PC will reject the raw `.msix` with `0x800B010A` until that certificate is trusted on that PC.
+
+For test installs, copy both files from the build output folder to the client PC:
+
+- `UlrichHornung.IronMesh_<version>_x64.msix`
+- `UlrichHornung.IronMesh_<version>_x64.cer`
+
+Then run this from an elevated PowerShell on the client PC:
+
+```powershell
+Import-Certificate -FilePath .\UlrichHornung.IronMesh_1.0.3.0_x64.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+Add-AppxPackage -Path .\UlrichHornung.IronMesh_1.0.3.0_x64.msix
+```
+
+If the certificate file was not copied separately, extract the signer certificate from the package and import it:
+
+```powershell
+$cert = (Get-AuthenticodeSignature -FilePath .\UlrichHornung.IronMesh_1.0.3.0_x64.msix).SignerCertificate
+Export-Certificate -Cert $cert -FilePath .\IronMesh.cer
+Import-Certificate -FilePath .\IronMesh.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+Add-AppxPackage -Path .\UlrichHornung.IronMesh_1.0.3.0_x64.msix
+```
+
+This trust step is only for direct sideload testing. Partner Center distribution should use the `.msixupload`; after Microsoft Store processing, end users should not need to import this development certificate manually.
+
 ## Install and Reinstall Workflow
 
 Use this when iterating on the thumbnail provider DLL, the manifest, or the packaged `ironmesh-os-integration.exe`.

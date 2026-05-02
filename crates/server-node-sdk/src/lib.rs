@@ -3525,7 +3525,7 @@ fn wait_for_local_node_ready(
 pub async fn run_from_env() -> Result<()> {
     let log_buffer = Arc::new(LogBuffer::new(500));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(common::logging::env_filter_from_default_env("info"))
         .with(common::logging::compact_fmt_layer())
         .with(LogCaptureLayer::new(log_buffer.clone()))
         .init();
@@ -13364,16 +13364,24 @@ async fn issue_pairing_token_impl(
 async fn enroll_client_device_impl(
     state: &ServerState,
     request: ClientEnrollmentRequest,
-) -> std::result::Result<ClientDeviceEnrollResponse, StatusCode> {
-    request.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> std::result::Result<ClientDeviceEnrollResponse, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     if request.cluster_id != state.cluster_id {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "client enrollment cluster_id does not match this node".to_string(),
+        ));
     }
 
     let pairing_token = request.pairing_token.trim();
     let public_key_pem = request.public_key_pem.trim();
     if pairing_token.is_empty() || public_key_pem.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "client enrollment requires a pairing token and public key".to_string(),
+        ));
     }
 
     let now = unix_ts();
@@ -13408,11 +13416,14 @@ async fn enroll_client_device_impl(
                 device_id = %device_id,
                 "failed to issue rendezvous client identity during device enrollment"
             );
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::PRECONDITION_FAILED,
+                format!("client enrollment issuance is unavailable on this node: {err}"),
+            ));
         }
     };
 
-    let response: std::result::Result<ClientDeviceEnrollResponse, StatusCode> = {
+    let response: std::result::Result<ClientDeviceEnrollResponse, (StatusCode, String)> = {
         let mut auth_state = state.client_credentials.lock().await;
         auth_state
             .pairing_authorizations
@@ -13423,7 +13434,10 @@ async fn enroll_client_device_impl(
             .iter()
             .any(|device| device.device_id == device_id && device.revoked_at_unix.is_none())
         {
-            return Err(StatusCode::CONFLICT);
+            return Err((
+                StatusCode::CONFLICT,
+                "client device is already enrolled".to_string(),
+            ));
         }
 
         let Some(pairing_auth) = auth_state.pairing_authorizations.iter_mut().find(|token| {
@@ -13434,7 +13448,10 @@ async fn enroll_client_device_impl(
                     Some(provided_hash.as_str()),
                 )
         }) else {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "pairing token is invalid, expired, or already used".to_string(),
+            ));
         };
 
         pairing_auth.used_at_unix = Some(now);
@@ -13444,7 +13461,12 @@ async fn enroll_client_device_impl(
         let public_key_fingerprint = text_fingerprint(public_key_pem);
         let credential_fingerprint = match credential_fingerprint(&credential_pem) {
             Ok(fingerprint) => fingerprint,
-            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to fingerprint issued client credential: {err}"),
+                ));
+            }
         };
         let device = ClientCredentialRecord {
             device_id: device_id.clone(),
@@ -13480,7 +13502,10 @@ async fn enroll_client_device_impl(
             error = %err,
             "failed to persist client credential state after enrollment"
         );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist client credential state after enrollment".to_string(),
+        ));
     }
 
     Ok(response)
@@ -13497,7 +13522,7 @@ async fn enroll_client_device(
 
     match enroll_client_device_impl(&state, request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
-        Err(status) => status.into_response(),
+        Err((status, error)) => (status, Json(json!({ "error": error }))).into_response(),
     }
 }
 
@@ -13617,11 +13642,11 @@ async fn redeem_client_bootstrap_claim(
 
             ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response()
         }
-        Err(status) => {
+        Err((status, error)) => {
             if status.is_server_error() {
                 state.bootstrap_claims.restore(&claim_token, claim).await;
             }
-            status.into_response()
+            (status, Json(json!({ "error": error }))).into_response()
         }
     }
 }

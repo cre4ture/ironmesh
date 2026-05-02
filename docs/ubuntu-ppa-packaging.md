@@ -175,3 +175,7 @@ you want local verification too.
 - The installed systemd units are present but intentionally not enabled or
   started automatically. Fill in `/etc/ironmesh/server-node.env` or
   `/etc/ironmesh/rendezvous-service.env` and then enable the service manually.
+- Server-node logs use Rust tracing. Set `RUST_LOG=server_node_sdk=debug,info`
+  in `/etc/ironmesh/server-node.env`, then run `sudo systemctl restart
+  ironmesh-server-node` and inspect logs with `journalctl -u
+  ironmesh-server-node -f`.
