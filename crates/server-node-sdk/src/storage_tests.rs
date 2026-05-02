@@ -2226,6 +2226,17 @@ async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
             revoked_by_source_node: Some("node-admin".to_string()),
             revoked_at_unix: Some(44),
         }],
+        bootstrap_claims: vec![ClientBootstrapClaimRecord {
+            claim_id: "claim-1".to_string(),
+            claim_secret_hash: "claim-hash-1".to_string(),
+            label: Some("tablet".to_string()),
+            target_node_id: NodeId::new_v4(),
+            rendezvous_urls: vec!["https://rendezvous.example/".to_string()],
+            created_at_unix: 55,
+            expires_at_unix: 66,
+            used_at_unix: Some(60),
+            consumed_by_device_id: Some("dev-1".to_string()),
+        }],
     };
 
     store.persist_client_credential_state(&state).await.unwrap();
@@ -2253,6 +2264,16 @@ async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
         Some("node-admin")
     );
     assert_eq!(loaded.credentials[0].revoked_at_unix, Some(44));
+    assert_eq!(loaded.bootstrap_claims.len(), 1);
+    assert_eq!(loaded.bootstrap_claims[0].claim_id, "claim-1");
+    assert_eq!(
+        loaded.bootstrap_claims[0].rendezvous_urls,
+        vec!["https://rendezvous.example/"]
+    );
+    assert_eq!(
+        loaded.bootstrap_claims[0].consumed_by_device_id.as_deref(),
+        Some("dev-1")
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }

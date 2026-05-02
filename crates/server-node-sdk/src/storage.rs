@@ -363,6 +363,8 @@ pub struct ClientCredentialState {
     pub pairing_authorizations: Vec<PairingAuthorizationRecord>,
     #[serde(default)]
     pub credentials: Vec<ClientCredentialRecord>,
+    #[serde(default)]
+    pub bootstrap_claims: Vec<ClientBootstrapClaimRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +398,22 @@ pub struct ClientCredentialRecord {
     #[serde(default)]
     pub revoked_by_source_node: Option<String>,
     pub revoked_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientBootstrapClaimRecord {
+    pub claim_id: String,
+    pub claim_secret_hash: String,
+    pub label: Option<String>,
+    pub target_node_id: NodeId,
+    #[serde(default)]
+    pub rendezvous_urls: Vec<String>,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+    #[serde(default)]
+    pub used_at_unix: Option<u64>,
+    #[serde(default)]
+    pub consumed_by_device_id: Option<String>,
 }
 
 #[derive(Debug)]

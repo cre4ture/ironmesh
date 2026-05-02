@@ -394,6 +394,21 @@ export type ClientCredentialView = {
   revoked_at_unix: number | null;
 };
 
+export type ClientBootstrapClaimStatus = "pending" | "redeemed" | "expired";
+
+export type ClientBootstrapClaimView = {
+  claim_id: string;
+  claim_fingerprint: string;
+  label: string | null;
+  target_node_id: string;
+  rendezvous_urls: string[];
+  created_at_unix: number;
+  expires_at_unix: number;
+  used_at_unix: number | null;
+  consumed_by_device_id: string | null;
+  status: ClientBootstrapClaimStatus;
+};
+
 export type NodeCertificateStatus = {
   name: string;
   configured: boolean;

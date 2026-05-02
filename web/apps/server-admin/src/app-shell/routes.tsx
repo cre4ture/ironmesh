@@ -56,7 +56,7 @@ export const serverAdminRoutes = [
   {
     id: "credentials",
     label: "Credentials",
-    description: "Review enrolled client credentials and revoke access when needed.",
+    description: "Review enrolled client credentials, recent bootstrap claims, and revoke access when needed.",
     icon: IconKey,
     element: <ClientCredentialsPage />
   },

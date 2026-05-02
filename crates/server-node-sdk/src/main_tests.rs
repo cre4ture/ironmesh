@@ -1742,6 +1742,18 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
                 used_at_unix: None,
                 consumed_by_device_id: None,
             });
+        auth.bootstrap_claims
+            .push(super::ClientBootstrapClaimRecord {
+                claim_id: "claim-relay-1".to_string(),
+                claim_secret_hash: super::hash_token(claim_token),
+                label: Some("Tablet".to_string()),
+                target_node_id: state.node_id,
+                rendezvous_urls: vec![canonical_rendezvous_url.clone()],
+                created_at_unix: now,
+                expires_at_unix: now + 300,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
     }
 
     state
@@ -1893,6 +1905,19 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
     assert_eq!(redeemed.device_id, redeem_request.device_id.unwrap());
     assert_eq!(redeemed.label.as_deref(), Some("Tablet"));
     assert_eq!(redeemed.bootstrap.pairing_token, None);
+    {
+        let auth = state.client_credentials.lock().await;
+        let claim = auth
+            .bootstrap_claims
+            .iter()
+            .find(|claim| claim.claim_id == "claim-relay-1")
+            .expect("claim history should remain listed");
+        assert!(claim.used_at_unix.is_some());
+        assert_eq!(
+            claim.consumed_by_device_id.as_deref(),
+            Some(redeemed.device_id.as_str())
+        );
+    }
 
     tokio::time::timeout(Duration::from_secs(5), relay_accept_task)
         .await
@@ -4543,6 +4568,111 @@ run_on_main_metadata_backends!(
     list_client_credentials_returns_fingerprint_metadata_impl,
     list_client_credentials_returns_fingerprint_metadata,
     list_client_credentials_returns_fingerprint_metadata_turso
+);
+
+async fn list_client_bootstrap_claims_returns_recent_claim_status_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let now = super::unix_ts();
+    {
+        let mut auth = state.client_credentials.lock().await;
+        auth.bootstrap_claims
+            .push(super::ClientBootstrapClaimRecord {
+                claim_id: "claim-pending".to_string(),
+                claim_secret_hash: "1234567890abcdefpending".to_string(),
+                label: Some("Tablet".to_string()),
+                target_node_id: state.node_id,
+                rendezvous_urls: vec!["https://rendezvous.example/".to_string()],
+                created_at_unix: now - 10,
+                expires_at_unix: now + 300,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
+        auth.bootstrap_claims
+            .push(super::ClientBootstrapClaimRecord {
+                claim_id: "claim-redeemed".to_string(),
+                claim_secret_hash: "fedcba0987654321redeemed".to_string(),
+                label: Some("Phone".to_string()),
+                target_node_id: state.node_id,
+                rendezvous_urls: vec!["https://rendezvous.example/".to_string()],
+                created_at_unix: now - 30,
+                expires_at_unix: now + 300,
+                used_at_unix: Some(now - 5),
+                consumed_by_device_id: Some("device-1".to_string()),
+            });
+        auth.bootstrap_claims
+            .push(super::ClientBootstrapClaimRecord {
+                claim_id: "claim-expired".to_string(),
+                claim_secret_hash: "aaaaaaaaaaaaaaaexpired".to_string(),
+                label: None,
+                target_node_id: state.node_id,
+                rendezvous_urls: vec!["https://rendezvous.example/".to_string()],
+                created_at_unix: now - 120,
+                expires_at_unix: now - 60,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
+        auth.bootstrap_claims
+            .push(super::ClientBootstrapClaimRecord {
+                claim_id: "claim-old".to_string(),
+                claim_secret_hash: "bbbbbbbbbbbbbbbbold".to_string(),
+                label: None,
+                target_node_id: state.node_id,
+                rendezvous_urls: vec!["https://rendezvous.example/".to_string()],
+                created_at_unix: now - super::CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS - 120,
+                expires_at_unix: now - super::CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS - 60,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::list_client_bootstrap_claims(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let claims = listed.as_array().expect("claims should be an array");
+    assert_eq!(claims.len(), 3);
+    assert!(
+        claims
+            .iter()
+            .all(|claim| claim.get("claim_secret_hash").is_none())
+    );
+
+    let pending = claims
+        .iter()
+        .find(|claim| claim["claim_id"] == "claim-pending")
+        .expect("pending claim should be listed");
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["claim_fingerprint"], "1234567890abcdef");
+    assert_eq!(pending["label"], "Tablet");
+
+    let redeemed = claims
+        .iter()
+        .find(|claim| claim["claim_id"] == "claim-redeemed")
+        .expect("redeemed claim should be listed");
+    assert_eq!(redeemed["status"], "redeemed");
+    assert_eq!(redeemed["consumed_by_device_id"], "device-1");
+
+    let expired = claims
+        .iter()
+        .find(|claim| claim["claim_id"] == "claim-expired")
+        .expect("recent expired claim should be listed");
+    assert_eq!(expired["status"], "expired");
+    assert!(claims.iter().all(|claim| claim["claim_id"] != "claim-old"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_client_bootstrap_claims_returns_recent_claim_status_impl,
+    list_client_bootstrap_claims_returns_recent_claim_status,
+    list_client_bootstrap_claims_returns_recent_claim_status_turso
 );
 
 async fn revoke_client_credential_persists_reason_and_admin_metadata_impl(

@@ -8,6 +8,7 @@ import type {
   AdminSessionStatus,
   BootstrapClaimIssueResponse,
   BootstrapBundle,
+  ClientBootstrapClaimView,
   ClientCredentialView,
   ClusterSummary,
   ControlPlanePromotionImportResponse,
@@ -519,6 +520,14 @@ export async function listClientCredentials(
   adminTokenOverride?: string
 ): Promise<ClientCredentialView[]> {
   return fetchAdminJson<ClientCredentialView[]>(apiV1("/auth/client-credentials"), {
+    adminTokenOverride
+  });
+}
+
+export async function listClientBootstrapClaims(
+  adminTokenOverride?: string
+): Promise<ClientBootstrapClaimView[]> {
+  return fetchAdminJson<ClientBootstrapClaimView[]>(apiV1("/auth/bootstrap-claims"), {
     adminTokenOverride
   });
 }

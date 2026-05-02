@@ -1,4 +1,11 @@
-import { listClientCredentials, revokeClientCredential, type ClientCredentialView } from "@ironmesh/api";
+import {
+  listClientBootstrapClaims,
+  listClientCredentials,
+  revokeClientCredential,
+  type ClientBootstrapClaimStatus,
+  type ClientBootstrapClaimView,
+  type ClientCredentialView
+} from "@ironmesh/api";
 import { StatCard } from "@ironmesh/ui";
 import {
   Alert,
@@ -19,9 +26,21 @@ import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatUnixTs } from "../lib/format";
 
+function bootstrapClaimStatusColor(status: ClientBootstrapClaimStatus): string {
+  switch (status) {
+    case "pending":
+      return "blue";
+    case "redeemed":
+      return "teal";
+    case "expired":
+      return "gray";
+  }
+}
+
 export function ClientCredentialsPage() {
   const { adminTokenOverride } = useAdminAccess();
   const [credentials, setCredentials] = useState<ClientCredentialView[]>([]);
+  const [bootstrapClaims, setBootstrapClaims] = useState<ClientBootstrapClaimView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedCredential, setSelectedCredential] = useState<ClientCredentialView | null>(null);
@@ -30,13 +49,18 @@ export function ClientCredentialsPage() {
   const [opened, disclosure] = useDisclosure(false);
   const activeCount = credentials.filter((credential) => credential.revoked_at_unix == null).length;
   const revokedCount = credentials.length - activeCount;
+  const pendingClaimCount = bootstrapClaims.filter((claim) => claim.status === "pending").length;
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const payload = await listClientCredentials(adminTokenOverride);
-      setCredentials(payload);
+      const [credentialPayload, claimPayload] = await Promise.all([
+        listClientCredentials(adminTokenOverride),
+        listClientBootstrapClaims(adminTokenOverride)
+      ]);
+      setCredentials(credentialPayload);
+      setBootstrapClaims(claimPayload);
     } catch (refreshError) {
       setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
     } finally {
@@ -81,11 +105,65 @@ export function ClientCredentialsPage() {
         </Button>
       </Group>
 
-      <SimpleGrid cols={{ base: 1, md: 3 }}>
+      <SimpleGrid cols={{ base: 1, md: 4 }}>
         <StatCard label="Known Credentials" value={credentials.length} hint="Total credential records" />
         <StatCard label="Active Credentials" value={activeCount} hint="Not currently revoked" />
         <StatCard label="Revoked Credentials" value={revokedCount} hint="Retained for audit visibility" />
+        <StatCard label="Pending Claims" value={pendingClaimCount} hint="Recent bootstrap claims awaiting redemption" />
       </SimpleGrid>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between">
+            <Text fw={700}>Client bootstrap claims</Text>
+            <Badge variant="light">{bootstrapClaims.length} recent</Badge>
+          </Group>
+          <ScrollArea type="auto">
+            <Table striped highlightOnHover withTableBorder>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Claim</Table.Th>
+                  <Table.Th>Label</Table.Th>
+                  <Table.Th>Primary rendezvous</Table.Th>
+                  <Table.Th>Created</Table.Th>
+                  <Table.Th>Expires</Table.Th>
+                  <Table.Th>Status</Table.Th>
+                  <Table.Th>Redeemed by</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {bootstrapClaims.length > 0 ? (
+                  bootstrapClaims.map((claim) => (
+                    <Table.Tr key={claim.claim_id}>
+                      <Table.Td>{claim.claim_fingerprint}</Table.Td>
+                      <Table.Td>{claim.label || "-"}</Table.Td>
+                      <Table.Td>{claim.rendezvous_urls[0] || "-"}</Table.Td>
+                      <Table.Td>{formatUnixTs(claim.created_at_unix)}</Table.Td>
+                      <Table.Td>{formatUnixTs(claim.expires_at_unix)}</Table.Td>
+                      <Table.Td>
+                        <Badge color={bootstrapClaimStatusColor(claim.status)} variant="light">
+                          {claim.status}
+                        </Badge>
+                      </Table.Td>
+                      <Table.Td>
+                        {claim.consumed_by_device_id
+                          ? `${claim.consumed_by_device_id} | ${formatUnixTs(claim.used_at_unix)}`
+                          : "-"}
+                      </Table.Td>
+                    </Table.Tr>
+                  ))
+                ) : (
+                  <Table.Tr>
+                    <Table.Td colSpan={7}>
+                      <Text c="dimmed">No recent client bootstrap claims are known to this node.</Text>
+                    </Table.Td>
+                  </Table.Tr>
+                )}
+              </Table.Tbody>
+            </Table>
+          </ScrollArea>
+        </Stack>
+      </Card>
 
       <Card withBorder radius="md" padding="lg">
         <Stack gap="md">

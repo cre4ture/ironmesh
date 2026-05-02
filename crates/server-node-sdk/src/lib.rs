@@ -148,6 +148,8 @@ const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thum
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
+const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
+const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -161,11 +163,11 @@ use setup::{
     managed_rendezvous_key_path, managed_signer_ca_cert_path,
 };
 use storage::{
-    AdminAuditEvent, ChunkIngestor, ClientCredentialRecord, ClientCredentialState, DataScrubReport,
-    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
-    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
-    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
-    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
+    AdminAuditEvent, ChunkIngestor, ClientBootstrapClaimRecord, ClientCredentialRecord,
+    ClientCredentialState, DataScrubReport, MediaCacheLookup, MediaCacheStatus,
+    MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle, ObjectReadDescriptor,
+    ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord, PathMutationResult,
+    PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
     SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
     UploadChunkRef, VersionConsistencyState,
 };
@@ -4213,6 +4215,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/auth/client-credentials/{device_id}",
             axum::routing::delete(revoke_client_credential),
         )
+        .route("/auth/bootstrap-claims", get(list_client_bootstrap_claims))
         .route(
             "/auth/bootstrap-bundles/issue",
             post(issue_bootstrap_bundle),
@@ -10769,6 +10772,28 @@ struct ClientCredentialView {
     revoked_at_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClientBootstrapClaimStatus {
+    Pending,
+    Redeemed,
+    Expired,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientBootstrapClaimView {
+    claim_id: String,
+    claim_fingerprint: String,
+    label: Option<String>,
+    target_node_id: NodeId,
+    rendezvous_urls: Vec<String>,
+    created_at_unix: u64,
+    expires_at_unix: u64,
+    used_at_unix: Option<u64>,
+    consumed_by_device_id: Option<String>,
+    status: ClientBootstrapClaimStatus,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct RevokeClientCredentialQuery {
     reason: Option<String>,
@@ -10833,6 +10858,112 @@ async fn persist_client_credential_state(state: &ServerState) -> Result<()> {
     };
     let store = lock_store(state, "client_credentials.persist").await;
     store.persist_client_credential_state(&snapshot).await
+}
+
+fn client_bootstrap_claim_fingerprint(claim_secret_hash: &str) -> String {
+    claim_secret_hash.chars().take(16).collect()
+}
+
+fn client_bootstrap_claim_activity_unix(record: &ClientBootstrapClaimRecord) -> u64 {
+    record
+        .used_at_unix
+        .unwrap_or(record.expires_at_unix)
+        .max(record.created_at_unix)
+}
+
+fn client_bootstrap_claim_status(
+    record: &ClientBootstrapClaimRecord,
+    now: u64,
+) -> ClientBootstrapClaimStatus {
+    if record.used_at_unix.is_some() {
+        ClientBootstrapClaimStatus::Redeemed
+    } else if record.expires_at_unix > now {
+        ClientBootstrapClaimStatus::Pending
+    } else {
+        ClientBootstrapClaimStatus::Expired
+    }
+}
+
+fn keep_client_bootstrap_claim_record(record: &ClientBootstrapClaimRecord, now: u64) -> bool {
+    if record.used_at_unix.is_none() && record.expires_at_unix > now {
+        return true;
+    }
+    let oldest_kept = now.saturating_sub(CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS);
+    client_bootstrap_claim_activity_unix(record) >= oldest_kept
+}
+
+fn prune_client_bootstrap_claim_records(records: &mut Vec<ClientBootstrapClaimRecord>, now: u64) {
+    records.retain(|record| keep_client_bootstrap_claim_record(record, now));
+    records.sort_by(|left, right| {
+        client_bootstrap_claim_activity_unix(left)
+            .cmp(&client_bootstrap_claim_activity_unix(right))
+            .then_with(|| left.claim_id.cmp(&right.claim_id))
+    });
+    if records.len() > CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT {
+        let remove_count = records.len() - CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT;
+        records.drain(0..remove_count);
+    }
+}
+
+fn client_bootstrap_claim_view(
+    record: &ClientBootstrapClaimRecord,
+    now: u64,
+) -> ClientBootstrapClaimView {
+    ClientBootstrapClaimView {
+        claim_id: record.claim_id.clone(),
+        claim_fingerprint: client_bootstrap_claim_fingerprint(&record.claim_secret_hash),
+        label: record.label.clone(),
+        target_node_id: record.target_node_id,
+        rendezvous_urls: record.rendezvous_urls.clone(),
+        created_at_unix: record.created_at_unix,
+        expires_at_unix: record.expires_at_unix,
+        used_at_unix: record.used_at_unix,
+        consumed_by_device_id: record.consumed_by_device_id.clone(),
+        status: client_bootstrap_claim_status(record, now),
+    }
+}
+
+async fn record_client_bootstrap_claim(
+    state: &ServerState,
+    record: ClientBootstrapClaimRecord,
+) -> Result<()> {
+    {
+        let mut auth_state = state.client_credentials.lock().await;
+        let now = unix_ts();
+        prune_client_bootstrap_claim_records(&mut auth_state.bootstrap_claims, now);
+        auth_state.bootstrap_claims.push(record);
+        prune_client_bootstrap_claim_records(&mut auth_state.bootstrap_claims, now);
+    }
+    persist_client_credential_state(state).await
+}
+
+async fn mark_client_bootstrap_claim_redeemed(
+    state: &ServerState,
+    claim_token: &str,
+    device_id: &str,
+    used_at_unix: u64,
+) -> Result<()> {
+    let claim_secret_hash = hash_token(claim_token);
+    let mut changed = false;
+    {
+        let mut auth_state = state.client_credentials.lock().await;
+        if let Some(record) = auth_state
+            .bootstrap_claims
+            .iter_mut()
+            .find(|record| record.claim_secret_hash == claim_secret_hash)
+        {
+            record.used_at_unix = Some(used_at_unix);
+            record.consumed_by_device_id = Some(device_id.to_string());
+            changed = true;
+        }
+        prune_client_bootstrap_claim_records(&mut auth_state.bootstrap_claims, used_at_unix);
+    }
+
+    if changed {
+        persist_client_credential_state(state).await
+    } else {
+        Ok(())
+    }
 }
 
 async fn issue_pairing_token(
@@ -11196,7 +11327,9 @@ async fn store_client_bootstrap_claim(
 ) -> std::result::Result<ClientBootstrapClaim, (StatusCode, String)> {
     let claim_rendezvous_urls =
         select_bootstrap_claim_rendezvous_urls(state, bootstrap, preferred_rendezvous_url).await?;
+    let now = unix_ts();
     let claim_token = generate_bootstrap_claim_token();
+    let claim_secret_hash = hash_token(&claim_token);
     let claim_trust = rendezvous_claim_trust_from_bootstrap(bootstrap).map_err(|status| {
         (
             status,
@@ -11207,7 +11340,7 @@ async fn store_client_bootstrap_claim(
         cluster_id: state.cluster_id,
         issuer: PeerIdentity::Node(state.node_id),
         target_node_id: state.node_id,
-        claim_secret_hash: hash_token(&claim_token),
+        claim_secret_hash: claim_secret_hash.clone(),
         expires_at_unix,
         bootstrap: bootstrap.clone(),
     };
@@ -11225,7 +11358,7 @@ async fn store_client_bootstrap_claim(
         version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
         cluster_id: bootstrap.cluster_id,
         target_node_id: state.node_id,
-        rendezvous_urls: claim_rendezvous_urls,
+        rendezvous_urls: claim_rendezvous_urls.clone(),
         trust: claim_trust,
         claim_token,
     };
@@ -11233,6 +11366,27 @@ async fn store_client_bootstrap_claim(
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to validate generated bootstrap claim: {err}"),
+        )
+    })?;
+    record_client_bootstrap_claim(
+        state,
+        ClientBootstrapClaimRecord {
+            claim_id: Uuid::now_v7().to_string(),
+            claim_secret_hash,
+            label: bootstrap.device_label.clone(),
+            target_node_id: state.node_id,
+            rendezvous_urls: claim_rendezvous_urls,
+            created_at_unix: now,
+            expires_at_unix,
+            used_at_unix: None,
+            consumed_by_device_id: None,
+        },
+    )
+    .await
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to persist bootstrap claim history: {err}"),
         )
     })?;
     Ok(claim)
@@ -13639,6 +13793,21 @@ async fn redeem_client_bootstrap_claim(
                 state.bootstrap_claims.restore(&claim_token, claim).await;
                 return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
             }
+            let used_at_unix = response.created_at_unix.unwrap_or_else(unix_ts);
+            if let Err(err) = mark_client_bootstrap_claim_redeemed(
+                &state,
+                &claim_token,
+                &response.device_id,
+                used_at_unix,
+            )
+            .await
+            {
+                warn!(
+                    error = %err,
+                    device_id = %response.device_id,
+                    "failed to persist bootstrap claim redemption history"
+                );
+            }
 
             ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response()
         }
@@ -13702,6 +13871,58 @@ async fn list_client_credentials(
     .await;
 
     (StatusCode::OK, Json(credentials)).into_response()
+}
+
+async fn list_client_bootstrap_claims(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/bootstrap-claims/list";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let now = unix_ts();
+    let mut claims = {
+        let auth_state = state.client_credentials.lock().await;
+        auth_state
+            .bootstrap_claims
+            .iter()
+            .filter(|record| keep_client_bootstrap_claim_record(record, now))
+            .map(|record| client_bootstrap_claim_view(record, now))
+            .collect::<Vec<_>>()
+    };
+    claims.sort_by(|left, right| {
+        let left_activity = left.used_at_unix.unwrap_or(left.expires_at_unix);
+        let right_activity = right.used_at_unix.unwrap_or(right.expires_at_unix);
+        right_activity
+            .cmp(&left_activity)
+            .then_with(|| right.created_at_unix.cmp(&left.created_at_unix))
+            .then_with(|| left.claim_id.cmp(&right.claim_id))
+    });
+    if claims.len() > CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT {
+        claims.truncate(CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT);
+    }
+    let pending = claims
+        .iter()
+        .filter(|claim| claim.status == ClientBootstrapClaimStatus::Pending)
+        .count();
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({ "claims": claims.len(), "pending": pending }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(claims)).into_response()
 }
 
 fn rendezvous_config_persistence_source(state: &ServerState) -> RendezvousConfigPersistenceSource {
