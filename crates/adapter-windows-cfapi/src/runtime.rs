@@ -844,7 +844,12 @@ impl FetchExecutionScheduler {
 
 pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRootIdentity> {
     validate_registration(registration)?;
-    std::fs::create_dir_all(&registration.root_path)?;
+    std::fs::create_dir_all(&registration.root_path).with_context(|| {
+        format!(
+            "failed to create or access sync root directory {}",
+            registration.root_path.display()
+        )
+    })?;
 
     let expected_shell_sync_root_id = build_shell_sync_root_id(registration)?;
     let expected_shell_sync_root_id_string =
@@ -878,7 +883,13 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         return Ok(existing.identity);
     }
 
-    if std::fs::read_dir(&registration.root_path)?
+    if std::fs::read_dir(&registration.root_path)
+        .with_context(|| {
+            format!(
+                "failed to inspect sync root directory {}",
+                registration.root_path.display()
+            )
+        })?
         .next()
         .transpose()?
         .is_some()
