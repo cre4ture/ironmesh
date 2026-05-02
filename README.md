@@ -125,6 +125,13 @@ sudo chown -R ironmesh-server-node:ironmesh-server-node /var/lib/ironmesh-server
 sudo systemctl restart ironmesh-server-node.service
 ```
 
+## Manual Cluster Initialisation Steps
+
+For fresh clusters that should support the gallery map view, initialize the
+self-hosted map datasets before expecting map-backed media browsing to work.
+The manual administrator flow is documented in
+[docs/map-viewer-data-installation.md](docs/map-viewer-data-installation.md).
+
 ## Developer Documentation
 
 Developer-oriented workspace notes, local test commands, runtime environment
