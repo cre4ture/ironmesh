@@ -269,6 +269,14 @@ mod tests {
                     .and_then(|value| value.as_bool()),
                 Some(false)
             );
+            let status_log_file = service_status
+                .get("log_file")
+                .and_then(|value| value.as_str())
+                .context("config response service status missing log_file")?;
+            assert!(
+                status_log_file.ends_with("folder-agent-folder-log-test.log"),
+                "unexpected service status log file path: {status_log_file}"
+            );
 
             let response = http
                 .post(format!(
@@ -371,6 +379,11 @@ mod tests {
                     })
                 })
                 .context("config response missing folder-agent service status after stop")?;
+            let log_file_string = log_file.to_string_lossy().to_string();
+            assert_eq!(
+                service_status.get("log_file").and_then(|value| value.as_str()),
+                Some(log_file_string.as_str())
+            );
             assert_eq!(
                 service_status
                     .get("running")

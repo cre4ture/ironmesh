@@ -2796,6 +2796,7 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
   const runtime = serviceStatusFor(serviceKind, instance.id);
   const running = !!runtime?.running;
   const encodedId = encodeURIComponent(instance.id);
+  const logFile = runtime?.log_file || runtime?.last_launch?.log_file || '';
   const details = kind === 'os'
     ? currentConfig?.platform === 'linux'
       ? [
@@ -2820,6 +2821,7 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
         ['Client Identity', identityLabelForProfile(instance)],
         ['Local Status UI Address', instance.ui_bind || ''],
       ];
+  details.push(['Local Log File', logFile]);
   if (runtime?.last_launch?.error) {
     details.push(['Last Launch Error', runtime.last_launch.error]);
   }

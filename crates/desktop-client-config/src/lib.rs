@@ -598,6 +598,8 @@ pub struct LaunchOutcome {
 pub struct ServiceRuntimeStatus {
     pub instance_kind: String,
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<String>,
     pub running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -663,6 +665,10 @@ pub fn default_service_log_dir() -> PathBuf {
             .join(CONFIG_SUBDIR)
             .join(SERVICE_LOG_SUBDIR)
     }
+}
+
+pub fn default_service_log_file_path(instance_kind: &str, id: &str) -> PathBuf {
+    service_log_file_path(&default_service_log_dir(), instance_kind, id)
 }
 
 pub fn default_desktop_status_file_path() -> PathBuf {
@@ -1032,9 +1038,19 @@ fn service_runtime_status(
     let running_pid = last_launch
         .and_then(|outcome| outcome.pid)
         .filter(|pid| process_is_running(*pid));
+    let log_file = last_launch
+        .and_then(|outcome| outcome.log_file.clone())
+        .or_else(|| {
+            Some(
+                default_service_log_file_path(instance_kind, id)
+                    .display()
+                    .to_string(),
+            )
+        });
     ServiceRuntimeStatus {
         instance_kind: instance_kind.to_string(),
         id: id.to_string(),
+        log_file,
         running: running_pid.is_some(),
         pid: running_pid,
         last_launch: last_launch.cloned(),
@@ -1698,6 +1714,12 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].instance_kind, "folder-agent");
         assert_eq!(statuses[0].id, "folder-1");
+        assert!(
+            statuses[0]
+                .log_file
+                .as_deref()
+                .is_some_and(|path| path.ends_with("folder-agent-folder-1.log"))
+        );
         assert!(statuses[0].running);
         assert_eq!(statuses[0].pid, Some(std::process::id()));
         assert!(statuses[0].last_launch.is_some());
