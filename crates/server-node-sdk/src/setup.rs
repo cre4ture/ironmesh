@@ -191,7 +191,14 @@ struct SetupTransitionResponse {
 }
 
 pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
-    if explicit_runtime_env_present() {
+    let explicit_runtime_env_vars = explicit_runtime_env_vars_present();
+    if !explicit_runtime_env_vars.is_empty() {
+        tracing::info!(
+            startup_mode = "runtime",
+            startup_reason = "explicit_runtime_environment",
+            env_vars = %explicit_runtime_env_vars.join(","),
+            "server node startup selected normal runtime mode"
+        );
         return Ok(StartupMode::Runtime(ServerNodeConfig::from_env()?));
     }
 
@@ -199,25 +206,111 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
 }
 
 fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<StartupMode> {
-    if let Some(mut managed_state) = read_managed_setup_state(&config.state_path)?
-        && managed_state.state == SetupLifecycleState::Online
-        && let Some(enrollment_path) = managed_state.runtime_node_enrollment_path.as_deref()
-    {
-        let resolved_path = resolve_materialized_path(&config.data_dir, enrollment_path);
-        if resolved_path.exists() {
-            let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path)?;
-            apply_managed_signer_paths(&config.data_dir, &mut runtime);
-            apply_managed_rendezvous_config(&config.data_dir, &managed_state, &mut runtime);
-            if runtime_enrollment_requires_rejoin(&runtime) {
-                transition_managed_setup_state_to_recovery(&config.state_path, &mut managed_state)?;
-                return Ok(StartupMode::Setup(config));
-            }
-            runtime.admin_password_hash = managed_state.admin_password_hash.clone();
-            return Ok(StartupMode::Runtime(runtime));
-        }
+    tracing::info!(
+        data_dir = %config.data_dir.display(),
+        state_path = %config.state_path.display(),
+        bind_addr = %config.bind_addr,
+        "server node checking managed startup state"
+    );
+
+    let Some(mut managed_state) = read_managed_setup_state(&config.state_path).map_err(|err| {
+        tracing::error!(
+            state_path = %config.state_path.display(),
+            error = %err,
+            "server node failed to read managed startup state"
+        );
+        err
+    })?
+    else {
+        tracing::info!(
+            startup_mode = "bootstrap_setup",
+            startup_reason = "managed_setup_state_missing",
+            state_path = %config.state_path.display(),
+            data_dir = %config.data_dir.display(),
+            "server node startup selected bootstrap setup mode"
+        );
+        return Ok(StartupMode::Setup(config));
+    };
+
+    if managed_state.state != SetupLifecycleState::Online {
+        tracing::info!(
+            startup_mode = "bootstrap_setup",
+            startup_reason = "managed_setup_state_not_online",
+            managed_state = ?managed_state.state,
+            state_path = %config.state_path.display(),
+            cluster_id = ?managed_state.cluster_id,
+            node_id = ?managed_state.node_id,
+            "server node startup selected bootstrap setup mode"
+        );
+        return Ok(StartupMode::Setup(config));
     }
 
-    Ok(StartupMode::Setup(config))
+    let Some(enrollment_path) = managed_state.runtime_node_enrollment_path.as_deref() else {
+        tracing::warn!(
+            startup_mode = "bootstrap_setup",
+            startup_reason = "runtime_node_enrollment_path_missing",
+            state_path = %config.state_path.display(),
+            cluster_id = ?managed_state.cluster_id,
+            node_id = ?managed_state.node_id,
+            "server node managed state is online but has no runtime enrollment path"
+        );
+        return Ok(StartupMode::Setup(config));
+    };
+
+    let resolved_path = resolve_materialized_path(&config.data_dir, enrollment_path);
+    if !resolved_path.exists() {
+        tracing::warn!(
+            startup_mode = "bootstrap_setup",
+            startup_reason = "runtime_node_enrollment_file_missing",
+            state_path = %config.state_path.display(),
+            enrollment_path = %enrollment_path,
+            resolved_enrollment_path = %resolved_path.display(),
+            cluster_id = ?managed_state.cluster_id,
+            node_id = ?managed_state.node_id,
+            "server node managed state is online but runtime enrollment file is missing"
+        );
+        return Ok(StartupMode::Setup(config));
+    }
+
+    let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path).map_err(|err| {
+        tracing::error!(
+            startup_reason = "runtime_node_enrollment_load_failed",
+            state_path = %config.state_path.display(),
+            enrollment_path = %enrollment_path,
+            resolved_enrollment_path = %resolved_path.display(),
+            error = %err,
+            "server node failed to load managed runtime enrollment"
+        );
+        err
+    })?;
+    apply_managed_signer_paths(&config.data_dir, &mut runtime);
+    apply_managed_rendezvous_config(&config.data_dir, &managed_state, &mut runtime);
+    if runtime_enrollment_requires_rejoin(&runtime) {
+        tracing::warn!(
+            startup_mode = "bootstrap_setup",
+            startup_reason = "runtime_node_enrollment_requires_rejoin",
+            state_path = %config.state_path.display(),
+            enrollment_path = %enrollment_path,
+            resolved_enrollment_path = %resolved_path.display(),
+            cluster_id = %runtime.cluster_id,
+            node_id = %runtime.node_id,
+            "server node startup selected setup recovery mode"
+        );
+        transition_managed_setup_state_to_recovery(&config.state_path, &mut managed_state)?;
+        return Ok(StartupMode::Setup(config));
+    }
+    runtime.admin_password_hash = managed_state.admin_password_hash.clone();
+    tracing::info!(
+        startup_mode = "runtime",
+        startup_reason = "managed_setup_state_online",
+        state_path = %config.state_path.display(),
+        enrollment_path = %enrollment_path,
+        resolved_enrollment_path = %resolved_path.display(),
+        cluster_id = %runtime.cluster_id,
+        node_id = %runtime.node_id,
+        "server node startup selected normal runtime mode"
+    );
+    Ok(StartupMode::Runtime(runtime))
 }
 
 pub(crate) async fn run_setup_mode(
@@ -736,7 +829,7 @@ async fn import_node_enrollment_package(
         .into_response()
 }
 
-fn explicit_runtime_env_present() -> bool {
+fn explicit_runtime_env_vars_present() -> Vec<&'static str> {
     [
         "IRONMESH_NODE_ENROLLMENT_FILE",
         "IRONMESH_NODE_BOOTSTRAP_FILE",
@@ -761,11 +854,13 @@ fn explicit_runtime_env_present() -> bool {
         "IRONMESH_REQUIRE_CLIENT_AUTH",
     ]
     .iter()
-    .any(|key| {
-        std::env::var(key)
+    .copied()
+    .filter(|key| {
+        std::env::var(*key)
             .ok()
             .is_some_and(|value| !value.trim().is_empty())
     })
+    .collect()
 }
 
 fn runtime_enrollment_requires_rejoin(config: &ServerNodeConfig) -> bool {
@@ -823,12 +918,26 @@ fn transition_managed_setup_state_to_recovery(
     managed_state: &mut ManagedSetupState,
 ) -> Result<()> {
     if managed_state.state == SetupLifecycleState::Recovery {
+        tracing::info!(
+            state_path = %state_path.display(),
+            cluster_id = ?managed_state.cluster_id,
+            node_id = ?managed_state.node_id,
+            "managed setup state is already in recovery"
+        );
         return Ok(());
     }
 
+    let previous_state = managed_state.state.clone();
     managed_state.state = SetupLifecycleState::Recovery;
     managed_state.updated_at_unix = unix_ts();
     managed_state.pending_join_request = None;
+    tracing::warn!(
+        state_path = %state_path.display(),
+        previous_state = ?previous_state,
+        cluster_id = ?managed_state.cluster_id,
+        node_id = ?managed_state.node_id,
+        "managed setup state transitioned to recovery"
+    );
     write_managed_setup_state(state_path, managed_state)
 }
 
