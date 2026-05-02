@@ -91,8 +91,10 @@ Server packages can be installed with `ironmesh-server-node` and
 
 ## Publishing updates
 
-For a new release, bump `debian/changelog`, build the local `.deb` packages,
-rebuild the repository metadata, and deploy again:
+For a new release, bump `[workspace.package].version` in `Cargo.toml`, build the
+local `.deb` packages, rebuild the repository metadata, and deploy again. The
+packaging helpers update the upstream portion of `debian/changelog`
+automatically while preserving the existing Debian revision suffix:
 
 ```bash
 ./scripts/build-local-debs.sh -- -jauto

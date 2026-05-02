@@ -69,6 +69,7 @@ if ! command -v debuild >/dev/null 2>&1; then
   exit 1
 fi
 
+"${ROOT_DIR}/scripts/sync-debian-version.sh"
 clean_debian_build_outputs
 "${ROOT_DIR}/scripts/prepare-ppa-source.sh"
 create_orig_tarball

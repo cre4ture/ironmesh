@@ -93,6 +93,7 @@ if [[ "${RUN_LINTIAN}" == true ]]; then
   require_command lintian
 fi
 
+"${ROOT_DIR}/scripts/sync-debian-version.sh"
 check_build_dependencies
 
 if [[ "${RUN_PREPARE}" == true ]]; then

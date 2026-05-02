@@ -129,6 +129,12 @@ you want local verification too.
 
 ## Typical upload flow
 
+The packaging helpers automatically align the upstream portion of
+`debian/changelog` with `[workspace.package].version` from `Cargo.toml`. Cargo
+pre-release hyphens are converted to Debian ordering syntax, for example
+`1.0.0-beta.1` becomes `1.0.0~beta.1`, while the Debian revision suffix from the
+current changelog entry is preserved.
+
 1. Prepare vendored crates and prebuilt web assets:
 
    ```bash

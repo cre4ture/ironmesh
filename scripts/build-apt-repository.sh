@@ -141,6 +141,8 @@ require_command dpkg-parsechangelog
 require_command dpkg-scanpackages
 require_command gzip
 
+"${ROOT_DIR}/scripts/sync-debian-version.sh"
+
 if [[ "${SIGN_REPO}" == true ]]; then
   require_command gpg
 

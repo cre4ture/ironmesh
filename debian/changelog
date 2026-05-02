@@ -1,5 +1,6 @@
-ironmesh (1.0.0~beta.1-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.4-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
+  * Align Debian package versioning with the Cargo workspace version.
   * Run ironmesh-server-node under a dedicated system user created at install
     time.
 
