@@ -155,6 +155,7 @@ Notes:
 - Store-compatible versioning must keep the first segment at `1` or higher and the fourth segment at `0`, for example `1.0.2.0`
 - if the workspace Cargo version still starts with `0`, automatic Store upload packaging will fail until you either bump Cargo to `1.x.y` or pass `-PackageVersion`
 - the script uses an isolated cargo target directory for each run so stale artifact locks do not block packaging
+- after a post-build packaging failure, rerun with `-CargoTargetDir <existing-cargo-target-dir>` to reuse the already compiled release artifacts
 - `-SkipSigning` leaves the package unsigned for upload-only scenarios; local installation will not work until the package is signed
 - `-IncludePdbSymbols` packages raw PDBs into `.appxsym`; use that only if you are comfortable uploading private symbol information
 - the script prepares the upload artifact only; Partner Center metadata, screenshots, age ratings, privacy policy, and certification notes still have to be filled manually

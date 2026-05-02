@@ -3,6 +3,7 @@ param(
     [string]$PackageVersion,
     [ValidateSet('x64')]
     [string]$Architecture = 'x64',
+    [string]$CargoTargetDir,
     [switch]$SkipSigning,
     [switch]$IncludePdbSymbols,
     [string]$CertificateSubject = 'CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21',
@@ -335,7 +336,12 @@ $outputRoot = Join-Path $scriptDir 'out\store-upload'
 $artifactName = '{0}_{1}_{2}' -f $identity.Name, $resolvedVersion, $Architecture
 $artifactRoot = Join-Path $outputRoot $artifactName
 $stagePath = Join-Path $artifactRoot 'stage'
-$cargoTargetDir = Join-Path $artifactRoot ('cargo-target-' + [Guid]::NewGuid().ToString('N'))
+$cargoTargetDir = if ($CargoTargetDir) {
+    (New-Item -ItemType Directory -Force -Path $CargoTargetDir).FullName
+}
+else {
+    Join-Path $artifactRoot ('cargo-target-' + [Guid]::NewGuid().ToString('N'))
+}
 $packagePath = Join-Path $artifactRoot ($artifactName + '.msix')
 $uploadPath = Join-Path $artifactRoot ($artifactName + '.msixupload')
 $appxSymPath = Join-Path $artifactRoot ($artifactName + '.appxsym')
@@ -381,21 +387,21 @@ $pdbCandidates = @(
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.pdb' -FallbackPatterns @('ironmesh_folder_agent-*.pdb', 'ironmesh-folder-agent-*.pdb')
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.pdb' -FallbackPatterns @('ironmesh_background_launcher-*.pdb', 'ironmesh-background-launcher-*.pdb')
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.pdb' -FallbackPatterns @('ironmesh_config_app-*.pdb', 'ironmesh-config-app-*.pdb')
-) | Where-Object { Test-Path $_ }
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
-if (-not (Test-Path $dllPath)) {
+if (-not $dllPath -or -not (Test-Path -LiteralPath $dllPath)) {
     throw "Expected DLL not found: $dllPath"
 }
-if (-not (Test-Path $exePath)) {
+if (-not $exePath -or -not (Test-Path -LiteralPath $exePath)) {
     throw "Expected EXE not found: $exePath"
 }
-if (-not (Test-Path $folderAgentPath)) {
+if (-not $folderAgentPath -or -not (Test-Path -LiteralPath $folderAgentPath)) {
     throw "Expected folder agent EXE not found: $folderAgentPath"
 }
-if (-not (Test-Path $backgroundLauncherPath)) {
+if (-not $backgroundLauncherPath -or -not (Test-Path -LiteralPath $backgroundLauncherPath)) {
     throw "Expected background launcher EXE not found: $backgroundLauncherPath"
 }
-if (-not (Test-Path $configAppPath)) {
+if (-not $configAppPath -or -not (Test-Path -LiteralPath $configAppPath)) {
     throw "Expected config app EXE not found: $configAppPath"
 }
 
