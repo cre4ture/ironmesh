@@ -169,6 +169,8 @@ Likely reusable with extension:
 Implemented:
 - durable local mutation queue for FUSE-originated writes, creates, renames, and deletes
 - offline restart from the last cached remote snapshot plus replayed local mutations
+- first startup refuses to mount an empty namespace when the initial remote snapshot cannot be
+  fetched and no cache exists, unless `--allow-empty-initial-namespace` is set
 - resumable client-side uploads for queued large-file writes
 - server-notification-driven remote refresh with polling fallback
 - content-hash-based placeholder identity and optional hydrated-object cache for remote reads

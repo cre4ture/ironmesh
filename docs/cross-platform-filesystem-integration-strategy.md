@@ -301,6 +301,9 @@ cargo run -p os-integration -- \
 - Local writes, deletes, and renames are captured into a durable local mutation queue first and
   then synchronized through client APIs.
 - Offline restart replays the last cached snapshot plus queued local mutations.
+- If the initial `/store/index` fetch fails before any cached snapshot exists, startup fails rather
+  than mounting an empty namespace. `--allow-empty-initial-namespace` restores the old empty-start
+  behavior for explicit offline-first tests.
 - `--remote-refresh-interval-ms` controls namespace polling while mounted.
 - `--client-edge-state-dir` overrides the default persisted state location.
 - `--offline-object-cache` controls whether hydrated remote objects are cached locally for offline

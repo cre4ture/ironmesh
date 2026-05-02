@@ -195,6 +195,9 @@ Notes:
 	`*.client-identity.json` file when present, for example
 	`ironmesh-client-bootstrap.client-identity.json` next to
 	`ironmesh-client-bootstrap.json`.
+- On first startup, live mounts fail instead of presenting an empty namespace when `/store/index`
+  cannot be fetched and no cached snapshot exists. Use `--allow-empty-initial-namespace` only for
+  deliberate offline-first testing.
 - `--remote-refresh-interval-ms` controls fallback polling/retry cadence for namespace updates in live modes.
 - Snapshot mode is still available for debugging with `--snapshot-file`.
 

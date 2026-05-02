@@ -64,6 +64,8 @@ struct Args {
     client_edge_state_dir: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliOfflineObjectCacheMode::On)]
     offline_object_cache: CliOfflineObjectCacheMode,
+    #[arg(long, default_value_t = false)]
+    allow_empty_initial_namespace: bool,
     #[arg(long)]
     mountpoint: PathBuf,
     #[arg(long, default_value = "ironmesh")]
@@ -267,25 +269,12 @@ fn run_mount_inner(
             client_edge_state.persist_snapshot(&snapshot)?;
             snapshot
         }
-        Err(error) => {
-            if is_unauthorized_store_index_error(&error) {
-                let auth_hint = live_mount_auth_hint(args, has_client_identity);
-                return Err(error).context(format!(
-                    "initial remote snapshot fetch was unauthorized; {auth_hint}"
-                ));
-            }
-            if let Some(snapshot) = client_edge_state.load_cached_snapshot()? {
-                tracing::warn!(
-                    "client-rights-edge: failed to fetch initial snapshot; using cached snapshot: {error}"
-                );
-                snapshot
-            } else {
-                tracing::warn!(
-                    "client-rights-edge: failed to fetch initial snapshot and no cache exists; starting from empty namespace: {error}"
-                );
-                SyncSnapshot::default()
-            }
-        }
+        Err(error) => initial_snapshot_from_fetch_error(
+            error,
+            client_edge_state.as_ref(),
+            args,
+            has_client_identity,
+        )?,
     };
     let planning_snapshot = client_edge_state.planning_snapshot(&remote_snapshot)?;
     let action_plan = adapter.plan_actions(&planning_snapshot, &SyncPolicy::default());
@@ -608,6 +597,38 @@ fn live_mount_auth_hint(args: &Args, has_client_identity: bool) -> String {
     }
 
     "live mounts now require client auth; pass --client-identity-file <path-to-client-identity.json>".to_string()
+}
+
+fn initial_snapshot_from_fetch_error(
+    error: anyhow::Error,
+    client_edge_state: &ClientRightsEdgeState,
+    args: &Args,
+    has_client_identity: bool,
+) -> Result<SyncSnapshot> {
+    if is_unauthorized_store_index_error(&error) {
+        let auth_hint = live_mount_auth_hint(args, has_client_identity);
+        return Err(error).context(format!(
+            "initial remote snapshot fetch was unauthorized; {auth_hint}"
+        ));
+    }
+
+    if let Some(snapshot) = client_edge_state.load_cached_snapshot()? {
+        tracing::warn!(
+            "client-rights-edge: failed to fetch initial snapshot; using cached snapshot: {error:#}"
+        );
+        return Ok(snapshot);
+    }
+
+    if args.allow_empty_initial_namespace {
+        tracing::warn!(
+            "client-rights-edge: failed to fetch initial snapshot and no cache exists; starting from empty namespace because --allow-empty-initial-namespace was set: {error:#}"
+        );
+        return Ok(SyncSnapshot::default());
+    }
+
+    Err(error).context(
+        "initial remote snapshot fetch failed and no cached client-rights edge snapshot exists; refusing to mount an empty namespace",
+    )
 }
 
 fn sanitize_path_component(raw: &str) -> String {
@@ -961,6 +982,7 @@ mod tests {
             client_identity_file: None,
             client_edge_state_dir: None,
             offline_object_cache: CliOfflineObjectCacheMode::On,
+            allow_empty_initial_namespace: false,
             mountpoint: PathBuf::from("/tmp/mount"),
             fs_name: "ironmesh".to_string(),
             allow_other: false,
@@ -1242,6 +1264,80 @@ mod tests {
 
         let derived = effective_client_edge_state_dir(&args).unwrap();
         assert_eq!(derived, PathBuf::from("/tmp/custom-edge-state"));
+    }
+
+    #[test]
+    fn initial_snapshot_error_without_cache_refuses_empty_namespace() {
+        let state_dir = unique_temp_dir("initial-snapshot-no-cache");
+        let state = ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::On)
+            .expect("edge state should initialize");
+        let args = sample_args();
+
+        let error = initial_snapshot_from_fetch_error(
+            anyhow::anyhow!("failed to request /store/index"),
+            &state,
+            &args,
+            false,
+        )
+        .expect_err("uncached initial fetch failure should abort");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("refusing to mount an empty namespace"));
+        assert!(message.contains("failed to request /store/index"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn initial_snapshot_error_uses_cached_snapshot_when_available() {
+        let state_dir = unique_temp_dir("initial-snapshot-cache");
+        let state = ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::On)
+            .expect("edge state should initialize");
+        let cached = SyncSnapshot {
+            local: vec![],
+            remote: vec![sync_core::NamespaceEntry::file(
+                "docs/readme.txt",
+                "v1",
+                "h1",
+            )],
+        };
+        state
+            .persist_snapshot(&cached)
+            .expect("cached snapshot should persist");
+        let args = sample_args();
+
+        let snapshot = initial_snapshot_from_fetch_error(
+            anyhow::anyhow!("failed to request /store/index"),
+            &state,
+            &args,
+            false,
+        )
+        .expect("cached snapshot should be reused");
+
+        assert_eq!(snapshot, cached);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn initial_snapshot_error_can_start_empty_when_explicitly_allowed() {
+        let state_dir = unique_temp_dir("initial-snapshot-empty-allowed");
+        let state = ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::On)
+            .expect("edge state should initialize");
+        let mut args = sample_args();
+        args.allow_empty_initial_namespace = true;
+
+        let snapshot = initial_snapshot_from_fetch_error(
+            anyhow::anyhow!("failed to request /store/index"),
+            &state,
+            &args,
+            false,
+        )
+        .expect("explicit empty namespace opt-in should allow startup");
+
+        assert_eq!(snapshot, SyncSnapshot::default());
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
