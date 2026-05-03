@@ -4665,9 +4665,6 @@ impl PersistentStore {
             format!("ren-{}-{}", unix_ts_nanos(), &renamed_manifest_hash[..12]);
         let source_head_version_id = source_head.version_id.clone();
 
-        for record in index.versions.values_mut() {
-            record.logical_path = Some(to_path.to_string());
-        }
         index.versions.insert(
             renamed_version_id.clone(),
             FileVersionRecord {

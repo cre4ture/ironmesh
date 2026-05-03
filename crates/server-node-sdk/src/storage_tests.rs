@@ -1514,12 +1514,39 @@ async fn rename_preserves_object_id_and_history_impl(backend: StorageTestBackend
             .iter()
             .any(|v| v.version_id == put.version_id)
     );
+    let original_record = after
+        .versions
+        .iter()
+        .find(|v| v.version_id == put.version_id)
+        .expect("renamed object history should retain the original version");
+    assert_eq!(
+        original_record.logical_path.as_deref(),
+        Some("docs/a.txt"),
+        "pre-rename versions should keep the path that matches their stored manifest"
+    );
 
     let read = store
         .get_object("docs/b.txt", None, None, ObjectReadMode::Preferred)
         .await
         .unwrap();
     assert_eq!(read.as_ref(), b"hello");
+
+    let historical_read = store
+        .get_object(
+            "docs/b.txt",
+            None,
+            Some(&put.version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical_read.as_ref(), b"hello");
+
+    let scrub = store.run_data_scrub().await.unwrap();
+    assert_eq!(
+        scrub.issue_count, 0,
+        "rename should leave scrub-clean metadata and manifests, report={scrub:?}"
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }
