@@ -3159,6 +3159,72 @@ run_on_all_metadata_backends!(
     metadata_only_cached_chunks_are_evicted_by_cleanup_turso
 );
 
+async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend
+        .init_store("scrub-metadata-only-incomplete-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("scrub-metadata-only-incomplete-target")
+        .await;
+
+    source
+        .put_object_versioned(
+            "docs/incomplete-replica.bin",
+            Bytes::from(sample_large_chunked_payload()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let bundle = source
+        .export_metadata_bundle(
+            "docs/incomplete-replica.bin",
+            None,
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    target.import_metadata_bundle(&bundle).await.unwrap();
+
+    assert!(
+        target
+            .list_locally_owned_manifests_for_test()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let report = target.run_data_scrub().await.unwrap();
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == super::DataScrubIssueKind::ReplicaIncomplete),
+        "metadata-only replica gaps should be reported as replica_incomplete, issues={:?}",
+        report.issues
+    );
+    assert!(
+        !report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == super::DataScrubIssueKind::ChunkMissing),
+        "metadata-only replica gaps should not be reported as chunk_missing, issues={:?}",
+        report.issues
+    );
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl,
+    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete,
+    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_turso
+);
+
 async fn importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl(
     backend: StorageTestBackend,
 ) {

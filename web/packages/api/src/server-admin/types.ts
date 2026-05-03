@@ -173,6 +173,7 @@ export type DataScrubIssueKind =
   | "manifest_hash_mismatch"
   | "manifest_key_mismatch"
   | "manifest_size_mismatch"
+  | "replica_incomplete"
   | "chunk_missing"
   | "chunk_unreadable"
   | "chunk_size_mismatch"

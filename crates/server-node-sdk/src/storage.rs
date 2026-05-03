@@ -229,6 +229,7 @@ pub enum DataScrubIssueKind {
     ManifestHashMismatch,
     ManifestKeyMismatch,
     ManifestSizeMismatch,
+    ReplicaIncomplete,
     ChunkMissing,
     ChunkUnreadable,
     ChunkSizeMismatch,
@@ -1669,6 +1670,12 @@ impl DataScrubber {
         let mut manifest_hashes: Vec<_> = manifest_references.keys().cloned().collect();
         manifest_hashes.sort();
         let mut verified_chunks = HashMap::<String, VerifiedChunkState>::new();
+        let locally_owned_manifests = self
+            .metadata_store
+            .list_locally_owned_manifests()
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         for manifest_hash in manifest_hashes {
             output.report.manifests_scanned = output.report.manifests_scanned.saturating_add(1);
@@ -1676,8 +1683,14 @@ impl DataScrubber {
                 .get(&manifest_hash)
                 .cloned()
                 .unwrap_or_default();
-            self.verify_manifest(&manifest_hash, &contexts, &mut verified_chunks, &mut output)
-                .await;
+            self.verify_manifest(
+                &manifest_hash,
+                &contexts,
+                locally_owned_manifests.contains(&manifest_hash),
+                &mut verified_chunks,
+                &mut output,
+            )
+            .await;
         }
 
         output.report.sampled_issue_count = output.report.issues.len();
@@ -1690,6 +1703,7 @@ impl DataScrubber {
         &self,
         manifest_hash: &str,
         contexts: &[DataScrubReference],
+        manifest_locally_owned: bool,
         verified_chunks: &mut HashMap<String, VerifiedChunkState>,
         output: &mut DataScrubRunOutput,
     ) {
@@ -1796,13 +1810,26 @@ impl DataScrubber {
             };
 
             if verified_state.missing {
+                let issue_kind = if manifest_locally_owned {
+                    DataScrubIssueKind::ChunkMissing
+                } else {
+                    DataScrubIssueKind::ReplicaIncomplete
+                };
+                let detail = if manifest_locally_owned {
+                    format!("chunk {} is missing from local storage", chunk.hash)
+                } else {
+                    format!(
+                        "replica is incomplete locally: chunk {} is referenced by metadata manifest {manifest_hash} but is not present in local storage",
+                        chunk.hash
+                    )
+                };
                 self.push_issue(
                     output,
                     contexts,
-                    DataScrubIssueKind::ChunkMissing,
+                    issue_kind,
                     Some(manifest_hash.to_string()),
                     Some(chunk.hash.clone()),
-                    format!("chunk {} is missing from local storage", chunk.hash),
+                    detail,
                 );
                 continue;
             }

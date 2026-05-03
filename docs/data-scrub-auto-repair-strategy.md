@@ -65,7 +65,8 @@ For the first implementation, the safest rule is:
 | `manifest_hash_mismatch` | Stored manifest bytes do not match the manifest hash referenced by metadata. | Queue local replica rehydrate from a healthy peer. | Healthy peer export is available. | Leave issue open and treat the subject as degraded locally. | Replace rather than rewrite the local file in place. |
 | `manifest_key_mismatch` | Manifest key disagrees with the logical path derived from metadata. | Detect only in the first implementation. | A later metadata-only reconcile path would need a clearly authoritative peer metadata bundle with matching identity and lineage. | Leave issue open for operator review. | This can change user-visible namespace bindings and should not auto-heal by default. |
 | `manifest_size_mismatch` | Manifest `total_size_bytes` disagrees with the sum of referenced chunk sizes. | Queue local replica rehydrate from a healthy peer. | Healthy peer export is available. | Leave issue open and degrade local readability for the subject. | Treat as manifest corruption, not as a chunk-only defect. |
-| `chunk_missing` | Referenced chunk file is absent locally. | Queue local replica rehydrate from a healthy peer. | Healthy peer export is available. | Leave issue open, stop treating the subject as fully readable locally, and surface it for later repair. | A chunk-only fetch can be a later optimization. |
+| `replica_incomplete` | Metadata references chunks that are not present, but the manifest is not marked locally owned by this node. | Queue local replica rehydrate from a healthy peer. | Healthy peer export is available. | Leave issue open and keep surfacing the subject as an incomplete local replica. | This is expected while metadata has arrived before chunk replication; it is not reported as local chunk corruption. |
+| `chunk_missing` | Referenced chunk file is absent for a locally owned manifest. | Queue local replica rehydrate from a healthy peer. | Healthy peer export is available. | Leave issue open, stop treating the subject as fully readable locally, and surface it for later repair. | A chunk-only fetch can be a later optimization. |
 | `chunk_unreadable` | Chunk file exists but could not be read. | Retry local read in a bounded way, then queue local replica rehydrate if still failing. | Healthy peer export is available after bounded retry fails. | Leave issue open and degrade local readability for the subject. | Treat persistent unreadable chunks as corruption. |
 | `chunk_size_mismatch` | Chunk length on disk differs from the manifest reference. | Queue local replica rehydrate from a healthy peer. | Healthy peer export is available. | Leave issue open and degrade local readability for the subject. | A chunk-only replacement can be added later, but the first slice should reuse bundle repair. |
 | `chunk_hash_mismatch` | Chunk bytes on disk differ from the expected content hash. | Queue local replica rehydrate from a healthy peer. | Healthy peer export is available. | Leave issue open and degrade local readability for the subject. | This is the clearest case for peer replacement rather than local mutation. |
@@ -141,7 +142,7 @@ This is safer than attempting to preserve availability by serving suspect bytes.
 
 ### 4. Chunk-Only Replacement as a Later Optimization
 
-For chunk-specific findings such as `chunk_missing`, `chunk_size_mismatch`, and
+For replica and chunk-specific findings such as `replica_incomplete`, `chunk_missing`, `chunk_size_mismatch`, and
 `chunk_hash_mismatch`, a future optimization could replace only the affected chunks.
 
 That should be deferred until after the first slice because:
@@ -189,6 +190,7 @@ The recommended first implementation scope is:
    - `manifest_invalid`,
    - `manifest_hash_mismatch`,
    - `manifest_size_mismatch`,
+   - `replica_incomplete`,
    - `chunk_missing`,
    - `chunk_unreadable`,
    - `chunk_size_mismatch`,
@@ -280,4 +282,3 @@ First-slice decision:
 - protect current readable namespace state and historical/versioned reads,
 - if scrub finds corruption in a specific historical version such as `docs/spec.txt@v1`, queue
    repair for that exact versioned subject rather than leaving it as a later manual-only repair.
-   
