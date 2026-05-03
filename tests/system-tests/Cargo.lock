@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-linux-fuse"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-windows-cfapi"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -565,7 +565,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "cli-client"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "client-sdk"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -628,7 +628,7 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
 name = "common"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-client-config"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-status"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "client-sdk",
@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-config-app"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-folder-agent"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -2048,7 +2048,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "os-integration"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "adapter-linux-fuse",
  "adapter-windows-cfapi",
@@ -2444,7 +2444,7 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "rendezvous-server"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-service"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -2768,7 +2768,7 @@ dependencies = [
 
 [[package]]
 name = "server-node"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "server-node-sdk"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "aead",
  "aes-gcm-siv",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "sync-agent-core"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -2986,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "serde",
 ]
@@ -3354,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "transport-sdk"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -3676,7 +3676,7 @@ dependencies = [
 
 [[package]]
 name = "web-ui-backend"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -4041,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "windows-thumbnail-provider"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "adapter-windows-cfapi",
  "anyhow",
