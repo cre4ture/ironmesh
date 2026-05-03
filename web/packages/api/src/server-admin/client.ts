@@ -21,6 +21,8 @@ import type {
   ManagedControlPlanePromotionPackage,
   ManagedRendezvousFailoverImportResponse,
   ManagedRendezvousFailoverPackage,
+  ManualRepairActionListResponse,
+  ManualRepairActionRunResponse,
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
@@ -275,6 +277,33 @@ export async function getRepairHistory(
   return fetchAdminJson<RepairHistoryResponse>(`${apiV1("/auth/repair/history")}${suffix}`, {
     adminTokenOverride
   });
+}
+
+export async function getManualRepairActions(
+  adminTokenOverride?: string
+): Promise<ManualRepairActionListResponse> {
+  return fetchAdminJson<ManualRepairActionListResponse>(apiV1("/auth/repair/actions"), {
+    adminTokenOverride
+  });
+}
+
+export async function runManualRepairAction(
+  actionId: string,
+  options?: {
+    dryRun?: boolean;
+  },
+  adminTokenOverride?: string
+): Promise<ManualRepairActionRunResponse> {
+  return fetchAdminJson<ManualRepairActionRunResponse>(
+    `${apiV1("/auth/repair/actions")}/${encodeURIComponent(actionId)}/run`,
+    {
+      method: "POST",
+      adminTokenOverride,
+      body: {
+        dry_run: options?.dryRun ?? true
+      }
+    }
+  );
 }
 
 export async function getDataScrubActivityStatus(

@@ -1710,6 +1710,52 @@ struct RepairActivityStatusResponse {
     latest_run: Option<RepairRunRecord>,
 }
 
+const LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID: &str = "legacy_rename_logical_paths";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionDescriptor {
+    id: String,
+    label: String,
+    description: String,
+    dry_run_supported: bool,
+    destructive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionListResponse {
+    actions: Vec<ManualRepairActionDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionRunRequest {
+    #[serde(default = "default_manual_repair_dry_run")]
+    dry_run: bool,
+}
+
+impl Default for ManualRepairActionRunRequest {
+    fn default() -> Self {
+        Self {
+            dry_run: default_manual_repair_dry_run(),
+        }
+    }
+}
+
+fn default_manual_repair_dry_run() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionRunResponse {
+    action_id: String,
+    dry_run: bool,
+    started_at_unix: u64,
+    finished_at_unix: u64,
+    duration_ms: u64,
+    changed: bool,
+    summary: String,
+    report: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum DataScrubScope {
@@ -4368,6 +4414,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/admin/logout", post(logout_admin_session))
         .route("/auth/repair/activity", get(repair_activity_status))
         .route("/auth/repair/history", get(repair_history))
+        .route("/auth/repair/actions", get(list_manual_repair_actions))
+        .route(
+            "/auth/repair/actions/{action_id}/run",
+            post(run_manual_repair_action),
+        )
         .route("/auth/scrub/activity", get(data_scrub_activity_status))
         .route("/auth/scrub/history", get(data_scrub_history))
         .route("/auth/scrub/cluster", get(data_scrub_cluster_status))
@@ -14926,6 +14977,129 @@ async fn trigger_data_scrub_public(
 async fn trigger_data_scrub_peer(State(state): State<ServerState>) -> impl IntoResponse {
     let result = start_local_data_scrub(&state, DataScrubRunTrigger::PeerClusterRequest).await;
     (StatusCode::ACCEPTED, Json(result)).into_response()
+}
+
+fn manual_repair_action_descriptors() -> Vec<ManualRepairActionDescriptor> {
+    vec![ManualRepairActionDescriptor {
+        id: LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID.to_string(),
+        label: "Reconcile legacy rename metadata".to_string(),
+        description: "Correct historical version logical paths left behind by older rename handling when the stored manifest still names the original path.".to_string(),
+        dry_run_supported: true,
+        destructive: false,
+    }]
+}
+
+async fn list_manual_repair_actions(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/repair/actions/list";
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        return status.into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(ManualRepairActionListResponse {
+            actions: manual_repair_action_descriptors(),
+        }),
+    )
+        .into_response()
+}
+
+async fn run_manual_repair_action(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(action_id): Path<String>,
+    Json(request): Json<ManualRepairActionRunRequest>,
+) -> impl IntoResponse {
+    let action = "auth/repair/actions/run";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "action_id": action_id.clone(),
+            "dry_run": request.dry_run,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    if action_id != LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let started_at_unix = unix_ts();
+    let started = Instant::now();
+    let report = {
+        let mut store = lock_store(&state, "manual_repair.legacy_rename_logical_paths").await;
+        match store
+            .reconcile_legacy_rename_logical_paths(request.dry_run)
+            .await
+        {
+            Ok(report) => report,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    action_id = %action_id,
+                    dry_run = request.dry_run,
+                    "manual repair action failed"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    let changed = !request.dry_run && report.updated_records > 0;
+    if changed {
+        publish_namespace_change(&state);
+        request_local_availability_refresh(&state);
+    }
+
+    let summary = if request.dry_run {
+        format!(
+            "{} legacy rename record(s) are eligible for logical-path correction",
+            report.eligible_records
+        )
+    } else {
+        format!(
+            "{} legacy rename record(s) eligible; {} updated",
+            report.eligible_records, report.updated_records
+        )
+    };
+    let report_value = match serde_json::to_value(&report) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(
+                error = %err,
+                action_id = %action_id,
+                "failed serializing manual repair action report"
+            );
+            json!({})
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(ManualRepairActionRunResponse {
+            action_id,
+            dry_run: request.dry_run,
+            started_at_unix,
+            finished_at_unix: unix_ts(),
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            changed,
+            summary,
+            report: report_value,
+        }),
+    )
+        .into_response()
 }
 
 async fn repair_activity_status(

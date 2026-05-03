@@ -1,15 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getDataScrubClusterStatus,
+  getManualRepairActions,
   getRepairActivityStatus,
   getRepairHistory,
   getReplicationPlan,
+  runManualRepairAction,
   triggerDataScrub,
   triggerReplicationRepair,
   type DataScrubRunRecord,
+  type ManualRepairActionRunResponse,
   type RepairRunRecord,
   type ReplicationPlan
 } from "@ironmesh/api";
+import { IconPlayerPlay, IconSearch } from "@tabler/icons-react";
 import {
   Alert,
   Badge,
@@ -35,6 +39,8 @@ export function RepairPage() {
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
   const [selectedRun, setSelectedRun] = useState<RepairRunRecord | null>(null);
   const [selectedScrubRun, setSelectedScrubRun] = useState<DataScrubRunRecord | null>(null);
+  const [manualActionResult, setManualActionResult] =
+    useState<ManualRepairActionRunResponse | null>(null);
   const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const hasExplicitAdminAccess =
     Boolean(normalizedAdminTokenOverride) || Boolean(sessionStatus?.authenticated);
@@ -51,6 +57,11 @@ export function RepairPage() {
   const repairHistoryQuery = useQuery({
     queryKey: ["repair-page", "history", normalizedAdminTokenOverride],
     queryFn: () => getRepairHistory({ limit: 120 }, normalizedAdminTokenOverride || undefined),
+    enabled: canInspectRepair
+  });
+  const manualRepairActionsQuery = useQuery({
+    queryKey: ["repair-page", "manual-actions", normalizedAdminTokenOverride],
+    queryFn: () => getManualRepairActions(normalizedAdminTokenOverride || undefined),
     enabled: canInspectRepair
   });
   const replicationPlanQuery = useQuery({
@@ -70,6 +81,7 @@ export function RepairPage() {
     const queryKeys: ReadonlyArray<readonly unknown[]> = [
       ["repair-page", "activity", normalizedAdminTokenOverride],
       ["repair-page", "history", normalizedAdminTokenOverride],
+      ["repair-page", "manual-actions", normalizedAdminTokenOverride],
       ["repair-page", "replication-plan", normalizedAdminTokenOverride],
       ["repair-page", "scrub-cluster", normalizedAdminTokenOverride]
     ];
@@ -96,9 +108,18 @@ export function RepairPage() {
       await refresh();
     }
   });
+  const manualRepairActionMutation = useMutation({
+    mutationFn: ({ actionId, dryRun }: { actionId: string; dryRun: boolean }) =>
+      runManualRepairAction(actionId, { dryRun }, normalizedAdminTokenOverride || undefined),
+    onSuccess: async (result) => {
+      setManualActionResult(result);
+      await refresh();
+    }
+  });
 
   const repairActivity = canInspectRepair ? repairActivityQuery.data ?? null : null;
   const repairHistory = canInspectRepair ? repairHistoryQuery.data ?? null : null;
+  const manualRepairActions = canInspectRepair ? manualRepairActionsQuery.data?.actions ?? [] : [];
   const replicationPlan = canInspectRepair ? replicationPlanQuery.data ?? null : null;
   const scrubCluster = canInspectRepair ? scrubClusterQuery.data ?? null : null;
   const scrubAutoRepairRuns =
@@ -120,13 +141,16 @@ export function RepairPage() {
   const loading =
     repairActivityQuery.isFetching ||
     repairHistoryQuery.isFetching ||
+    manualRepairActionsQuery.isFetching ||
     replicationPlanQuery.isFetching ||
     scrubClusterQuery.isFetching;
   const error = firstErrorMessage([
+    manualRepairActionMutation.error,
     scrubMutation.error,
     repairMutation.error,
     repairActivityQuery.error,
     repairHistoryQuery.error,
+    manualRepairActionsQuery.error,
     replicationPlanQuery.error,
     scrubClusterQuery.error
   ]);
@@ -179,6 +203,128 @@ export function RepairPage() {
         </Alert>
       ) : null}
       {error ? <Alert color="red" title="Failed to load maintenance state">{error}</Alert> : null}
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between" align="flex-start">
+            <Text fw={700}>Manual repair actions</Text>
+            <Badge variant="light">
+              {manualRepairActionsQuery.data
+                ? `${manualRepairActions.length} available`
+                : loading
+                  ? "loading"
+                  : "not loaded"}
+            </Badge>
+          </Group>
+          {manualRepairActions.length > 0 ? (
+            <Table.ScrollContainer minWidth={760}>
+              <Table striped highlightOnHover withTableBorder>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Action</Table.Th>
+                    <Table.Th>Description</Table.Th>
+                    <Table.Th>Mode</Table.Th>
+                    <Table.Th />
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {manualRepairActions.map((action) => {
+                    const actionPending =
+                      manualRepairActionMutation.isPending &&
+                      manualRepairActionMutation.variables?.actionId === action.id;
+                    return (
+                      <Table.Tr key={action.id}>
+                        <Table.Td>
+                          <Stack gap={4}>
+                            <Text fw={600}>{action.label}</Text>
+                            <Text size="xs" ff="monospace" c="dimmed">
+                              {action.id}
+                            </Text>
+                          </Stack>
+                        </Table.Td>
+                        <Table.Td maw={420}>
+                          <Text size="sm" c="dimmed">
+                            {action.description}
+                          </Text>
+                        </Table.Td>
+                        <Table.Td>
+                          <Group gap="xs">
+                            {action.dry_run_supported ? (
+                              <Badge variant="light" color="blue">
+                                dry run
+                              </Badge>
+                            ) : null}
+                            <Badge variant="light" color={action.destructive ? "red" : "teal"}>
+                              {action.destructive ? "destructive" : "metadata"}
+                            </Badge>
+                          </Group>
+                        </Table.Td>
+                        <Table.Td>
+                          <Group gap="xs" justify="flex-end" wrap="nowrap">
+                            <Button
+                              size="xs"
+                              variant="default"
+                              disabled={!canInspectRepair || !action.dry_run_supported}
+                              loading={actionPending && manualRepairActionMutation.variables?.dryRun}
+                              leftSection={<IconSearch size={14} />}
+                              onClick={() =>
+                                void manualRepairActionMutation.mutateAsync({
+                                  actionId: action.id,
+                                  dryRun: true
+                                })
+                              }
+                            >
+                              Dry run
+                            </Button>
+                            <Button
+                              size="xs"
+                              color={action.destructive ? "red" : "teal"}
+                              variant="light"
+                              disabled={!canInspectRepair}
+                              loading={
+                                actionPending && !manualRepairActionMutation.variables?.dryRun
+                              }
+                              leftSection={<IconPlayerPlay size={14} />}
+                              onClick={() =>
+                                void manualRepairActionMutation.mutateAsync({
+                                  actionId: action.id,
+                                  dryRun: false
+                                })
+                              }
+                            >
+                              Run action
+                            </Button>
+                          </Group>
+                        </Table.Td>
+                      </Table.Tr>
+                    );
+                  })}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+          ) : (
+            <Text c="dimmed">
+              {loading ? "Loading manual repair actions..." : "No manual repair actions are available."}
+            </Text>
+          )}
+          {manualActionResult ? (
+            <Alert
+              color={manualActionResult.changed ? "teal" : "blue"}
+              variant="light"
+              title={manualActionResult.dry_run ? "Manual repair dry run finished" : "Manual repair action finished"}
+            >
+              <Stack gap="sm">
+                <Text size="sm">{manualActionResult.summary}</Text>
+                <Text size="xs" c="dimmed">
+                  Action <Code>{manualActionResult.action_id}</Code> finished after{" "}
+                  {formatDurationShort(manualActionResult.duration_ms)}.
+                </Text>
+                <JsonBlock value={manualActionResult} />
+              </Stack>
+            </Alert>
+          ) : null}
+        </Stack>
+      </Card>
 
       <Grid>
         <Grid.Col span={{ base: 12, md: 4 }}>

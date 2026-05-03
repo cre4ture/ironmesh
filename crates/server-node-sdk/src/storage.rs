@@ -51,6 +51,7 @@ const VIDEO_THUMBNAIL_SEEK_FRACTION: f64 = 0.10;
 const VIDEO_THUMBNAIL_SEEK_MIN_SECS: f64 = 1.0;
 const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 60.0;
 const DATA_SCRUB_ISSUE_SAMPLE_LIMIT: usize = 128;
+const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkRef {
@@ -131,6 +132,34 @@ pub struct VersionGraphSummary {
     pub preferred_head_reason: Option<PreferredHeadReason>,
     pub head_version_ids: Vec<String>,
     pub versions: Vec<VersionRecordSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyRenameLogicalPathReconcileUpdate {
+    pub object_id: String,
+    pub version_id: String,
+    pub manifest_hash: String,
+    pub old_logical_path: String,
+    pub corrected_logical_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LegacyRenameLogicalPathReconcileReport {
+    pub dry_run: bool,
+    pub version_indexes_scanned: usize,
+    pub version_records_scanned: usize,
+    pub skipped_indexes_without_rename_lineage: usize,
+    pub skipped_head_records: usize,
+    pub skipped_tombstone_records: usize,
+    pub skipped_records_without_logical_path: usize,
+    pub skipped_missing_manifests: usize,
+    pub skipped_unreadable_manifests: usize,
+    pub skipped_unrelated_mismatches: usize,
+    pub manifest_key_mismatches_seen: usize,
+    pub eligible_records: usize,
+    pub updated_records: usize,
+    pub sampled_updates: Vec<LegacyRenameLogicalPathReconcileUpdate>,
+    pub update_sample_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3236,6 +3265,134 @@ impl PersistentStore {
             head_version_ids: index.head_version_ids,
             versions,
         }))
+    }
+
+    pub async fn reconcile_legacy_rename_logical_paths(
+        &mut self,
+        dry_run: bool,
+    ) -> Result<LegacyRenameLogicalPathReconcileReport> {
+        let mut report = LegacyRenameLogicalPathReconcileReport {
+            dry_run,
+            ..LegacyRenameLogicalPathReconcileReport::default()
+        };
+
+        let mut indexes = self.load_all_version_indexes().await?;
+        indexes.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+
+        for mut index in indexes {
+            report.version_indexes_scanned = report.version_indexes_scanned.saturating_add(1);
+
+            if !index
+                .versions
+                .keys()
+                .any(|version_id| version_id.starts_with("ren-"))
+            {
+                report.skipped_indexes_without_rename_lineage = report
+                    .skipped_indexes_without_rename_lineage
+                    .saturating_add(1);
+                continue;
+            }
+
+            let head_version_ids = index
+                .head_version_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            let current_head_paths = index
+                .head_version_ids
+                .iter()
+                .filter_map(|version_id| index.versions.get(version_id))
+                .filter_map(|record| record.logical_path.clone())
+                .collect::<HashSet<_>>();
+
+            let mut index_changed = false;
+            let mut version_ids = index.versions.keys().cloned().collect::<Vec<_>>();
+            version_ids.sort();
+
+            for version_id in version_ids {
+                report.version_records_scanned = report.version_records_scanned.saturating_add(1);
+
+                if head_version_ids.contains(&version_id) {
+                    report.skipped_head_records = report.skipped_head_records.saturating_add(1);
+                    continue;
+                }
+
+                let Some(record) = index.versions.get(&version_id).cloned() else {
+                    continue;
+                };
+
+                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                    report.skipped_tombstone_records =
+                        report.skipped_tombstone_records.saturating_add(1);
+                    continue;
+                }
+
+                let Some(logical_path) = record.logical_path.clone() else {
+                    report.skipped_records_without_logical_path = report
+                        .skipped_records_without_logical_path
+                        .saturating_add(1);
+                    continue;
+                };
+
+                let manifest = match self.load_manifest_by_hash(&record.manifest_hash).await {
+                    Ok(Some(manifest)) => manifest,
+                    Ok(None) => {
+                        report.skipped_missing_manifests =
+                            report.skipped_missing_manifests.saturating_add(1);
+                        continue;
+                    }
+                    Err(_) => {
+                        report.skipped_unreadable_manifests =
+                            report.skipped_unreadable_manifests.saturating_add(1);
+                        continue;
+                    }
+                };
+
+                if manifest.key == logical_path {
+                    continue;
+                }
+
+                report.manifest_key_mismatches_seen =
+                    report.manifest_key_mismatches_seen.saturating_add(1);
+
+                if !current_head_paths.contains(&logical_path) {
+                    report.skipped_unrelated_mismatches =
+                        report.skipped_unrelated_mismatches.saturating_add(1);
+                    continue;
+                }
+
+                report.eligible_records = report.eligible_records.saturating_add(1);
+
+                if report.sampled_updates.len() < LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT {
+                    report
+                        .sampled_updates
+                        .push(LegacyRenameLogicalPathReconcileUpdate {
+                            object_id: index.object_id.clone(),
+                            version_id: record.version_id.clone(),
+                            manifest_hash: record.manifest_hash.clone(),
+                            old_logical_path: logical_path,
+                            corrected_logical_path: manifest.key.clone(),
+                        });
+                } else {
+                    report.update_sample_truncated = true;
+                }
+
+                if !dry_run {
+                    if let Some(record) = index.versions.get_mut(&version_id) {
+                        record.logical_path = Some(manifest.key);
+                        report.updated_records = report.updated_records.saturating_add(1);
+                        index_changed = true;
+                    }
+                }
+            }
+
+            if index_changed {
+                self.persist_version_index_by_object_id(&index.object_id, &index)
+                    .await?;
+            }
+        }
+
+        Ok(report)
     }
 
     pub async fn has_manifest_for_key(&self, key: &str, manifest_hash: &str) -> Result<bool> {

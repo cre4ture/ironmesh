@@ -1557,6 +1557,111 @@ run_on_all_metadata_backends!(
     rename_preserves_object_id_and_history_turso
 );
 
+async fn reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("legacy-rename-logical-path-reconcile")
+        .await;
+
+    let put = store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"hello"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let mutation = store
+        .rename_object_path("docs/a.txt", "docs/b.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    let object_id = store
+        .current_state
+        .object_ids
+        .get("docs/b.txt")
+        .cloned()
+        .expect("renamed object should be current at destination");
+    let mut index = store
+        .load_version_index_by_object_id(&object_id)
+        .await
+        .unwrap()
+        .expect("renamed object should retain version index");
+    index
+        .versions
+        .get_mut(&put.version_id)
+        .expect("original version should remain in renamed object history")
+        .logical_path = Some("docs/b.txt".to_string());
+    store
+        .persist_version_index_by_object_id(&object_id, &index)
+        .await
+        .unwrap();
+
+    let dirty_scrub = store.run_data_scrub().await.unwrap();
+    assert!(
+        dirty_scrub
+            .issues
+            .iter()
+            .any(|issue| issue.kind == super::DataScrubIssueKind::ManifestKeyMismatch),
+        "simulated legacy rename metadata should trigger manifest_key_mismatch, report={dirty_scrub:?}"
+    );
+
+    let dry_run = store
+        .reconcile_legacy_rename_logical_paths(true)
+        .await
+        .unwrap();
+    assert_eq!(dry_run.eligible_records, 1);
+    assert_eq!(dry_run.updated_records, 0);
+
+    let after_dry_run = store.list_versions("docs/b.txt").await.unwrap().unwrap();
+    let dry_run_original = after_dry_run
+        .versions
+        .iter()
+        .find(|record| record.version_id == put.version_id)
+        .expect("original version should still be present after dry run");
+    assert_eq!(dry_run_original.logical_path.as_deref(), Some("docs/b.txt"));
+
+    let applied = store
+        .reconcile_legacy_rename_logical_paths(false)
+        .await
+        .unwrap();
+    assert_eq!(applied.eligible_records, 1);
+    assert_eq!(applied.updated_records, 1);
+    assert_eq!(applied.sampled_updates.len(), 1);
+    assert_eq!(
+        applied.sampled_updates[0].corrected_logical_path,
+        "docs/a.txt"
+    );
+
+    let after_apply = store.list_versions("docs/b.txt").await.unwrap().unwrap();
+    let repaired_original = after_apply
+        .versions
+        .iter()
+        .find(|record| record.version_id == put.version_id)
+        .expect("original version should still be present after repair");
+    assert_eq!(
+        repaired_original.logical_path.as_deref(),
+        Some("docs/a.txt")
+    );
+
+    let clean_scrub = store.run_data_scrub().await.unwrap();
+    assert_eq!(
+        clean_scrub.issue_count, 0,
+        "legacy rename reconcile should leave scrub clean, report={clean_scrub:?}"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl,
+    reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata,
+    reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_turso
+);
+
 async fn rename_replication_subjects_include_source_path_deletion_event_impl(
     backend: StorageTestBackend,
 ) {

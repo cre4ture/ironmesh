@@ -155,6 +155,33 @@ export type RepairActivityStatusResponse = {
   latest_run?: RepairRunRecord | null;
 };
 
+export type ManualRepairActionDescriptor = {
+  id: string;
+  label: string;
+  description: string;
+  dry_run_supported: boolean;
+  destructive: boolean;
+};
+
+export type ManualRepairActionListResponse = {
+  actions: ManualRepairActionDescriptor[];
+};
+
+export type ManualRepairActionRunRequest = {
+  dry_run?: boolean;
+};
+
+export type ManualRepairActionRunResponse = {
+  action_id: string;
+  dry_run: boolean;
+  started_at_unix: number;
+  finished_at_unix: number;
+  duration_ms: number;
+  changed: boolean;
+  summary: string;
+  report: Record<string, unknown>;
+};
+
 export type DataScrubScope = "local" | "cluster";
 
 export type DataScrubRunTrigger =

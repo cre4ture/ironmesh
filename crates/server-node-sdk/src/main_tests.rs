@@ -7610,6 +7610,53 @@ async fn resolve_peer_base_url_rejects_public_api_only_candidate() {
 }
 
 #[tokio::test]
+async fn manual_repair_action_handlers_list_and_run_dry_run() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let list_response = super::list_manual_repair_actions(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_body = to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_payload: super::ManualRepairActionListResponse =
+        serde_json::from_slice(&list_body).unwrap();
+    assert!(
+        list_payload
+            .actions
+            .iter()
+            .any(|action| action.id == super::LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID)
+    );
+
+    let run_response = super::run_manual_repair_action(
+        State(state.clone()),
+        headers,
+        Path(super::LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID.to_string()),
+        Json(super::ManualRepairActionRunRequest { dry_run: true }),
+    )
+    .await
+    .into_response();
+    assert_eq!(run_response.status(), StatusCode::OK);
+    let run_body = to_bytes(run_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let run_payload: super::ManualRepairActionRunResponse =
+        serde_json::from_slice(&run_body).unwrap();
+    assert_eq!(
+        run_payload.action_id,
+        super::LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID
+    );
+    assert!(run_payload.dry_run);
+    assert!(!run_payload.changed);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn internal_peer_api_routes_replication_repair_locally() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
 
