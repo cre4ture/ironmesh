@@ -131,7 +131,13 @@ const DATA_SCRUB_HISTORY_RETENTION_SECS: u64 = 12 * 30 * 24 * 60 * 60;
 const MAX_DATA_SCRUB_HISTORY_LIMIT: usize = 4_096;
 const REPAIR_RUN_HISTORY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_REPAIR_RUN_HISTORY_LIMIT: usize = 4_096;
-const UPLOAD_SESSION_PERSIST_INACTIVITY_SECS: u64 = 60;
+const UPLOAD_SESSION_PERSIST_COALESCE_SECS: u64 = 5;
+const RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS: u64 = 50;
+const RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS: u64 = 250;
+const RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS: u64 = 30;
+const EMBEDDED_RENDEZVOUS_RESTART_INITIAL_DELAY_SECS: u64 = 1;
+const EMBEDDED_RENDEZVOUS_RESTART_MAX_DELAY_SECS: u64 = 30;
+const EMBEDDED_RENDEZVOUS_STABLE_UPTIME_RESET_SECS: u64 = 60;
 const DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS: u64 = 30;
 const SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_UPLOAD_FINALIZE_LOG_THRESHOLD_MS: u128 = 500;
@@ -623,7 +629,7 @@ async fn load_upload_session_store(data_dir: &FsPath) -> Result<UploadSessionSto
 }
 
 async fn persist_upload_session_store(store: &UploadSessionStore) -> Result<()> {
-    let payload = serde_json::to_vec_pretty(&UploadSessionFile {
+    let payload = serde_json::to_vec(&UploadSessionFile {
         sessions: store.sessions.clone(),
     })
     .context("failed encoding upload session state")?;
@@ -659,33 +665,27 @@ fn spawn_upload_session_store_persister(state: ServerState) {
 
             loop {
                 let observed_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
-                let sleep =
-                    tokio::time::sleep(Duration::from_secs(UPLOAD_SESSION_PERSIST_INACTIVITY_SECS));
-                tokio::pin!(sleep);
-                tokio::select! {
-                    _ = &mut sleep => {}
-                    _ = state.upload_sessions_persist_notify.notified() => {
-                        continue;
-                    }
-                }
-                let stable_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
-                if stable_generation != observed_generation {
-                    continue;
-                }
-                if stable_generation == persisted_generation {
+                if observed_generation == persisted_generation {
                     break;
                 }
 
+                tokio::time::sleep(Duration::from_secs(UPLOAD_SESSION_PERSIST_COALESCE_SECS)).await;
+                let target_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
+                if target_generation == persisted_generation {
+                    break;
+                }
                 match persist_upload_session_store_now(&state).await {
                     Ok(()) => {
-                        persisted_generation = stable_generation;
+                        persisted_generation = target_generation;
                     }
                     Err(err) => {
                         warn!(error = %err, "failed to persist debounced upload session state");
-                        state.upload_sessions_persist_notify.notify_one();
+                        tokio::time::sleep(Duration::from_secs(
+                            UPLOAD_SESSION_PERSIST_COALESCE_SECS,
+                        ))
+                        .await;
                     }
-                }
-                break;
+                };
             }
         }
     });
@@ -2443,6 +2443,23 @@ async fn record_rendezvous_registration_failure(
     entry.consecutive_failures
 }
 
+fn should_log_rendezvous_failure(consecutive_failures: u64) -> bool {
+    consecutive_failures == 1 || consecutive_failures % 10 == 0
+}
+
+fn rendezvous_relay_accept_retry_delay(consecutive_failures: u64) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::from_millis(RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS);
+    }
+
+    let initial_ms = RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS;
+    let max_ms = RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS.saturating_mul(1_000);
+    let shift = consecutive_failures.saturating_sub(1).min(16) as u32;
+    let multiplier = 1_u64 << shift;
+    let delay_ms = initial_ms.saturating_mul(multiplier).min(max_ms);
+    Duration::from_millis(delay_ms)
+}
+
 async fn rendezvous_registration_views(
     state: &ServerState,
 ) -> Vec<RendezvousEndpointRegistrationView> {
@@ -3558,6 +3575,163 @@ async fn wait_for_shutdown_trigger(mut shutdown_rx: watch::Receiver<bool>) {
     }
 }
 
+fn embedded_rendezvous_restart_delay(restart_attempts: u32) -> Duration {
+    let attempt = restart_attempts.max(1);
+    let shift = attempt.saturating_sub(1).min(16);
+    let multiplier = 1_u64 << shift;
+    Duration::from_secs(
+        EMBEDDED_RENDEZVOUS_RESTART_INITIAL_DELAY_SECS
+            .saturating_mul(multiplier)
+            .min(EMBEDDED_RENDEZVOUS_RESTART_MAX_DELAY_SECS),
+    )
+}
+
+fn spawn_embedded_managed_rendezvous_listener(
+    state: ServerState,
+    managed_rendezvous: ManagedRendezvousConfig,
+    shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut restart_attempts = 0u32;
+
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
+            let started_at = Instant::now();
+            let listener_config = embedded_rendezvous::EmbeddedRendezvousConfig {
+                bind_addr: managed_rendezvous.bind_addr,
+                public_url: managed_rendezvous.public_url.clone(),
+                client_ca_cert_path: managed_rendezvous.client_ca_cert_path.clone(),
+                cert_path: managed_rendezvous.cert_path.clone(),
+                key_path: managed_rendezvous.key_path.clone(),
+            };
+
+            info!(
+                bind_addr = %managed_rendezvous.bind_addr,
+                public_url = %managed_rendezvous.public_url,
+                node_id = %state.node_id,
+                restart_attempts,
+                "server node embedded managed rendezvous listener starting"
+            );
+
+            let mut listener_task =
+                tokio::spawn(
+                    async move { embedded_rendezvous::run_listener(listener_config).await },
+                );
+
+            tokio::select! {
+                outcome = &mut listener_task => {
+                    let uptime_ms = started_at.elapsed().as_millis();
+                    if started_at.elapsed()
+                        >= Duration::from_secs(EMBEDDED_RENDEZVOUS_STABLE_UPTIME_RESET_SECS)
+                    {
+                        restart_attempts = 0;
+                    }
+                    restart_attempts = restart_attempts.saturating_add(1);
+                    let restart_delay = embedded_rendezvous_restart_delay(restart_attempts);
+
+                    match outcome {
+                        Ok(Ok(())) => {
+                            warn!(
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                uptime_ms,
+                                restart_attempts,
+                                restart_delay_secs = restart_delay.as_secs(),
+                                "embedded managed rendezvous listener exited unexpectedly"
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            warn!(
+                                error = %err,
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                uptime_ms,
+                                restart_attempts,
+                                restart_delay_secs = restart_delay.as_secs(),
+                                "embedded managed rendezvous listener stopped unexpectedly"
+                            );
+                        }
+                        Err(err) if err.is_panic() => {
+                            tracing::error!(
+                                error = %err,
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                uptime_ms,
+                                restart_attempts,
+                                restart_delay_secs = restart_delay.as_secs(),
+                                "embedded managed rendezvous listener panicked"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                uptime_ms,
+                                restart_attempts,
+                                restart_delay_secs = restart_delay.as_secs(),
+                                "embedded managed rendezvous listener task ended unexpectedly"
+                            );
+                        }
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(restart_delay) => {}
+                        _ = wait_for_shutdown_trigger(shutdown_rx.clone()) => return,
+                    }
+                }
+                _ = wait_for_shutdown_trigger(shutdown_rx.clone()) => {
+                    listener_task.abort();
+                    match listener_task.await {
+                        Err(err) if err.is_cancelled() => {
+                            tracing::debug!(
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                "embedded managed rendezvous listener stopped for shutdown"
+                            );
+                        }
+                        Ok(Ok(())) => {
+                            tracing::debug!(
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                "embedded managed rendezvous listener exited during shutdown"
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            warn!(
+                                error = %err,
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                "embedded managed rendezvous listener returned an error during shutdown"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                bind_addr = %managed_rendezvous.bind_addr,
+                                public_url = %managed_rendezvous.public_url,
+                                node_id = %state.node_id,
+                                "embedded managed rendezvous listener join failed during shutdown"
+                            );
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    })
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -4479,6 +4653,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut internal_server_handle = None;
     let mut internal_server_task = None;
+    let mut embedded_rendezvous_task = None;
 
     if let Some(internal_tls) = config.internal_tls.as_ref() {
         let internal_bind_addr = internal_tls.bind_addr;
@@ -4508,28 +4683,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     }
 
     if let Some(managed_rendezvous) = config.managed_rendezvous.clone() {
-        let rendezvous_state = state.clone();
-        tokio::spawn(async move {
-            info!(
-                bind_addr = %managed_rendezvous.bind_addr,
-                public_url = %managed_rendezvous.public_url,
-                node_id = %rendezvous_state.node_id,
-                "server node embedded managed rendezvous listener"
-            );
-
-            if let Err(err) =
-                embedded_rendezvous::run_listener(embedded_rendezvous::EmbeddedRendezvousConfig {
-                    bind_addr: managed_rendezvous.bind_addr,
-                    public_url: managed_rendezvous.public_url,
-                    client_ca_cert_path: managed_rendezvous.client_ca_cert_path,
-                    cert_path: managed_rendezvous.cert_path,
-                    key_path: managed_rendezvous.key_path,
-                })
-                .await
-            {
-                warn!(error = %err, "embedded managed rendezvous listener stopped");
-            }
-        });
+        embedded_rendezvous_task = Some(spawn_embedded_managed_rendezvous_listener(
+            state.clone(),
+            managed_rendezvous,
+            shutdown_rx.clone(),
+        ));
     }
 
     info!(
@@ -4587,6 +4745,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             if let Some(task) = internal_server_task.take() {
                 task.await.context("internal server task join failure")??;
             }
+            if let Some(task) = embedded_rendezvous_task.take() {
+                task.await.context("embedded rendezvous supervisor task join failure")?;
+            }
             if let Err(err) = persist_upload_session_store_now(&state).await {
                 warn!(error = %err, "failed to persist upload session state during shutdown");
             }
@@ -4600,6 +4761,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     }
     if let Some(task) = internal_server_task {
         task.await.context("internal server task join failure")??;
+    }
+    if let Some(task) = embedded_rendezvous_task {
+        task.abort();
     }
     if let Err(err) = persist_upload_session_store_now(&state).await {
         warn!(error = %err, "failed to persist upload session state during shutdown");
@@ -4868,7 +5032,7 @@ fn spawn_rendezvous_presence_heartbeat(
                         let error_text = err.to_string();
                         let failures =
                             record_rendezvous_registration_failure(&state, &url, &error_text).await;
-                        if failures == 1 || failures % 10 == 0 {
+                        if should_log_rendezvous_failure(failures) {
                             warn!(
                                 error = %err,
                                 node_id = %state.node_id,
@@ -4893,7 +5057,7 @@ fn spawn_rendezvous_presence_heartbeat(
                         );
                         let failures =
                             record_rendezvous_registration_failure(&state, &url, &error_text).await;
-                        if failures == 1 || failures % 10 == 0 {
+                        if should_log_rendezvous_failure(failures) {
                             warn!(
                                 error = %error_text,
                                 node_id = %state.node_id,
@@ -6291,6 +6455,7 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
             }
 
             let mut handled_session = false;
+            let mut retry_delay = Duration::from_millis(RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS);
             while let Some(result) = accepts.join_next().await {
                 let Ok((endpoint, result)) = result else {
                     continue;
@@ -6372,19 +6537,32 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                                 &error_text,
                             )
                             .await;
-                            warn!(
-                                error = %err,
-                                rendezvous_url = %endpoint.url,
-                                consecutive_failures = failures,
-                                "multiplex relay accept failed"
-                            );
+                            let next_retry_delay = rendezvous_relay_accept_retry_delay(failures);
+                            retry_delay = retry_delay.max(next_retry_delay);
+                            if should_log_rendezvous_failure(failures) {
+                                warn!(
+                                    error = %err,
+                                    rendezvous_url = %endpoint.url,
+                                    consecutive_failures = failures,
+                                    next_retry_ms = next_retry_delay.as_millis(),
+                                    "multiplex relay accept failed"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    error = %err,
+                                    rendezvous_url = %endpoint.url,
+                                    consecutive_failures = failures,
+                                    next_retry_ms = next_retry_delay.as_millis(),
+                                    "multiplex relay accept failed"
+                                );
+                            }
                         }
                     }
                 }
             }
 
             if !handled_session {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(retry_delay).await;
             }
         }
     });
@@ -7558,6 +7736,13 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
                 )
                 .await
                 {
+                    Ok(response) if response.is_success() => {
+                        tracing::debug!(
+                            node_id = %peer.node_id,
+                            status = response.status,
+                            "peer heartbeat sent"
+                        );
+                    }
                     Ok(response) => {
                         tracing::debug!(
                             node_id = %peer.node_id,
@@ -8625,7 +8810,7 @@ async fn upload_session_chunk_response(
     };
 
     drop(sessions);
-    persist_upload_session_store_after_mutation(state, "upload_session_chunk").await;
+    mark_upload_session_store_dirty(state);
     let total_ms = request_started_at.elapsed().as_millis();
     if total_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
         || store_lock_wait_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS

@@ -6658,6 +6658,7 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
         .as_ref()
         .expect("chunk should be recorded");
     assert_eq!(chunk.size_bytes, payload.len());
+    assert_eq!(state.upload_sessions_dirty.load(Ordering::SeqCst), 1);
 }
 
 async fn data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl(
@@ -8771,6 +8772,52 @@ async fn cleanup_test_state(state: &ServerState) {
         store.root_dir().to_path_buf()
     };
     let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[test]
+fn rendezvous_failure_logging_is_throttled() {
+    assert!(super::should_log_rendezvous_failure(1));
+    assert!(!super::should_log_rendezvous_failure(2));
+    assert!(!super::should_log_rendezvous_failure(9));
+    assert!(super::should_log_rendezvous_failure(10));
+    assert!(super::should_log_rendezvous_failure(453_400));
+    assert!(!super::should_log_rendezvous_failure(453_401));
+}
+
+#[test]
+fn rendezvous_relay_accept_retry_delay_backs_off_and_caps() {
+    assert_eq!(
+        super::rendezvous_relay_accept_retry_delay(0),
+        Duration::from_millis(super::RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS)
+    );
+    assert_eq!(
+        super::rendezvous_relay_accept_retry_delay(1),
+        Duration::from_millis(super::RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS)
+    );
+    assert_eq!(
+        super::rendezvous_relay_accept_retry_delay(2),
+        Duration::from_millis(super::RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS * 2)
+    );
+    assert_eq!(
+        super::rendezvous_relay_accept_retry_delay(999),
+        Duration::from_secs(super::RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS)
+    );
+}
+
+#[test]
+fn embedded_rendezvous_restart_delay_backs_off_and_caps() {
+    assert_eq!(
+        super::embedded_rendezvous_restart_delay(0),
+        Duration::from_secs(super::EMBEDDED_RENDEZVOUS_RESTART_INITIAL_DELAY_SECS)
+    );
+    assert_eq!(
+        super::embedded_rendezvous_restart_delay(2),
+        Duration::from_secs(super::EMBEDDED_RENDEZVOUS_RESTART_INITIAL_DELAY_SECS * 2)
+    );
+    assert_eq!(
+        super::embedded_rendezvous_restart_delay(999),
+        Duration::from_secs(super::EMBEDDED_RENDEZVOUS_RESTART_MAX_DELAY_SECS)
+    );
 }
 
 fn fresh_test_dir(name: &str) -> PathBuf {
