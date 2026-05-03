@@ -3377,12 +3377,10 @@ impl PersistentStore {
                     report.update_sample_truncated = true;
                 }
 
-                if !dry_run {
-                    if let Some(record) = index.versions.get_mut(&version_id) {
-                        record.logical_path = Some(manifest.key);
-                        report.updated_records = report.updated_records.saturating_add(1);
-                        index_changed = true;
-                    }
+                if !dry_run && let Some(record) = index.versions.get_mut(&version_id) {
+                    record.logical_path = Some(manifest.key);
+                    report.updated_records = report.updated_records.saturating_add(1);
+                    index_changed = true;
                 }
             }
 

@@ -2490,7 +2490,7 @@ async fn record_rendezvous_registration_failure(
 }
 
 fn should_log_rendezvous_failure(consecutive_failures: u64) -> bool {
-    consecutive_failures == 1 || consecutive_failures % 10 == 0
+    consecutive_failures == 1 || consecutive_failures.is_multiple_of(10)
 }
 
 fn rendezvous_relay_accept_retry_delay(consecutive_failures: u64) -> Duration {
@@ -8861,7 +8861,7 @@ async fn upload_session_chunk_response(
     };
 
     drop(sessions);
-    mark_upload_session_store_dirty(state);
+    persist_upload_session_store_after_mutation(state, "upload_session_chunk").await;
     let total_ms = request_started_at.elapsed().as_millis();
     if total_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
         || store_lock_wait_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS

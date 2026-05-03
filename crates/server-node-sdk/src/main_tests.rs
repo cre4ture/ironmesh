@@ -6658,7 +6658,19 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
         .as_ref()
         .expect("chunk should be recorded");
     assert_eq!(chunk.size_bytes, payload.len());
-    assert_eq!(state.upload_sessions_dirty.load(Ordering::SeqCst), 1);
+    drop(sessions);
+
+    let persisted_payload = fs::read(state.data_dir.join("state").join("upload_sessions.json"))
+        .await
+        .expect("upload session state should be persisted");
+    let persisted = serde_json::from_slice::<super::UploadSessionFile>(&persisted_payload)
+        .expect("persisted upload session state should parse");
+    let persisted_session = persisted
+        .sessions
+        .get(&upload_id)
+        .expect("persisted upload session should remain present");
+    assert!(persisted_session.received_chunks[0].is_some());
+    assert_eq!(state.upload_sessions_dirty.load(Ordering::SeqCst), 0);
 }
 
 async fn data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl(
