@@ -124,4 +124,4 @@ override_dh_auto_install:
 		$(CURDIR)/debian/ironmesh-client/etc/xdg/autostart/ironmesh-config-app-background.desktop
 
 override_dh_installsystemd:
-	dh_installsystemd --no-enable --no-start
+	dh_installsystemd --no-enable --no-start --restart-after-upgrade
