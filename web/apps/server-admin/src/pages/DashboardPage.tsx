@@ -13,8 +13,10 @@ import {
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import {
+  ActionIcon,
   Alert,
   Badge,
+  Box,
   Button,
   Card,
   Code,
@@ -25,11 +27,24 @@ import {
   ScrollArea,
   Stack,
   Table,
-  Text
+  Text,
+  Tooltip as MantineTooltip
 } from "@mantine/core";
 import { StatCard } from "@ironmesh/ui";
 import { useDisclosure } from "@mantine/hooks";
-import { useCallback, useState } from "react";
+import { IconZoomIn, IconZoomOut, IconZoomReset } from "@tabler/icons-react";
+import { useCallback, useMemo, useState } from "react";
+import {
+  Brush,
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+  type TooltipContentProps
+} from "recharts";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
@@ -47,6 +62,42 @@ const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
   { key: "90d", label: "90d", windowSecs: 90 * 24 * 60 * 60 },
   { key: "1y", label: "1y", windowSecs: 365 * 24 * 60 * 60 },
   { key: "all", label: "All", windowSecs: null }
+];
+
+const EMPTY_STORAGE_HISTORY: StorageStatsSample[] = [];
+
+type StorageStatsChartMetricKey =
+  | "chunkStoreBytes"
+  | "metadataFootprintBytes"
+  | "latestSnapshotUniqueChunkBytes";
+
+type StorageStatsChartPoint = {
+  collectedAtMs: number;
+  collectedAtUnix: number;
+  chunkStoreBytes: number;
+  metadataFootprintBytes: number;
+  latestSnapshotUniqueChunkBytes: number;
+};
+
+type StorageStatsBrushRange = {
+  startIndex: number;
+  endIndex: number;
+};
+
+const STORAGE_CHART_SERIES: Array<{
+  key: StorageStatsChartMetricKey;
+  label: string;
+  color: string;
+  badgeColor: string;
+}> = [
+  { key: "chunkStoreBytes", label: "Chunk store", color: "#38bdf8", badgeColor: "cyan" },
+  { key: "metadataFootprintBytes", label: "Metadata footprint", color: "#f59e0b", badgeColor: "yellow" },
+  {
+    key: "latestSnapshotUniqueChunkBytes",
+    label: "Latest snapshot unique",
+    color: "#34d399",
+    badgeColor: "teal"
+  }
 ];
 
 export function DashboardPage() {
@@ -158,7 +209,7 @@ export function DashboardPage() {
       : null;
   const backendHealth = backendHealthQuery.data ?? null;
   const storageStats = storageStatsQuery.data ?? null;
-  const storageHistory = storageHistoryQuery.data ?? [];
+  const storageHistory = storageHistoryQuery.data ?? EMPTY_STORAGE_HISTORY;
   const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
   const mediaCacheClearPending = mediaCacheClearMutation.isPending;
   const loading =
@@ -198,7 +249,10 @@ export function DashboardPage() {
       latestStorageSample.manifest_store_bytes +
       latestStorageSample.media_cache_bytes
     : null;
-  const storageHistoryChronological = [...storageHistory].reverse();
+  const storageHistoryChronological = useMemo(
+    () => [...storageHistory].reverse(),
+    [storageHistory]
+  );
   const selectedStorageHistoryRange =
     STORAGE_HISTORY_RANGE_OPTIONS.find((option) => option.key === storageHistoryRange) ??
     STORAGE_HISTORY_RANGE_OPTIONS[0];
@@ -830,203 +884,323 @@ function describeDashboardRepairSummary(
 }
 
 function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
-  if (samples.length === 0) {
+  const [brushRange, setBrushRange] = useState<StorageStatsBrushRange | null>(null);
+  const chartPoints: StorageStatsChartPoint[] = useMemo(
+    () =>
+      samples.map((sample) => ({
+        collectedAtMs: sample.collected_at_unix * 1000,
+        collectedAtUnix: sample.collected_at_unix,
+        chunkStoreBytes: sample.chunk_store_bytes,
+        metadataFootprintBytes:
+          sample.metadata_db_bytes + sample.manifest_store_bytes + sample.media_cache_bytes,
+        latestSnapshotUniqueChunkBytes: sample.latest_snapshot_unique_chunk_bytes
+      })),
+    [samples]
+  );
+
+  if (chartPoints.length === 0) {
     return <Text c="dimmed">No storage stats samples collected yet.</Text>;
   }
 
-  const width = 720;
-  const height = 240;
-  const padding = {
-    top: 20,
-    right: 16,
-    bottom: 56,
-    left: 72
-  };
-  const metadataValues = samples.map(
-    (sample) => sample.metadata_db_bytes + sample.manifest_store_bytes + sample.media_cache_bytes
+  const timeSpanSeconds = Math.max(
+    0,
+    (chartPoints[chartPoints.length - 1]?.collectedAtUnix ?? 0) -
+      (chartPoints[0]?.collectedAtUnix ?? 0)
   );
-  const maxima = Math.max(
+  const yMax = Math.max(
     1,
-    ...samples.map((sample) => sample.chunk_store_bytes),
-    ...metadataValues,
-    ...samples.map((sample) => sample.latest_snapshot_unique_chunk_bytes)
+    ...chartPoints.flatMap((point) =>
+      STORAGE_CHART_SERIES.map((series) => point[series.key])
+    )
   );
-  const chartWidth = width - padding.left - padding.right;
-  const chartHeight = height - padding.top - padding.bottom;
-  const baselineY = height - padding.bottom;
-  const xAxisTicks = buildXAxisTicks(samples, width, padding);
-  const yAxisTicks = Array.from(new Set([maxima, Math.round(maxima / 2), 0])).sort(
-    (left, right) => right - left
-  );
-
-  const buildPath = (values: number[]): string => {
-    if (values.length === 1) {
-      const y = projectY(values[0], maxima, height, padding);
-      return `M ${padding.left} ${y} L ${width - padding.right} ${y}`;
+  const resolvedBrushRange = resolveStorageStatsBrushRange(brushRange, chartPoints.length);
+  const xDomain = buildStorageStatsXDomain(chartPoints, resolvedBrushRange);
+  const xAxisTimeSpanSeconds = Math.max(0, Math.floor((xDomain[1] - xDomain[0]) / 1000));
+  const zoomed =
+    resolvedBrushRange.startIndex > 0 ||
+    resolvedBrushRange.endIndex < chartPoints.length - 1;
+  const canZoom = chartPoints.length > 2;
+  const visiblePointCount =
+    resolvedBrushRange.endIndex - resolvedBrushRange.startIndex + 1;
+  const handleBrushChange = (nextRange: Partial<StorageStatsBrushRange>) => {
+    const nextBrushRange = resolveStorageStatsBrushRange(nextRange, chartPoints.length);
+    const nextZoomed =
+      nextBrushRange.startIndex > 0 ||
+      nextBrushRange.endIndex < chartPoints.length - 1;
+    if (zoomed && !nextZoomed) {
+      return;
     }
-    return values
-      .map((value, index) => {
-        const x = projectX(index, values.length, width, padding);
-        const y = projectY(value, maxima, height, padding);
-        return `${index === 0 ? "M" : "L"} ${x} ${y}`;
-      })
-      .join(" ");
+
+    setBrushRange(nextBrushRange);
+  };
+
+  const setZoomWindow = (visibleRatio: number) => {
+    if (!canZoom) {
+      return;
+    }
+
+    const nextVisiblePointCount = Math.min(
+      chartPoints.length,
+      Math.max(2, Math.round(visiblePointCount * visibleRatio))
+    );
+    if (nextVisiblePointCount === visiblePointCount) {
+      return;
+    }
+
+    const centerIndex = (resolvedBrushRange.startIndex + resolvedBrushRange.endIndex) / 2;
+    const nextStartIndex = clampStorageStatsBrushStart(
+      Math.round(centerIndex - (nextVisiblePointCount - 1) / 2),
+      nextVisiblePointCount,
+      chartPoints.length
+    );
+
+    setBrushRange({
+      startIndex: nextStartIndex,
+      endIndex: nextStartIndex + nextVisiblePointCount - 1
+    });
   };
 
   return (
     <Stack gap="xs">
-      <svg
-        aria-label="Storage stats history chart"
-        role="img"
-        viewBox={`0 0 ${width} ${height}`}
-        style={{ width: "100%", height: "auto", display: "block" }}
+      <Box
+        style={{
+          width: "100%",
+          height: "19rem",
+          minHeight: "19rem",
+          borderRadius: "var(--mantine-radius-md)",
+          background: "#0f172a",
+          padding: "0.75rem 0.5rem 0.25rem"
+        }}
       >
-        <title>Storage stats history</title>
-        <desc>Chunk store, metadata footprint, and latest snapshot unique bytes by sample time.</desc>
-        <rect x="0" y="0" width={width} height={height} fill="#0f172a" rx="12" />
-        {yAxisTicks.map((tickValue) => {
-          const y = projectY(tickValue, maxima, height, padding);
-          return (
-            <g key={tickValue}>
-              <line
-                x1={padding.left}
-                y1={y}
-                x2={width - padding.right}
-                y2={y}
-                stroke="#1e293b"
-                strokeWidth="1"
-                strokeDasharray="4 4"
-              />
-              <text
-                x={padding.left - 10}
-                y={y}
-                fill="#cbd5e1"
-                fontSize="11"
-                textAnchor="end"
-                dominantBaseline="middle"
-              >
-                {formatBytes(tickValue)}
-              </text>
-            </g>
-          );
-        })}
-        <line
-          x1={padding.left}
-          y1={padding.top}
-          x2={padding.left}
-          y2={baselineY}
-          stroke="#334155"
-          strokeWidth="1"
-        />
-        <line
-          x1={padding.left}
-          y1={baselineY}
-          x2={width - padding.right}
-          y2={baselineY}
-          stroke="#334155"
-          strokeWidth="1"
-        />
-        {xAxisTicks.map((tick) => (
-          <g key={`${tick.label}-${tick.index}`}>
-            <line
-              x1={tick.x}
-              y1={baselineY}
-              x2={tick.x}
-              y2={baselineY + 6}
-              stroke="#475569"
-              strokeWidth="1"
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart
+            data={chartPoints}
+            margin={{ top: 8, right: 20, bottom: 18, left: 8 }}
+            accessibilityLayer
+            role="img"
+            title="Storage stats history"
+            desc="Chunk store, metadata footprint, and latest snapshot unique bytes by sample time."
+            {...({ "aria-label": "Storage stats history chart" } as { "aria-label": string })}
+          >
+            <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" vertical={false} />
+            <XAxis
+              dataKey="collectedAtMs"
+              type="number"
+              scale="time"
+              domain={xDomain}
+              allowDataOverflow
+              tickFormatter={(value) =>
+                formatChartTimestamp(Math.floor(Number(value) / 1000), xAxisTimeSpanSeconds)
+              }
+              tick={{ fill: "#cbd5e1", fontSize: "0.72rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              minTickGap={24}
+              label={{
+                value: "Collected at (UTC)",
+                position: "insideBottom",
+                offset: -8,
+                fill: "#e2e8f0",
+                fontSize: "0.75rem",
+                fontWeight: 600
+              }}
             />
-            <text
-              x={tick.x}
-              y={baselineY + 22}
-              fill="#cbd5e1"
-              fontSize="11"
-              textAnchor={tick.index === 0 ? "start" : tick.isLast ? "end" : "middle"}
+            <YAxis
+              width={78}
+              domain={[0, yMax]}
+              allowDecimals={false}
+              tickFormatter={(value) => formatBytes(Number(value))}
+              tick={{ fill: "#cbd5e1", fontSize: "0.72rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              label={{
+                value: "Storage used (bytes)",
+                angle: -90,
+                position: "insideLeft",
+                fill: "#e2e8f0",
+                fontSize: "0.75rem",
+                fontWeight: 600
+              }}
+            />
+            <Tooltip
+              content={StorageStatsTooltip}
+              cursor={{ stroke: "#94a3b8", strokeDasharray: "4 4" }}
+              isAnimationActive={false}
+            />
+            {STORAGE_CHART_SERIES.map((series) => (
+              <Line
+                key={series.key}
+                type="linear"
+                dataKey={series.key}
+                name={series.label}
+                stroke={series.color}
+                strokeWidth={2.5}
+                dot={chartPoints.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+                activeDot={{ r: 5, strokeWidth: 0 }}
+                isAnimationActive={false}
+              />
+            ))}
+            {chartPoints.length > 1 ? (
+              <Brush
+                dataKey="collectedAtMs"
+                height={28}
+                travellerWidth={8}
+                startIndex={resolvedBrushRange.startIndex}
+                endIndex={resolvedBrushRange.endIndex}
+                onChange={handleBrushChange}
+                stroke="#64748b"
+                fill="#111827"
+                fontSize="0.65rem"
+                tickFormatter={(value) =>
+                  formatChartTimestamp(Math.floor(Number(value) / 1000), timeSpanSeconds)
+                }
+              />
+            ) : null}
+          </LineChart>
+        </ResponsiveContainer>
+      </Box>
+      <Group justify="space-between" gap="xs">
+        <Group gap="md">
+          {STORAGE_CHART_SERIES.map((series) => (
+            <Badge key={series.key} color={series.badgeColor} variant="light">
+              {series.label}
+            </Badge>
+          ))}
+        </Group>
+        <Group gap={4}>
+          <MantineTooltip label="Zoom in">
+            <ActionIcon
+              aria-label="Zoom in on storage history chart"
+              disabled={!canZoom || visiblePointCount <= 2}
+              size="sm"
+              variant="default"
+              onClick={() => setZoomWindow(0.5)}
             >
-              {tick.label}
-            </text>
-          </g>
-        ))}
-        <path
-          d={buildPath(samples.map((sample) => sample.chunk_store_bytes))}
-          fill="none"
-          stroke="#38bdf8"
-          strokeWidth="3"
-          strokeLinejoin="round"
-          strokeLinecap="round"
-        />
-        <path
-          d={buildPath(metadataValues)}
-          fill="none"
-          stroke="#f59e0b"
-          strokeWidth="3"
-          strokeLinejoin="round"
-          strokeLinecap="round"
-        />
-        <path
-          d={buildPath(samples.map((sample) => sample.latest_snapshot_unique_chunk_bytes))}
-          fill="none"
-          stroke="#34d399"
-          strokeWidth="3"
-          strokeLinejoin="round"
-          strokeLinecap="round"
-        />
-        <text
-          x={padding.left + chartWidth / 2}
-          y={height - 14}
-          fill="#e2e8f0"
-          fontSize="12"
-          fontWeight="600"
-          textAnchor="middle"
-        >
-          Collected at (UTC)
-        </text>
-        <text
-          x={18}
-          y={padding.top + chartHeight / 2}
-          fill="#e2e8f0"
-          fontSize="12"
-          fontWeight="600"
-          textAnchor="middle"
-          transform={`rotate(-90 18 ${padding.top + chartHeight / 2})`}
-        >
-          Storage used (bytes)
-        </text>
-      </svg>
-      <Group gap="md">
-        <Badge color="cyan" variant="light">
-          Chunk store
-        </Badge>
-        <Badge color="yellow" variant="light">
-          Metadata footprint
-        </Badge>
-        <Badge color="teal" variant="light">
-          Latest snapshot unique
-        </Badge>
+              <IconZoomIn size={16} />
+            </ActionIcon>
+          </MantineTooltip>
+          <MantineTooltip label="Zoom out">
+            <ActionIcon
+              aria-label="Zoom out of storage history chart"
+              disabled={!canZoom || !zoomed}
+              size="sm"
+              variant="default"
+              onClick={() => setZoomWindow(2)}
+            >
+              <IconZoomOut size={16} />
+            </ActionIcon>
+          </MantineTooltip>
+          <MantineTooltip label="Reset zoom">
+            <ActionIcon
+              aria-label="Reset storage history chart zoom"
+              disabled={!zoomed}
+              size="sm"
+              variant="default"
+              onClick={() => setBrushRange(null)}
+            >
+              <IconZoomReset size={16} />
+            </ActionIcon>
+          </MantineTooltip>
+        </Group>
       </Group>
     </Stack>
   );
 }
 
-function buildXAxisTicks(
-  samples: StorageStatsSample[],
-  width: number,
-  padding: { left: number; right: number }
-): Array<{ index: number; isLast: boolean; label: string; x: number }> {
-  const timeSpanSeconds = Math.max(
-    0,
-    (samples[samples.length - 1]?.collected_at_unix ?? 0) - (samples[0]?.collected_at_unix ?? 0)
-  );
-  const indexes = Array.from(new Set([0, Math.floor((samples.length - 1) / 2), samples.length - 1])).sort(
-    (left, right) => left - right
-  );
+function StorageStatsTooltip({
+  active,
+  payload
+}: TooltipContentProps) {
+  if (!active || !payload || payload.length === 0) {
+    return null;
+  }
 
-  return indexes.map((index) => ({
-    index,
-    isLast: index === samples.length - 1,
-    label: formatChartTimestamp(samples[index]?.collected_at_unix ?? null, timeSpanSeconds),
-    x: projectX(index, samples.length, width, padding)
-  }));
+  const point = payload[0]?.payload as StorageStatsChartPoint | undefined;
+  if (!point) {
+    return null;
+  }
+
+  return (
+    <Box
+      style={{
+        minWidth: "13rem",
+        border: "1px solid #334155",
+        borderRadius: "0.5rem",
+        background: "rgba(15, 23, 42, 0.97)",
+        boxShadow: "var(--mantine-shadow-md)",
+        color: "#e2e8f0",
+        padding: "0.625rem 0.75rem"
+      }}
+    >
+      <Stack gap={4}>
+        <Text size="xs" c="dimmed">
+          {formatUnixTs(point.collectedAtUnix)}
+        </Text>
+        {STORAGE_CHART_SERIES.map((series) => (
+          <Group key={series.key} justify="space-between" gap="md" wrap="nowrap">
+            <Group gap={6} wrap="nowrap">
+              <Box
+                aria-hidden="true"
+                style={{
+                  width: "0.55rem",
+                  height: "0.55rem",
+                  borderRadius: "999px",
+                  background: series.color
+                }}
+              />
+              <Text size="xs">{series.label}</Text>
+            </Group>
+            <Text size="xs" fw={700}>
+              {formatBytes(point[series.key])}
+            </Text>
+          </Group>
+        ))}
+      </Stack>
+    </Box>
+  );
+}
+
+function resolveStorageStatsBrushRange(
+  range: Partial<StorageStatsBrushRange> | null | undefined,
+  pointCount: number
+): StorageStatsBrushRange {
+  const lastIndex = Math.max(0, pointCount - 1);
+  const rawStartIndex = Number.isFinite(range?.startIndex) ? Number(range?.startIndex) : 0;
+  const rawEndIndex = Number.isFinite(range?.endIndex) ? Number(range?.endIndex) : lastIndex;
+  const startIndex = Math.max(0, Math.min(Math.floor(rawStartIndex), lastIndex));
+  const endIndex = Math.max(startIndex, Math.min(Math.floor(rawEndIndex), lastIndex));
+
+  return { startIndex, endIndex };
+}
+
+function clampStorageStatsBrushStart(
+  startIndex: number,
+  visiblePointCount: number,
+  pointCount: number
+): number {
+  const maxStartIndex = Math.max(0, pointCount - visiblePointCount);
+  return Math.max(0, Math.min(startIndex, maxStartIndex));
+}
+
+function buildStorageStatsXDomain(
+  chartPoints: StorageStatsChartPoint[],
+  brushRange: StorageStatsBrushRange
+): [number, number] {
+  const firstPointMs = chartPoints[0]?.collectedAtMs ?? 0;
+  if (chartPoints.length <= 1) {
+    return [firstPointMs - 60_000, firstPointMs + 60_000];
+  }
+
+  const startMs = chartPoints[brushRange.startIndex]?.collectedAtMs ?? firstPointMs;
+  const endMs =
+    chartPoints[brushRange.endIndex]?.collectedAtMs ??
+    chartPoints[chartPoints.length - 1].collectedAtMs;
+
+  if (startMs === endMs) {
+    return [startMs - 60_000, endMs + 60_000];
+  }
+
+  return [startMs, endMs];
 }
 
 function formatChartTimestamp(unixTs: number | null | undefined, timeSpanSeconds: number): string {
@@ -1076,27 +1250,4 @@ function describeStorageHistoryWindow(
   return `Showing ${requestedLabel} view with ${samples.length} sampled points from ${formatUnixTs(
     oldestSample.collected_at_unix
   )} to ${formatUnixTs(newestSample.collected_at_unix)}.`;
-}
-
-function projectX(
-  index: number,
-  sampleCount: number,
-  width: number,
-  padding: { left: number; right: number }
-): number {
-  if (sampleCount <= 1) {
-    return padding.left + (width - padding.left - padding.right) / 2;
-  }
-  return padding.left + (index / (sampleCount - 1)) * (width - padding.left - padding.right);
-}
-
-function projectY(
-  value: number,
-  maxValue: number,
-  height: number,
-  padding: { top: number; bottom: number }
-): number {
-  const drawableHeight = height - padding.top - padding.bottom;
-  const normalized = maxValue <= 0 ? 0 : value / maxValue;
-  return height - padding.bottom - normalized * drawableHeight;
 }
