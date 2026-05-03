@@ -1445,7 +1445,7 @@ function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
           </Card>
         </Grid.Col>
 
-        <Grid.Col span={{ base: 12, lg: 6 }}>
+        <Grid.Col span={12}>
           <Card withBorder radius="md" padding="lg">
             <Stack gap="sm">
               <Group justify="space-between" gap="sm" align="flex-start">
