@@ -1,0 +1,7 @@
+- No file upload on admin explorer
+- unnecessesary fields in join request
+- why is cluster admin password needed for joining from enrollment package?
+
+TODO:
+- replication jobs should run on low prio and not doing too much stuff in parallel
+- emergency page for case when server-node has been killed by OS when memory mapped file is not accessable
