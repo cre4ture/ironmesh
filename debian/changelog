@@ -1,3 +1,10 @@
+ironmesh (1.0.6-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Keep gallery image previews on the lazy thumbnail route when a node has
+    cached media metadata but has not generated local thumbnails yet.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 05 May 2026 00:40:44 +0200
+
 ironmesh (1.0.5-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Persist resumable upload-session chunk metadata before acknowledging

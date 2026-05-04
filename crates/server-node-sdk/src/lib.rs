@@ -9587,7 +9587,7 @@ fn build_media_index_response(
                 .or_else(|| {
                     (metadata.status == MediaCacheStatus::Ready
                         && metadata.media_type.as_deref() == Some("image"))
-                        .then(|| placeholder_thumbnail_response(thumbnail_url.clone()))
+                    .then(|| placeholder_thumbnail_response(thumbnail_url.clone()))
                 }),
             error: metadata.error.clone(),
         },

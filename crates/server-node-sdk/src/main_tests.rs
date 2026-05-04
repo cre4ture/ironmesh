@@ -5514,7 +5514,10 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
     };
     {
         let locked = lock_store(&state, "tests.state.store").await;
-        locked.ensure_media_metadata(&put.manifest_hash).await.unwrap();
+        locked
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .unwrap();
     }
 
     let response = axum::response::IntoResponse::into_response(
