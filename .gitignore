@@ -1,7 +1,6 @@
 /target
 **/target
 Cargo.lock
-!/Cargo.lock
 !tests/system-tests/Cargo.lock
 /data
 server_ca.pem

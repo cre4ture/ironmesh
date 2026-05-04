@@ -2,8 +2,9 @@ ironmesh (1.0.6-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Keep gallery image previews on the lazy thumbnail route when a node has
     cached media metadata but has not generated local thumbnails yet.
-  * Track the root Cargo.lock so Debian vendoring and package builds can honor
-    --locked from a clean release checkout.
+  * Generate a transient root Cargo.lock during Debian packaging prep so
+    vendoring and package builds can honor --locked from a clean release
+    checkout.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 05 May 2026 00:40:44 +0200
 
