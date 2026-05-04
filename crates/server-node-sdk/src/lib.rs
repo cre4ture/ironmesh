@@ -9583,6 +9583,11 @@ fn build_media_index_response(
                     height: thumb.height,
                     format: thumb.format.clone(),
                     size_bytes: thumb.size_bytes,
+                })
+                .or_else(|| {
+                    (metadata.status == MediaCacheStatus::Ready
+                        && metadata.media_type.as_deref() == Some("image"))
+                        .then(|| placeholder_thumbnail_response(thumbnail_url.clone()))
                 }),
             error: metadata.error.clone(),
         },
@@ -9596,16 +9601,20 @@ fn build_media_index_response(
             orientation: None,
             taken_at_unix: None,
             gps: None,
-            thumbnail: Some(MediaThumbnailResponse {
-                url: thumbnail_url,
-                profile: "grid".to_string(),
-                width: 256,
-                height: 256,
-                format: "jpeg".to_string(),
-                size_bytes: 0,
-            }),
+            thumbnail: Some(placeholder_thumbnail_response(thumbnail_url)),
             error: None,
         },
+    }
+}
+
+fn placeholder_thumbnail_response(url: String) -> MediaThumbnailResponse {
+    MediaThumbnailResponse {
+        url,
+        profile: "grid".to_string(),
+        width: 256,
+        height: 256,
+        format: "jpeg".to_string(),
+        size_bytes: 0,
     }
 }
 

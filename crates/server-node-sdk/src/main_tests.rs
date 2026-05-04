@@ -5497,6 +5497,66 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_turso
 );
 
+async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked.ensure_media_metadata(&put.manifest_hash).await.unwrap();
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+    let media = &entries[0]["media"];
+
+    assert_eq!(entries[0]["path"], "gallery/cat.png");
+    assert_eq!(media["status"], "ready");
+    assert_eq!(media["mime_type"], "image/png");
+    assert_eq!(media["width"], 4);
+    assert_eq!(media["height"], 3);
+    assert!(
+        media["thumbnail"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/media/thumbnail?key=gallery%2Fcat.png")
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_includes_thumbnail_url_for_metadata_only_images_impl,
+    list_store_index_includes_thumbnail_url_for_metadata_only_images,
+    list_store_index_includes_thumbnail_url_for_metadata_only_images_turso
+);
+
 #[cfg(unix)]
 async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;

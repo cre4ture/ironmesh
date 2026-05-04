@@ -106,8 +106,9 @@ When the object looks like an image or video but no cache record exists yet, the
 
 - `media.status = "pending"`
 
-Once metadata is available, `media.status` becomes `ready` even if `media.thumbnail` is still `null`.
-For images, current gallery clients already fall back to the original object when no thumbnail URL is present.
+Once metadata is available, `media.status` becomes `ready` even if the cached thumbnail payload has not been generated yet.
+For ready images, `GET /store/index` still advertises the `media.thumbnail.url` route so clients can trigger lazy thumbnail generation without downloading the original object first.
+Ready videos keep `media.thumbnail = null` until a poster frame has actually been generated.
 
 ### `GET /media/thumbnail`
 
