@@ -74,6 +74,34 @@ class IronmeshRepository {
         )
     }
 
+    suspend fun verifyEnrollmentAccess(
+        authState: DeviceAuthState,
+        fallbackBaseUrl: String? = null,
+    ) {
+        val connectionInput = authState.preferredConnectionInput(fallbackBaseUrl)
+        check(connectionInput.isNotBlank()) {
+            "enrollment did not return a usable connection target"
+        }
+        val clientIdentityJson = authState.toClientIdentityJson()
+        check(!clientIdentityJson.isNullOrBlank()) {
+            "enrollment did not return a usable client identity"
+        }
+
+        runCatching {
+            storeIndex(
+                connectionInput = connectionInput,
+                depth = 1,
+                serverCaPem = authState.serverCaPem?.takeIf { it.isNotBlank() },
+                clientIdentityJson = clientIdentityJson,
+            )
+        }.getOrElse { error ->
+            throw IllegalStateException(
+                "Enrollment succeeded, but signed access verification failed: ${error.message}",
+                error,
+            )
+        }
+    }
+
     suspend fun putObject(
         connectionInput: String,
         key: String,

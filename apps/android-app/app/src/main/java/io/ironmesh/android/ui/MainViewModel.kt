@@ -489,16 +489,23 @@ class MainViewModel(
         }
 
         val label = uiState.value.deviceLabelInput.trim().takeIf { it.isNotBlank() }
+        val existingDeviceId = uiState.value.deviceAuthState.deviceId.takeIf { it.isNotBlank() }
+        val fallbackBaseUrl = uiState.value.baseUrl
         uiState.value = uiState.value.copy(loading = true, status = "Enrolling device...")
         viewModelScope.launch {
             runCatching {
-                withContext(Dispatchers.IO) {
+                val authState = withContext(Dispatchers.IO) {
                     repository.enrollWithBootstrap(
                         bootstrapJson = bootstrapJson,
-                        deviceId = uiState.value.deviceAuthState.deviceId.takeIf { it.isNotBlank() },
+                        deviceId = existingDeviceId,
                         label = label,
                     )
                 }
+                uiState.value = uiState.value.copy(status = "Verifying enrollment...")
+                withContext(Dispatchers.IO) {
+                    repository.verifyEnrollmentAccess(authState, fallbackBaseUrl)
+                }
+                authState
             }
                 .onSuccess { authState ->
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)

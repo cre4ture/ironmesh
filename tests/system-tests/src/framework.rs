@@ -1011,6 +1011,66 @@ pub async fn issue_bootstrap_bundle_and_enroll_client(
     })
 }
 
+pub async fn issue_bootstrap_claim_and_enroll_client(
+    http: &reqwest::Client,
+    base_url: &str,
+    admin_token: &str,
+    client_dir: &Path,
+    claim_file_name: &str,
+    bootstrap_file_name: &str,
+    label: Option<&str>,
+    expires_in_secs: Option<u64>,
+    preferred_rendezvous_url: Option<&str>,
+) -> Result<EnrolledTestClient> {
+    let issued_claim = issue_bootstrap_claim(
+        http,
+        base_url,
+        admin_token,
+        label,
+        expires_in_secs,
+        preferred_rendezvous_url,
+    )
+    .await?;
+    issued_claim.validate()?;
+
+    let claim_path = client_dir.join(claim_file_name);
+    let claim_json = issued_claim.bootstrap_claim.to_json_pretty()?;
+    fs::write(&claim_path, &claim_json).with_context(|| {
+        format!(
+            "failed to write bootstrap claim file {}",
+            claim_path.display()
+        )
+    })?;
+
+    let label = label.map(ToString::to_string);
+    let enrolled = tokio::task::spawn_blocking(move || {
+        enroll_connection_input_blocking(&claim_json, None, label.as_deref())
+    })
+    .await
+    .context("bootstrap claim enrollment task panicked")??;
+
+    let persisted_bootstrap_json = enrolled
+        .connection_bootstrap_json
+        .clone()
+        .context("claim enrollment response did not include connection_bootstrap_json")?;
+    let persisted_bootstrap = ConnectionBootstrap::from_json_str(&persisted_bootstrap_json)
+        .context("failed to parse persisted bootstrap JSON from claim enrollment response")?;
+    let bootstrap_path = client_dir.join(bootstrap_file_name);
+    persisted_bootstrap.write_to_path(&bootstrap_path)?;
+
+    let identity = enrolled
+        .client_identity_material()
+        .context("failed to build client identity material from claim enrollment response")?;
+    let identity_path = default_client_identity_path(&bootstrap_path);
+    identity.write_to_path(&identity_path)?;
+
+    Ok(EnrolledTestClient {
+        bootstrap: persisted_bootstrap,
+        bootstrap_path,
+        identity,
+    })
+}
+
 #[allow(dead_code)]
 pub async fn issue_bootstrap_claim(
     http: &reqwest::Client,
