@@ -11330,6 +11330,17 @@ async fn issue_client_bootstrap_impl(
                 .then_with(|| left.node_id.cmp(&right.node_id))
         });
         endpoints.dedup_by(|left, right| left.url == right.url && left.node_id == right.node_id);
+        if state.client_auth_control.require_client_auth {
+            // TODO: remove after syncing client credentials across nodes is implemented
+            let local_endpoints = endpoints
+                .iter()
+                .filter(|endpoint| endpoint.node_id == Some(state.node_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !local_endpoints.is_empty() {
+                endpoints = local_endpoints;
+            }
+        }
         endpoints
     };
 

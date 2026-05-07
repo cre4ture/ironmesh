@@ -76,9 +76,8 @@ class IronmeshRepository {
 
     suspend fun verifyEnrollmentAccess(
         authState: DeviceAuthState,
-        fallbackBaseUrl: String? = null,
     ) {
-        val connectionInput = authState.preferredConnectionInput(fallbackBaseUrl)
+        val connectionInput = authState.preferredConnectionInput()
         check(connectionInput.isNotBlank()) {
             "enrollment did not return a usable connection target"
         }

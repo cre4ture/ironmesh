@@ -7,9 +7,7 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import io.ironmesh.android.ui.GalleryViewMode
 
 object IronmeshPreferences {
-    const val DEFAULT_BASE_URL = "http://10.0.2.2:18080"
     private const val PREFS_NAME = "ironmesh_prefs"
-    private const val PREF_BASE_URL = "base_url"
     private const val PREF_SYNC_CONFIGS = "folder_sync_configs"
     private const val PREF_DEVICE_AUTH_STATE = "device_auth_state"
     private const val PREF_GALLERY_VIEW_MODE = "gallery_view_mode"
@@ -31,14 +29,6 @@ object IronmeshPreferences {
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-
-    fun getBaseUrl(context: Context): String {
-        return prefs(context).getString(PREF_BASE_URL, DEFAULT_BASE_URL) ?: DEFAULT_BASE_URL
-    }
-
-    fun setBaseUrl(context: Context, baseUrl: String) {
-        prefs(context).edit().putString(PREF_BASE_URL, baseUrl).apply()
-    }
 
     fun getFolderSyncConfigs(context: Context): List<FolderSyncConfig> {
         val raw = prefs(context).getString(PREF_SYNC_CONFIGS, null) ?: return emptyList()

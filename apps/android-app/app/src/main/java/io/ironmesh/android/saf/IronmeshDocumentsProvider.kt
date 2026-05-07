@@ -356,9 +356,9 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     }
 
     private fun resolveConnectionInput(): String {
-        val context = context ?: return IronmeshPreferences.DEFAULT_BASE_URL
+        val context = context ?: return ""
         val auth = IronmeshPreferences.getDeviceAuthState(context)
-        return auth.preferredConnectionInput(IronmeshPreferences.getBaseUrl(context))
+        return auth.preferredConnectionInput()
     }
 
     private fun resolveClientIdentityJson(): String? {

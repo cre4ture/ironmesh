@@ -78,9 +78,7 @@ class FolderSyncForegroundService : Service() {
     private suspend fun reconcileProfiles(): Boolean {
         return withContext(Dispatchers.IO) {
             val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
-            val connectionInput = deviceAuth.preferredConnectionInput(
-                IronmeshPreferences.getBaseUrl(applicationContext),
-            )
+            val connectionInput = deviceAuth.preferredConnectionInput()
             val clientIdentityJson = deviceAuth.toClientIdentityJson()
             val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
             val profiles = IronmeshPreferences

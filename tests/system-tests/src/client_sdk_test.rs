@@ -9,15 +9,18 @@ mod tests {
     use anyhow::{Context, Result};
     use bytes::Bytes;
     use client_sdk::{
-        ClientNode, ContentAddressedClientCache, IronMeshClient, LatencyProbeConfig, UploadMode,
+        BootstrapEndpointUse, ClientNode, ConnectionBootstrap, ContentAddressedClientCache,
+        IronMeshClient, LatencyProbeConfig, UploadMode, enroll_connection_input_blocking,
     };
     use serde_json::json;
     use uuid::Uuid;
 
     use crate::framework::{
         EnrolledTestClient, TEST_ADMIN_TOKEN, fresh_data_dir,
-        issue_bootstrap_bundle_and_enroll_client, latest_snapshot_id_for_client,
-        start_authenticated_server, start_open_server_with_config, stop_server,
+        issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client, issue_bootstrap_claim,
+        latest_snapshot_id_for_client, register_node, start_authenticated_server,
+        start_open_server_with_config, start_open_server_with_env, start_rendezvous_service,
+        stop_server, wait_for_online_nodes, wait_for_rendezvous_registered_endpoints,
     };
 
     async fn start_authenticated_test_client(
@@ -80,6 +83,178 @@ mod tests {
 
         stop_server(&mut server).await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn android_style_enrollment_verifies_signed_store_index() -> Result<()> {
+        let bind = "127.0.0.1:19243";
+        let data_dir = fresh_data_dir("android-style-enroll-server");
+        let node_id = Uuid::new_v4().to_string();
+        let mut server = start_authenticated_server(bind, &data_dir, &node_id, 1).await?;
+
+        let result = async {
+            let base_url = format!("http://{bind}");
+            let http = reqwest::Client::new();
+            let issued_bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                TEST_ADMIN_TOKEN,
+                Some("android-style-client"),
+                Some(3600),
+            )
+            .await?;
+
+            let bootstrap_json = issued_bootstrap.to_json_pretty()?;
+            let enrolled = tokio::task::spawn_blocking(move || {
+                enroll_connection_input_blocking(
+                    &bootstrap_json,
+                    None,
+                    Some("android-style-client"),
+                )
+            })
+            .await
+            .context("android-style enrollment task panicked")??;
+            let connection_bootstrap_json = enrolled
+                .connection_bootstrap_json
+                .clone()
+                .context("enrollment response did not include connection_bootstrap_json")?;
+            let client_identity_json = enrolled
+                .client_identity_material()
+                .context("failed to build Android-style client identity material")?
+                .to_json_pretty()?;
+
+            let server_ca_pem = enrolled.server_ca_pem.clone();
+            let sdk = tokio::task::spawn_blocking(move || {
+                sync_agent_core::build_configured_client(
+                    None,
+                    Some(&connection_bootstrap_json),
+                    server_ca_pem.as_deref(),
+                    Some(&client_identity_json),
+                )
+            })
+            .await
+            .context("Android-style client reconstruction task panicked")?
+            .context("failed to rebuild client from Android-style persisted state")?;
+
+            sdk.store_index(None, 1, None)
+                .await
+                .context("Android-style signed access verification failed")?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn android_style_claim_enrollment_uses_credential_issuer_direct_endpoint()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19244";
+        let bind_b = "127.0.0.1:19245";
+        let bind_a = "127.0.0.1:19246";
+        let cluster_id = "11111111-1111-7111-8111-111111111144";
+        let node_id_a = "00000000-0000-0000-0000-000000000924";
+        let node_id_b = "00000000-0000-0000-0000-000000000110";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let data_a = fresh_data_dir("android-style-claim-node-a");
+        let data_b = fresh_data_dir("android-style-claim-node-b");
+
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node_b = start_open_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env)
+            .await?;
+        let mut node_a = start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env)
+            .await?;
+
+        let result = async {
+            let http = reqwest::Client::new();
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&http, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+            wait_for_online_nodes(&http, &base_a, 2, 120).await?;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 2, 120).await?;
+
+            let issued = issue_bootstrap_claim(
+                &http,
+                &base_a,
+                TEST_ADMIN_TOKEN,
+                Some("android-style-claim-client"),
+                Some(3600),
+                None,
+            )
+            .await?;
+            issued.validate()?;
+
+            assert_eq!(issued.bootstrap_claim.target_node_id.to_string(), node_id_a);
+
+            let claim_json = issued.bootstrap_claim.to_json_pretty()?;
+            let enrolled = tokio::task::spawn_blocking(move || {
+                enroll_connection_input_blocking(
+                    &claim_json,
+                    None,
+                    Some("android-style-claim-client"),
+                )
+            })
+            .await
+            .context("Android-style claim enrollment task panicked")??;
+            let connection_bootstrap_json = enrolled
+                .connection_bootstrap_json
+                .clone()
+                .context("claim enrollment response did not include connection_bootstrap_json")?;
+            let persisted_bootstrap = ConnectionBootstrap::from_json_str(&connection_bootstrap_json)
+                .context("failed to parse Android-style persisted claim bootstrap")?;
+            let public_direct_node_ids = persisted_bootstrap
+                .direct_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.usage == Some(BootstrapEndpointUse::PublicApi))
+                .filter_map(|endpoint| endpoint.node_id.map(|node_id| node_id.to_string()))
+                .collect::<Vec<_>>();
+
+            assert_eq!(public_direct_node_ids, vec![node_id_a.to_string()]);
+
+            let client_identity_json = enrolled
+                .client_identity_material()
+                .context("failed to build Android-style claim identity material")?
+                .to_json_pretty()?;
+            let server_ca_pem = enrolled.server_ca_pem.clone();
+            let sdk = tokio::task::spawn_blocking(move || {
+                sync_agent_core::build_configured_client(
+                    None,
+                    Some(&connection_bootstrap_json),
+                    server_ca_pem.as_deref(),
+                    Some(&client_identity_json),
+                )
+            })
+            .await
+            .context("Android-style claim client reconstruction task panicked")?
+            .context("failed to rebuild client from Android-style persisted claim state")?;
+
+            sdk.store_index(None, 1, None)
+                .await
+                .context("Android-style claim signed access verification failed")?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        result
     }
 
     #[tokio::test]

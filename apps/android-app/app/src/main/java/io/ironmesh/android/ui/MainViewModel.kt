@@ -82,7 +82,6 @@ data class GalleryBreadcrumbItem(
 )
 
 data class MainUiState(
-    val baseUrl: String = IronmeshPreferences.DEFAULT_BASE_URL,
     val deviceAuthState: DeviceAuthState = DeviceAuthState(),
     val bootstrapInput: String = "",
     val deviceLabelInput: String = "",
@@ -120,12 +119,10 @@ class MainViewModel(
         private set
 
     init {
-        val persistedBaseUrl = IronmeshPreferences.getBaseUrl(getApplication())
         val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
         val persistedDeviceAuth = IronmeshPreferences.getDeviceAuthState(getApplication())
         val persistedGalleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication())
         uiState.value = uiState.value.copy(
-            baseUrl = persistedBaseUrl,
             syncProfiles = persistedProfiles,
             deviceAuthState = persistedDeviceAuth,
             deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
@@ -133,11 +130,6 @@ class MainViewModel(
         )
         FolderSyncScheduler.reschedule(getApplication())
         observeFolderSyncStatus()
-    }
-
-    fun updateBaseUrl(value: String) {
-        uiState.value = uiState.value.copy(baseUrl = value)
-        IronmeshPreferences.setBaseUrl(getApplication(), value)
     }
 
     fun updateKey(value: String) {
@@ -490,7 +482,6 @@ class MainViewModel(
 
         val label = uiState.value.deviceLabelInput.trim().takeIf { it.isNotBlank() }
         val existingDeviceId = uiState.value.deviceAuthState.deviceId.takeIf { it.isNotBlank() }
-        val fallbackBaseUrl = uiState.value.baseUrl
         uiState.value = uiState.value.copy(loading = true, status = "Enrolling device...")
         viewModelScope.launch {
             runCatching {
@@ -503,7 +494,7 @@ class MainViewModel(
                 }
                 uiState.value = uiState.value.copy(status = "Verifying enrollment...")
                 withContext(Dispatchers.IO) {
-                    repository.verifyEnrollmentAccess(authState, fallbackBaseUrl)
+                    repository.verifyEnrollmentAccess(authState)
                 }
                 authState
             }
@@ -810,7 +801,7 @@ class MainViewModel(
     }
 
     private fun currentConnectionInput(): String {
-        return uiState.value.deviceAuthState.preferredConnectionInput(uiState.value.baseUrl)
+        return uiState.value.deviceAuthState.preferredConnectionInput()
     }
 
     private fun currentServerCaPem(): String? {

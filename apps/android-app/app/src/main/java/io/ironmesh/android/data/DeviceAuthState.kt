@@ -23,7 +23,7 @@ data class DeviceAuthState(
             !privateKeyPem.isNullOrBlank() &&
             !credentialPem.isNullOrBlank()
 
-    fun preferredConnectionInput(fallbackBaseUrl: String? = null): String {
+    fun preferredConnectionInput(): String {
         val bootstrapJson = connectionBootstrapJson.trim()
         if (bootstrapJson.isNotEmpty()) {
             return bootstrapJson
@@ -34,7 +34,7 @@ data class DeviceAuthState(
             return directBaseUrl
         }
 
-        return fallbackBaseUrl?.trim().orEmpty()
+        return ""
     }
 
     fun toClientIdentityJson(): String? {

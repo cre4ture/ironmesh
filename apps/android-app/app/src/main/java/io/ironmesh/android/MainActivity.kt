@@ -542,14 +542,6 @@ private fun ServerControls(
     onOpenFiles: () -> Unit,
     onScanQr: () -> Unit,
 ) {
-    OutlinedTextField(
-        modifier = Modifier.fillMaxWidth(),
-        value = state.baseUrl,
-        onValueChange = vm::updateBaseUrl,
-        label = { Text("Server URL") },
-        singleLine = true,
-    )
-
     Text("Device Identity", style = MaterialTheme.typography.titleMedium)
 
     if (state.deviceAuthState.hasClientIdentity()) {
