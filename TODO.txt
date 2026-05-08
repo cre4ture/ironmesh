@@ -5,3 +5,32 @@
 TODO:
 - replication jobs should run on low prio and not doing too much stuff in parallel
 - emergency page for case when server-node has been killed by OS when memory mapped file is not accessable
+
+
+
+ISSUE:
+connecting to https://192.168.178.110:18080 fails and client can't operate in this case.
+removing https://192.168.178.110:18080 makes it work again.
+{
+  "version": 1,
+  "cluster_id": "019de3ba-2f20-7901-8670-fb6600317ca4",
+  "rendezvous_urls": [
+    "https://192.168.178.92:19080/"
+  ],
+  "rendezvous_mtls_required": true,
+  "direct_endpoints": [
+    {
+      "url": "https://192.168.178.110:18080",
+      "usage": "public_api",
+      "node_id": "7650f28f-c815-499e-b255-fccccf24addc"
+    },
+    {
+      "url": "https://192.168.178.92:18080",
+      "usage": "public_api",
+      "node_id": "7314c3bb-2e1d-4508-a4d1-d274d985f059"
+    }
+  ],
+
+
+
+ISSUE: export and import of control-plane promotion package doesn't seem to work even though it reports success on import.
