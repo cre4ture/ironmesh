@@ -3292,12 +3292,8 @@ run_on_all_metadata_backends!(
 );
 
 async fn metadata_import_advances_local_snapshot_state_impl(backend: StorageTestBackend) {
-    let (source_root, mut source) = backend
-        .init_store("metadata-import-snapshot-source")
-        .await;
-    let (target_root, mut target) = backend
-        .init_store("metadata-import-snapshot-target")
-        .await;
+    let (source_root, mut source) = backend.init_store("metadata-import-snapshot-source").await;
+    let (target_root, mut target) = backend.init_store("metadata-import-snapshot-target").await;
 
     let payload = sample_large_chunked_payload();
     source
@@ -3326,7 +3322,10 @@ async fn metadata_import_advances_local_snapshot_state_impl(backend: StorageTest
     let sample = target.collect_storage_stats_sample().await.unwrap();
     assert_eq!(sample.latest_snapshot_object_count, 1);
     assert_eq!(sample.latest_snapshot_logical_bytes, payload.len() as u64);
-    assert_eq!(sample.latest_snapshot_unique_chunk_bytes, payload.len() as u64);
+    assert_eq!(
+        sample.latest_snapshot_unique_chunk_bytes,
+        payload.len() as u64
+    );
 
     let changed_again = target.import_metadata_bundle(&bundle).await.unwrap();
     assert!(!changed_again);
