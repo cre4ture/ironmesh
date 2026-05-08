@@ -1032,6 +1032,205 @@ fn client_device_enroll_response_serializes_device_label() {
     assert!(!object.contains_key("label"));
 }
 
+fn sample_replicated_client_credential(
+    device_id: &str,
+) -> super::ClientCredentialReplicationRecord {
+    let public_key_pem =
+        format!("-----BEGIN PUBLIC KEY-----\n{device_id}\n-----END PUBLIC KEY-----");
+    super::ClientCredentialReplicationRecord {
+        device_id: device_id.to_string(),
+        label: Some("Laptop".to_string()),
+        public_key_fingerprint: Some(super::text_fingerprint(&public_key_pem)),
+        public_key_pem,
+        credential_fingerprint: format!("credential-{device_id}"),
+        created_at_unix: 123,
+        revocation_reason: None,
+        revoked_by_actor: None,
+        revoked_by_source_node: None,
+        revoked_at_unix: None,
+    }
+}
+
+async fn import_client_credentials_upserts_idempotently_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_node_id = NodeId::new_v4();
+    let credential = sample_replicated_client_credential("device-sync");
+
+    let response = super::import_client_credentials(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::ClientCredentialImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            credentials: vec![credential.clone()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let imported: super::ClientCredentialImportResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(imported.imported, 1);
+    assert_eq!(imported.updated, 0);
+    assert_eq!(imported.unchanged, 0);
+    assert_eq!(imported.conflicted, 0);
+    assert_eq!(imported.rejected, 0);
+
+    let response = super::import_client_credentials(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::ClientCredentialImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            credentials: vec![credential],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let unchanged: super::ClientCredentialImportResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(unchanged.imported, 0);
+    assert_eq!(unchanged.unchanged, 1);
+
+    let auth = state.client_credentials.lock().await;
+    assert_eq!(auth.credentials.len(), 1);
+    let stored = &auth.credentials[0];
+    assert_eq!(stored.device_id, "device-sync");
+    assert_eq!(stored.label.as_deref(), Some("Laptop"));
+    assert_eq!(
+        stored.credential_fingerprint.as_deref(),
+        Some("credential-device-sync")
+    );
+    assert!(stored.issued_credential_pem.is_none());
+    drop(auth);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    import_client_credentials_upserts_idempotently_impl,
+    import_client_credentials_upserts_idempotently,
+    import_client_credentials_upserts_idempotently_turso
+);
+
+async fn import_client_credentials_rejects_conflicting_device_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_node_id = NodeId::new_v4();
+    {
+        let mut auth = state.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
+            device_id: "device-conflict".to_string(),
+            label: Some("Original".to_string()),
+            public_key_pem: Some(
+                "-----BEGIN PUBLIC KEY-----\noriginal\n-----END PUBLIC KEY-----".to_string(),
+            ),
+            public_key_fingerprint: Some("pub-original".to_string()),
+            issued_credential_pem: None,
+            credential_fingerprint: Some("credential-original".to_string()),
+            created_at_unix: 10,
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+    }
+
+    let response = super::import_client_credentials(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::ClientCredentialImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            credentials: vec![sample_replicated_client_credential("device-conflict")],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let report: super::ClientCredentialImportResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(report.imported, 0);
+    assert_eq!(report.conflicted, 1);
+
+    let auth = state.client_credentials.lock().await;
+    assert_eq!(auth.credentials.len(), 1);
+    let stored = &auth.credentials[0];
+    assert_eq!(stored.label.as_deref(), Some("Original"));
+    assert_eq!(
+        stored.credential_fingerprint.as_deref(),
+        Some("credential-original")
+    );
+    drop(auth);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    import_client_credentials_rejects_conflicting_device_impl,
+    import_client_credentials_rejects_conflicting_device,
+    import_client_credentials_rejects_conflicting_device_turso
+);
+
+async fn export_client_credentials_omits_issued_credential_pem_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let issued_credential_pem = "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\nexport-test\n-----END IRONMESH CLIENT CREDENTIAL-----\n";
+    let expected_fingerprint =
+        transport_sdk::credential_fingerprint(issued_credential_pem).unwrap();
+    {
+        let mut auth = state.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
+            device_id: "device-export".to_string(),
+            label: Some("Tablet".to_string()),
+            public_key_pem: Some(
+                "-----BEGIN PUBLIC KEY-----\nexport\n-----END PUBLIC KEY-----".to_string(),
+            ),
+            public_key_fingerprint: None,
+            issued_credential_pem: Some(issued_credential_pem.to_string()),
+            credential_fingerprint: None,
+            created_at_unix: 77,
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+    }
+
+    let response = super::export_client_credentials(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: NodeId::new_v4(),
+            cluster_id: state.cluster_id,
+        },
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let exported: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let credential = &exported["credentials"][0];
+    assert_eq!(credential["device_id"], "device-export");
+    assert_eq!(credential["credential_fingerprint"], expected_fingerprint);
+    assert!(credential.get("issued_credential_pem").is_none());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    export_client_credentials_omits_issued_credential_pem_impl,
+    export_client_credentials_omits_issued_credential_pem,
+    export_client_credentials_omits_issued_credential_pem_turso
+);
+
 #[tokio::test]
 async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;

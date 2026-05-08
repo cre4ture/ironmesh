@@ -156,6 +156,8 @@ const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
+const CLIENT_CREDENTIAL_IMPORT_PATH: &str = "/cluster/client-credentials/import";
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -5457,6 +5459,14 @@ pub(crate) fn build_internal_peer_api() -> Router<ServerState> {
     Router::new()
         .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route(
+            CLIENT_CREDENTIAL_EXPORT_PATH,
+            get(export_client_credentials),
+        )
+        .route(
+            CLIENT_CREDENTIAL_IMPORT_PATH,
+            post(import_client_credentials),
+        )
+        .route(
             "/cluster/node-enrollments/renew",
             post(renew_node_enrollment_authenticated),
         )
@@ -6981,6 +6991,7 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
             ticker.tick().await;
             sync_remote_availability_views_once(&state).await;
             sync_cluster_metadata_once(&state).await;
+            sync_client_credentials_once(&state).await;
         }
     });
 }
@@ -11017,6 +11028,49 @@ struct ClientCredentialView {
     revoked_at_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClientCredentialReplicationRecord {
+    device_id: String,
+    label: Option<String>,
+    public_key_pem: String,
+    public_key_fingerprint: Option<String>,
+    credential_fingerprint: String,
+    created_at_unix: u64,
+    revocation_reason: Option<String>,
+    revoked_by_actor: Option<String>,
+    revoked_by_source_node: Option<String>,
+    revoked_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClientCredentialExportResponse {
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    credentials: Vec<ClientCredentialReplicationRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClientCredentialImportRequest {
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    credentials: Vec<ClientCredentialReplicationRecord>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ClientCredentialImportResponse {
+    imported: usize,
+    updated: usize,
+    unchanged: usize,
+    conflicted: usize,
+    rejected: usize,
+}
+
+impl ClientCredentialImportResponse {
+    fn changed(&self) -> bool {
+        self.imported > 0 || self.updated > 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ClientBootstrapClaimStatus {
@@ -11103,6 +11157,475 @@ async fn persist_client_credential_state(state: &ServerState) -> Result<()> {
     };
     let store = lock_store(state, "client_credentials.persist").await;
     store.persist_client_credential_state(&snapshot).await
+}
+
+fn normalize_optional_replication_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn credential_record_fingerprint(record: &ClientCredentialRecord) -> Option<String> {
+    record
+        .credential_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            record
+                .issued_credential_pem
+                .as_deref()
+                .and_then(|pem| credential_fingerprint(pem).ok())
+        })
+}
+
+fn client_credential_replication_record(
+    record: &ClientCredentialRecord,
+) -> Result<Option<ClientCredentialReplicationRecord>> {
+    let Some(public_key_pem) = record
+        .public_key_pem
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    else {
+        return Ok(None);
+    };
+    let Some(credential_fingerprint) = credential_record_fingerprint(record) else {
+        return Ok(None);
+    };
+
+    Ok(Some(ClientCredentialReplicationRecord {
+        device_id: record.device_id.trim().to_string(),
+        label: record.label.clone(),
+        public_key_fingerprint: record
+            .public_key_fingerprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| Some(text_fingerprint(&public_key_pem))),
+        public_key_pem,
+        credential_fingerprint,
+        created_at_unix: record.created_at_unix,
+        revocation_reason: record.revocation_reason.clone(),
+        revoked_by_actor: record.revoked_by_actor.clone(),
+        revoked_by_source_node: record.revoked_by_source_node.clone(),
+        revoked_at_unix: record.revoked_at_unix,
+    }))
+}
+
+fn client_credential_export_records(
+    records: &[ClientCredentialRecord],
+) -> Vec<ClientCredentialReplicationRecord> {
+    records
+        .iter()
+        .filter_map(
+            |record| match client_credential_replication_record(record) {
+                Ok(record) => record,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        device_id = %record.device_id,
+                        "skipping client credential during replication export"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+fn imported_client_credential_record(
+    record: ClientCredentialReplicationRecord,
+) -> std::result::Result<ClientCredentialRecord, String> {
+    let device_id = record.device_id.trim().to_string();
+    if device_id.is_empty() {
+        return Err("replicated client credential is missing device_id".to_string());
+    }
+    let public_key_pem = record.public_key_pem.trim().to_string();
+    if public_key_pem.is_empty() {
+        return Err(format!(
+            "replicated client credential {device_id} is missing public_key_pem"
+        ));
+    }
+    let credential_fingerprint = record.credential_fingerprint.trim().to_string();
+    if credential_fingerprint.is_empty() {
+        return Err(format!(
+            "replicated client credential {device_id} is missing credential_fingerprint"
+        ));
+    }
+
+    Ok(ClientCredentialRecord {
+        device_id,
+        label: normalize_optional_replication_text(record.label),
+        public_key_fingerprint: normalize_optional_replication_text(record.public_key_fingerprint)
+            .or_else(|| Some(text_fingerprint(&public_key_pem))),
+        public_key_pem: Some(public_key_pem),
+        issued_credential_pem: None,
+        credential_fingerprint: Some(credential_fingerprint),
+        created_at_unix: record.created_at_unix,
+        revocation_reason: normalize_optional_replication_text(record.revocation_reason),
+        revoked_by_actor: normalize_optional_replication_text(record.revoked_by_actor),
+        revoked_by_source_node: normalize_optional_replication_text(record.revoked_by_source_node),
+        revoked_at_unix: record.revoked_at_unix,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientCredentialImportOutcome {
+    Updated,
+    Unchanged,
+    Conflicted,
+}
+
+fn merge_imported_client_credential(
+    existing: &mut ClientCredentialRecord,
+    incoming: ClientCredentialRecord,
+) -> ClientCredentialImportOutcome {
+    let incoming_public_key = incoming
+        .public_key_pem
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    if existing
+        .public_key_pem
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|existing_public_key| existing_public_key != incoming_public_key)
+    {
+        return ClientCredentialImportOutcome::Conflicted;
+    }
+
+    let incoming_fingerprint = incoming
+        .credential_fingerprint
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    if credential_record_fingerprint(existing)
+        .as_deref()
+        .is_some_and(|existing_fingerprint| existing_fingerprint != incoming_fingerprint)
+    {
+        return ClientCredentialImportOutcome::Conflicted;
+    }
+
+    let mut changed = false;
+    if existing.public_key_pem.is_none() {
+        existing.public_key_pem = incoming.public_key_pem.clone();
+        changed = true;
+    }
+    if existing
+        .public_key_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        existing.public_key_fingerprint = incoming.public_key_fingerprint.clone();
+        changed = true;
+    }
+    if existing
+        .credential_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        existing.credential_fingerprint = incoming.credential_fingerprint.clone();
+        changed = true;
+    }
+    if incoming.label.is_some() && existing.label != incoming.label {
+        existing.label = incoming.label.clone();
+        changed = true;
+    }
+    if incoming.created_at_unix > 0
+        && (existing.created_at_unix == 0 || incoming.created_at_unix < existing.created_at_unix)
+    {
+        existing.created_at_unix = incoming.created_at_unix;
+        changed = true;
+    }
+    if incoming.revoked_at_unix.is_some() && existing.revoked_at_unix != incoming.revoked_at_unix {
+        existing.revoked_at_unix = incoming.revoked_at_unix;
+        existing.revocation_reason = incoming.revocation_reason.clone();
+        existing.revoked_by_actor = incoming.revoked_by_actor.clone();
+        existing.revoked_by_source_node = incoming.revoked_by_source_node.clone();
+        changed = true;
+    }
+
+    if changed {
+        ClientCredentialImportOutcome::Updated
+    } else {
+        ClientCredentialImportOutcome::Unchanged
+    }
+}
+
+fn apply_client_credential_import_records(
+    auth_state: &mut ClientCredentialState,
+    credentials: Vec<ClientCredentialReplicationRecord>,
+) -> ClientCredentialImportResponse {
+    let mut response = ClientCredentialImportResponse::default();
+
+    for record in credentials {
+        let incoming = match imported_client_credential_record(record) {
+            Ok(record) => record,
+            Err(err) => {
+                response.rejected += 1;
+                warn!(error = %err, "rejected replicated client credential");
+                continue;
+            }
+        };
+
+        match auth_state
+            .credentials
+            .iter_mut()
+            .find(|credential| credential.device_id == incoming.device_id)
+        {
+            Some(existing) => match merge_imported_client_credential(existing, incoming) {
+                ClientCredentialImportOutcome::Updated => response.updated += 1,
+                ClientCredentialImportOutcome::Unchanged => response.unchanged += 1,
+                ClientCredentialImportOutcome::Conflicted => {
+                    response.conflicted += 1;
+                    warn!(
+                        device_id = %existing.device_id,
+                        "replicated client credential conflicts with local credential"
+                    );
+                }
+            },
+            None => {
+                auth_state.credentials.push(incoming);
+                response.imported += 1;
+            }
+        }
+    }
+
+    response
+}
+
+async fn import_client_credential_records_from_peer(
+    state: &ServerState,
+    source_node_id: NodeId,
+    credentials: Vec<ClientCredentialReplicationRecord>,
+) -> Result<ClientCredentialImportResponse> {
+    let response = {
+        let mut auth_state = state.client_credentials.lock().await;
+        apply_client_credential_import_records(&mut auth_state, credentials)
+    };
+
+    if response.changed() {
+        persist_client_credential_state(state).await?;
+    }
+
+    if response.conflicted > 0 {
+        append_admin_audit(
+            state,
+            "cluster/client-credentials/import",
+            &AdminRequestMetadata {
+                actor: Some("cluster-client-credential-sync".to_string()),
+                source_node: Some(source_node_id.to_string()),
+            },
+            true,
+            false,
+            true,
+            "conflict",
+            json!({
+                "source_node_id": source_node_id,
+                "conflicted": response.conflicted,
+                "rejected": response.rejected,
+            }),
+        )
+        .await;
+    }
+
+    Ok(response)
+}
+
+async fn online_peer_nodes(state: &ServerState) -> Vec<NodeDescriptor> {
+    let mut cluster = state.cluster.lock().await;
+    cluster.update_health_and_detect_offline_transition();
+    cluster
+        .list_nodes()
+        .into_iter()
+        .filter(|node| node.node_id != state.node_id && node.status == cluster::NodeStatus::Online)
+        .collect()
+}
+
+fn peer_json_headers() -> Vec<RelayHttpHeader> {
+    vec![RelayHttpHeader {
+        name: "content-type".to_string(),
+        value: "application/json".to_string(),
+    }]
+}
+
+fn spawn_client_credential_fanout(
+    state: ServerState,
+    credentials: Vec<ClientCredentialReplicationRecord>,
+) {
+    if credentials.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        fanout_client_credentials_once(&state, credentials).await;
+    });
+}
+
+async fn fanout_client_credentials_once(
+    state: &ServerState,
+    credentials: Vec<ClientCredentialReplicationRecord>,
+) {
+    let peers = online_peer_nodes(state).await;
+    if peers.is_empty() {
+        return;
+    }
+
+    let request = ClientCredentialImportRequest {
+        cluster_id: state.cluster_id,
+        source_node_id: state.node_id,
+        credentials,
+    };
+    let body = match serde_json::to_vec(&request) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(error = %err, "failed to serialize client credential fan-out payload");
+            return;
+        }
+    };
+
+    for peer in peers {
+        match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::POST,
+            CLIENT_CREDENTIAL_IMPORT_PATH,
+            peer_json_headers(),
+            body.clone(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => {
+                match response.json::<ClientCredentialImportResponse>() {
+                    Ok(report) => {
+                        tracing::debug!(
+                            peer_node_id = %peer.node_id,
+                            imported = report.imported,
+                            updated = report.updated,
+                            unchanged = report.unchanged,
+                            conflicted = report.conflicted,
+                            rejected = report.rejected,
+                            "client credential fan-out finished"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            peer_node_id = %peer.node_id,
+                            error = %err,
+                            "failed decoding client credential fan-out response"
+                        );
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    status = response.status,
+                    "client credential fan-out rejected by peer"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "client credential fan-out failed"
+                );
+            }
+        }
+    }
+}
+
+async fn sync_client_credentials_once(state: &ServerState) {
+    let peers = online_peer_nodes(state).await;
+
+    for peer in peers {
+        let response = match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::GET,
+            CLIENT_CREDENTIAL_EXPORT_PATH,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => response,
+            Ok(response) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    status = response.status,
+                    "client credential export rejected by peer"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "client credential export failed"
+                );
+                continue;
+            }
+        };
+
+        let payload = match response.json::<ClientCredentialExportResponse>() {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "failed decoding client credential export response"
+                );
+                continue;
+            }
+        };
+        if payload.cluster_id != state.cluster_id || payload.source_node_id != peer.node_id {
+            warn!(
+                peer_node_id = %peer.node_id,
+                payload_cluster_id = %payload.cluster_id,
+                payload_source_node_id = %payload.source_node_id,
+                "client credential export identity mismatch"
+            );
+            continue;
+        }
+
+        match import_client_credential_records_from_peer(
+            state,
+            payload.source_node_id,
+            payload.credentials,
+        )
+        .await
+        {
+            Ok(report) if report.changed() || report.conflicted > 0 || report.rejected > 0 => {
+                info!(
+                    peer_node_id = %peer.node_id,
+                    imported = report.imported,
+                    updated = report.updated,
+                    unchanged = report.unchanged,
+                    conflicted = report.conflicted,
+                    rejected = report.rejected,
+                    "client credential sync applied peer snapshot"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "failed importing client credential peer snapshot"
+                );
+            }
+        }
+    }
 }
 
 fn client_bootstrap_claim_fingerprint(claim_secret_hash: &str) -> String {
@@ -13833,7 +14356,13 @@ async fn enroll_client_device_impl(
         }
     };
 
-    let response: std::result::Result<ClientDeviceEnrollResponse, (StatusCode, String)> = {
+    let response: std::result::Result<
+        (
+            ClientDeviceEnrollResponse,
+            ClientCredentialReplicationRecord,
+        ),
+        (StatusCode, String),
+    > = {
         let mut auth_state = state.client_credentials.lock().await;
         auth_state
             .pairing_authorizations
@@ -13878,6 +14407,18 @@ async fn enroll_client_device_impl(
                 ));
             }
         };
+        let replication_record = ClientCredentialReplicationRecord {
+            device_id: device_id.clone(),
+            label: final_label.clone(),
+            public_key_pem: public_key_pem.to_string(),
+            public_key_fingerprint: Some(public_key_fingerprint.clone()),
+            credential_fingerprint: credential_fingerprint.clone(),
+            created_at_unix: now,
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        };
         let device = ClientCredentialRecord {
             device_id: device_id.clone(),
             label: final_label.clone(),
@@ -13893,19 +14434,22 @@ async fn enroll_client_device_impl(
         };
         auth_state.credentials.push(device);
 
-        Ok(ClientDeviceEnrollResponse {
-            cluster_id: state.cluster_id,
-            device_id,
-            label: final_label,
-            public_key_pem: public_key_pem.to_string(),
-            credential_pem,
-            rendezvous_client_identity_pem,
-            created_at_unix: now,
-            expires_at_unix: credential_expires_at_unix,
-        })
+        Ok((
+            ClientDeviceEnrollResponse {
+                cluster_id: state.cluster_id,
+                device_id,
+                label: final_label,
+                public_key_pem: public_key_pem.to_string(),
+                credential_pem,
+                rendezvous_client_identity_pem,
+                created_at_unix: now,
+                expires_at_unix: credential_expires_at_unix,
+            },
+            replication_record,
+        ))
     };
 
-    let response = response?;
+    let (response, replication_record) = response?;
 
     if let Err(err) = persist_client_credential_state(state).await {
         warn!(
@@ -13917,6 +14461,8 @@ async fn enroll_client_device_impl(
             "failed to persist client credential state after enrollment".to_string(),
         ));
     }
+
+    spawn_client_credential_fanout(state.clone(), vec![replication_record]);
 
     Ok(response)
 }
@@ -13933,6 +14479,61 @@ async fn enroll_client_device(
     match enroll_client_device_impl(&state, request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err((status, error)) => (status, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
+async fn export_client_credentials(
+    State(state): State<ServerState>,
+    caller: InternalCaller,
+) -> impl IntoResponse {
+    if caller.cluster_id != state.cluster_id {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let credentials = {
+        let auth_state = state.client_credentials.lock().await;
+        client_credential_export_records(&auth_state.credentials)
+    };
+
+    (
+        StatusCode::OK,
+        Json(ClientCredentialExportResponse {
+            cluster_id: state.cluster_id,
+            source_node_id: state.node_id,
+            credentials,
+        }),
+    )
+        .into_response()
+}
+
+async fn import_client_credentials(
+    State(state): State<ServerState>,
+    caller: InternalCaller,
+    Json(request): Json<ClientCredentialImportRequest>,
+) -> impl IntoResponse {
+    if caller.cluster_id != state.cluster_id || request.cluster_id != state.cluster_id {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.source_node_id != caller.node_id {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    match import_client_credential_records_from_peer(
+        &state,
+        request.source_node_id,
+        request.credentials,
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                source_node_id = %request.source_node_id,
+                "failed importing replicated client credentials"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -14444,7 +15045,7 @@ async fn revoke_client_credential(
     };
 
     let now = unix_ts();
-    let revoked = {
+    let replication_record = {
         let mut auth_state = state.client_credentials.lock().await;
         let Some(device) = auth_state
             .credentials
@@ -14457,15 +15058,29 @@ async fn revoke_client_credential(
         device.revocation_reason = reason.clone();
         device.revoked_by_actor = authz.actor.clone();
         device.revoked_by_source_node = authz.source_node.clone();
-        true
+        match client_credential_replication_record(device) {
+            Ok(record) => record,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    device_id = %device_id,
+                    "failed to build replicated client credential revocation record"
+                );
+                None
+            }
+        }
     };
 
-    if revoked && let Err(err) = persist_client_credential_state(&state).await {
+    if let Err(err) = persist_client_credential_state(&state).await {
         warn!(
             error = %err,
             "failed to persist client credential state after client credential revocation"
         );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Some(record) = replication_record {
+        spawn_client_credential_fanout(state.clone(), vec![record]);
     }
 
     append_admin_audit(

@@ -59,6 +59,43 @@ mod tests {
         }
     }
 
+    async fn wait_for_authenticated_cluster_status(
+        client: &AuthenticatedTestHttp,
+        expected: StatusCode,
+        label: &str,
+        retries: usize,
+    ) -> Result<()> {
+        let mut last_status = None;
+        let mut last_error = None;
+
+        for _ in 0..retries {
+            match client.request(Method::GET, "/cluster/status") {
+                Ok(request) => match request.send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status == expected {
+                            return Ok(());
+                        }
+                        last_status = Some(status);
+                        last_error = None;
+                    }
+                    Err(err) => {
+                        last_error = Some(err.to_string());
+                    }
+                },
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "authenticated cluster status for {label} did not become {expected}; last_status={last_status:?}; last_error={last_error:?}"
+        )
+    }
+
     struct AuthenticatedClusterFixture {
         server: ChildGuard,
         data_dir: PathBuf,
@@ -2180,6 +2217,191 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn client_credential_fanout_and_tombstone_reach_online_and_offline_nodes() -> Result<()> {
+        let bind_a = find_available_bind_addr()?;
+        let bind_b = find_available_bind_addr()?;
+        let bind_c = find_available_bind_addr()?;
+        let node_id_a = "00000000-0000-0000-0000-0000000012a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000012b2";
+        let node_id_c = "00000000-0000-0000-0000-0000000012c3";
+
+        let data_a = fresh_data_dir("client-credential-fanout-a");
+        let data_b = fresh_data_dir("client-credential-fanout-b");
+        let data_c = fresh_data_dir("client-credential-fanout-c");
+        let client_dir = fresh_data_dir("client-credential-fanout-client");
+
+        let node_env = [
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
+        ];
+
+        let mut node_a = start_authenticated_server_with_env_options(
+            &bind_a,
+            &data_a,
+            node_id_a,
+            3,
+            None,
+            Some(5),
+            &node_env,
+        )
+        .await?;
+        let mut node_b = start_authenticated_server_with_env_options(
+            &bind_b,
+            &data_b,
+            node_id_b,
+            3,
+            None,
+            Some(5),
+            &node_env,
+        )
+        .await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let base_c = format!("http://{bind_c}");
+        let http = reqwest::Client::new();
+
+        let mut node_c = start_authenticated_server_with_env_options(
+            &bind_c,
+            &data_c,
+            node_id_c,
+            3,
+            None,
+            Some(5),
+            &node_env,
+        )
+        .await?;
+        stop_server(&mut node_c).await;
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&http, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+            wait_for_online_nodes(&http, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&http, &base_b, 2, 120).await?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_a,
+                TEST_ADMIN_TOKEN,
+                &client_dir,
+                "client-credential-fanout.bootstrap.json",
+                Some("client-credential-fanout"),
+                Some(3600),
+            )
+            .await?;
+
+            let client_on_b = AuthenticatedTestHttp::new(base_b.clone(), enrolled.identity.clone());
+            wait_for_authenticated_cluster_status(
+                &client_on_b,
+                StatusCode::OK,
+                "online peer enrollment fan-out",
+                160,
+            )
+            .await?;
+
+            node_c = start_authenticated_server_with_env_options(
+                &bind_c,
+                &data_c,
+                node_id_c,
+                3,
+                None,
+                Some(5),
+                &node_env,
+            )
+            .await?;
+            let nodes = [
+                (&base_a, node_id_a, "dc-a", "rack-a"),
+                (&base_b, node_id_b, "dc-b", "rack-b"),
+                (&base_c, node_id_c, "dc-c", "rack-c"),
+            ];
+            for (controller_base, controller_node_id, _, _) in nodes {
+                for (peer_base, peer_node_id, peer_dc, peer_rack) in nodes {
+                    if controller_node_id == peer_node_id {
+                        continue;
+                    }
+                    register_node(
+                        &http,
+                        controller_base,
+                        peer_node_id,
+                        peer_base,
+                        peer_dc,
+                        peer_rack,
+                    )
+                    .await?;
+                }
+            }
+            wait_for_online_nodes(&http, &base_a, 3, 120).await?;
+            wait_for_online_nodes(&http, &base_b, 3, 120).await?;
+            wait_for_online_nodes(&http, &base_c, 3, 120).await?;
+
+            let client_on_c = AuthenticatedTestHttp::new(base_c.clone(), enrolled.identity.clone());
+            wait_for_authenticated_cluster_status(
+                &client_on_c,
+                StatusCode::OK,
+                "offline peer enrollment catch-up",
+                180,
+            )
+            .await?;
+
+            stop_server(&mut node_c).await;
+
+            http.delete(format!(
+                "{base_a}/auth/client-credentials/{}?reason=system-test-tombstone",
+                enrolled.identity.device_id
+            ))
+            .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+            .send()
+            .await?
+            .error_for_status()?;
+
+            wait_for_authenticated_cluster_status(
+                &client_on_b,
+                StatusCode::UNAUTHORIZED,
+                "online peer revocation tombstone fan-out",
+                160,
+            )
+            .await?;
+
+            node_c = start_authenticated_server_with_env_options(
+                &bind_c,
+                &data_c,
+                node_id_c,
+                3,
+                None,
+                Some(5),
+                &node_env,
+            )
+            .await?;
+            register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-c").await?;
+            register_node(&http, &base_b, node_id_c, &base_c, "dc-c", "rack-c").await?;
+            register_node(&http, &base_c, node_id_a, &base_a, "dc-a", "rack-a").await?;
+            register_node(&http, &base_c, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            wait_for_online_nodes(&http, &base_c, 3, 120).await?;
+            wait_for_authenticated_cluster_status(
+                &client_on_c,
+                StatusCode::UNAUTHORIZED,
+                "offline peer revocation tombstone catch-up",
+                180,
+            )
+            .await?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        stop_server(&mut node_c).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&data_c);
+        let _ = fs::remove_dir_all(&client_dir);
 
         result
     }
