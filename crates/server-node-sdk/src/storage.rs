@@ -4018,6 +4018,7 @@ impl PersistentStore {
 
         if current_state_changed {
             self.persist_current_state().await?;
+            self.create_snapshot().await?;
             changed = true;
         }
 

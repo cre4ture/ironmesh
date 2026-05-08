@@ -3291,6 +3291,57 @@ run_on_all_metadata_backends!(
     metadata_only_cached_chunks_are_evicted_by_cleanup_turso
 );
 
+async fn metadata_import_advances_local_snapshot_state_impl(backend: StorageTestBackend) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-import-snapshot-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-import-snapshot-target")
+        .await;
+
+    let payload = sample_large_chunked_payload();
+    source
+        .put_object_versioned(
+            "docs/replicated.bin",
+            Bytes::from(payload.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let bundle = source
+        .export_metadata_bundle("docs/replicated.bin", None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(target.list_snapshots().await.unwrap().is_empty());
+
+    let changed = target.import_metadata_bundle(&bundle).await.unwrap();
+    assert!(changed);
+
+    let snapshots = target.list_snapshots().await.unwrap();
+    assert_eq!(snapshots.len(), 1);
+
+    let sample = target.collect_storage_stats_sample().await.unwrap();
+    assert_eq!(sample.latest_snapshot_object_count, 1);
+    assert_eq!(sample.latest_snapshot_logical_bytes, payload.len() as u64);
+    assert_eq!(sample.latest_snapshot_unique_chunk_bytes, payload.len() as u64);
+
+    let changed_again = target.import_metadata_bundle(&bundle).await.unwrap();
+    assert!(!changed_again);
+    assert_eq!(target.list_snapshots().await.unwrap().len(), 1);
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_import_advances_local_snapshot_state_impl,
+    metadata_import_advances_local_snapshot_state,
+    metadata_import_advances_local_snapshot_state_turso
+);
+
 async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl(
     backend: StorageTestBackend,
 ) {
