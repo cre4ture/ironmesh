@@ -441,6 +441,14 @@ class MainViewModel(
     fun startWebUi() {
         val connectionInput = currentConnectionInput()
         val clientIdentityJson = currentClientIdentityJson()
+        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+            uiState.value = uiState.value.copy(
+                selectedSection = MainSection.WEB_UI,
+                webUiUrl = "",
+                status = "Enroll this device before opening the Web UI.",
+            )
+            return
+        }
         uiState.value = uiState.value.copy(
             loading = true,
             selectedSection = MainSection.WEB_UI,

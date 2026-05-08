@@ -263,10 +263,14 @@ class IronmeshRepository {
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): String {
+        val normalizedIdentityJson = normalizedClientIdentityJson(clientIdentityJson)
+        check(connectionInput.isNotBlank() && !normalizedIdentityJson.isNullOrBlank()) {
+            "Enroll this device before opening the Web UI."
+        }
         return RustClientBridge.startWebUi(
             normalizedConnectionInput(connectionInput),
             serverCaPem,
-            normalizedClientIdentityJson(clientIdentityJson),
+            normalizedIdentityJson,
         )
     }
 
