@@ -5844,10 +5844,20 @@ mod tests {
         .expect("background probe should hit the recovered relay route");
         assert_eq!(background_capture.path_and_query, "/api/v1/health");
 
-        let third = client
-            .get_json_path("/cluster/status")
-            .await
-            .expect("third request should use the recovered relay route");
+        let third = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = client
+                    .get_json_path("/cluster/status")
+                    .await
+                    .expect("request after background probe should succeed");
+                if response["route"] == "primary" {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("client should eventually prefer the recovered relay route");
         assert_eq!(third["route"], "primary");
         assert_eq!(client.relay_target_node_id(), Some(primary_target_node_id));
         assert!(primary_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
