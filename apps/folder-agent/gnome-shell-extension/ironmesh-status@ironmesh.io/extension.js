@@ -19,6 +19,7 @@ const IronmeshIndicator = GObject.registerClass(
 class IronmeshIndicator extends PanelMenu.Button {
     _init(extension) {
         super._init(0.0, 'IronMesh Status', false);
+        this.add_style_class_name('ironmesh-indicator');
 
         this._extension = extension;
         this._statusFile = Gio.File.new_for_path(STATUS_FILE_PATH);
@@ -26,15 +27,39 @@ class IronmeshIndicator extends PanelMenu.Button {
         this._pollTimeoutId = null;
         this._webUiUrl = null;
 
-        this._icon = new St.Icon({
-            icon_name: 'dialog-question-symbolic',
-            style_class: 'system-status-icon',
+        this._iconBox = new St.BoxLayout({
+            style_class: 'ironmesh-panel-icons',
         });
-        this.add_child(this._icon);
+        this._brandIcon = new St.Icon({
+            gicon: this._loadBrandIcon(),
+            icon_size: 15,
+            style_class: 'ironmesh-brand-icon',
+        });
+        this._statusIcon = new St.Icon({
+            icon_name: 'dialog-question-symbolic',
+            icon_size: 16,
+            style_class: 'system-status-icon ironmesh-status-icon',
+        });
+        this._iconBox.add_child(this._brandIcon);
+        this._iconBox.add_child(this._statusIcon);
+        this.add_child(this._iconBox);
 
         this._buildMenu();
         this._startMonitoring();
         this._reloadStatus();
+    }
+
+    _loadBrandIcon() {
+        const iconPath = GLib.build_filenamev([
+            this._extension.path,
+            'icons',
+            'ironmesh-brand-symbolic.svg',
+        ]);
+        const iconFile = Gio.File.new_for_path(iconPath);
+        if (!iconFile.query_exists(null)) {
+            throw new Error(`IronMesh brand icon is missing at ${iconPath}`);
+        }
+        return new Gio.FileIcon({file: iconFile});
     }
 
     _buildMenu() {
@@ -166,7 +191,7 @@ class IronmeshIndicator extends PanelMenu.Button {
     }
 
     _applyPayload(payload) {
-        this._icon.icon_name = payload?.overall?.iconName ?? 'dialog-question-symbolic';
+        this._statusIcon.icon_name = payload?.overall?.iconName ?? 'dialog-question-symbolic';
 
         this._applyFacet(this._summaryRow, payload?.overall);
         this._applyFacet(this._connectionRow, payload?.connection);
@@ -242,7 +267,7 @@ class IronmeshIndicator extends PanelMenu.Button {
     }
 
     _applyMissingState(summary, detail) {
-        this._icon.icon_name = 'dialog-question-symbolic';
+        this._statusIcon.icon_name = 'dialog-question-symbolic';
         this._webUiUrl = null;
         this._openConfigItem.setSensitive(false);
 

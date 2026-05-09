@@ -1,3 +1,25 @@
+.ironmesh-indicator {
+    background-color: #0d6b5c;
+}
+
+.ironmesh-indicator:hover,
+.ironmesh-indicator:focus,
+.ironmesh-indicator:active {
+    background-color: #0d6b5c;
+}
+
+.ironmesh-panel-icons {
+    spacing: 1px;
+}
+
+.ironmesh-status-icon {
+    padding: 0px 0px;
+}
+
+.ironmesh-brand-icon {
+    color: #effff9;
+}
+
 .ironmesh-header {
     font-weight: 700;
 }

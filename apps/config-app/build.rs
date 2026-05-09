@@ -2,5 +2,5 @@
 mod windows_icon_build;
 
 fn main() {
-    windows_icon_build::embed_icon("../../assets/windows/ironmesh.ico");
+    windows_icon_build::embed_icon("../../assets/windows/ironmesh-tray.ico");
 }

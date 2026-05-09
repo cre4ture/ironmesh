@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">ironmesh tray mark</title>
+  <desc id="desc">A compact IronMesh network mark optimized for Windows tray and other small icon sizes.</desc>
+  <defs>
+    <linearGradient id="panel" x1="34" y1="18" x2="220" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#102739"/>
+      <stop offset="0.55" stop-color="#133447"/>
+      <stop offset="1" stop-color="#0f4651"/>
+    </linearGradient>
+    <linearGradient id="mesh" x1="56" y1="42" x2="198" y2="212" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d9fff5"/>
+      <stop offset="0.5" stop-color="#92f1dd"/>
+      <stop offset="1" stop-color="#4edbc6"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="10" y="10" width="236" height="236" rx="46" fill="url(#panel)"/>
+
+  <g fill="none" stroke="url(#mesh)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M128 48 L56 100"/>
+    <path d="M128 48 L200 100"/>
+    <path d="M56 100 L128 208"/>
+    <path d="M200 100 L128 208"/>
+    <path d="M128 48 L128 208"/>
+  </g>
+
+  <g fill="#f3fffb">
+    <circle cx="128" cy="48" r="20"/>
+    <circle cx="56" cy="100" r="19"/>
+    <circle cx="200" cy="100" r="19"/>
+    <circle cx="128" cy="208" r="20"/>
+  </g>
+</svg>
