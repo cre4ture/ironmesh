@@ -1,3 +1,9 @@
+ironmesh (1.0.7-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Roll the workspace release to 1.0.7.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 09 May 2026 15:51:18 +0200
+
 ironmesh (1.0.6-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Keep gallery image previews on the lazy thumbnail route when a node has
