@@ -20,7 +20,7 @@ export function ServerAdminShell() {
   const visibleRoutes =
     surfaceMode === "setup"
       ? serverAdminRoutes.filter((route) => route.id === "setup")
-      : serverAdminRoutes;
+      : serverAdminRoutes.filter((route) => route.id !== "setup");
   const activeRoute = visibleRoutes.find((route) => route.id === activeRouteId) ?? visibleRoutes[0];
 
   useEffect(() => {
@@ -61,7 +61,7 @@ export function ServerAdminShell() {
       <NavigationShell
         surfaceLabel="Server Admin"
         navigationItems={visibleRoutes}
-        activeItemId={activeRouteId}
+        activeItemId={activeRoute.id}
         onNavigate={setActiveRouteId}
         contentGap="xl"
         headerActions={
