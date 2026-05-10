@@ -930,6 +930,53 @@ run_on_main_metadata_backends!(
     public_logs_route_requires_client_or_admin_auth_turso
 );
 
+async fn public_logs_route_returns_timestamped_entries_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    state
+        .log_buffer
+        .push_with_timestamp(1_700_000_000, "INFO runtime ready".to_string());
+    state
+        .log_buffer
+        .push_with_timestamp(1_700_000_002, "INFO replication audit healthy".to_string());
+
+    let app = Router::new()
+        .route("/logs", get(super::ui::list_logs))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/logs?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "entries": [
+                {
+                    "captured_at_unix": 1_700_000_002u64,
+                    "line": "INFO replication audit healthy"
+                }
+            ]
+        })
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    public_logs_route_returns_timestamped_entries_impl,
+    public_logs_route_returns_timestamped_entries,
+    public_logs_route_returns_timestamped_entries_turso
+);
+
 async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     backend: MainTestBackend,
 ) {

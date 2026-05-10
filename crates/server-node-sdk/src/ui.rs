@@ -34,7 +34,7 @@ pub(crate) struct LogsQuery {
 
 #[derive(Debug, Serialize)]
 struct LogsResponse {
-    entries: Vec<String>,
+    entries: Vec<LogBufferEntry>,
 }
 
 pub(crate) async fn list_logs(

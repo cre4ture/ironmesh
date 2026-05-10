@@ -11,6 +11,7 @@ import {
 } from "@mantine/core";
 import { useCallback, useEffect, useRef, useState, type UIEvent } from "react";
 import { useAdminAccess } from "../lib/admin-access";
+import { formatUnixTs } from "../lib/format";
 
 const LOGS_POLL_INTERVAL_MS = 3_000;
 const LOGS_AUTO_FOLLOW_THRESHOLD_PX = 24;
@@ -28,6 +29,9 @@ export function LogsPage() {
   const logsScrollReadyRef = useRef(false);
   const logEntries = logs?.entries ?? [];
   const latestLogEntry = logEntries.length > 0 ? logEntries[logEntries.length - 1] : null;
+  const renderedLogEntries = logEntries.map(
+    (entry) => `${formatUnixTs(entry.captured_at_unix)} ${entry.line}`
+  );
 
   const refresh = useCallback(async (options?: { background?: boolean }) => {
     const background = options?.background ?? false;
@@ -150,7 +154,11 @@ export function LogsPage() {
             }}
           >
             <Text ff="monospace" size="sm" style={{ whiteSpace: "pre-wrap" }}>
-              {logEntries.length > 0 ? logEntries.join("\n") : loading ? "loading..." : "no logs yet"}
+              {renderedLogEntries.length > 0
+                ? renderedLogEntries.join("\n")
+                : loading
+                  ? "loading..."
+                  : "no logs yet"}
             </Text>
           </div>
         </Stack>

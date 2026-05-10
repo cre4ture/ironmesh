@@ -1334,8 +1334,14 @@ impl ServerCertVerifier for ExpectedPeerServerCertVerifier {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct LogBufferEntry {
+    pub(crate) captured_at_unix: u64,
+    pub(crate) line: String,
+}
+
 struct LogBuffer {
-    entries: StdMutex<VecDeque<String>>,
+    entries: StdMutex<VecDeque<LogBufferEntry>>,
     max_entries: usize,
 }
 
@@ -1348,18 +1354,25 @@ impl LogBuffer {
     }
 
     fn push(&self, line: String) {
+        self.push_with_timestamp(unix_ts(), line);
+    }
+
+    fn push_with_timestamp(&self, captured_at_unix: u64, line: String) {
         let mut entries = match self.entries.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        entries.push_back(line);
+        entries.push_back(LogBufferEntry {
+            captured_at_unix,
+            line,
+        });
         while entries.len() > self.max_entries {
             entries.pop_front();
         }
     }
 
-    fn recent(&self, limit: usize) -> Vec<String> {
+    fn recent(&self, limit: usize) -> Vec<LogBufferEntry> {
         let entries = match self.entries.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

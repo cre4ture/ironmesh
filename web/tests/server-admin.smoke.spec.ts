@@ -100,6 +100,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByText("Recent server logs", { exact: true })).toBeVisible();
+  await expect(page.getByText("2023-11-14T22:13:20.000Z INFO runtime ready")).toBeVisible();
   await expect(page.getByText("runtime ready")).toBeVisible();
   await expect(page.getByText("replication audit healthy")).toBeVisible();
 
@@ -718,8 +719,14 @@ async function installServerAdminMocks(
     if (pathname === "/logs" && method === "GET") {
       return json(route, {
         entries: [
-          "2026-03-19T17:00:00Z INFO runtime ready",
-          "2026-03-19T17:00:02Z INFO replication audit healthy"
+          {
+            captured_at_unix: 1_700_000_000,
+            line: "INFO runtime ready"
+          },
+          {
+            captured_at_unix: 1_700_000_002,
+            line: "INFO replication audit healthy"
+          }
         ]
       });
     }
