@@ -791,24 +791,58 @@ mod tests {
                     format!("failed to create mounted directory {}", dir_path.display())
                 })?;
                 wait_for_remote_directory_existence(&sdk_a, dir_name, 180).await?;
-                wait_for_remote_directory_existence(&sdk_b, dir_name, 220).await?;
 
                 fs::write(&file_path, &file_payload).with_context(|| {
                     format!("failed to write mounted file {}", file_path.display())
                 })?;
                 wait_for_object_bytes(&sdk_a, file_key, &file_payload, 180).await?;
+
+                let repair_report: serde_json::Value = http
+                    .post(format!("{base_a}/cluster/replication/repair"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let successful = repair_report
+                    .get("successful_transfers")
+                    .and_then(|value| value.as_u64())
+                    .context("missing successful_transfers for cluster delete repair")?;
+                assert!(
+                    successful >= 1,
+                    "expected at least one successful transfer for cluster delete baseline, report={repair_report:?}"
+                );
+
                 wait_for_object_bytes(&sdk_b, file_key, &file_payload, 220).await?;
+                wait_for_remote_directory_existence(&sdk_b, dir_name, 220).await?;
 
                 fs::remove_file(&file_path).with_context(|| {
                     format!("failed to remove mounted file {}", file_path.display())
                 })?;
                 wait_for_remote_file_absence(&sdk_a, file_key, 220).await?;
-                wait_for_remote_file_absence(&sdk_b, file_key, 260).await?;
 
                 fs::remove_dir(&dir_path).with_context(|| {
                     format!("failed to remove mounted directory {}", dir_path.display())
                 })?;
                 wait_for_remote_directory_absence(&sdk_a, dir_name, 220).await?;
+
+                let delete_repair_report: serde_json::Value = http
+                    .post(format!("{base_a}/cluster/replication/repair"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let delete_successful = delete_repair_report
+                    .get("successful_transfers")
+                    .and_then(|value| value.as_u64())
+                    .context("missing successful_transfers for cluster delete tombstone repair")?;
+                assert!(
+                    delete_successful >= 1,
+                    "expected at least one successful tombstone transfer for cluster delete cleanup, report={delete_repair_report:?}"
+                );
+
+                wait_for_remote_file_absence(&sdk_b, file_key, 260).await?;
                 wait_for_remote_directory_absence(&sdk_b, dir_name, 260).await?;
 
                 Ok::<(), anyhow::Error>(())
