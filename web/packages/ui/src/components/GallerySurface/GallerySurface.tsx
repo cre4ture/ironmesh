@@ -12,6 +12,7 @@ import {
   Modal,
   NumberInput,
   Select,
+  SimpleGrid,
   Stack,
   Switch,
   Text,
@@ -150,6 +151,7 @@ export function GallerySurface({
   );
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [debugPayloadOpened, setDebugPayloadOpened] = useState(false);
 
   useEffect(() => {
     void refreshSnapshots();
@@ -346,103 +348,122 @@ export function GallerySurface({
                   </Button>
                 </Group>
               </Group>
-              <TextInput
-                label="Prefix"
-                value={prefix}
-                onChange={(event) => setPrefix(event.currentTarget.value)}
-                placeholder="gallery/"
-              />
-              <NumberInput
-                label="Depth"
-                min={1}
-                max={64}
-                value={depth}
-                onChange={(value) => setDepth(typeof value === "number" && value > 0 ? value : 1)}
-              />
-              <Select
-                label="Snapshot"
-                data={[
-                  { value: "", label: "Current data" },
-                  ...snapshots.map((snapshot) => ({ value: snapshot.id, label: snapshot.id }))
-                ]}
-                value={snapshotId ?? ""}
-                onChange={(value) => {
-                  const nextSnapshot = value || null;
-                  setSnapshotId(nextSnapshot);
-                  void refreshEntries(undefined, nextSnapshot);
-                }}
-              />
-              <Select
-                label="Sort"
-                data={[
-                  { value: "captured_desc", label: "Newest first" },
-                  { value: "path_asc", label: "Path" }
-                ]}
-                value={sortOrder}
-                onChange={(value) =>
-                  setSortOrder(value === "path_asc" ? "path_asc" : "captured_desc")
-                }
-              />
-              {enabledMediaKinds.length > 1 ? (
+              <SimpleGrid cols={{ base: 1, md: 3 }} spacing="md" verticalSpacing="md">
+                <TextInput
+                  label="Prefix"
+                  value={prefix}
+                  onChange={(event) => setPrefix(event.currentTarget.value)}
+                  placeholder="gallery/"
+                />
+                <NumberInput
+                  label="Depth"
+                  min={1}
+                  max={64}
+                  value={depth}
+                  onChange={(value) => setDepth(typeof value === "number" && value > 0 ? value : 1)}
+                />
                 <Select
-                  label="Media"
+                  label="Snapshot"
                   data={[
-                    { value: "all", label: "Photos and movies" },
-                    ...(enabledMediaKinds.includes("image")
-                      ? [{ value: "image", label: "Photos only" }]
-                      : []),
-                    ...(enabledMediaKinds.includes("video")
-                      ? [{ value: "video", label: "Movies only" }]
-                      : [])
+                    { value: "", label: "Current data" },
+                    ...snapshots.map((snapshot) => ({ value: snapshot.id, label: snapshot.id }))
                   ]}
-                  value={mediaFilter}
+                  value={snapshotId ?? ""}
                   onChange={(value) => {
-                    setMediaFilter(
-                      value === "image" || value === "video" || value === "all" ? value : "all"
-                    );
+                    const nextSnapshot = value || null;
+                    setSnapshotId(nextSnapshot);
+                    void refreshEntries(undefined, nextSnapshot);
                   }}
                 />
-              ) : null}
-              <Group grow>
-                <Button
-                  variant={viewMode === "grid" ? "filled" : "default"}
-                  leftSection={<IconLayoutGrid size={14} />}
-                  onClick={() => setViewMode("grid")}
-                >
-                  Grid
-                </Button>
-                <Button
-                  variant={viewMode === "map" ? "filled" : "default"}
-                  leftSection={<IconMap2 size={14} />}
-                  onClick={() => setViewMode("map")}
-                >
-                  Map
-                </Button>
-              </Group>
-              <NumberInput
-                label="Thumbnails per row"
-                description="Any positive integer"
-                min={1}
-                step={1}
-                allowDecimal={false}
-                allowNegative={false}
-                value={thumbnailsPerRow}
-                onChange={(value) => {
-                  setThumbnailsPerRow((current) => parseThumbnailsPerRow(value, current));
-                }}
-              />
-              <Switch
-                label="Show metadata"
-                checked={showMetadata}
-                onChange={(event) => setShowMetadata(event.currentTarget.checked)}
-              />
-              <Group gap="sm">
-                <Button onClick={() => void refreshEntries()}>Load</Button>
-                <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
-                  Up one prefix
-                </Button>
-                <Button variant="subtle" onClick={() => void refreshEntries("")}>
-                  Root
+              </SimpleGrid>
+              <SimpleGrid
+                cols={{ base: 1, sm: 2, xl: enabledMediaKinds.length > 1 ? 5 : 4 }}
+                spacing="md"
+                verticalSpacing="md"
+              >
+                <Select
+                  label="Sort"
+                  data={[
+                    { value: "captured_desc", label: "Newest first" },
+                    { value: "path_asc", label: "Path" }
+                  ]}
+                  value={sortOrder}
+                  onChange={(value) =>
+                    setSortOrder(value === "path_asc" ? "path_asc" : "captured_desc")
+                  }
+                />
+                {enabledMediaKinds.length > 1 ? (
+                  <Select
+                    label="Media"
+                    data={[
+                      { value: "all", label: "Photos and movies" },
+                      ...(enabledMediaKinds.includes("image")
+                        ? [{ value: "image", label: "Photos only" }]
+                        : []),
+                      ...(enabledMediaKinds.includes("video")
+                        ? [{ value: "video", label: "Movies only" }]
+                        : [])
+                    ]}
+                    value={mediaFilter}
+                    onChange={(value) => {
+                      setMediaFilter(
+                        value === "image" || value === "video" || value === "all" ? value : "all"
+                      );
+                    }}
+                  />
+                ) : null}
+                <Stack gap={6}>
+                  <Text size="sm" fw={500}>
+                    Grid / Map
+                  </Text>
+                  <Group grow wrap="nowrap">
+                    <Button
+                      variant={viewMode === "grid" ? "filled" : "default"}
+                      leftSection={<IconLayoutGrid size={14} />}
+                      onClick={() => setViewMode("grid")}
+                    >
+                      Grid
+                    </Button>
+                    <Button
+                      variant={viewMode === "map" ? "filled" : "default"}
+                      leftSection={<IconMap2 size={14} />}
+                      onClick={() => setViewMode("map")}
+                    >
+                      Map
+                    </Button>
+                  </Group>
+                </Stack>
+                <NumberInput
+                  label="Thumbnails per row"
+                  min={1}
+                  max={64}
+                  step={1}
+                  allowDecimal={false}
+                  allowNegative={false}
+                  value={thumbnailsPerRow}
+                  onChange={(value) => {
+                    setThumbnailsPerRow((current) => parseThumbnailsPerRow(value, current));
+                  }}
+                />
+                <Switch
+                  label="Show metadata"
+                  checked={showMetadata}
+                  onChange={(event) => setShowMetadata(event.currentTarget.checked)}
+                  mt={34}
+                />
+              </SimpleGrid>
+              <Group justify="space-between" gap="sm">
+                <Group gap="sm">
+                  <Button onClick={() => void refreshEntries()}>Load</Button>
+                  <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
+                    Up one prefix
+                  </Button>
+                  <Button variant="subtle" onClick={() => void refreshEntries("")}>
+                    Root
+                  </Button>
+                </Group>
+                <Button variant="subtle" onClick={() => setDebugPayloadOpened(true)}>
+                  Debug JSON
                 </Button>
               </Group>
               <Group gap="xs">
@@ -482,13 +503,6 @@ export function GallerySurface({
               <Text size="sm" c="dimmed">
                 {previewHint}
               </Text>
-              <JsonBlock
-                value={
-                  entriesPayload ?? {
-                    message: "No gallery payload loaded yet."
-                  }
-                }
-              />
             </Stack>
           </Card>
         </Grid.Col>
@@ -722,6 +736,21 @@ export function GallerySurface({
           )}
         </Grid.Col>
       </Grid>
+
+      <Modal
+        opened={debugPayloadOpened}
+        onClose={() => setDebugPayloadOpened(false)}
+        title="Gallery debug JSON"
+        size="xl"
+      >
+        <JsonBlock
+          value={
+            entriesPayload ?? {
+              message: "No gallery payload loaded yet."
+            }
+          }
+        />
+      </Modal>
 
       <Modal
         opened={selectedEntry !== null}
