@@ -242,6 +242,13 @@ struct DehydrateScanSummary {
     eligible_count: usize,
 }
 
+#[derive(Debug, Default)]
+struct SnapshotEntries {
+    entries: HashMap<String, SeenEntry>,
+    walk_error_count: usize,
+    walk_error_samples: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RemoteAppliedTracker {
     directories: Arc<Mutex<HashSet<String>>>,
@@ -320,7 +327,16 @@ impl SyncRootMonitor {
     }
 
     pub fn seed_seen(&mut self) {
-        self.seen = self.snapshot_entries();
+        let snapshot = self.snapshot_entries();
+        if snapshot.walk_error_count != 0 {
+            tracing::info!(
+                "{}: seed_seen captured partial snapshot due to {} walk errors sample={:?}",
+                self.name,
+                snapshot.walk_error_count,
+                snapshot.walk_error_samples
+            );
+        }
+        self.seen = snapshot.entries;
     }
 
     pub fn seed_remote_entries(&mut self, plan: &CfapiActionPlan) {
@@ -362,7 +378,12 @@ impl SyncRootMonitor {
         let _refresh_gate = refresh_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut current = self.snapshot_entries();
+        let SnapshotEntries {
+            entries: current,
+            walk_error_count,
+            walk_error_samples,
+        } = self.snapshot_entries();
+        let mut current = current;
         let handled_renames = self.handle_local_file_renames(&current);
         let dehydrate_summary = summarize_dehydrate_scan(&current);
         let paths = current.keys().cloned().collect::<Vec<_>>();
@@ -377,7 +398,19 @@ impl SyncRootMonitor {
         }
 
         self.log_dehydrate_scan_summary(dehydrate_summary);
-        self.handle_deleted_entries(&current, &handled_renames);
+        if walk_error_count == 0 {
+            self.handle_deleted_entries(&current, &handled_renames);
+        } else {
+            let preserved_count =
+                self.preserve_missing_entries_after_incomplete_snapshot(&mut current, &handled_renames);
+            tracing::info!(
+                "{}: snapshot scan encountered {} walk errors; suppressing delete detection for this pass and preserving {} prior entries sample={:?}",
+                self.name,
+                walk_error_count,
+                preserved_count,
+                walk_error_samples
+            );
+        }
         self.seen = current;
     }
 
@@ -501,10 +534,35 @@ impl SyncRootMonitor {
         );
     }
 
-    fn snapshot_entries(&self) -> HashMap<String, SeenEntry> {
-        let mut current = HashMap::new();
+    fn snapshot_entries(&self) -> SnapshotEntries {
+        let mut snapshot = SnapshotEntries::default();
         let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
-        for entry in walker.flatten() {
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    snapshot.walk_error_count += 1;
+                    if snapshot.walk_error_samples.len() < 8 {
+                        let location = err
+                            .path()
+                            .map(|path| {
+                                let rel_path =
+                                    path_to_relative(&self.sync_root, &path.to_string_lossy());
+                                if rel_path.is_empty() {
+                                    path.display().to_string()
+                                } else {
+                                    rel_path
+                                }
+                            })
+                            .unwrap_or_else(|| String::from("<unknown>"));
+                        snapshot
+                            .walk_error_samples
+                            .push(format!("{location}: {err}"));
+                    }
+                    continue;
+                }
+            };
+
             let path = entry.path();
             let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
             if rel_path.is_empty()
@@ -515,13 +573,29 @@ impl SyncRootMonitor {
                 continue;
             }
 
-            current.insert(
+            snapshot.entries.insert(
                 rel_path.clone(),
                 snapshot_entry(&self.sync_root, &rel_path, path, entry.file_type().is_dir()),
             );
         }
 
-        current
+        snapshot
+    }
+
+    fn preserve_missing_entries_after_incomplete_snapshot(
+        &self,
+        current: &mut HashMap<String, SeenEntry>,
+        handled_renames: &HashSet<String>,
+    ) -> usize {
+        let mut preserved_count = 0;
+        for (path, entry) in &self.seen {
+            if current.contains_key(path) || handled_renames.contains(path) {
+                continue;
+            }
+            current.insert(path.clone(), entry.clone());
+            preserved_count += 1;
+        }
+        preserved_count
     }
 
     fn seed_existing_entry(
@@ -1326,6 +1400,17 @@ mod tests {
         }
     }
 
+    fn seen_entry(is_dir: bool) -> SeenEntry {
+        SeenEntry {
+            is_dir,
+            file_attributes: 0,
+            local_file_identity: None,
+            placeholder_identity_path: None,
+            placeholder_state: None,
+            provider_hydration_active: false,
+        }
+    }
+
     #[test]
     fn seed_seen_makes_startup_walk_passive_for_existing_entries() {
         let unique = uuid::Uuid::new_v4();
@@ -1463,6 +1548,57 @@ mod tests {
         assert!(
             uploads.iter().all(|path| path != "docs/"),
             "remote-applied directory should remain suppressed, uploads={uploads:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn incomplete_snapshot_preserves_missing_paths_and_skips_delete_emission() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-partial-scan-{unique}"));
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        monitor
+            .seen
+            .insert(String::from("docs/keep.txt"), seen_entry(false));
+        monitor
+            .seen
+            .insert(String::from("docs/old-name.txt"), seen_entry(false));
+
+        let mut current = HashMap::from([(
+            String::from("docs/new-name.txt"),
+            seen_entry(false),
+        )]);
+        let handled_renames = HashSet::from([
+            String::from("docs/old-name.txt"),
+            String::from("docs/new-name.txt"),
+        ]);
+
+        let preserved_count = monitor
+            .preserve_missing_entries_after_incomplete_snapshot(&mut current, &handled_renames);
+
+        assert_eq!(preserved_count, 1);
+        assert!(current.contains_key("docs/keep.txt"));
+        assert!(!current.contains_key("docs/old-name.txt"));
+
+        monitor.handle_deleted_entries(&current, &handled_renames);
+
+        assert!(
+            uploader
+                .deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .is_empty(),
+            "incomplete snapshots should not emit deletes for omitted entries"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
