@@ -401,8 +401,8 @@ impl SyncRootMonitor {
         if walk_error_count == 0 {
             self.handle_deleted_entries(&current, &handled_renames);
         } else {
-            let preserved_count =
-                self.preserve_missing_entries_after_incomplete_snapshot(&mut current, &handled_renames);
+            let preserved_count = self
+                .preserve_missing_entries_after_incomplete_snapshot(&mut current, &handled_renames);
             tracing::info!(
                 "{}: snapshot scan encountered {} walk errors; suppressing delete detection for this pass and preserving {} prior entries sample={:?}",
                 self.name,
@@ -1574,10 +1574,7 @@ mod tests {
             .seen
             .insert(String::from("docs/old-name.txt"), seen_entry(false));
 
-        let mut current = HashMap::from([(
-            String::from("docs/new-name.txt"),
-            seen_entry(false),
-        )]);
+        let mut current = HashMap::from([(String::from("docs/new-name.txt"), seen_entry(false))]);
         let handled_renames = HashSet::from([
             String::from("docs/old-name.txt"),
             String::from("docs/new-name.txt"),
