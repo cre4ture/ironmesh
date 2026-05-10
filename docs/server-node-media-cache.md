@@ -55,10 +55,16 @@ Current implementation:
 
 Unsupported or undecodable media still get a cache record with status:
 
+- `incomplete`
 - `unsupported`
 - `failed`
 
-This prevents repeated expensive decode attempts on every listing.
+`incomplete` means the local node could not derive the artifact because the object is not fully local yet and remote artifact import did not succeed.
+Incomplete records carry a retry timestamp so repeated gallery requests do not keep faning out to peers on every view.
+
+`unsupported` and `failed` remain terminal states for a fully available source.
+
+This prevents repeated expensive decode attempts on every listing while still allowing incomplete replicas to recover automatically.
 
 Related design note:
 
@@ -123,6 +129,7 @@ Behavior:
 
 - resolves the selected manifest for the requested object state
 - ensures full media cache data, including the thumbnail, on demand when missing
+- when the local node cannot derive media data because the manifest is not fully local, it may import a manifest-pinned media artifact from a peer that already has the full source locally
 - returns the cached `grid` thumbnail as `image/jpeg`
 
 Example:
@@ -148,6 +155,13 @@ Existing objects are backfilled in the background:
 - once on server startup
 - after an admin-triggered media-cache clear
 
+Background metadata warming and foreground thumbnail requests both use the same remote-aware flow:
+
+1. try local derivation first
+2. if the local source is incomplete, try importing media metadata or metadata plus thumbnail from an online peer for the same manifest
+3. persist imported metadata and thumbnails locally for future requests
+4. if no peer can satisfy the request, persist `incomplete` with a retry timestamp and stop retrying until the backoff window expires
+
 This keeps map and metadata-driven views useful even after clearing thumbnails, without making directory listings block on thumbnail rendering.
 
 ## Cleanup
@@ -171,6 +185,6 @@ For gallery-style UIs:
 - EXIF extraction is best-effort and format-dependent
 - `taken_at_unix` is best-effort and may fall back to interpreting EXIF datetimes without an explicit offset as UTC
 - video thumbnails require `ffprobe` and `ffmpeg` to be available on `PATH`
-- video thumbnail generation currently assumes all chunk files for the manifest are already local on the node performing the work
-- objects that are not fully local do not yet use a remote-aware fallback path for video thumbnails
+- remote media artifact import is manifest-pinned so the importing node only accepts metadata and thumbnails for the exact manifest it resolved locally
+- cluster availability is best for current keys and head versions; snapshot requests may need to probe online peers more broadly when no availability hint exists
 - audio derivatives are not implemented yet

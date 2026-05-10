@@ -200,6 +200,7 @@ export function GallerySurface({
   );
   const readyCount = mediaEntries.filter((entry) => entry.media?.status === "ready").length;
   const pendingCount = mediaEntries.filter((entry) => entry.media?.status === "pending").length;
+  const incompleteCount = mediaEntries.filter((entry) => entry.media?.status === "incomplete").length;
   const imageCount = mediaEntries.filter((entry) => galleryMediaKind(entry) === "image").length;
   const videoCount = mediaEntries.filter((entry) => galleryMediaKind(entry) === "video").length;
   const hiddenOnMapCount = mediaEntries.length - geotaggedEntries.length;
@@ -470,6 +471,11 @@ export function GallerySurface({
                 {pendingCount > 0 ? (
                   <Badge color="yellow" variant="light">
                     {pendingCount} pending
+                  </Badge>
+                ) : null}
+                {incompleteCount > 0 ? (
+                  <Badge color="orange" variant="light">
+                    {incompleteCount} incomplete
                   </Badge>
                 ) : null}
               </Group>
@@ -1848,6 +1854,9 @@ function mediaStatusColor(status?: string | null): string {
   }
   if (status === "pending") {
     return "yellow";
+  }
+  if (status === "incomplete") {
+    return "orange";
   }
   if (status === "failed") {
     return "red";

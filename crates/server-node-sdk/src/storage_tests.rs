@@ -2653,6 +2653,85 @@ run_on_all_metadata_backends!(
     ensure_video_metadata_survives_thumbnail_failures_turso
 );
 
+async fn ensure_media_metadata_marks_missing_local_chunks_incomplete_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-cache-incomplete").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/incomplete.png",
+            Bytes::from(sample_png_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let manifest = store
+        .load_manifest_by_hash(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_chunk = manifest
+        .chunks
+        .first()
+        .cloned()
+        .expect("expected at least one chunk for media cache test");
+    fs::remove_file(store.chunk_path_for_test(&first_chunk.hash))
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(metadata.status, MediaCacheStatus::Incomplete);
+    assert!(metadata.thumbnail.is_none());
+    assert!(
+        metadata
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("incomplete locally")
+    );
+
+    let retry_after = metadata
+        .retry_after_unix
+        .expect("incomplete media cache should set a retry timestamp");
+    assert_eq!(
+        retry_after,
+        metadata.generated_at_unix + MEDIA_CACHE_INCOMPLETE_RETRY_SECS
+    );
+    assert!(!media_cache_retry_due(
+        &metadata,
+        retry_after.saturating_sub(1)
+    ));
+    assert!(media_cache_retry_due(&metadata, retry_after));
+
+    let cached = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap()
+        .metadata
+        .expect("expected cached incomplete metadata");
+    assert_eq!(cached.status, MediaCacheStatus::Incomplete);
+    assert_eq!(cached.retry_after_unix, Some(retry_after));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_metadata_marks_missing_local_chunks_incomplete_impl,
+    ensure_media_metadata_marks_missing_local_chunks_incomplete,
+    ensure_media_metadata_marks_missing_local_chunks_incomplete_turso
+);
+
 async fn clear_media_cache_removes_metadata_and_thumbnails_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("media-cache-clear").await;
 

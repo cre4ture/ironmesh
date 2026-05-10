@@ -19,7 +19,7 @@ mod tests {
         CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
         KeyPair, SanType,
     };
-    use reqwest::{Method, RequestBuilder, StatusCode};
+    use reqwest::{Method, RequestBuilder, StatusCode, Url};
     use time::OffsetDateTime;
     use tokio::time::sleep;
     use transport_sdk::{BootstrapTlsMaterialMetadata, NodeEnrollmentPackage};
@@ -399,6 +399,86 @@ mod tests {
         bail!(
             "store index did not expose expected media metadata state for key={key} prefix={prefix}"
         )
+    }
+
+    async fn wait_for_public_store_index_entry<F>(
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &str,
+        attempts: usize,
+        predicate: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: Fn(&serde_json::Value) -> bool,
+    {
+        for _ in 0..attempts {
+            if let Ok(response) = client
+                .get(format!("{base_url}/store/index?prefix=&depth=4"))
+                .send()
+                .await
+                && let Ok(response) = response.error_for_status()
+                && let Ok(index) = response.json::<serde_json::Value>().await
+                && let Some(entries) = index.get("entries").and_then(|value| value.as_array())
+                && let Some(entry) = entries
+                    .iter()
+                    .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some(key))
+                && predicate(entry)
+            {
+                return Ok(entry.clone());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("store index did not expose expected state for key={key} at {base_url}")
+    }
+
+    fn media_thumbnail_url(base_url: &str, key: &str) -> Result<Url> {
+        let mut url =
+            Url::parse(base_url).context("failed to parse base url for media thumbnail")?;
+        url.set_path("/media/thumbnail");
+        url.query_pairs_mut().append_pair("key", key);
+        Ok(url)
+    }
+
+    async fn media_thumbnail_status(
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &str,
+    ) -> Result<StatusCode> {
+        let url = media_thumbnail_url(base_url, key)?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .context("failed requesting media thumbnail")?;
+        Ok(response.status())
+    }
+
+    async fn wait_for_media_thumbnail_bytes(
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &str,
+        attempts: usize,
+    ) -> Result<Bytes> {
+        let url = media_thumbnail_url(base_url, key)?;
+        for _ in 0..attempts {
+            if let Ok(response) = client.get(url.clone()).send().await
+                && response.status() == StatusCode::OK
+            {
+                let body = response
+                    .bytes()
+                    .await
+                    .context("failed reading media thumbnail response bytes")?;
+                if !body.is_empty() {
+                    return Ok(body);
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("media thumbnail did not become available for key={key} at {base_url}")
     }
 
     async fn enroll_authenticated_http_client(
@@ -2138,6 +2218,284 @@ mod tests {
         let _ = fs::remove_dir_all(&data_c);
         let _ = fs::remove_dir_all(&data_d);
         let _ = fs::remove_dir_all(&data_e);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn remote_media_artifacts_recover_after_source_restart_without_chunk_replication()
+    -> Result<()> {
+        let bind_a = find_available_bind_addr()?;
+        let bind_b = find_available_bind_addr()?;
+        let node_id_a = "00000000-0000-0000-0000-0000000013a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000013b2";
+
+        let data_a = fresh_data_dir("media-artifact-restart-a");
+        let data_b = fresh_data_dir("media-artifact-restart-b");
+
+        let node_env = [
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
+            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
+            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
+            ("IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS", "20"),
+        ];
+
+        let mut node_a = start_open_server_with_env_options(
+            &bind_a,
+            &data_a,
+            node_id_a,
+            1,
+            None,
+            Some(2),
+            &node_env,
+        )
+        .await?;
+        let mut node_b = start_open_server_with_env_options(
+            &bind_b,
+            &data_b,
+            node_id_b,
+            1,
+            None,
+            Some(2),
+            &node_env,
+        )
+        .await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let internal_base_a = internal_base_url_from_public_bind(&bind_a)?;
+        let internal_base_b = internal_base_url_from_public_bind(&bind_b)?;
+        let internal_client_a = mtls_client_from_data_dir(&data_a)?;
+        let internal_client_b = mtls_client_from_data_dir(&data_b)?;
+        let client = reqwest::Client::new();
+
+        let image_a_key = "photos/node-a.jpg";
+        let image_b_key = "photos/node-b.jpg";
+        let image_a_payload = sample_media_jpeg_with_gps_bytes();
+        let image_b_payload = sample_media_jpeg_bytes();
+
+        let result = async {
+            register_node(&client, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+
+            wait_for_online_nodes(&client, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&client, &base_b, 2, 120).await?;
+
+            client
+                .put(format!(
+                    "{base_a}/store/{}",
+                    image_a_key.replace('/', "%2F")
+                ))
+                .header("content-type", "image/jpeg")
+                .body(image_a_payload.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            client
+                .put(format!(
+                    "{base_b}/store/{}",
+                    image_b_key.replace('/', "%2F")
+                ))
+                .header("content-type", "image/jpeg")
+                .body(image_b_payload.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            for (base_url, key) in [
+                (&base_a, image_a_key),
+                (&base_a, image_b_key),
+                (&base_b, image_a_key),
+                (&base_b, image_b_key),
+            ] {
+                wait_for_store_index_path_visible(&client, base_url, key, 240).await?;
+            }
+
+            wait_for_local_available_subject(
+                &internal_client_a,
+                &internal_base_a,
+                image_a_key,
+                true,
+                160,
+            )
+            .await?;
+            wait_for_local_available_subject(
+                &internal_client_a,
+                &internal_base_a,
+                image_b_key,
+                false,
+                160,
+            )
+            .await?;
+            wait_for_local_available_subject(
+                &internal_client_b,
+                &internal_base_b,
+                image_a_key,
+                false,
+                160,
+            )
+            .await?;
+            wait_for_local_available_subject(
+                &internal_client_b,
+                &internal_base_b,
+                image_b_key,
+                true,
+                160,
+            )
+            .await?;
+
+            let image_a_thumbnail_on_a =
+                wait_for_media_thumbnail_bytes(&client, &base_a, image_a_key, 160).await?;
+            let image_b_thumbnail_on_a =
+                wait_for_media_thumbnail_bytes(&client, &base_a, image_b_key, 160).await?;
+            assert!(
+                !image_a_thumbnail_on_a.is_empty() && !image_b_thumbnail_on_a.is_empty(),
+                "node A should fetch thumbnails for both local and remote media"
+            );
+
+            for key in [image_a_key, image_b_key] {
+                let entry =
+                    wait_for_public_store_index_entry(&client, &base_a, key, 160, |entry| {
+                        entry
+                            .get("media")
+                            .and_then(|media| media.get("status"))
+                            .and_then(|status| status.as_str())
+                            == Some("ready")
+                            && entry
+                                .get("media")
+                                .and_then(|media| media.get("width"))
+                                .and_then(|value| value.as_u64())
+                                .is_some()
+                            && entry
+                                .get("media")
+                                .and_then(|media| media.get("height"))
+                                .and_then(|value| value.as_u64())
+                                .is_some()
+                            && entry
+                                .get("media")
+                                .and_then(|media| media.get("thumbnail"))
+                                .and_then(|thumbnail| thumbnail.get("url"))
+                                .and_then(|value| value.as_str())
+                                .is_some()
+                    })
+                    .await?;
+
+                assert_eq!(
+                    entry.get("path").and_then(|value| value.as_str()),
+                    Some(key),
+                    "ready media entry should remain keyed correctly"
+                );
+            }
+
+            stop_server(&mut node_a).await;
+            wait_for_online_nodes(&client, &base_b, 1, 120).await?;
+
+            assert_eq!(
+                media_thumbnail_status(&client, &base_b, image_a_key).await?,
+                StatusCode::NOT_FOUND,
+                "node B should not serve node A's thumbnail while node A is offline"
+            );
+
+            let incomplete_entry =
+                wait_for_public_store_index_entry(&client, &base_b, image_a_key, 160, |entry| {
+                    entry
+                        .get("media")
+                        .and_then(|media| media.get("status"))
+                        .and_then(|status| status.as_str())
+                        == Some("incomplete")
+                })
+                .await?;
+            assert_eq!(
+                incomplete_entry
+                    .get("media")
+                    .and_then(|media| media.get("status"))
+                    .and_then(|status| status.as_str()),
+                Some("incomplete")
+            );
+
+            wait_for_public_store_index_entry(&client, &base_b, image_b_key, 120, |entry| {
+                entry
+                    .get("media")
+                    .and_then(|media| media.get("status"))
+                    .and_then(|status| status.as_str())
+                    == Some("ready")
+            })
+            .await?;
+
+            node_a = start_open_server_with_env_options(
+                &bind_a,
+                &data_a,
+                node_id_a,
+                1,
+                None,
+                Some(2),
+                &node_env,
+            )
+            .await?;
+
+            register_node(&client, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+
+            wait_for_online_nodes(&client, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&client, &base_b, 2, 120).await?;
+
+            assert_eq!(
+                media_thumbnail_status(&client, &base_b, image_a_key).await?,
+                StatusCode::NOT_FOUND,
+                "node B should keep the incomplete backoff until the retry window elapses"
+            );
+
+            sleep(Duration::from_secs(22)).await;
+
+            let recovered_thumbnail_on_b =
+                wait_for_media_thumbnail_bytes(&client, &base_b, image_a_key, 160).await?;
+            assert_eq!(recovered_thumbnail_on_b, image_a_thumbnail_on_a);
+
+            let recovered_entry =
+                wait_for_public_store_index_entry(&client, &base_b, image_a_key, 160, |entry| {
+                    entry
+                        .get("media")
+                        .and_then(|media| media.get("status"))
+                        .and_then(|status| status.as_str())
+                        == Some("ready")
+                        && entry
+                            .get("media")
+                            .and_then(|media| media.get("width"))
+                            .and_then(|value| value.as_u64())
+                            .is_some()
+                        && entry
+                            .get("media")
+                            .and_then(|media| media.get("height"))
+                            .and_then(|value| value.as_u64())
+                            .is_some()
+                        && entry
+                            .get("media")
+                            .and_then(|media| media.get("thumbnail"))
+                            .and_then(|thumbnail| thumbnail.get("url"))
+                            .and_then(|value| value.as_str())
+                            .is_some()
+                })
+                .await?;
+            assert_eq!(
+                recovered_entry
+                    .get("media")
+                    .and_then(|media| media.get("status"))
+                    .and_then(|status| status.as_str()),
+                Some("ready")
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
 
         result
     }

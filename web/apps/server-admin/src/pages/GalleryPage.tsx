@@ -66,16 +66,25 @@ export function GalleryPage() {
     [adminTokenOverride]
   );
   const getMediaRequests = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null): GalleryMediaRequests => ({
-      thumbnail: {
-        url: entry.media?.thumbnail?.url || adminBinaryObjectUrl(entry.path, snapshotId),
-        headers: previewHeaders
-      },
-      original: {
+    (entry: GalleryEntry, snapshotId: string | null): GalleryMediaRequests => {
+      const original = {
         url: adminBinaryObjectUrl(entry.path, snapshotId),
         headers: previewHeaders
-      }
-    }),
+      };
+      const thumbnailUrl =
+        entry.media?.thumbnail?.url ||
+        (entry.media?.status === "ready" ? adminBinaryObjectUrl(entry.path, snapshotId) : null);
+
+      return {
+        thumbnail: thumbnailUrl
+          ? {
+              url: thumbnailUrl,
+              headers: previewHeaders
+            }
+          : null,
+        original
+      };
+    },
     [previewHeaders]
   );
 

@@ -5359,10 +5359,7 @@ fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
 
 #[test]
 fn autonomous_post_write_replication_subjects_include_head_and_version() {
-    let subjects = super::autonomous_post_write_replication_subjects(
-        "docs/report.txt",
-        "ver-123",
-    );
+    let subjects = super::autonomous_post_write_replication_subjects("docs/report.txt", "ver-123");
 
     assert_eq!(
         subjects.into_iter().collect::<Vec<_>>(),
@@ -5377,10 +5374,7 @@ fn autonomous_post_write_replication_subjects_include_head_and_version() {
 fn autonomous_post_write_repair_runtime_coalesces_pending_subjects() {
     let mut runtime = super::AutonomousPostWriteRepairRuntime::default();
 
-    assert!(runtime.enqueue([
-        "docs/a.txt".to_string(),
-        "docs/a.txt@ver-1".to_string(),
-    ]));
+    assert!(runtime.enqueue(["docs/a.txt".to_string(), "docs/a.txt@ver-1".to_string(),]));
     assert!(!runtime.enqueue([
         "docs/b.txt".to_string(),
         "docs/b.txt@ver-2".to_string(),
@@ -6495,6 +6489,231 @@ run_on_main_metadata_backends!(
     get_media_thumbnail_admin_requires_auth_and_serves_image_impl,
     get_media_thumbnail_admin_requires_auth_and_serves_image,
     get_media_thumbnail_admin_requires_auth_and_serves_image_turso
+);
+
+async fn media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+
+    let (manifest_hash, version_id, thumbnail_path, bundle) = {
+        let mut locked = lock_store(&source, "tests.source.store").await;
+        let put = locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let metadata = locked
+            .ensure_media_cache(&put.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let thumb = metadata.thumbnail.as_ref().expect("expected thumbnail");
+        let thumbnail_path =
+            locked.media_thumbnail_path(&metadata.content_fingerprint, &thumb.profile);
+        let bundle = locked
+            .export_metadata_bundle(
+                "gallery/cat.png",
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        (put.manifest_hash, put.version_id, thumbnail_path, bundle)
+    };
+    let source_thumbnail_bytes = fs::read(&thumbnail_path).await.unwrap();
+
+    {
+        let mut locked = lock_store(&target, "tests.target.store").await;
+        let changed = locked.import_metadata_bundle(&bundle).await.unwrap();
+        assert!(changed);
+    }
+
+    let (peer_base_url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+    {
+        let mut cluster = target.cluster.lock().await;
+        cluster.note_replica("gallery/cat.png", source.node_id);
+        cluster.note_replica(format!("gallery/cat.png@{}", version_id), source.node_id);
+    }
+
+    let response = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: "gallery/cat.png".to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), source_thumbnail_bytes.as_slice());
+
+    let imported_thumbnail_path = {
+        let locked = lock_store(&target, "tests.target.store").await;
+        let metadata = locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .expect("expected imported media cache metadata");
+        assert_eq!(metadata.status, super::storage::MediaCacheStatus::Ready);
+        let thumb = metadata
+            .thumbnail
+            .as_ref()
+            .expect("expected imported thumbnail");
+        locked.media_thumbnail_path(&metadata.content_fingerprint, &thumb.profile)
+    };
+    assert_eq!(
+        fs::read(&imported_thumbnail_path).await.unwrap(),
+        source_thumbnail_bytes
+    );
+
+    handle.abort();
+    let _ = handle.await;
+
+    let cached_response = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: "gallery/cat.png".to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+        },
+    )
+    .await;
+
+    assert_eq!(cached_response.status(), StatusCode::OK);
+    let cached_body = to_bytes(cached_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(cached_body.as_ref(), source_thumbnail_bytes.as_slice());
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl,
+    media_thumbnail_request_imports_peer_artifact_and_persists_locally,
+    media_thumbnail_request_imports_peer_artifact_and_persists_locally_turso
+);
+
+async fn media_thumbnail_request_marks_cache_incomplete_when_no_peer_artifact_available_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+
+    let (manifest_hash, bundle) = {
+        let mut locked = lock_store(&source, "tests.source.store").await;
+        let put = locked
+            .put_object_versioned(
+                "gallery/missing.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let bundle = locked
+            .export_metadata_bundle(
+                "gallery/missing.png",
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        (put.manifest_hash, bundle)
+    };
+
+    {
+        let mut locked = lock_store(&target, "tests.target.store").await;
+        let changed = locked.import_metadata_bundle(&bundle).await.unwrap();
+        assert!(changed);
+    }
+
+    let first_response = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: "gallery/missing.png".to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+        },
+    )
+    .await;
+    assert_eq!(first_response.status(), StatusCode::NOT_FOUND);
+
+    let first_metadata = {
+        let locked = lock_store(&target, "tests.target.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .expect("expected incomplete media cache metadata")
+    };
+    assert_eq!(
+        first_metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    assert!(first_metadata.thumbnail.is_none());
+    assert!(first_metadata.retry_after_unix.is_some());
+
+    let second_response = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: "gallery/missing.png".to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+        },
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::NOT_FOUND);
+
+    let second_metadata = {
+        let locked = lock_store(&target, "tests.target.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .expect("expected cached incomplete media cache metadata")
+    };
+    assert_eq!(
+        second_metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    assert_eq!(
+        second_metadata.generated_at_unix,
+        first_metadata.generated_at_unix
+    );
+    assert_eq!(
+        second_metadata.retry_after_unix,
+        first_metadata.retry_after_unix
+    );
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    media_thumbnail_request_marks_cache_incomplete_when_no_peer_artifact_available_impl,
+    media_thumbnail_request_marks_cache_incomplete_when_no_peer_artifact_available,
+    media_thumbnail_request_marks_cache_incomplete_when_no_peer_artifact_available_turso
 );
 
 async fn clear_media_cache_admin_requires_auth_and_clears_cached_media_impl(

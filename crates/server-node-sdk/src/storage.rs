@@ -37,7 +37,9 @@ use super::{DataScrubRunRecord, RepairRunRecord};
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
-const MEDIA_CACHE_SCHEMA_VERSION: u32 = 4;
+const MEDIA_CACHE_SCHEMA_VERSION: u32 = 5;
+const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
+const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
 const MEDIA_FORMAT_SNIFF_BYTES: usize = 64 * 1024;
@@ -601,6 +603,7 @@ pub struct PutResult {
 #[serde(rename_all = "snake_case")]
 pub enum MediaCacheStatus {
     Ready,
+    Incomplete,
     Unsupported,
     Failed,
 }
@@ -636,6 +639,8 @@ pub struct CachedMediaMetadata {
     pub thumbnail: Option<CachedThumbnailInfo>,
     pub source_size_bytes: usize,
     pub generated_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_unix: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -1044,6 +1049,7 @@ impl MediaCacheWorker {
         include_thumbnail: bool,
     ) -> Result<Option<CachedMediaMetadata>> {
         let ensure_started_at = Instant::now();
+        let now_unix = unix_ts();
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(None);
         }
@@ -1057,9 +1063,14 @@ impl MediaCacheWorker {
                 .await?,
         );
         if let Some(existing) = existing.as_ref() {
-            let cache_satisfies_request = !include_thumbnail
-                || existing.thumbnail.is_some()
-                || existing.status != MediaCacheStatus::Ready;
+            let retry_due = media_cache_retry_due(existing, now_unix);
+            let cache_satisfies_request = if retry_due {
+                false
+            } else {
+                !include_thumbnail
+                    || existing.thumbnail.is_some()
+                    || existing.status != MediaCacheStatus::Ready
+            };
             if !cache_satisfies_request {
                 // Fall through and rebuild the artifact with a thumbnail.
             } else {
@@ -1106,6 +1117,53 @@ impl MediaCacheWorker {
             && (derived.metadata.status != MediaCacheStatus::Ready
                 || derived.metadata.thumbnail.is_none())
         {
+            if derived.metadata.status == MediaCacheStatus::Incomplete {
+                let merged = promote_cached_media_metadata_to_incomplete(
+                    existing,
+                    derived.metadata.generated_at_unix,
+                    derived
+                        .metadata
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "media source is incomplete locally".to_string()),
+                );
+                let derived = DerivedMediaCacheArtifact {
+                    metadata: merged,
+                    thumbnail_payload: None,
+                };
+                let persist_started_at = Instant::now();
+                self.persist_media_cache_record(&derived).await?;
+                let persist_ms = persist_started_at.elapsed().as_millis();
+                let total_ms = ensure_started_at.elapsed().as_millis();
+                let metadata = &derived.metadata;
+                info!(
+                    manifest_hash,
+                    content_fingerprint = %content_fingerprint,
+                    total_ms,
+                    build_record_ms,
+                    persist_ms,
+                    include_thumbnail,
+                    status = ?metadata.status,
+                    has_thumbnail = metadata.thumbnail.is_some(),
+                    error = metadata.error.as_deref().unwrap_or(""),
+                    "media cache build finished"
+                );
+                if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
+                    warn!(
+                        manifest_hash,
+                        content_fingerprint = %content_fingerprint,
+                        total_ms,
+                        build_record_ms,
+                        persist_ms,
+                        include_thumbnail,
+                        status = ?metadata.status,
+                        has_thumbnail = metadata.thumbnail.is_some(),
+                        error = metadata.error.as_deref().unwrap_or(""),
+                        "slow media cache build"
+                    );
+                }
+                return Ok(Some(metadata.clone()));
+            }
             warn!(
                 manifest_hash,
                 content_fingerprint = %content_fingerprint,
@@ -1149,6 +1207,24 @@ impl MediaCacheWorker {
             );
         }
         Ok(Some(metadata.clone()))
+    }
+
+    pub(crate) async fn import_media_cache_artifact(
+        &self,
+        mut metadata: CachedMediaMetadata,
+        thumbnail_payload: Option<Vec<u8>>,
+    ) -> Result<CachedMediaMetadata> {
+        if metadata.status != MediaCacheStatus::Ready || thumbnail_payload.is_none() {
+            metadata.thumbnail = None;
+        }
+        metadata.retry_after_unix = None;
+
+        let derived = DerivedMediaCacheArtifact {
+            metadata: metadata.clone(),
+            thumbnail_payload,
+        };
+        self.persist_media_cache_record(&derived).await?;
+        Ok(metadata)
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
@@ -1244,6 +1320,28 @@ impl MediaCacheWorker {
         include_thumbnail: bool,
     ) -> DerivedMediaCacheArtifact {
         let generated_at_unix = unix_ts();
+
+        match manifest_chunks_are_locally_complete(manifest, &self.chunks_dir).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return incomplete_media_cache_artifact(
+                    manifest_hash,
+                    content_fingerprint,
+                    manifest.total_size_bytes,
+                    generated_at_unix,
+                    "media source is incomplete locally; one or more chunks are missing or have the wrong size",
+                );
+            }
+            Err(err) => {
+                return failed_media_cache_artifact(
+                    manifest_hash,
+                    content_fingerprint,
+                    manifest.total_size_bytes,
+                    generated_at_unix,
+                    err.to_string(),
+                );
+            }
+        }
 
         let sniff_bytes = match read_object_prefix_from_manifest(
             manifest,
@@ -6291,8 +6389,66 @@ fn base_media_metadata(
         thumbnail: None,
         source_size_bytes,
         generated_at_unix,
+        retry_after_unix: None,
         error: None,
     }
+}
+
+pub(crate) fn media_cache_incomplete_retry_after_unix(now_unix: u64) -> u64 {
+    now_unix.saturating_add(media_cache_incomplete_retry_secs())
+}
+
+fn media_cache_incomplete_retry_secs() -> u64 {
+    std::env::var(MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MEDIA_CACHE_INCOMPLETE_RETRY_SECS)
+}
+
+fn incomplete_media_cache_artifact(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    source_size_bytes: usize,
+    generated_at_unix: u64,
+    error: impl Into<String>,
+) -> DerivedMediaCacheArtifact {
+    DerivedMediaCacheArtifact {
+        metadata: CachedMediaMetadata {
+            status: MediaCacheStatus::Incomplete,
+            retry_after_unix: Some(media_cache_incomplete_retry_after_unix(generated_at_unix)),
+            error: Some(error.into()),
+            ..base_media_metadata(
+                manifest_hash,
+                content_fingerprint,
+                source_size_bytes,
+                generated_at_unix,
+            )
+        },
+        thumbnail_payload: None,
+    }
+}
+
+pub(crate) fn promote_cached_media_metadata_to_incomplete(
+    metadata: &CachedMediaMetadata,
+    generated_at_unix: u64,
+    error: impl Into<String>,
+) -> CachedMediaMetadata {
+    let mut next = metadata.clone();
+    next.status = MediaCacheStatus::Incomplete;
+    next.thumbnail = None;
+    next.generated_at_unix = generated_at_unix;
+    next.retry_after_unix = Some(media_cache_incomplete_retry_after_unix(generated_at_unix));
+    next.error = Some(error.into());
+    next
+}
+
+pub(crate) fn media_cache_retry_due(metadata: &CachedMediaMetadata, now_unix: u64) -> bool {
+    metadata.status == MediaCacheStatus::Incomplete
+        && metadata
+            .retry_after_unix
+            .map(|retry_after_unix| retry_after_unix <= now_unix)
+            .unwrap_or(true)
 }
 
 fn failed_media_cache_artifact(
@@ -6352,6 +6508,25 @@ async fn persist_media_cache_record_with_payload(
         write_atomic(&thumbnail_path, payload).await?;
     }
     metadata_store.persist_media_cache_record(metadata).await
+}
+
+async fn manifest_chunks_are_locally_complete(
+    manifest: &ObjectManifest,
+    chunks_dir: &Path,
+) -> Result<bool> {
+    for chunk in &manifest.chunks {
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let metadata = match fs::metadata(&chunk_path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        if metadata.len() != chunk.size_bytes as u64 {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 async fn read_object_prefix_from_manifest(

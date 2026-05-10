@@ -30,6 +30,7 @@ use axum_server::Handle;
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
@@ -158,6 +159,7 @@ const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
 const CLIENT_CREDENTIAL_IMPORT_PATH: &str = "/cluster/client-credentials/import";
+const PEER_MEDIA_ARTIFACT_ROUTE: &str = "/cluster/media/artifact";
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -171,13 +173,14 @@ use setup::{
     managed_rendezvous_key_path, managed_signer_ca_cert_path,
 };
 use storage::{
-    AdminAuditEvent, ChunkIngestor, ClientBootstrapClaimRecord, ClientCredentialRecord,
-    ClientCredentialState, DataScrubReport, MediaCacheLookup, MediaCacheStatus,
-    MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle, ObjectReadDescriptor,
-    ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord, PathMutationResult,
-    PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
-    UploadChunkRef, VersionConsistencyState,
+    AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, ClientBootstrapClaimRecord,
+    ClientCredentialRecord, ClientCredentialState, DataScrubReport, MediaCacheLookup,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
+    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
+    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    ReplicationChunkInfo, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    promote_cached_media_metadata_to_incomplete,
 };
 #[derive(Clone)]
 struct ServerState {
@@ -1917,7 +1920,11 @@ impl AutonomousPostWriteRepairRuntime {
             return None;
         }
 
-        Some(std::mem::take(&mut self.pending_subjects).into_iter().collect())
+        Some(
+            std::mem::take(&mut self.pending_subjects)
+                .into_iter()
+                .collect(),
+        )
     }
 }
 
@@ -5525,6 +5532,7 @@ pub(crate) fn build_internal_peer_api() -> Router<ServerState> {
             "/cluster/metadata/subjects/local",
             get(local_metadata_subjects),
         )
+        .route(PEER_MEDIA_ARTIFACT_ROUTE, get(get_peer_media_artifact))
         .route(
             "/cluster/replication/export",
             get(export_replication_bundle),
@@ -8121,6 +8129,20 @@ struct MediaThumbnailQuery {
     read_mode: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct PeerMediaArtifactQuery {
+    manifest_hash: String,
+    #[serde(default)]
+    include_thumbnail: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PeerMediaArtifactResponse {
+    metadata: CachedMediaMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumbnail_payload_b64: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct MediaGpsResponse {
     latitude: f64,
@@ -8307,13 +8329,15 @@ async fn run_autonomous_post_write_replication(state: ServerState) {
 
 fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: String) {
     tokio::spawn(async move {
-        let media_cache_worker = {
-            let store = read_store(&state, "media_cache_warmup.clone_worker").await;
-            store.media_cache_worker()
-        };
-        if let Err(err) = media_cache_worker
-            .ensure_media_metadata(&manifest_hash)
-            .await
+        if let Err(err) = ensure_media_artifact_with_remote_import(
+            &state,
+            &key,
+            None,
+            None,
+            &manifest_hash,
+            false,
+        )
+        .await
         {
             warn!(
                 key = %key,
@@ -8327,7 +8351,7 @@ fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: S
 
 fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
     tokio::spawn(async move {
-        let (media_cache_worker, targets) = {
+        let targets = {
             let store = read_store(&state, "media_metadata_backfill.snapshot").await;
             let inspector = store.store_index_inspector();
             let mut targets = BTreeMap::new();
@@ -8336,7 +8360,7 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
                     targets.entry(manifest_hash).or_insert(key);
                 }
             }
-            (store.media_cache_worker(), targets)
+            targets
         };
 
         let target_count = targets.len();
@@ -8350,9 +8374,15 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
             "starting media metadata backfill"
         );
         for (manifest_hash, key) in targets {
-            if let Err(err) = media_cache_worker
-                .ensure_media_metadata(&manifest_hash)
-                .await
+            if let Err(err) = ensure_media_artifact_with_remote_import(
+                &state,
+                &key,
+                None,
+                None,
+                &manifest_hash,
+                false,
+            )
+            .await
             {
                 warn!(
                     reason,
@@ -9454,6 +9484,7 @@ async fn list_store_index_response(
     let media_lookup_started_at = Instant::now();
     let mut media_ready_count = 0;
     let mut media_pending_count = 0;
+    let mut media_incomplete_count = 0;
     let mut media_unsupported_count = 0;
     let mut media_failed_count = 0;
     let mut media_missing_count = 0;
@@ -9475,6 +9506,7 @@ async fn list_store_index_response(
             Ok(Some(lookup)) => {
                 match lookup.metadata.as_ref().map(|metadata| &metadata.status) {
                     Some(MediaCacheStatus::Ready) => media_ready_count += 1,
+                    Some(MediaCacheStatus::Incomplete) => media_incomplete_count += 1,
                     Some(MediaCacheStatus::Unsupported) => media_unsupported_count += 1,
                     Some(MediaCacheStatus::Failed) => media_failed_count += 1,
                     None => media_pending_count += 1,
@@ -9517,6 +9549,7 @@ async fn list_store_index_response(
             phase_ms = media_lookup_ms,
             ready_count = media_ready_count,
             pending_count = media_pending_count,
+            incomplete_count = media_incomplete_count,
             unsupported_count = media_unsupported_count,
             failed_count = media_failed_count,
             missing_count = media_missing_count,
@@ -9715,6 +9748,7 @@ fn build_thumbnail_url(key: &str, snapshot: Option<&str>, thumbnail_route: &str)
 fn media_cache_status_label(status: &MediaCacheStatus) -> &'static str {
     match status {
         MediaCacheStatus::Ready => "ready",
+        MediaCacheStatus::Incomplete => "incomplete",
         MediaCacheStatus::Unsupported => "unsupported",
         MediaCacheStatus::Failed => "failed",
     }
@@ -10132,6 +10166,227 @@ async fn read_through_source_nodes(state: &ServerState, subject: &str) -> Vec<No
         .collect()
 }
 
+async fn media_artifact_source_nodes(
+    state: &ServerState,
+    subject_hint: Option<&str>,
+) -> Vec<NodeDescriptor> {
+    let mut cluster = state.cluster.lock().await;
+    cluster.update_health_and_detect_offline_transition();
+
+    let mut seen = HashSet::new();
+    let mut nodes = Vec::new();
+
+    if let Some(subject) = subject_hint {
+        for node in cluster.available_nodes_for_subject(subject) {
+            if node.node_id != state.node_id && seen.insert(node.node_id) {
+                nodes.push(node);
+            }
+        }
+    }
+
+    for node in cluster.list_nodes() {
+        if node.node_id == state.node_id || node.status != cluster::NodeStatus::Online {
+            continue;
+        }
+        if seen.insert(node.node_id) {
+            nodes.push(node);
+        }
+    }
+
+    nodes
+}
+
+fn build_peer_media_artifact_path(manifest_hash: &str, include_thumbnail: bool) -> String {
+    let encoded_manifest_hash =
+        utf8_percent_encode(manifest_hash, QUERY_COMPONENT_ENCODE_SET).to_string();
+    format!(
+        "{PEER_MEDIA_ARTIFACT_ROUTE}?manifest_hash={encoded_manifest_hash}&include_thumbnail={include_thumbnail}"
+    )
+}
+
+#[derive(Debug)]
+struct ImportedPeerMediaArtifact {
+    metadata: CachedMediaMetadata,
+    thumbnail_payload: Option<Vec<u8>>,
+}
+
+fn should_attempt_remote_media_artifact_import(
+    previous_metadata: Option<&CachedMediaMetadata>,
+    metadata: &CachedMediaMetadata,
+    include_thumbnail: bool,
+    now_unix: u64,
+) -> bool {
+    match metadata.status {
+        MediaCacheStatus::Ready => include_thumbnail && metadata.thumbnail.is_none(),
+        MediaCacheStatus::Incomplete => match previous_metadata {
+            Some(previous) if previous.status == MediaCacheStatus::Incomplete => {
+                media_cache_retry_due(previous, now_unix)
+            }
+            _ => true,
+        },
+        MediaCacheStatus::Unsupported | MediaCacheStatus::Failed => false,
+    }
+}
+
+async fn fetch_peer_media_artifact(
+    state: &ServerState,
+    node: &NodeDescriptor,
+    manifest_hash: &str,
+    expected_content_fingerprint: &str,
+    include_thumbnail: bool,
+) -> Result<Option<ImportedPeerMediaArtifact>> {
+    let response = execute_peer_request(
+        state,
+        node,
+        reqwest::Method::GET,
+        &build_peer_media_artifact_path(manifest_hash, include_thumbnail),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await?;
+
+    if !response.is_success() {
+        return Ok(None);
+    }
+
+    let artifact = response.json::<PeerMediaArtifactResponse>()?;
+    if artifact.metadata.source_manifest_hash != manifest_hash {
+        bail!(
+            "peer media artifact manifest mismatch expected={} actual={}",
+            manifest_hash,
+            artifact.metadata.source_manifest_hash
+        );
+    }
+    if artifact.metadata.content_fingerprint != expected_content_fingerprint {
+        bail!(
+            "peer media artifact fingerprint mismatch expected={} actual={}",
+            expected_content_fingerprint,
+            artifact.metadata.content_fingerprint
+        );
+    }
+    if artifact.metadata.status == MediaCacheStatus::Incomplete {
+        return Ok(None);
+    }
+
+    let thumbnail_payload = match artifact.thumbnail_payload_b64 {
+        Some(payload_b64) => Some(
+            BASE64_STANDARD
+                .decode(payload_b64.as_bytes())
+                .context("failed decoding peer media artifact thumbnail payload")?,
+        ),
+        None => None,
+    };
+
+    if include_thumbnail
+        && artifact.metadata.status == MediaCacheStatus::Ready
+        && artifact.metadata.thumbnail.is_some()
+        && thumbnail_payload.is_none()
+    {
+        bail!("peer media artifact omitted thumbnail payload for ready thumbnail metadata");
+    }
+
+    Ok(Some(ImportedPeerMediaArtifact {
+        metadata: artifact.metadata,
+        thumbnail_payload,
+    }))
+}
+
+async fn ensure_media_artifact_with_remote_import(
+    state: &ServerState,
+    key: &str,
+    snapshot_id: Option<&str>,
+    version_id: Option<&str>,
+    manifest_hash: &str,
+    include_thumbnail: bool,
+) -> Result<Option<CachedMediaMetadata>> {
+    let now_unix = unix_ts();
+    let (media_cache_worker, store_index_inspector) = {
+        let store = read_store(state, "media_cache.remote_import.clone_worker").await;
+        (store.media_cache_worker(), store.store_index_inspector())
+    };
+
+    let existing_lookup = store_index_inspector
+        .lookup_media_cache(manifest_hash)
+        .await?;
+    let previous_metadata = existing_lookup
+        .as_ref()
+        .and_then(|lookup| lookup.metadata.clone());
+    let expected_content_fingerprint = existing_lookup
+        .as_ref()
+        .map(|lookup| lookup.content_fingerprint.clone());
+
+    let local_metadata = if include_thumbnail {
+        media_cache_worker.ensure_media_cache(manifest_hash).await?
+    } else {
+        media_cache_worker
+            .ensure_media_metadata(manifest_hash)
+            .await?
+    };
+    let Some(local_metadata) = local_metadata else {
+        return Ok(None);
+    };
+
+    if !should_attempt_remote_media_artifact_import(
+        previous_metadata.as_ref(),
+        &local_metadata,
+        include_thumbnail,
+        now_unix,
+    ) {
+        return Ok(Some(local_metadata));
+    }
+
+    let expected_content_fingerprint =
+        expected_content_fingerprint.unwrap_or_else(|| local_metadata.content_fingerprint.clone());
+    let subject_hint = read_through_replication_subject(key, snapshot_id, version_id);
+
+    for node in media_artifact_source_nodes(state, subject_hint.as_deref()).await {
+        match fetch_peer_media_artifact(
+            state,
+            &node,
+            manifest_hash,
+            &expected_content_fingerprint,
+            include_thumbnail,
+        )
+        .await
+        {
+            Ok(Some(artifact)) => {
+                let imported = media_cache_worker
+                    .import_media_cache_artifact(artifact.metadata, artifact.thumbnail_payload)
+                    .await?;
+                return Ok(Some(imported));
+            }
+            Ok(None) => continue,
+            Err(err) => {
+                warn!(
+                    peer_node_id = %node.node_id,
+                    key = %key,
+                    manifest_hash = %manifest_hash,
+                    include_thumbnail,
+                    error = %err,
+                    "peer media artifact import failed"
+                );
+            }
+        }
+    }
+
+    if include_thumbnail
+        && local_metadata.status == MediaCacheStatus::Ready
+        && local_metadata.thumbnail.is_none()
+    {
+        let incomplete = promote_cached_media_metadata_to_incomplete(
+            &local_metadata,
+            now_unix,
+            "thumbnail generation is incomplete locally and no peer media artifact was available",
+        );
+        let imported = media_cache_worker
+            .import_media_cache_artifact(incomplete, None)
+            .await?;
+        return Ok(Some(imported));
+    }
+
+    Ok(Some(local_metadata))
+}
+
 async fn hydrate_missing_chunks_for_range(
     state: &ServerState,
     subject: &str,
@@ -10460,6 +10715,81 @@ async fn get_media_thumbnail_admin(
     get_media_thumbnail_response(&state, query).await
 }
 
+async fn get_peer_media_artifact(
+    State(state): State<ServerState>,
+    Query(query): Query<PeerMediaArtifactQuery>,
+) -> Response {
+    if query.manifest_hash.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let media_cache_worker = {
+        let store = read_store(&state, "media_cache.peer_artifact.clone_worker").await;
+        store.media_cache_worker()
+    };
+
+    let metadata = match if query.include_thumbnail {
+        media_cache_worker
+            .ensure_media_cache(&query.manifest_hash)
+            .await
+    } else {
+        media_cache_worker
+            .ensure_media_metadata(&query.manifest_hash)
+            .await
+    } {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(
+                manifest_hash = %query.manifest_hash,
+                include_thumbnail = query.include_thumbnail,
+                error = %err,
+                "failed to resolve peer media artifact"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut response_metadata = metadata.clone();
+    let thumbnail_payload_b64 = if query.include_thumbnail
+        && response_metadata.status == MediaCacheStatus::Ready
+        && let Some(thumbnail) = response_metadata.thumbnail.as_ref()
+    {
+        let thumbnail_path = {
+            let store = read_store(&state, "media_cache.peer_artifact.thumbnail_path").await;
+            store.media_thumbnail_path(&response_metadata.content_fingerprint, &thumbnail.profile)
+        };
+        let payload = match tokio::fs::read(&thumbnail_path).await {
+            Ok(payload) => payload,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Err(err) => {
+                tracing::error!(
+                    manifest_hash = %query.manifest_hash,
+                    path = %thumbnail_path.display(),
+                    error = %err,
+                    "failed to read peer media artifact thumbnail"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        Some(BASE64_STANDARD.encode(payload))
+    } else {
+        response_metadata.thumbnail = None;
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(PeerMediaArtifactResponse {
+            metadata: response_metadata,
+            thumbnail_payload_b64,
+        }),
+    )
+        .into_response()
+}
+
 async fn clear_media_cache_admin(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -10540,7 +10870,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
 
     let request_started_at = Instant::now();
     let resolve_started_at = Instant::now();
-    let (manifest_hash, media_cache_worker, resolve_waited_ms) = {
+    let (manifest_hash, resolve_waited_ms) = {
         let store = read_store(state, "media_thumbnail.resolve_and_ensure").await;
         let waited_ms = store.waited_ms();
         let manifest_hash = match store
@@ -10563,7 +10893,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        (manifest_hash, store.media_cache_worker(), waited_ms)
+        (manifest_hash, waited_ms)
     };
     let resolve_ms = resolve_started_at.elapsed().as_millis();
     if resolve_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
@@ -10583,7 +10913,16 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
     }
 
     let ensure_started_at = Instant::now();
-    let metadata = match media_cache_worker.ensure_media_cache(&manifest_hash).await {
+    let metadata = match ensure_media_artifact_with_remote_import(
+        state,
+        &query.key,
+        query.snapshot.as_deref(),
+        query.version.as_deref(),
+        &manifest_hash,
+        true,
+    )
+    .await
+    {
         Ok(Some(metadata)) => metadata,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
