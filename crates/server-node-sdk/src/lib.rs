@@ -7679,12 +7679,8 @@ async fn execute_tracked_targeted_replication_repair(
 ) -> replication::ReplicationRepairReport {
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let (plan, report) = replication::execute_planned_targeted_replication_repair_inner(
-        state,
-        subjects,
-        None,
-    )
-    .await;
+    let (plan, report) =
+        replication::execute_planned_targeted_replication_repair_inner(state, subjects, None).await;
     finish_repair_run_tracking(
         state,
         tracker,

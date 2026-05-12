@@ -5596,10 +5596,12 @@ async fn autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl(
 
     {
         let mut runtime = source.autonomous_post_write_repair.lock().await;
-        assert!(runtime.enqueue(super::autonomous_post_write_replication_subjects(
-            &key,
-            &version_id,
-        )));
+        assert!(
+            runtime.enqueue(super::autonomous_post_write_replication_subjects(
+                &key,
+                &version_id,
+            ))
+        );
     }
 
     super::run_autonomous_post_write_replication(source.clone()).await;
