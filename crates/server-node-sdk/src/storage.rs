@@ -19,9 +19,7 @@ use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::Mutex as AsyncMutex;
-#[cfg(test)]
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::time::{Duration, Instant, timeout};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -46,6 +44,7 @@ const MEDIA_FORMAT_SNIFF_BYTES: usize = 64 * 1024;
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
 const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 20000;
+const MEDIA_CACHE_BUILD_MAX_CONCURRENCY: usize = 20;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 const FFPROBE_TIMEOUT_SECS: u64 = 15;
 const FFMPEG_TIMEOUT_SECS: u64 = 60;
@@ -719,6 +718,7 @@ pub struct PersistentStore {
     manifests_dir: PathBuf,
     metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
+    media_cache_build_permits: Arc<Semaphore>,
     current_state: CurrentState,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
@@ -740,6 +740,7 @@ pub(crate) struct MediaCacheWorker {
     manifests_dir: PathBuf,
     chunks_dir: PathBuf,
     media_thumbnails_dir: PathBuf,
+    media_cache_build_permits: Arc<Semaphore>,
     metadata_store: Arc<dyn MetadataStore>,
     media_tools: MediaToolPaths,
 }
@@ -1017,6 +1018,7 @@ impl MediaCacheWorker {
         manifests_dir: PathBuf,
         chunks_dir: PathBuf,
         media_thumbnails_dir: PathBuf,
+        media_cache_build_permits: Arc<Semaphore>,
         metadata_store: Arc<dyn MetadataStore>,
         media_tools: MediaToolPaths,
     ) -> Self {
@@ -1024,6 +1026,7 @@ impl MediaCacheWorker {
             manifests_dir,
             chunks_dir,
             media_thumbnails_dir,
+            media_cache_build_permits,
             metadata_store,
             media_tools,
         }
@@ -1101,14 +1104,21 @@ impl MediaCacheWorker {
         );
 
         let build_started_at = Instant::now();
-        let derived = self
-            .build_media_cache_artifact(
+        let derived = {
+            let _build_permit = self
+                .media_cache_build_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("media cache build semaphore should remain open");
+            self.build_media_cache_artifact(
                 &manifest,
                 manifest_hash,
                 &content_fingerprint,
                 include_thumbnail,
             )
-            .await;
+            .await
+        };
         let build_record_ms = build_started_at.elapsed().as_millis();
         if include_thumbnail
             && let Some(existing) = existing.as_ref()
@@ -2506,6 +2516,7 @@ impl PersistentStore {
         };
         let current_state = metadata_store.load_current_state().await?;
         let storage_stats_lock = Arc::new(AsyncMutex::new(()));
+        let media_cache_build_permits = Arc::new(Semaphore::new(MEDIA_CACHE_BUILD_MAX_CONCURRENCY));
         let chunk_ingestor = ChunkIngestor::new(
             chunks_dir.clone(),
             metadata_store.clone(),
@@ -2518,6 +2529,7 @@ impl PersistentStore {
             manifests_dir,
             metadata_db_path,
             media_thumbnails_dir,
+            media_cache_build_permits,
             current_state,
             metadata_store,
             storage_stats_lock,
@@ -2537,6 +2549,7 @@ impl PersistentStore {
             self.manifests_dir.clone(),
             self.chunks_dir.clone(),
             self.media_thumbnails_dir.clone(),
+            self.media_cache_build_permits.clone(),
             self.metadata_store.clone(),
             self.media_tools.clone(),
         )
