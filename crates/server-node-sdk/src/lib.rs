@@ -8645,18 +8645,19 @@ async fn rename_object_path_response(
             if request.from_path != request.to_path {
                 record_data_change_event(
                     state,
-                    DataChangeAction::Rename,
-                    actor.as_ref(),
-                    request.to_path.clone(),
-                    Some(request.from_path.clone()),
-                    Some(request.to_path.clone()),
-                    false,
-                    1,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    PendingDataChangeEvent {
+                        action: DataChangeAction::Rename,
+                        actor: actor.clone(),
+                        path: request.to_path.clone(),
+                        from_path: Some(request.from_path.clone()),
+                        to_path: Some(request.to_path.clone()),
+                        recursive: false,
+                        affected_path_count: 1,
+                        total_size_bytes: None,
+                        version_id: None,
+                        snapshot_id: None,
+                        upload_mode: None,
+                    },
                 )
                 .await;
             }
@@ -8735,18 +8736,19 @@ async fn copy_object_path_response(
             if request.from_path != request.to_path {
                 record_data_change_event(
                     state,
-                    DataChangeAction::Copy,
-                    actor.as_ref(),
-                    request.to_path.clone(),
-                    Some(request.from_path.clone()),
-                    Some(request.to_path.clone()),
-                    false,
-                    1,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    PendingDataChangeEvent {
+                        action: DataChangeAction::Copy,
+                        actor: actor.clone(),
+                        path: request.to_path.clone(),
+                        from_path: Some(request.from_path.clone()),
+                        to_path: Some(request.to_path.clone()),
+                        recursive: false,
+                        affected_path_count: 1,
+                        total_size_bytes: None,
+                        version_id: None,
+                        snapshot_id: None,
+                        upload_mode: None,
+                    },
                 )
                 .await;
             }
@@ -8925,18 +8927,19 @@ async fn put_object(
             if !query.internal_replication {
                 record_data_change_event(
                     &state,
-                    DataChangeAction::Upload,
-                    Some(&actor),
-                    key.clone(),
-                    None,
-                    None,
-                    false,
-                    1,
-                    Some(total_size_bytes),
-                    Some(outcome.version_id.clone()),
-                    Some(outcome.snapshot_id.clone()),
-                    Some(DataChangeUploadMode::Direct),
-                    None,
+                    PendingDataChangeEvent {
+                        action: DataChangeAction::Upload,
+                        actor: Some(actor.clone()),
+                        path: key.clone(),
+                        from_path: None,
+                        to_path: None,
+                        recursive: false,
+                        affected_path_count: 1,
+                        total_size_bytes: Some(total_size_bytes),
+                        version_id: Some(outcome.version_id.clone()),
+                        snapshot_id: Some(outcome.snapshot_id.clone()),
+                        upload_mode: Some(DataChangeUploadMode::Direct),
+                    },
                 )
                 .await;
             }
@@ -9359,18 +9362,19 @@ async fn complete_upload_session_route(
     .await;
     record_data_change_event(
         &state,
-        DataChangeAction::Upload,
-        Some(&actor),
-        key.clone(),
-        None,
-        None,
-        false,
-        1,
-        Some(total_size_bytes),
-        Some(outcome.version_id.clone()),
-        Some(outcome.snapshot_id.clone()),
-        Some(DataChangeUploadMode::Chunked),
-        None,
+        PendingDataChangeEvent {
+            action: DataChangeAction::Upload,
+            actor: Some(actor.clone()),
+            path: key.clone(),
+            from_path: None,
+            to_path: None,
+            recursive: false,
+            affected_path_count: 1,
+            total_size_bytes: Some(total_size_bytes),
+            version_id: Some(outcome.version_id.clone()),
+            snapshot_id: Some(outcome.snapshot_id.clone()),
+            upload_mode: Some(DataChangeUploadMode::Chunked),
+        },
     )
     .await;
 
@@ -9505,7 +9509,7 @@ async fn delete_object_response(
             }
             drop(cluster);
 
-            if let Err(err) = persist_cluster_replicas_state(&state).await {
+            if let Err(err) = persist_cluster_replicas_state(state).await {
                 warn!(error = %err, "failed to persist cluster replicas after tombstone");
             }
 
@@ -9532,18 +9536,19 @@ async fn delete_object_response(
                 };
                 record_data_change_event(
                     state,
-                    DataChangeAction::Delete,
-                    actor.as_ref(),
-                    key.clone(),
-                    None,
-                    None,
-                    recursive,
-                    deleted_paths.len(),
-                    None,
-                    version_id,
-                    None,
-                    None,
-                    None,
+                    PendingDataChangeEvent {
+                        action: DataChangeAction::Delete,
+                        actor: actor.clone(),
+                        path: key.clone(),
+                        from_path: None,
+                        to_path: None,
+                        recursive,
+                        affected_path_count: deleted_paths.len(),
+                        total_size_bytes: None,
+                        version_id,
+                        snapshot_id: None,
+                        upload_mode: None,
+                    },
                 )
                 .await;
             }
@@ -9568,10 +9573,9 @@ async fn delete_object_response(
     }
 }
 
-async fn record_data_change_event(
-    state: &ServerState,
+struct PendingDataChangeEvent {
     action: DataChangeAction,
-    actor: Option<&DataChangeActorContext>,
+    actor: Option<DataChangeActorContext>,
     path: String,
     from_path: Option<String>,
     to_path: Option<String>,
@@ -9581,27 +9585,27 @@ async fn record_data_change_event(
     version_id: Option<String>,
     snapshot_id: Option<String>,
     upload_mode: Option<DataChangeUploadMode>,
-    actor_source_node_override: Option<String>,
-) {
-    let fallback_actor = DataChangeActorContext::unknown();
-    let actor = actor.unwrap_or(&fallback_actor);
+}
+
+async fn record_data_change_event(state: &ServerState, pending: PendingDataChangeEvent) {
+    let actor = pending.actor.unwrap_or_else(DataChangeActorContext::unknown);
     let event = DataChangeEvent {
         event_id: Uuid::now_v7().to_string(),
-        action,
-        path: path.clone(),
-        from_path,
-        to_path,
-        recursive,
-        affected_path_count,
-        total_size_bytes,
-        version_id,
-        snapshot_id,
-        upload_mode,
+        action: pending.action,
+        path: pending.path,
+        from_path: pending.from_path,
+        to_path: pending.to_path,
+        recursive: pending.recursive,
+        affected_path_count: pending.affected_path_count,
+        total_size_bytes: pending.total_size_bytes,
+        version_id: pending.version_id,
+        snapshot_id: pending.snapshot_id,
+        upload_mode: pending.upload_mode,
         actor_kind: actor.actor_kind,
-        actor_id: actor.actor_id.clone(),
-        actor_label: actor.actor_label.clone(),
-        actor_credential_fingerprint: actor.actor_credential_fingerprint.clone(),
-        actor_source_node: actor_source_node_override.or_else(|| actor.actor_source_node.clone()),
+        actor_id: actor.actor_id,
+        actor_label: actor.actor_label,
+        actor_credential_fingerprint: actor.actor_credential_fingerprint,
+        actor_source_node: actor.actor_source_node,
         recorded_by_node_id: state.node_id,
         created_at_unix: unix_ts(),
     };
