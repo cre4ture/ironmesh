@@ -61,6 +61,7 @@ const PROVIDER_BUILD_REVISION: &str = git_version::git_version!(fallback = "unkn
 const MIN_THUMBNAIL_SIZE: u32 = 32;
 const MAX_THUMBNAIL_SIZE: u32 = 512;
 const MAX_CACHED_THUMBNAILS: usize = 128;
+const MAX_CACHED_THUMBNAIL_CLIENTS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct DebugThumbnailFetchResult {
@@ -659,11 +660,85 @@ struct ThumbnailIdentityLoad {
     client_identity: Option<client_sdk::ClientIdentityMaterial>,
 }
 
+#[derive(Clone)]
 struct ThumbnailClientBuild {
     client: client_sdk::IronMeshClient,
     auth_mode: &'static str,
     candidate_paths: Vec<PathBuf>,
     selected_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThumbnailClientCacheKey {
+    bootstrap_path: PathBuf,
+    bootstrap_modified_at_unix_ms: Option<u128>,
+    selected_identity_path: Option<PathBuf>,
+    selected_identity_modified_at_unix_ms: Option<u128>,
+}
+
+#[derive(Default)]
+struct ThumbnailClientCache {
+    order: VecDeque<ThumbnailClientCacheKey>,
+    items: HashMap<ThumbnailClientCacheKey, ThumbnailClientBuild>,
+}
+
+impl ThumbnailClientCache {
+    fn get(&mut self, key: &ThumbnailClientCacheKey) -> Option<ThumbnailClientBuild> {
+        let value = self.items.get(key)?.clone();
+        self.touch(key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: ThumbnailClientCacheKey, value: ThumbnailClientBuild) {
+        if self.items.contains_key(&key) {
+            self.items.insert(key.clone(), value);
+            self.touch(&key);
+            return;
+        }
+
+        self.items.insert(key.clone(), value);
+        self.order.push_back(key);
+
+        while self.items.len() > MAX_CACHED_THUMBNAIL_CLIENTS {
+            if let Some(stale) = self.order.pop_front() {
+                self.items.remove(&stale);
+            }
+        }
+    }
+
+    fn touch(&mut self, key: &ThumbnailClientCacheKey) {
+        if let Some(index) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key.clone());
+    }
+}
+
+fn thumbnail_client_cache() -> &'static Mutex<ThumbnailClientCache> {
+    static CACHE: OnceLock<Mutex<ThumbnailClientCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ThumbnailClientCache::default()))
+}
+
+fn modified_at_unix_ms(path: &Path) -> Option<u128> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_millis())
+}
+
+fn thumbnail_client_cache_key(
+    bootstrap_path: &Path,
+    selected_identity_path: Option<&Path>,
+) -> ThumbnailClientCacheKey {
+    ThumbnailClientCacheKey {
+        bootstrap_path: bootstrap_path.to_path_buf(),
+        bootstrap_modified_at_unix_ms: modified_at_unix_ms(bootstrap_path),
+        selected_identity_path: selected_identity_path.map(|path| path.to_path_buf()),
+        selected_identity_modified_at_unix_ms: selected_identity_path.and_then(modified_at_unix_ms),
+    }
 }
 
 struct FetchedThumbnail {
@@ -716,6 +791,24 @@ fn build_thumbnail_client(
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "-".to_string());
+            let cache_key = thumbnail_client_cache_key(
+                &resolved.bootstrap_path,
+                identity_load.selected_path.as_deref(),
+            );
+
+            if let Some(cached) = thumbnail_client_cache()
+                .lock()
+                .expect("thumbnail client cache lock poisoned")
+                .get(&cache_key)
+            {
+                append_diagnostic_log(&format!(
+                    "thumbnail-client-cache hit bootstrap_path={} identity_path={} auth_mode={}",
+                    resolved.bootstrap_path.display(),
+                    selected_path,
+                    cached.auth_mode
+                ));
+                return Ok(cached);
+            }
 
             if let Some(identity) = identity_load.client_identity.as_ref() {
                 append_diagnostic_log(&format!(
@@ -731,12 +824,17 @@ fn build_thumbnail_client(
                 ));
                 match resolved.build_client(Some(identity)) {
                     Ok(client) => {
-                        return Ok(ThumbnailClientBuild {
+                        let build = ThumbnailClientBuild {
                             client,
                             auth_mode: "client-identity",
-                            candidate_paths: identity_load.candidate_paths,
-                            selected_path: identity_load.selected_path,
-                        });
+                            candidate_paths: identity_load.candidate_paths.clone(),
+                            selected_path: identity_load.selected_path.clone(),
+                        };
+                        thumbnail_client_cache()
+                            .lock()
+                            .expect("thumbnail client cache lock poisoned")
+                            .insert(cache_key, build.clone());
+                        return Ok(build);
                     }
                     Err(error) => {
                         append_diagnostic_log(&format!(
@@ -764,6 +862,27 @@ fn build_thumbnail_client(
                     candidate_paths
                 ));
             }
+
+            let client = resolved
+                .build_client(None)
+                .map_err(ThumbnailProviderError::permanent)
+                .map_err(|error| {
+                    error.with_context(format!(
+                        "failed to build anonymous client for thumbnail requests using bootstrap {}",
+                        resolved.bootstrap_path.display()
+                    ))
+                })?;
+            let build = ThumbnailClientBuild {
+                client,
+                auth_mode: "anonymous",
+                candidate_paths: identity_load.candidate_paths,
+                selected_path: identity_load.selected_path,
+            };
+            thumbnail_client_cache()
+                .lock()
+                .expect("thumbnail client cache lock poisoned")
+                .insert(cache_key, build.clone());
+            Ok(build)
         }
         Err(error) => {
             let discovery = inspect_persisted_client_identity_paths(
@@ -787,29 +906,47 @@ fn build_thumbnail_client(
                 candidate_paths,
                 error
             ));
+
+            let cache_key = thumbnail_client_cache_key(
+                &resolved.bootstrap_path,
+                discovery.selected_path.as_deref(),
+            );
+            if let Some(cached) = thumbnail_client_cache()
+                .lock()
+                .expect("thumbnail client cache lock poisoned")
+                .get(&cache_key)
+            {
+                append_diagnostic_log(&format!(
+                    "thumbnail-client-cache hit bootstrap_path={} identity_path={} auth_mode={}",
+                    resolved.bootstrap_path.display(),
+                    selected_path,
+                    cached.auth_mode
+                ));
+                return Ok(cached);
+            }
+
+            let client = resolved
+                .build_client(None)
+                .map_err(ThumbnailProviderError::permanent)
+                .map_err(|error| {
+                    error.with_context(format!(
+                        "failed to build anonymous client for thumbnail requests using bootstrap {}",
+                        resolved.bootstrap_path.display()
+                    ))
+                })?;
+            let build = ThumbnailClientBuild {
+                client,
+                auth_mode: "anonymous",
+                candidate_paths: discovery.candidate_paths,
+                selected_path: discovery.selected_path,
+            };
+            thumbnail_client_cache()
+                .lock()
+                .expect("thumbnail client cache lock poisoned")
+                .insert(cache_key, build.clone());
+            Ok(build)
         }
     }
-
-    let discovery = inspect_persisted_client_identity_paths(
-        sync_root_path,
-        Some(&resolved.bootstrap_path),
-        None,
-    );
-    resolved
-        .build_client(None)
-        .map(|client| ThumbnailClientBuild {
-            client,
-            auth_mode: "anonymous",
-            candidate_paths: discovery.candidate_paths,
-            selected_path: discovery.selected_path,
-        })
-        .map_err(ThumbnailProviderError::permanent)
-        .map_err(|error| {
-            error.with_context(format!(
-                "failed to build anonymous client for thumbnail requests using bootstrap {}",
-                resolved.bootstrap_path.display()
-            ))
-        })
 }
 
 fn load_thumbnail_client_identity(
@@ -1274,13 +1411,65 @@ fn fill_circle(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE, ThumbnailFailureKind, ThumbnailProviderError,
-        media_thumbnail_request_path, prototype_bgra_pixels, remote_key_for_item,
-        rgba_pixels_to_bgra, thumbnail_status_should_retry,
+        MAX_CACHED_THUMBNAIL_CLIENTS, MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE,
+        ThumbnailClientBuild, ThumbnailClientCache, ThumbnailClientCacheKey,
+        ThumbnailFailureKind, ThumbnailProviderError, media_thumbnail_request_path,
+        modified_at_unix_ms, prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
+        thumbnail_client_cache_key, thumbnail_status_should_retry,
     };
     use anyhow::anyhow;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use reqwest::StatusCode;
     use windows::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
+
+    fn test_temp_dir(label: &str) -> PathBuf {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ironmesh-thumbnail-provider-{label}-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("failed to create temp test directory");
+        path
+    }
+
+    fn update_file_until_mtime_changes(path: &Path) {
+        let original = modified_at_unix_ms(path).expect("test file should have an mtime");
+        for attempt in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::write(path, format!("updated-{attempt}"))
+                .expect("failed to update test file");
+            let updated = modified_at_unix_ms(path).expect("test file should keep an mtime");
+            if updated != original {
+                return;
+            }
+        }
+
+        panic!("expected file mtime to change for {}", path.display());
+    }
+
+    fn test_client_build(label: &str) -> ThumbnailClientBuild {
+        ThumbnailClientBuild {
+            client: client_sdk::IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+            auth_mode: "anonymous",
+            candidate_paths: vec![],
+            selected_path: Some(PathBuf::from(label)),
+        }
+    }
+
+    fn test_client_cache_key(label: &str) -> ThumbnailClientCacheKey {
+        ThumbnailClientCacheKey {
+            bootstrap_path: PathBuf::from(format!("C:/test/{label}/connection-bootstrap.json")),
+            bootstrap_modified_at_unix_ms: Some(1),
+            selected_identity_path: Some(PathBuf::from(format!(
+                "C:/test/{label}/client-identity.json"
+            ))),
+            selected_identity_modified_at_unix_ms: Some(1),
+        }
+    }
 
     #[test]
     fn prototype_bitmap_respects_size_bounds() {
@@ -1376,5 +1565,68 @@ mod tests {
         let retry_later = ThumbnailProviderError::retry_later(anyhow!("server busy"));
         assert_eq!(retry_later.kind, ThumbnailFailureKind::RetryLater);
         assert_eq!(retry_later.hresult(), WTS_E_EXTRACTIONPENDING);
+    }
+
+    #[test]
+    fn thumbnail_client_cache_evicts_least_recently_used_entry() {
+        let mut cache = ThumbnailClientCache::default();
+        let mut keys = Vec::with_capacity(MAX_CACHED_THUMBNAIL_CLIENTS);
+
+        for index in 0..MAX_CACHED_THUMBNAIL_CLIENTS {
+            let key = test_client_cache_key(&format!("client-{index}"));
+            cache.insert(key.clone(), test_client_build(&format!("selected-{index}")));
+            keys.push(key);
+        }
+
+        assert_eq!(
+            cache.get(&keys[0]).and_then(|build| build.selected_path),
+            Some(PathBuf::from("selected-0"))
+        );
+
+        let overflow_key = test_client_cache_key("client-overflow");
+        cache.insert(
+            overflow_key.clone(),
+            test_client_build("selected-overflow"),
+        );
+
+        assert!(
+            cache.get(&keys[1]).is_none(),
+            "the oldest untouched client should be evicted"
+        );
+        assert_eq!(
+            cache.get(&keys[0]).and_then(|build| build.selected_path),
+            Some(PathBuf::from("selected-0"))
+        );
+        assert_eq!(
+            cache.get(&overflow_key).and_then(|build| build.selected_path),
+            Some(PathBuf::from("selected-overflow"))
+        );
+    }
+
+    #[test]
+    fn thumbnail_client_cache_key_changes_when_bootstrap_or_identity_mtime_changes() {
+        let temp_dir = test_temp_dir("cache-key");
+        let bootstrap_path = temp_dir.join("connection-bootstrap.json");
+        let identity_path = temp_dir.join("client-identity.json");
+        std::fs::write(&bootstrap_path, "bootstrap-v1").expect("failed to write bootstrap");
+        std::fs::write(&identity_path, "identity-v1").expect("failed to write identity");
+
+        let original_key = thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
+
+        update_file_until_mtime_changes(&bootstrap_path);
+        let bootstrap_updated_key = thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
+        assert_ne!(
+            original_key, bootstrap_updated_key,
+            "bootstrap mtime should participate in the cache key"
+        );
+
+        update_file_until_mtime_changes(&identity_path);
+        let identity_updated_key = thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
+        assert_ne!(
+            bootstrap_updated_key, identity_updated_key,
+            "identity mtime should participate in the cache key"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
