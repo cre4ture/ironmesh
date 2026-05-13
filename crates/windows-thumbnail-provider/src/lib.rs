@@ -1411,16 +1411,16 @@ fn fill_circle(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CACHED_THUMBNAIL_CLIENTS, MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE,
-        ThumbnailClientBuild, ThumbnailClientCache, ThumbnailClientCacheKey,
-        ThumbnailFailureKind, ThumbnailProviderError, media_thumbnail_request_path,
-        modified_at_unix_ms, prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
+        MAX_CACHED_THUMBNAIL_CLIENTS, MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE, ThumbnailClientBuild,
+        ThumbnailClientCache, ThumbnailClientCacheKey, ThumbnailFailureKind,
+        ThumbnailProviderError, media_thumbnail_request_path, modified_at_unix_ms,
+        prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
         thumbnail_client_cache_key, thumbnail_status_should_retry,
     };
     use anyhow::anyhow;
+    use reqwest::StatusCode;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use reqwest::StatusCode;
     use windows::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
 
     fn test_temp_dir(label: &str) -> PathBuf {
@@ -1440,8 +1440,7 @@ mod tests {
         let original = modified_at_unix_ms(path).expect("test file should have an mtime");
         for attempt in 0..20 {
             std::thread::sleep(Duration::from_millis(50));
-            std::fs::write(path, format!("updated-{attempt}"))
-                .expect("failed to update test file");
+            std::fs::write(path, format!("updated-{attempt}")).expect("failed to update test file");
             let updated = modified_at_unix_ms(path).expect("test file should keep an mtime");
             if updated != original {
                 return;
@@ -1584,10 +1583,7 @@ mod tests {
         );
 
         let overflow_key = test_client_cache_key("client-overflow");
-        cache.insert(
-            overflow_key.clone(),
-            test_client_build("selected-overflow"),
-        );
+        cache.insert(overflow_key.clone(), test_client_build("selected-overflow"));
 
         assert!(
             cache.get(&keys[1]).is_none(),
@@ -1598,7 +1594,9 @@ mod tests {
             Some(PathBuf::from("selected-0"))
         );
         assert_eq!(
-            cache.get(&overflow_key).and_then(|build| build.selected_path),
+            cache
+                .get(&overflow_key)
+                .and_then(|build| build.selected_path),
             Some(PathBuf::from("selected-overflow"))
         );
     }
@@ -1614,14 +1612,16 @@ mod tests {
         let original_key = thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
 
         update_file_until_mtime_changes(&bootstrap_path);
-        let bootstrap_updated_key = thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
+        let bootstrap_updated_key =
+            thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
         assert_ne!(
             original_key, bootstrap_updated_key,
             "bootstrap mtime should participate in the cache key"
         );
 
         update_file_until_mtime_changes(&identity_path);
-        let identity_updated_key = thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
+        let identity_updated_key =
+            thumbnail_client_cache_key(&bootstrap_path, Some(&identity_path));
         assert_ne!(
             bootstrap_updated_key, identity_updated_key,
             "identity mtime should participate in the cache key"

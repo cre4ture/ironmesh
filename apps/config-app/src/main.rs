@@ -19,9 +19,9 @@ use desktop_client_config::{
     FolderAgentInstance, LaunchOutcome, LaunchReport, ManagedInstanceStore,
     OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance, PLATFORM_KIND,
     STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
-    ServiceRuntimeStatus, StopOutcome, default_instance_store_path,
-    default_launch_report_path, default_service_log_dir, generate_instance_id,
-    launch_enabled_instances, launch_folder_agent_instance, launch_os_integration_instance,
+    ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
+    default_service_log_dir, generate_instance_id, launch_enabled_instances,
+    launch_folder_agent_instance, launch_os_integration_instance,
     launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
     package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
     service_runtime_statuses, stop_service_from_report,
@@ -1248,8 +1248,8 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
     let service_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
     Ok(ConfigResponse {
         platform: PLATFORM_KIND,
-    desktop_config_version: DESKTOP_CLIENT_CONFIG_VERSION,
-    desktop_config_revision: DESKTOP_CLIENT_CONFIG_REVISION,
+        desktop_config_version: DESKTOP_CLIENT_CONFIG_VERSION,
+        desktop_config_revision: DESKTOP_CLIENT_CONFIG_REVISION,
         supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
         config_path: state.instance_store_path.display().to_string(),
         launch_report_path: state.launch_report_path.display().to_string(),
