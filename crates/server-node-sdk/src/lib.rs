@@ -176,13 +176,12 @@ use storage::{
     AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, ClientBootstrapClaimRecord,
     ClientCredentialRecord, ClientCredentialState, DataChangeAction, DataChangeActorKind,
     DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
-    DataScrubReport,
-    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
+    DataScrubReport, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
     MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
     ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
-    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
+    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
     promote_cached_media_metadata_to_incomplete,
 };
 #[derive(Clone)]
@@ -9214,7 +9213,15 @@ async fn complete_upload_session_route(
 ) -> impl IntoResponse {
     let finalize_started_at = Instant::now();
     let requester_device_id = request_device_id(&headers);
-    let (key, total_size_bytes, parent_version_ids, version_state, explicit_version_id, owner_device_id, chunk_refs) = {
+    let (
+        key,
+        total_size_bytes,
+        parent_version_ids,
+        version_state,
+        explicit_version_id,
+        owner_device_id,
+        chunk_refs,
+    ) = {
         let now = unix_ts();
         let mut sessions = write_upload_sessions(&state, "upload_sessions.complete.prepare").await;
         prune_expired_upload_sessions(&mut sessions, now);
@@ -15470,10 +15477,12 @@ async fn list_data_change_events(
         query.before_event_id.as_deref().map(str::trim),
     ) {
         (None, None) => None,
-        (Some(created_at_unix), Some(event_id)) if !event_id.is_empty() => Some(DataChangeEventCursor {
-            created_at_unix,
-            event_id: event_id.to_string(),
-        }),
+        (Some(created_at_unix), Some(event_id)) if !event_id.is_empty() => {
+            Some(DataChangeEventCursor {
+                created_at_unix,
+                event_id: event_id.to_string(),
+            })
+        }
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
 
@@ -15510,7 +15519,14 @@ async fn list_data_change_events(
                 None
             };
 
-            (StatusCode::OK, Json(DataChangeEventsResponse { entries, next_cursor })).into_response()
+            (
+                StatusCode::OK,
+                Json(DataChangeEventsResponse {
+                    entries,
+                    next_cursor,
+                }),
+            )
+                .into_response()
         }
         Err(err) => {
             tracing::error!(error = %err, "failed listing data change events");

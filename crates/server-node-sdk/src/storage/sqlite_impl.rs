@@ -493,9 +493,16 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(snapshots)
     }
 
-    async fn list_data_change_events(&self, query: &DataChangeEventQuery) -> Result<Vec<DataChangeEvent>> {
+    async fn list_data_change_events(
+        &self,
+        query: &DataChangeEventQuery,
+    ) -> Result<Vec<DataChangeEvent>> {
         let db = self.metadata_conn()?;
-        let limit = query.limit.map(usize_to_i64).transpose()?.unwrap_or(i64::MAX);
+        let limit = query
+            .limit
+            .map(usize_to_i64)
+            .transpose()?
+            .unwrap_or(i64::MAX);
         let action_filter = query.action.map(|action| action.as_str().to_string());
         let path_filter = query
             .path_prefix
@@ -509,8 +516,12 @@ impl MetadataStore for SqliteMetadataStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| format!("%{value}%"));
-                let before_created_at_unix = query.before.as_ref().map(|cursor| u64_to_i64(cursor.created_at_unix)).transpose()?;
-                let before_event_id = query.before.as_ref().map(|cursor| cursor.event_id.as_str());
+        let before_created_at_unix = query
+            .before
+            .as_ref()
+            .map(|cursor| u64_to_i64(cursor.created_at_unix))
+            .transpose()?;
+        let before_event_id = query.before.as_ref().map(|cursor| cursor.event_id.as_str());
 
         let mut stmt = db.prepare(
             "SELECT event_json
@@ -523,7 +534,14 @@ impl MetadataStore for SqliteMetadataStore {
                          LIMIT ?6",
         )?;
         let rows = stmt.query_map(
-                        params![action_filter, path_filter, actor_filter, before_created_at_unix, before_event_id, limit],
+            params![
+                action_filter,
+                path_filter,
+                actor_filter,
+                before_created_at_unix,
+                before_event_id,
+                limit
+            ],
             |row| row.get::<_, Vec<u8>>(0),
         )?;
 

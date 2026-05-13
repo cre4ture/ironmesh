@@ -467,7 +467,11 @@ async fn load_data_change_event_from_metadata_db(
                 )
                 .await
                 .unwrap();
-            let row = rows.next().await.unwrap().expect("expected data change row");
+            let row = rows
+                .next()
+                .await
+                .unwrap()
+                .expect("expected data change row");
             let payload = match row.get_value(0).unwrap() {
                 turso::Value::Blob(value) => value,
                 turso::Value::Text(value) => value.into_bytes(),
@@ -1287,7 +1291,15 @@ async fn data_change_event_roundtrips_and_filters_via_metadata_backend_impl(
         })
         .await
         .unwrap();
-    assert_eq!(listed, vec![deleted.clone(), copied.clone(), renamed.clone(), uploaded.clone()]);
+    assert_eq!(
+        listed,
+        vec![
+            deleted.clone(),
+            copied.clone(),
+            renamed.clone(),
+            uploaded.clone()
+        ]
+    );
 
     let renamed_only = store
         .list_data_change_events(&DataChangeEventQuery {

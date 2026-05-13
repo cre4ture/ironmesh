@@ -510,28 +510,36 @@ impl MetadataStore for TursoMetadataStore {
         Ok(snapshots)
     }
 
-            async fn list_data_change_events(&self, query: &DataChangeEventQuery) -> Result<Vec<DataChangeEvent>> {
-                let limit = match query.limit {
-                    Some(limit) => i64::try_from(limit).context("data change event limit overflow")?,
-                    None => i64::MAX,
-                };
-                let action_filter = query.action.map(|action| action.as_str().to_string());
-                let path_filter = query
-                    .path_prefix
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| format!("{value}%"));
-                let actor_filter = query
-                    .actor_query
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| format!("%{value}%"));
-                                let before_created_at_unix = query.before.as_ref().map(|cursor| i64::try_from(cursor.created_at_unix)).transpose().context("data change event cursor timestamp overflow")?;
-                                let before_event_id = query.before.as_ref().map(|cursor| cursor.event_id.as_str());
+    async fn list_data_change_events(
+        &self,
+        query: &DataChangeEventQuery,
+    ) -> Result<Vec<DataChangeEvent>> {
+        let limit = match query.limit {
+            Some(limit) => i64::try_from(limit).context("data change event limit overflow")?,
+            None => i64::MAX,
+        };
+        let action_filter = query.action.map(|action| action.as_str().to_string());
+        let path_filter = query
+            .path_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("{value}%"));
+        let actor_filter = query
+            .actor_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("%{value}%"));
+        let before_created_at_unix = query
+            .before
+            .as_ref()
+            .map(|cursor| i64::try_from(cursor.created_at_unix))
+            .transpose()
+            .context("data change event cursor timestamp overflow")?;
+        let before_event_id = query.before.as_ref().map(|cursor| cursor.event_id.as_str());
 
-                let mut rows = self
+        let mut rows = self
                     .connection
                     .query(
                         "SELECT event_json
@@ -546,17 +554,17 @@ impl MetadataStore for TursoMetadataStore {
                     )
                     .await?;
 
-                let mut events = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    let payload = row_blob(&row, 0, "data_change_events.event_json")?;
-                    events.push(
-                        serde_json::from_slice::<DataChangeEvent>(&payload)
-                            .context("invalid data change event in turso")?,
-                    );
-                }
+        let mut events = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "data_change_events.event_json")?;
+            events.push(
+                serde_json::from_slice::<DataChangeEvent>(&payload)
+                    .context("invalid data change event in turso")?,
+            );
+        }
 
-                Ok(events)
-            }
+        Ok(events)
+    }
 
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
         let payload = serde_json::to_vec(event)?;

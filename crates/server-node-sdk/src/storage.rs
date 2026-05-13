@@ -971,8 +971,10 @@ trait MetadataStore: Send + Sync {
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()>;
     async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()>;
     async fn list_snapshot_infos(&self) -> Result<Vec<SnapshotInfo>>;
-    async fn list_data_change_events(&self, query: &DataChangeEventQuery)
-    -> Result<Vec<DataChangeEvent>>;
+    async fn list_data_change_events(
+        &self,
+        query: &DataChangeEventQuery,
+    ) -> Result<Vec<DataChangeEvent>>;
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()>;
     async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()>;
     async fn load_version_index_by_object_id(
