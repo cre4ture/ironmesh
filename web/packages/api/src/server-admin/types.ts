@@ -30,6 +30,43 @@ export type AdminVersionGraphResponse = VersionGraphResponse;
 
 export type { StoreListView };
 
+export type DataChangeAction = "upload" | "rename" | "copy" | "delete";
+
+export type DataChangeActorKind = "client" | "admin" | "unknown";
+
+export type DataChangeUploadMode = "direct" | "chunked";
+
+export type DataChangeEvent = {
+  event_id: string;
+  action: DataChangeAction;
+  path: string;
+  from_path?: string | null;
+  to_path?: string | null;
+  recursive: boolean;
+  affected_path_count: number;
+  total_size_bytes?: number | null;
+  version_id?: string | null;
+  snapshot_id?: string | null;
+  upload_mode?: DataChangeUploadMode | null;
+  actor_kind: DataChangeActorKind;
+  actor_id?: string | null;
+  actor_label?: string | null;
+  actor_credential_fingerprint?: string | null;
+  actor_source_node?: string | null;
+  recorded_by_node_id: string;
+  created_at_unix: number;
+};
+
+export type DataChangeEventsCursor = {
+  created_at_unix: number;
+  event_id: string;
+};
+
+export type DataChangeEventsResponse = {
+  entries: DataChangeEvent[];
+  next_cursor?: DataChangeEventsCursor | null;
+};
+
 export type ClusterSummary = {
   local_node_id: string;
   total_nodes: number;

@@ -5005,6 +5005,7 @@ async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBacken
     tokio::time::sleep(Duration::from_millis(100)).await;
     let response = super::put_object(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         axum::extract::Path("notify.txt".to_string()),
         Query(super::PutObjectQuery {
             state: None,
@@ -5683,6 +5684,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
 
     let resp = super::delete_object(
         axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
         axum::extract::Path(key.clone()),
         query,
     )
@@ -5738,6 +5740,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
 
     let resp = super::delete_object(
         axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
         axum::extract::Path("docs/".to_string()),
         query,
     )
@@ -5793,6 +5796,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
 
     let resp = super::delete_object(
         axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
         axum::extract::Path("docs/".to_string()),
         query,
     )

@@ -174,11 +174,14 @@ use setup::{
 };
 use storage::{
     AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, ClientBootstrapClaimRecord,
-    ClientCredentialRecord, ClientCredentialState, DataScrubReport, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationChunkInfo, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    ClientCredentialRecord, ClientCredentialState, DataChangeAction, DataChangeActorKind,
+    DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
+    DataScrubReport,
+    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
+    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
+    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
+    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
     TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
     promote_cached_media_metadata_to_incomplete,
 };
@@ -748,6 +751,77 @@ fn request_device_id(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+#[derive(Debug, Clone)]
+struct DataChangeActorContext {
+    actor_kind: DataChangeActorKind,
+    actor_id: Option<String>,
+    actor_label: Option<String>,
+    actor_credential_fingerprint: Option<String>,
+    actor_source_node: Option<String>,
+}
+
+impl DataChangeActorContext {
+    fn unknown() -> Self {
+        Self {
+            actor_kind: DataChangeActorKind::Unknown,
+            actor_id: None,
+            actor_label: None,
+            actor_credential_fingerprint: None,
+            actor_source_node: None,
+        }
+    }
+}
+
+async fn data_change_actor_from_client_headers(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> DataChangeActorContext {
+    data_change_actor_from_client_device_id(state, request_device_id(headers).as_deref()).await
+}
+
+async fn data_change_actor_from_client_device_id(
+    state: &ServerState,
+    device_id: Option<&str>,
+) -> DataChangeActorContext {
+    let Some(device_id) = device_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DataChangeActorContext::unknown();
+    };
+
+    let (actor_label, actor_credential_fingerprint) = {
+        let auth_state = state.client_credentials.lock().await;
+        auth_state
+            .credentials
+            .iter()
+            .find(|credential| credential.device_id == device_id)
+            .map(|credential| {
+                (
+                    credential.label.clone(),
+                    credential_record_fingerprint(credential),
+                )
+            })
+            .unwrap_or((None, None))
+    };
+
+    DataChangeActorContext {
+        actor_kind: DataChangeActorKind::Client,
+        actor_id: Some(device_id.to_string()),
+        actor_label,
+        actor_credential_fingerprint,
+        actor_source_node: None,
+    }
+}
+
+fn data_change_actor_from_admin_request(request: &AdminRequestMetadata) -> DataChangeActorContext {
+    let actor_id = request.actor.clone();
+    DataChangeActorContext {
+        actor_kind: DataChangeActorKind::Admin,
+        actor_id: actor_id.clone(),
+        actor_label: actor_id,
+        actor_credential_fingerprint: None,
+        actor_source_node: request.source_node.clone(),
+    }
 }
 
 impl AdminSessionStore {
@@ -4481,6 +4555,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/scrub/run", post(trigger_data_scrub_public))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/data-changes", get(list_data_change_events))
         .route("/auth/versions/{key}", get(list_versions_admin))
         .route("/auth/store/delete", post(delete_object_by_query_admin))
         .route("/auth/store/rename", post(rename_object_path_admin))
@@ -8273,6 +8348,16 @@ struct SnapshotRestoreRequest {
     overwrite: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct DataChangeEventsQuery {
+    limit: Option<usize>,
+    action: Option<DataChangeAction>,
+    path_prefix: Option<String>,
+    actor: Option<String>,
+    before_created_at_unix: Option<u64>,
+    before_event_id: Option<String>,
+}
+
 fn should_trigger_autonomous_post_write_replication(
     autonomous_replication_on_put_enabled: bool,
     internal_replication: bool,
@@ -8424,9 +8509,11 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
 
 async fn delete_object_by_query(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<DeleteObjectByQuery>,
 ) -> Response {
-    delete_object_by_query_response(&state, query).await
+    let actor = data_change_actor_from_client_headers(&state, &headers).await;
+    delete_object_by_query_response(&state, query, Some(actor)).await
 }
 
 async fn delete_object_by_query_admin(
@@ -8435,7 +8522,7 @@ async fn delete_object_by_query_admin(
     Query(query): Query<DeleteObjectByQuery>,
 ) -> Response {
     let action = "auth/store/delete";
-    if let Err(status) = authorize_admin_request(
+    let authz = match authorize_admin_request(
         &state,
         &headers,
         action,
@@ -8451,30 +8538,34 @@ async fn delete_object_by_query_admin(
     )
     .await
     {
-        return status.into_response();
-    }
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
 
-    delete_object_by_query_response(&state, query).await
+    let actor = data_change_actor_from_admin_request(&authz);
+    delete_object_by_query_response(&state, query, Some(actor)).await
 }
 
 async fn delete_object_by_query_response(
     state: &ServerState,
     query: DeleteObjectByQuery,
+    actor: Option<DataChangeActorContext>,
 ) -> Response {
     if query.key.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    delete_object(
-        State(state.clone()),
-        Path(query.key),
-        Query(PutObjectQuery {
+    delete_object_response(
+        state,
+        query.key,
+        PutObjectQuery {
             state: query.state,
             parent: query.parent,
             version_id: query.version_id,
             internal_replication: query.internal_replication,
             recursive: query.recursive,
-        }),
+        },
+        actor,
     )
     .await
     .into_response()
@@ -8482,9 +8573,11 @@ async fn delete_object_by_query_response(
 
 async fn rename_object_path(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<PathMutationRequest>,
 ) -> Response {
-    rename_object_path_response(&state, request).await
+    let actor = data_change_actor_from_client_headers(&state, &headers).await;
+    rename_object_path_response(&state, request, Some(actor)).await
 }
 
 async fn rename_object_path_admin(
@@ -8493,7 +8586,7 @@ async fn rename_object_path_admin(
     Json(request): Json<PathMutationRequest>,
 ) -> Response {
     let action = "auth/store/rename";
-    if let Err(status) = authorize_admin_request(
+    let authz = match authorize_admin_request(
         &state,
         &headers,
         action,
@@ -8507,15 +8600,18 @@ async fn rename_object_path_admin(
     )
     .await
     {
-        return status.into_response();
-    }
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
 
-    rename_object_path_response(&state, request).await
+    let actor = data_change_actor_from_admin_request(&authz);
+    rename_object_path_response(&state, request, Some(actor)).await
 }
 
 async fn rename_object_path_response(
     state: &ServerState,
     request: PathMutationRequest,
+    actor: Option<DataChangeActorContext>,
 ) -> Response {
     if request.from_path.trim().is_empty() || request.to_path.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -8547,6 +8643,24 @@ async fn rename_object_path_response(
             drop(store);
             publish_namespace_change(state);
             request_local_availability_refresh(state);
+            if request.from_path != request.to_path {
+                record_data_change_event(
+                    state,
+                    DataChangeAction::Rename,
+                    actor.as_ref(),
+                    request.to_path.clone(),
+                    Some(request.from_path.clone()),
+                    Some(request.to_path.clone()),
+                    false,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
             info!(
                 from_path = %request.from_path,
                 to_path = %request.to_path,
@@ -8594,21 +8708,49 @@ async fn rename_object_path_response(
 
 async fn copy_object_path(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<PathMutationRequest>,
+) -> Response {
+    let actor = data_change_actor_from_client_headers(&state, &headers).await;
+    copy_object_path_response(&state, request, Some(actor)).await
+}
+
+async fn copy_object_path_response(
+    state: &ServerState,
+    request: PathMutationRequest,
+    actor: Option<DataChangeActorContext>,
 ) -> Response {
     if request.from_path.trim().is_empty() || request.to_path.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let mut store = lock_store(&state, "store_path.copy").await;
+    let mut store = lock_store(state, "store_path.copy").await;
     match store
         .copy_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
     {
         Ok(PathMutationResult::Applied) => {
             drop(store);
-            publish_namespace_change(&state);
-            request_local_availability_refresh(&state);
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
+            if request.from_path != request.to_path {
+                record_data_change_event(
+                    state,
+                    DataChangeAction::Copy,
+                    actor.as_ref(),
+                    request.to_path.clone(),
+                    Some(request.from_path.clone()),
+                    Some(request.to_path.clone()),
+                    false,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
@@ -8721,6 +8863,7 @@ async fn restore_snapshot_path(
 
 async fn put_object(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     Query(query): Query<PutObjectQuery>,
     payload: Bytes,
@@ -8734,6 +8877,8 @@ async fn put_object(
         Some("provisional") => VersionConsistencyState::Provisional,
         Some(_) => return StatusCode::BAD_REQUEST,
     };
+    let actor = data_change_actor_from_client_headers(&state, &headers).await;
+    let total_size_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let mut store = lock_store(&state, "store_object.put").await;
     match store
@@ -8774,6 +8919,25 @@ async fn put_object(
                 enqueue_autonomous_post_write_replication(
                     &state,
                     autonomous_post_write_replication_subjects(&key, outcome.version_id.as_str()),
+                )
+                .await;
+            }
+
+            if !query.internal_replication {
+                record_data_change_event(
+                    &state,
+                    DataChangeAction::Upload,
+                    Some(&actor),
+                    key.clone(),
+                    None,
+                    None,
+                    false,
+                    1,
+                    Some(total_size_bytes),
+                    Some(outcome.version_id.clone()),
+                    Some(outcome.snapshot_id.clone()),
+                    Some(DataChangeUploadMode::Direct),
+                    None,
                 )
                 .await;
             }
@@ -9050,7 +9214,7 @@ async fn complete_upload_session_route(
 ) -> impl IntoResponse {
     let finalize_started_at = Instant::now();
     let requester_device_id = request_device_id(&headers);
-    let (key, total_size_bytes, parent_version_ids, version_state, explicit_version_id, chunk_refs) = {
+    let (key, total_size_bytes, parent_version_ids, version_state, explicit_version_id, owner_device_id, chunk_refs) = {
         let now = unix_ts();
         let mut sessions = write_upload_sessions(&state, "upload_sessions.complete.prepare").await;
         prune_expired_upload_sessions(&mut sessions, now);
@@ -9082,6 +9246,7 @@ async fn complete_upload_session_route(
             session.parent_version_ids.clone(),
             session.state.clone(),
             session.explicit_version_id.clone(),
+            session.owner_device_id.clone(),
             session
                 .received_chunks
                 .iter()
@@ -9178,6 +9343,30 @@ async fn complete_upload_session_route(
         .await;
     }
 
+    let actor = data_change_actor_from_client_device_id(
+        &state,
+        requester_device_id
+            .as_deref()
+            .or(owner_device_id.as_deref()),
+    )
+    .await;
+    record_data_change_event(
+        &state,
+        DataChangeAction::Upload,
+        Some(&actor),
+        key.clone(),
+        None,
+        None,
+        false,
+        1,
+        Some(total_size_bytes),
+        Some(outcome.version_id.clone()),
+        Some(outcome.snapshot_id.clone()),
+        Some(DataChangeUploadMode::Chunked),
+        None,
+    )
+    .await;
+
     let response = UploadSessionCompleteResponse {
         snapshot_id: outcome.snapshot_id.clone(),
         version_id: outcome.version_id.clone(),
@@ -9229,9 +9418,20 @@ async fn complete_upload_session_route(
 
 async fn delete_object(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     Query(query): Query<PutObjectQuery>,
 ) -> impl IntoResponse {
+    let actor = data_change_actor_from_client_headers(&state, &headers).await;
+    delete_object_response(&state, key, query, Some(actor)).await
+}
+
+async fn delete_object_response(
+    state: &ServerState,
+    key: String,
+    query: PutObjectQuery,
+    actor: Option<DataChangeActorContext>,
+) -> StatusCode {
     if key.trim().is_empty() {
         return StatusCode::BAD_REQUEST;
     }
@@ -9250,7 +9450,7 @@ async fn delete_object(
         return StatusCode::BAD_REQUEST;
     }
 
-    let mut store = lock_store(&state, "store_object.tombstone").await;
+    let mut store = lock_store(state, "store_object.tombstone").await;
     let delete_result = if recursive {
         store
             .tombstone_subtree(
@@ -9289,7 +9489,7 @@ async fn delete_object(
     match delete_result {
         Ok(deleted_paths) => {
             drop(store);
-            publish_namespace_change(&state);
+            publish_namespace_change(state);
 
             let mut cluster = state.cluster.lock().await;
             for (deleted_path, version_id) in &deleted_paths {
@@ -9314,7 +9514,31 @@ async fn delete_object(
                         version_id,
                     );
                 }
-                enqueue_autonomous_post_write_replication(&state, repair_subjects).await;
+                enqueue_autonomous_post_write_replication(state, repair_subjects).await;
+            }
+
+            if !query.internal_replication {
+                let version_id = if deleted_paths.len() == 1 {
+                    Some(deleted_paths[0].1.clone())
+                } else {
+                    None
+                };
+                record_data_change_event(
+                    state,
+                    DataChangeAction::Delete,
+                    actor.as_ref(),
+                    key.clone(),
+                    None,
+                    None,
+                    recursive,
+                    deleted_paths.len(),
+                    None,
+                    version_id,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             }
 
             info!(
@@ -9334,6 +9558,54 @@ async fn delete_object(
             );
             StatusCode::INTERNAL_SERVER_ERROR
         }
+    }
+}
+
+async fn record_data_change_event(
+    state: &ServerState,
+    action: DataChangeAction,
+    actor: Option<&DataChangeActorContext>,
+    path: String,
+    from_path: Option<String>,
+    to_path: Option<String>,
+    recursive: bool,
+    affected_path_count: usize,
+    total_size_bytes: Option<u64>,
+    version_id: Option<String>,
+    snapshot_id: Option<String>,
+    upload_mode: Option<DataChangeUploadMode>,
+    actor_source_node_override: Option<String>,
+) {
+    let fallback_actor = DataChangeActorContext::unknown();
+    let actor = actor.unwrap_or(&fallback_actor);
+    let event = DataChangeEvent {
+        event_id: Uuid::now_v7().to_string(),
+        action,
+        path: path.clone(),
+        from_path,
+        to_path,
+        recursive,
+        affected_path_count,
+        total_size_bytes,
+        version_id,
+        snapshot_id,
+        upload_mode,
+        actor_kind: actor.actor_kind,
+        actor_id: actor.actor_id.clone(),
+        actor_label: actor.actor_label.clone(),
+        actor_credential_fingerprint: actor.actor_credential_fingerprint.clone(),
+        actor_source_node: actor_source_node_override.or_else(|| actor.actor_source_node.clone()),
+        recorded_by_node_id: state.node_id,
+        created_at_unix: unix_ts(),
+    };
+    let store = lock_store(state, "data_change.append").await;
+    if let Err(err) = store.append_data_change_event(&event).await {
+        warn!(
+            error = %err,
+            action = ?event.action,
+            path = %event.path,
+            "failed to append data change event"
+        );
     }
 }
 
@@ -11457,6 +11729,12 @@ struct ClientCredentialView {
     revoked_by_actor: Option<String>,
     revoked_by_source_node: Option<String>,
     revoked_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DataChangeEventsResponse {
+    entries: Vec<DataChangeEvent>,
+    next_cursor: Option<DataChangeEventCursor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -15159,6 +15437,86 @@ async fn list_client_credentials(
     .await;
 
     (StatusCode::OK, Json(credentials)).into_response()
+}
+
+async fn list_data_change_events(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<DataChangeEventsQuery>,
+) -> impl IntoResponse {
+    let action = "auth/data-changes/list";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "limit": query.limit,
+            "action": query.action,
+            "path_prefix": query.path_prefix,
+            "actor": query.actor,
+            "before_created_at_unix": query.before_created_at_unix,
+            "before_event_id": query.before_event_id,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let before_cursor = match (
+        query.before_created_at_unix,
+        query.before_event_id.as_deref().map(str::trim),
+    ) {
+        (None, None) => None,
+        (Some(created_at_unix), Some(event_id)) if !event_id.is_empty() => Some(DataChangeEventCursor {
+            created_at_unix,
+            event_id: event_id.to_string(),
+        }),
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let response_limit = query.limit.unwrap_or(200).clamp(1, 1000);
+
+    let normalized_query = DataChangeEventQuery {
+        limit: Some(response_limit.saturating_add(1)),
+        action: query.action,
+        path_prefix: query
+            .path_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        actor_query: query
+            .actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        before: before_cursor,
+    };
+
+    let store = read_store(&state, "data_change.list").await;
+    match store.list_data_change_events(&normalized_query).await {
+        Ok(mut entries) => {
+            let next_cursor = if entries.len() > response_limit {
+                entries.truncate(response_limit);
+                entries.last().map(|entry| DataChangeEventCursor {
+                    created_at_unix: entry.created_at_unix,
+                    event_id: entry.event_id.clone(),
+                })
+            } else {
+                None
+            };
+
+            (StatusCode::OK, Json(DataChangeEventsResponse { entries, next_cursor })).into_response()
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed listing data change events");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn list_client_bootstrap_claims(

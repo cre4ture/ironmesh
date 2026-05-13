@@ -436,6 +436,48 @@ async fn load_admin_audit_event_from_metadata_db(
     }
 }
 
+async fn load_data_change_event_from_metadata_db(
+    backend: StorageTestBackend,
+    metadata_db_path: &Path,
+    event_id: &str,
+) -> DataChangeEvent {
+    match backend {
+        StorageTestBackend::Sqlite => {
+            let db = rusqlite::Connection::open(metadata_db_path).unwrap();
+            let payload: Vec<u8> = db
+                .query_row(
+                    "SELECT event_json FROM data_change_events WHERE event_id = ?1",
+                    rusqlite::params![event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_slice(&payload).unwrap()
+        }
+        #[cfg(feature = "turso-metadata")]
+        StorageTestBackend::Turso => {
+            let db = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT event_json FROM data_change_events WHERE event_id = ?1",
+                    (event_id,),
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("expected data change row");
+            let payload = match row.get_value(0).unwrap() {
+                turso::Value::Blob(value) => value,
+                turso::Value::Text(value) => value.into_bytes(),
+                other => panic!("unexpected data change payload type: {other:?}"),
+            };
+            serde_json::from_slice(&payload).unwrap()
+        }
+    }
+}
+
 async fn persist_raw_media_cache_record(
     backend: StorageTestBackend,
     metadata_db_path: &Path,
@@ -1141,6 +1183,171 @@ run_on_all_metadata_backends!(
     append_admin_audit_event_roundtrips_via_metadata_backend_impl,
     append_admin_audit_event_roundtrips_via_metadata_backend,
     append_admin_audit_event_roundtrips_via_metadata_backend_turso
+);
+
+async fn data_change_event_roundtrips_and_filters_via_metadata_backend_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, store) = backend.init_store("data-change-log").await;
+
+    let uploaded = DataChangeEvent {
+        event_id: "evt-1".to_string(),
+        action: DataChangeAction::Upload,
+        path: "docs/report.txt".to_string(),
+        from_path: None,
+        to_path: None,
+        recursive: false,
+        affected_path_count: 1,
+        total_size_bytes: Some(128),
+        version_id: Some("ver-1".to_string()),
+        snapshot_id: Some("snap-1".to_string()),
+        upload_mode: Some(DataChangeUploadMode::Direct),
+        actor_kind: DataChangeActorKind::Client,
+        actor_id: Some("device-a".to_string()),
+        actor_label: Some("Alice Laptop".to_string()),
+        actor_credential_fingerprint: Some("cred-a".to_string()),
+        actor_source_node: None,
+        recorded_by_node_id: NodeId::new_v4(),
+        created_at_unix: 1,
+    };
+    let renamed = DataChangeEvent {
+        event_id: "evt-2".to_string(),
+        action: DataChangeAction::Rename,
+        path: "archive/report.txt".to_string(),
+        from_path: Some("docs/report.txt".to_string()),
+        to_path: Some("archive/report.txt".to_string()),
+        recursive: false,
+        affected_path_count: 1,
+        total_size_bytes: None,
+        version_id: Some("ver-2".to_string()),
+        snapshot_id: None,
+        upload_mode: None,
+        actor_kind: DataChangeActorKind::Client,
+        actor_id: Some("device-b".to_string()),
+        actor_label: Some("Bob Desktop".to_string()),
+        actor_credential_fingerprint: Some("cred-b".to_string()),
+        actor_source_node: None,
+        recorded_by_node_id: NodeId::new_v4(),
+        created_at_unix: 2,
+    };
+    let copied = DataChangeEvent {
+        event_id: "evt-3".to_string(),
+        action: DataChangeAction::Copy,
+        path: "archive/report-copy.txt".to_string(),
+        from_path: Some("archive/report.txt".to_string()),
+        to_path: Some("archive/report-copy.txt".to_string()),
+        recursive: false,
+        affected_path_count: 1,
+        total_size_bytes: Some(128),
+        version_id: Some("ver-3".to_string()),
+        snapshot_id: None,
+        upload_mode: None,
+        actor_kind: DataChangeActorKind::Client,
+        actor_id: Some("device-c".to_string()),
+        actor_label: Some("Charlie Workstation".to_string()),
+        actor_credential_fingerprint: Some("cred-c".to_string()),
+        actor_source_node: None,
+        recorded_by_node_id: NodeId::new_v4(),
+        created_at_unix: 2,
+    };
+    let deleted = DataChangeEvent {
+        event_id: "evt-4".to_string(),
+        action: DataChangeAction::Delete,
+        path: "archive/report-copy.txt".to_string(),
+        from_path: None,
+        to_path: None,
+        recursive: false,
+        affected_path_count: 1,
+        total_size_bytes: None,
+        version_id: Some("ver-4".to_string()),
+        snapshot_id: None,
+        upload_mode: None,
+        actor_kind: DataChangeActorKind::Admin,
+        actor_id: Some("admin-local".to_string()),
+        actor_label: Some("Admin Session".to_string()),
+        actor_credential_fingerprint: None,
+        actor_source_node: Some("node-a".to_string()),
+        recorded_by_node_id: NodeId::new_v4(),
+        created_at_unix: 3,
+    };
+
+    store.append_data_change_event(&uploaded).await.unwrap();
+    store.append_data_change_event(&renamed).await.unwrap();
+    store.append_data_change_event(&copied).await.unwrap();
+    store.append_data_change_event(&deleted).await.unwrap();
+
+    let parsed =
+        load_data_change_event_from_metadata_db(backend, &store.metadata_db_path, "evt-1").await;
+    assert_eq!(parsed, uploaded);
+
+    let listed = store
+        .list_data_change_events(&DataChangeEventQuery {
+            limit: Some(10),
+            ..DataChangeEventQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed, vec![deleted.clone(), copied.clone(), renamed.clone(), uploaded.clone()]);
+
+    let renamed_only = store
+        .list_data_change_events(&DataChangeEventQuery {
+            limit: Some(10),
+            action: Some(DataChangeAction::Rename),
+            ..DataChangeEventQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(renamed_only, vec![renamed.clone()]);
+
+    let docs_prefix = store
+        .list_data_change_events(&DataChangeEventQuery {
+            limit: Some(10),
+            path_prefix: Some("docs/".to_string()),
+            ..DataChangeEventQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(docs_prefix, vec![renamed.clone(), uploaded.clone()]);
+
+    let actor_filtered = store
+        .list_data_change_events(&DataChangeEventQuery {
+            limit: Some(10),
+            actor_query: Some("device-b".to_string()),
+            ..DataChangeEventQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(actor_filtered, vec![renamed.clone()]);
+
+    let first_page = store
+        .list_data_change_events(&DataChangeEventQuery {
+            limit: Some(2),
+            ..DataChangeEventQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(first_page, vec![deleted.clone(), copied.clone()]);
+
+    let second_page = store
+        .list_data_change_events(&DataChangeEventQuery {
+            limit: Some(2),
+            before: Some(DataChangeEventCursor {
+                created_at_unix: copied.created_at_unix,
+                event_id: copied.event_id.clone(),
+            }),
+            ..DataChangeEventQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(second_page, vec![renamed, uploaded]);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    data_change_event_roundtrips_and_filters_via_metadata_backend_impl,
+    data_change_event_roundtrips_and_filters_via_metadata_backend,
+    data_change_event_roundtrips_and_filters_via_metadata_backend_turso
 );
 
 async fn load_repair_attempts_returns_empty_when_file_missing_impl(backend: StorageTestBackend) {

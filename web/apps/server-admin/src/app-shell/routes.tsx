@@ -1,4 +1,4 @@
-import { IconActivity, IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconFolder, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconActivity, IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { RepairPage } from "../pages/RepairPage";
 import { SetupPage } from "../pages/SetupPage";
@@ -6,6 +6,7 @@ import { BootstrapBundlesPage } from "../pages/BootstrapBundlesPage";
 import { ClientCredentialsPage } from "../pages/ClientCredentialsPage";
 import { CertificatesPage } from "../pages/CertificatesPage";
 import { ControlPlanePage } from "../pages/ControlPlanePage";
+import { DataChangesPage } from "../pages/DataChangesPage";
 import { LogsPage } from "../pages/LogsPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { ExplorerPage } from "../pages/ExplorerPage";
@@ -45,6 +46,13 @@ export const serverAdminRoutes = [
     description: "Browse prefixes, snapshots, and version history from the node side, with admin-authenticated rename and delete on current data.",
     icon: IconFolder,
     element: <ExplorerPage />
+  },
+  {
+    id: "data-changes",
+    label: "Data Changes",
+    description: "Inspect the recent node-local feed of uploaded, renamed, copied, and deleted data with client identity attribution when available.",
+    icon: IconHistory,
+    element: <DataChangesPage />
   },
   {
     id: "bootstrap",

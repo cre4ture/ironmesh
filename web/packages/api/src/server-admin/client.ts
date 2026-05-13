@@ -12,6 +12,8 @@ import type {
   ClientCredentialView,
   ClusterSummary,
   ControlPlanePromotionImportResponse,
+  DataChangeAction,
+  DataChangeEventsResponse,
   DataScrubActivityStatusResponse,
   DataScrubClusterStatusResponse,
   DataScrubHistoryResponse,
@@ -409,6 +411,51 @@ export async function clearAdminMediaCache(
     method: "POST",
     adminTokenOverride
   });
+}
+
+export async function getDataChangeEvents(
+  options?: {
+    limit?: number;
+    action?: DataChangeAction | null;
+    pathPrefix?: string | null;
+    actor?: string | null;
+    before?: {
+      created_at_unix: number;
+      event_id: string;
+    } | null;
+  },
+  adminTokenOverride?: string
+): Promise<DataChangeEventsResponse> {
+  const query = new URLSearchParams();
+  const limit =
+    typeof options?.limit === "number" && Number.isFinite(options.limit)
+      ? Math.max(1, Math.min(1000, Math.trunc(options.limit)))
+      : 200;
+  query.set("limit", String(limit));
+  if (options?.action) {
+    query.set("action", options.action);
+  }
+  if (options?.pathPrefix?.trim()) {
+    query.set("path_prefix", options.pathPrefix.trim());
+  }
+  if (options?.actor?.trim()) {
+    query.set("actor", options.actor.trim());
+  }
+  if (
+    options?.before &&
+    Number.isFinite(options.before.created_at_unix) &&
+    options.before.event_id.trim()
+  ) {
+    query.set("before_created_at_unix", String(Math.max(0, Math.trunc(options.before.created_at_unix))));
+    query.set("before_event_id", options.before.event_id.trim());
+  }
+
+  return fetchAdminJson<DataChangeEventsResponse>(
+    `${apiV1("/auth/data-changes")}?${query.toString()}`,
+    {
+      adminTokenOverride
+    }
+  );
 }
 
 export async function getRecentLogs(

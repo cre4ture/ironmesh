@@ -388,6 +388,98 @@ pub struct AdminAuditEvent {
     pub created_at_unix: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataChangeAction {
+    Upload,
+    Rename,
+    Copy,
+    Delete,
+}
+
+impl DataChangeAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Rename => "rename",
+            Self::Copy => "copy",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataChangeActorKind {
+    Client,
+    Admin,
+    Unknown,
+}
+
+impl DataChangeActorKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Admin => "admin",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataChangeUploadMode {
+    Direct,
+    Chunked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataChangeEvent {
+    pub event_id: String,
+    pub action: DataChangeAction,
+    pub path: String,
+    #[serde(default)]
+    pub from_path: Option<String>,
+    #[serde(default)]
+    pub to_path: Option<String>,
+    pub recursive: bool,
+    pub affected_path_count: usize,
+    #[serde(default)]
+    pub total_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub upload_mode: Option<DataChangeUploadMode>,
+    pub actor_kind: DataChangeActorKind,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub actor_label: Option<String>,
+    #[serde(default)]
+    pub actor_credential_fingerprint: Option<String>,
+    #[serde(default)]
+    pub actor_source_node: Option<String>,
+    pub recorded_by_node_id: NodeId,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataChangeEventCursor {
+    pub created_at_unix: u64,
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DataChangeEventQuery {
+    pub limit: Option<usize>,
+    pub action: Option<DataChangeAction>,
+    pub path_prefix: Option<String>,
+    pub actor_query: Option<String>,
+    pub before: Option<DataChangeEventCursor>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientCredentialState {
     #[serde(default)]
@@ -879,7 +971,10 @@ trait MetadataStore: Send + Sync {
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()>;
     async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()>;
     async fn list_snapshot_infos(&self) -> Result<Vec<SnapshotInfo>>;
+    async fn list_data_change_events(&self, query: &DataChangeEventQuery)
+    -> Result<Vec<DataChangeEvent>>;
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()>;
+    async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()>;
     async fn load_version_index_by_object_id(
         &self,
         object_id: &str,
@@ -2655,6 +2750,13 @@ impl PersistentStore {
         self.metadata_store
             .list_data_scrub_run_history(limit, finished_since_unix)
             .await
+    }
+
+    pub async fn list_data_change_events(
+        &self,
+        query: &DataChangeEventQuery,
+    ) -> Result<Vec<DataChangeEvent>> {
+        self.metadata_store.list_data_change_events(query).await
     }
 
     pub async fn persist_data_scrub_run_record(&self, record: &DataScrubRunRecord) -> Result<()> {
@@ -5819,6 +5921,10 @@ impl PersistentStore {
 
     pub async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
         self.metadata_store.append_admin_audit_event(event).await
+    }
+
+    pub async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()> {
+        self.metadata_store.append_data_change_event(event).await
     }
 
     fn object_id_for_key(&self, key: &str) -> Option<String> {

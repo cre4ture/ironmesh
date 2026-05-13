@@ -11,8 +11,9 @@ use tracing::warn;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
-    DataScrubRunRecord, FileVersionIndex, MetadataStore, ReconcileMarker, RepairAttemptRecord,
-    RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
+    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, MetadataStore,
+    ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
+    StorageStatsSample, StorageStatsState,
 };
 
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
@@ -492,6 +493,52 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(snapshots)
     }
 
+    async fn list_data_change_events(&self, query: &DataChangeEventQuery) -> Result<Vec<DataChangeEvent>> {
+        let db = self.metadata_conn()?;
+        let limit = query.limit.map(usize_to_i64).transpose()?.unwrap_or(i64::MAX);
+        let action_filter = query.action.map(|action| action.as_str().to_string());
+        let path_filter = query
+            .path_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("{value}%"));
+        let actor_filter = query
+            .actor_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("%{value}%"));
+                let before_created_at_unix = query.before.as_ref().map(|cursor| u64_to_i64(cursor.created_at_unix)).transpose()?;
+                let before_event_id = query.before.as_ref().map(|cursor| cursor.event_id.as_str());
+
+        let mut stmt = db.prepare(
+            "SELECT event_json
+             FROM data_change_events
+             WHERE (?1 IS NULL OR action = ?1)
+               AND (?2 IS NULL OR path LIKE ?2 OR COALESCE(from_path, '') LIKE ?2 OR COALESCE(to_path, '') LIKE ?2)
+               AND (?3 IS NULL OR COALESCE(actor_id, '') LIKE ?3 OR COALESCE(actor_label, '') LIKE ?3 OR COALESCE(actor_credential_fingerprint, '') LIKE ?3)
+                             AND (?4 IS NULL OR created_at_unix < ?4 OR (created_at_unix = ?4 AND event_id < ?5))
+                         ORDER BY created_at_unix DESC, event_id DESC
+                         LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+                        params![action_filter, path_filter, actor_filter, before_created_at_unix, before_event_id, limit],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let payload = row?;
+            events.push(
+                serde_json::from_slice::<DataChangeEvent>(&payload)
+                    .context("invalid data change event in sqlite")?,
+            );
+        }
+
+        Ok(events)
+    }
+
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
         let payload = serde_json::to_vec(event)?;
         let db = self.metadata_conn()?;
@@ -502,6 +549,52 @@ impl MetadataStore for SqliteMetadataStore {
              SET created_at_unix = excluded.created_at_unix,
                  event_json = excluded.event_json",
             params![event.event_id, u64_to_i64(event.created_at_unix)?, payload],
+        )?;
+        Ok(())
+    }
+
+    async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()> {
+        let payload = serde_json::to_vec(event)?;
+        let db = self.metadata_conn()?;
+        db.execute(
+            "INSERT INTO data_change_events (
+                 event_id,
+                 created_at_unix,
+                 action,
+                 path,
+                 from_path,
+                 to_path,
+                 actor_kind,
+                 actor_id,
+                 actor_label,
+                 actor_credential_fingerprint,
+                 event_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(event_id) DO UPDATE
+             SET created_at_unix = excluded.created_at_unix,
+                 action = excluded.action,
+                 path = excluded.path,
+                 from_path = excluded.from_path,
+                 to_path = excluded.to_path,
+                 actor_kind = excluded.actor_kind,
+                 actor_id = excluded.actor_id,
+                 actor_label = excluded.actor_label,
+                 actor_credential_fingerprint = excluded.actor_credential_fingerprint,
+                 event_json = excluded.event_json",
+            params![
+                event.event_id,
+                u64_to_i64(event.created_at_unix)?,
+                event.action.as_str(),
+                event.path,
+                event.from_path,
+                event.to_path,
+                event.actor_kind.as_str(),
+                event.actor_id,
+                event.actor_label,
+                event.actor_credential_fingerprint,
+                payload,
+            ],
         )?;
         Ok(())
     }
@@ -993,6 +1086,20 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             event_json BLOB NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS data_change_events (
+            event_id TEXT PRIMARY KEY,
+            created_at_unix INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            path TEXT NOT NULL,
+            from_path TEXT,
+            to_path TEXT,
+            actor_kind TEXT NOT NULL,
+            actor_id TEXT,
+            actor_label TEXT,
+            actor_credential_fingerprint TEXT,
+            event_json BLOB NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS media_cache (
             content_fingerprint TEXT PRIMARY KEY,
             metadata_json BLOB NOT NULL
@@ -1029,6 +1136,14 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created
             ON admin_audit_events(created_at_unix DESC, event_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_data_change_events_created
+            ON data_change_events(created_at_unix DESC, event_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_data_change_events_action
+            ON data_change_events(action, created_at_unix DESC, event_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_data_change_events_path
+            ON data_change_events(path);
+        CREATE INDEX IF NOT EXISTS idx_data_change_events_actor_id
+            ON data_change_events(actor_id);
         CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
             ON cluster_replicas(subject);
         ",
