@@ -225,7 +225,7 @@ pub mod runtime {
             base_remote_version: Option<&str>,
             reader: &mut dyn std::io::Read,
             length: u64,
-        ) -> Result<Option<String>>;
+        ) -> Result<bool>;
 
         fn rename_path(
             &self,
@@ -265,8 +265,8 @@ pub mod runtime {
             _base_remote_version: Option<&str>,
             _reader: &mut dyn std::io::Read,
             _length: u64,
-        ) -> Result<Option<String>> {
-            Ok(Some("demo-upload".to_string()))
+        ) -> Result<bool> {
+            Ok(true)
         }
 
         fn rename_path(
@@ -1599,11 +1599,10 @@ pub mod runtime {
             };
 
             let mut reader = Cursor::new(payload);
-            let remote_version = self
+            let synced = self
                 .uploader
                 .upload_reader(&path, base_remote_version.as_deref(), &mut reader, size)
                 .with_context(|| format!("failed to upload path {path}"))?;
-            let synced = remote_version.is_some();
 
             if !synced && let Some(node) = self.nodes.get_mut(&inode) {
                 // Once a mutation is only queued, the old remote version is no longer a reliable
@@ -3014,7 +3013,7 @@ pub mod runtime {
                 _base_remote_version: Option<&str>,
                 reader: &mut dyn Read,
                 length: u64,
-            ) -> Result<Option<String>> {
+            ) -> Result<bool> {
                 let mut bytes = Vec::new();
                 reader.read_to_end(&mut bytes)?;
                 self.ops.lock().expect("upload op log lock poisoned").push(
@@ -3024,7 +3023,7 @@ pub mod runtime {
                         bytes,
                     },
                 );
-                Ok(Some("recorded".to_string()))
+                Ok(true)
             }
 
             fn rename_path(

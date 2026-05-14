@@ -863,11 +863,32 @@ impl Uploader for ClientRightsEdgeIo {
         base_remote_version: Option<&str>,
         reader: &mut dyn std::io::Read,
         length: u64,
-    ) -> Result<Option<String>> {
-        self.edge_state
-            .enqueue_upload(path, base_remote_version, reader, length)
+    ) -> Result<bool> {
+        if path.ends_with('/') {
+            self.edge_state.enqueue_directory(path).with_context(|| {
+                format!("failed to persist queued directory marker for path {path}")
+            })?;
+            return Ok(false);
+        }
+
+        let mutation_id = self
+            .edge_state
+            .queue_upload(path, base_remote_version, reader, length)
             .with_context(|| format!("failed to persist queued upload for path {path}"))?;
-        Ok(None)
+        match self
+            .edge_state
+            .try_apply_queued_mutation_now(&self.sdk, mutation_id)
+        {
+            Ok(synced) => Ok(synced),
+            Err(error) => {
+                tracing::warn!(
+                    mutation_id,
+                    path,
+                    "client-rights-edge: immediate queued upload apply failed, leaving mutation queued: {error}"
+                );
+                Ok(false)
+            }
+        }
     }
 
     fn rename_path(
@@ -965,8 +986,9 @@ fn read_optional_utf8_file(path: Option<&std::path::Path>) -> Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::ReplayAction;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -1481,6 +1503,107 @@ mod tests {
         assert_eq!(recorded_requests.len(), 2);
         assert!(recorded_requests[0].starts_with("HEAD /api/v1/store/docs%2Fphoto.jpg HTTP/1.1"));
         assert!(recorded_requests[1].starts_with("GET /api/v1/store/docs%2Fphoto.jpg HTTP/1.1"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
+    }
+
+    #[test]
+    fn client_rights_edge_upload_reader_applies_new_upload_immediately_when_online() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener bind should succeed");
+        let server_addr = listener
+            .local_addr()
+            .expect("listener local addr should succeed");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_server = requests.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept should succeed");
+            let request = read_http_request(&mut stream);
+            requests_for_server
+                .lock()
+                .expect("request log lock should succeed")
+                .push(request);
+            stream
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Length: 0\r\n",
+                        "Connection: close\r\n",
+                        "\r\n",
+                    )
+                    .as_bytes(),
+                )
+                .expect("response write should succeed");
+            stream.flush().expect("response flush should succeed");
+        });
+
+        let state_dir = unique_temp_dir("upload-immediate");
+        let stage_dir = unique_temp_dir("upload-immediate-stage");
+        fs::create_dir_all(&stage_dir).expect("stage dir create should succeed");
+        let edge_state = Arc::new(
+            ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::Off)
+                .expect("edge state create should succeed"),
+        );
+        let io = ClientRightsEdgeIo::with_client(
+            IronMeshClient::from_direct_base_url(format!("http://{server_addr}")),
+            stage_dir.clone(),
+            edge_state.clone(),
+        );
+
+        let mut reader = Cursor::new(b"payload".to_vec());
+        let synced = io
+            .upload_reader("docs/report.txt", None, &mut reader, 7)
+            .expect("upload should succeed");
+
+        assert!(synced);
+        assert!(
+            edge_state
+                .replay_actions()
+                .expect("replay actions should load")
+                .is_empty(),
+            "immediately synced upload should not remain queued"
+        );
+
+        server.join().expect("server thread should succeed");
+
+        let recorded_requests = requests.lock().expect("request log lock should succeed");
+        assert_eq!(recorded_requests.len(), 1);
+        assert!(recorded_requests[0].starts_with("PUT /api/v1/store/docs%2Freport.txt HTTP/1.1"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
+    }
+
+    #[test]
+    fn client_rights_edge_upload_reader_leaves_failed_immediate_upload_queued() {
+        let state_dir = unique_temp_dir("upload-queued-on-failure");
+        let stage_dir = unique_temp_dir("upload-queued-on-failure-stage");
+        fs::create_dir_all(&stage_dir).expect("stage dir create should succeed");
+        let edge_state = Arc::new(
+            ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::Off)
+                .expect("edge state create should succeed"),
+        );
+        let io = ClientRightsEdgeIo::with_client(
+            IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+            stage_dir.clone(),
+            edge_state.clone(),
+        );
+
+        let mut reader = Cursor::new(b"payload".to_vec());
+        let synced = io
+            .upload_reader("docs/report.txt", Some("v1"), &mut reader, 7)
+            .expect("queue fallback should succeed");
+
+        assert!(!synced);
+        assert_eq!(
+            edge_state
+                .replay_actions()
+                .expect("replay actions should load"),
+            vec![ReplayAction::UpsertFile {
+                path: "docs/report.txt".to_string(),
+                data: b"payload".to_vec(),
+            }]
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
         let _ = fs::remove_dir_all(&stage_dir);

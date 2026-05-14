@@ -37,6 +37,7 @@ pub struct ClientRightsEdgeState {
     upload_state_dir: PathBuf,
     object_cache_dir: PathBuf,
     queue: Mutex<MutationLog>,
+    apply_lock: Mutex<()>,
     range_chunk_cache: Mutex<RangeChunkCache<RangeChunkCacheKey, Vec<u8>>>,
     object_cache_mode: OfflineObjectCacheMode,
 }
@@ -148,6 +149,7 @@ impl ClientRightsEdgeState {
             upload_state_dir,
             object_cache_dir,
             queue: Mutex::new(queue),
+            apply_lock: Mutex::new(()),
             range_chunk_cache: Mutex::new(RangeChunkCache::default()),
             object_cache_mode,
         })
@@ -168,12 +170,25 @@ impl ClientRightsEdgeState {
         reader: &mut dyn Read,
         length: u64,
     ) -> Result<()> {
+        self.queue_upload(path, base_remote_version, reader, length)
+            .map(|_| ())
+    }
+
+    pub fn queue_upload(
+        &self,
+        path: &str,
+        base_remote_version: Option<&str>,
+        reader: &mut dyn Read,
+        length: u64,
+    ) -> Result<u64> {
         if path.ends_with('/') {
-            return self.enqueue_directory(path);
+            return Err(anyhow!(
+                "directory markers must be queued via enqueue_directory"
+            ));
         }
 
         let path = normalize_logical_path(path);
-        let (removed_uploads, persisted) = {
+        let (removed_uploads, persisted, id) = {
             let mut queue = self
                 .queue
                 .lock()
@@ -202,10 +217,11 @@ impl ClientRightsEdgeState {
                 },
             });
             let persisted = persist_json_file_atomic(&self.queue_path, &*queue);
-            (removed_uploads, persisted)
+            (removed_uploads, persisted, id)
         };
         persisted?;
-        cleanup_removed_uploads(&self.staged_dir, &self.upload_state_dir, &removed_uploads)
+        cleanup_removed_uploads(&self.staged_dir, &self.upload_state_dir, &removed_uploads)?;
+        Ok(id)
     }
 
     pub fn enqueue_directory(&self, path: &str) -> Result<()> {
@@ -448,41 +464,19 @@ impl ClientRightsEdgeState {
         let state = Arc::clone(self);
         thread::spawn(move || {
             while running.load(Ordering::SeqCst) {
-                let next = match state.peek_next_mutation() {
-                    Ok(Some(next)) => next,
+                match state.apply_next_pending_mutation(&client) {
+                    Ok(Some(ApplyMutationResult::Applied)) => {}
+                    Ok(Some(ApplyMutationResult::Conflict)) => {
+                        tracing::warn!(
+                            "client-rights-edge: next pending mutation blocked by remote divergence"
+                        );
+                        sleep_until_or_stop(retry_interval, &running);
+                    }
                     Ok(None) => {
                         sleep_until_or_stop(retry_interval, &running);
-                        continue;
                     }
                     Err(error) => {
-                        tracing::warn!("client-rights-edge: failed reading queue: {error}");
-                        sleep_until_or_stop(retry_interval, &running);
-                        continue;
-                    }
-                };
-
-                match state.apply_mutation(&client, &next) {
-                    Ok(ApplyMutationResult::Applied) => {
-                        if let Err(error) = state.complete_mutation(next.id) {
-                            tracing::warn!(
-                                "client-rights-edge: failed to finalize mutation {}: {error}",
-                                next.id
-                            );
-                            sleep_until_or_stop(retry_interval, &running);
-                        }
-                    }
-                    Ok(ApplyMutationResult::Conflict) => {
-                        tracing::warn!(
-                            "client-rights-edge: pending mutation {} blocked by remote divergence",
-                            next.id
-                        );
-                        sleep_until_or_stop(retry_interval, &running);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "client-rights-edge: mutation {} sync attempt failed: {error}",
-                            next.id
-                        );
+                        tracing::warn!("client-rights-edge: failed applying queue: {error}");
                         sleep_until_or_stop(retry_interval, &running);
                     }
                 }
@@ -490,12 +484,60 @@ impl ClientRightsEdgeState {
         })
     }
 
-    fn peek_next_mutation(&self) -> Result<Option<PendingMutation>> {
-        let queue = self
-            .queue
+    pub fn try_apply_queued_mutation_now(&self, client: &IronMeshClient, id: u64) -> Result<bool> {
+        let _apply_guard = self
+            .apply_lock
             .lock()
-            .map_err(|_| anyhow!("queue lock poisoned"))?;
-        Ok(queue.pending.first().cloned())
+            .map_err(|_| anyhow!("mutation apply lock poisoned"))?;
+        let next = {
+            let queue = self
+                .queue
+                .lock()
+                .map_err(|_| anyhow!("queue lock poisoned"))?;
+            match queue.pending.first() {
+                Some(first) if first.id == id => Some(first.clone()),
+                Some(_) => None,
+                None => return Ok(true),
+            }
+        };
+
+        let Some(next) = next else {
+            return Ok(false);
+        };
+
+        match self.apply_mutation(client, &next)? {
+            ApplyMutationResult::Applied => {
+                self.complete_mutation(next.id)?;
+                Ok(true)
+            }
+            ApplyMutationResult::Conflict => Ok(false),
+        }
+    }
+
+    fn apply_next_pending_mutation(
+        &self,
+        client: &IronMeshClient,
+    ) -> Result<Option<ApplyMutationResult>> {
+        let _apply_guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| anyhow!("mutation apply lock poisoned"))?;
+        let next = {
+            let queue = self
+                .queue
+                .lock()
+                .map_err(|_| anyhow!("queue lock poisoned"))?;
+            queue.pending.first().cloned()
+        };
+        let Some(next) = next else {
+            return Ok(None);
+        };
+
+        let result = self.apply_mutation(client, &next)?;
+        if result == ApplyMutationResult::Applied {
+            self.complete_mutation(next.id)?;
+        }
+        Ok(Some(result))
     }
 
     fn complete_mutation(&self, id: u64) -> Result<()> {
