@@ -46,11 +46,12 @@ const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 20000;
 const MEDIA_CACHE_BUILD_MAX_CONCURRENCY: usize = 20;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
-const FFPROBE_TIMEOUT_SECS: u64 = 15;
-const FFMPEG_TIMEOUT_SECS: u64 = 60;
+const FFPROBE_TIMEOUT_SECS: u64 = 30;
+const FFMPEG_TIMEOUT_SECS: u64 = 120;
 const VIDEO_THUMBNAIL_SEEK_FRACTION: f64 = 0.10;
-const VIDEO_THUMBNAIL_SEEK_MIN_SECS: f64 = 1.0;
-const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 60.0;
+const VIDEO_THUMBNAIL_SEEK_MIN_SECS: f64 = 10.0;
+const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 120.0;
+const VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS: f64 = 60.0;
 const DATA_SCRUB_ISSUE_SAMPLE_LIMIT: usize = 128;
 const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
 
@@ -7137,10 +7138,12 @@ fn trimmed_command_output(stderr: &[u8]) -> String {
 }
 
 fn preferred_video_seek_time(duration_secs: Option<f64>) -> Option<String> {
-    let duration_secs = duration_secs?;
-    let seek = (duration_secs * VIDEO_THUMBNAIL_SEEK_FRACTION)
-        .clamp(VIDEO_THUMBNAIL_SEEK_MIN_SECS, VIDEO_THUMBNAIL_SEEK_MAX_SECS)
-        .min(duration_secs);
+    let seek = match duration_secs {
+        Some(duration_secs) => (duration_secs * VIDEO_THUMBNAIL_SEEK_FRACTION)
+            .clamp(VIDEO_THUMBNAIL_SEEK_MIN_SECS, VIDEO_THUMBNAIL_SEEK_MAX_SECS)
+            .min(duration_secs),
+        None => VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS,
+    };
     Some(format!("{seek:.3}"))
 }
 

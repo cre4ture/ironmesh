@@ -259,6 +259,11 @@ fn assert_dominant_color(pixel: &image::Rgb<u8>, expected: [u8; 3]) {
     }
 }
 
+#[test]
+fn preferred_video_seek_time_falls_back_to_sixty_seconds_without_duration() {
+    assert_eq!(preferred_video_seek_time(None).as_deref(), Some("60.000"));
+}
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
