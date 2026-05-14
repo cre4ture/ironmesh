@@ -176,12 +176,12 @@ use storage::{
     AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, ClientBootstrapClaimRecord,
     ClientCredentialRecord, ClientCredentialState, DataChangeAction, DataChangeActorKind,
     DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
-    DataScrubReport, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
-    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
-    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
-    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
-    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
+    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
+    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    ReplicationChunkInfo, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
     promote_cached_media_metadata_to_incomplete,
 };
 #[derive(Clone)]
@@ -4619,6 +4619,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/auth/node-certificates/status",
             get(node_certificate_status),
         )
+        .route("/auth/host/dependencies", get(host_dependency_status))
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
     let public_maps_api = Router::new()
@@ -8184,6 +8185,54 @@ async fn node_certificate_status(
     .await;
 
     (StatusCode::OK, Json(status)).into_response()
+}
+
+async fn host_dependency_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/host/dependencies/get";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "node_id": state.node_id }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let report: HostDependencyReport = {
+        let store = read_store(&state, "host_dependency_report").await;
+        store.host_dependency_report()
+    };
+    let missing_count = report
+        .checks
+        .iter()
+        .filter(|check| check.status == HostDependencyStatus::Missing)
+        .count();
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "host_os": report.host_os,
+            "dependency_count": report.checks.len(),
+            "missing_count": missing_count,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(report)).into_response()
 }
 
 async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {

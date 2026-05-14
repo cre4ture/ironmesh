@@ -342,6 +342,25 @@ export type LogsResponse = {
   entries: ServerLogEntry[];
 };
 
+export type HostDependencyStatus = "ready" | "missing" | "builtin";
+
+export type HostDependencyCheck = {
+  id: string;
+  feature: string;
+  status: HostDependencyStatus;
+  summary: string;
+  detail: string;
+  configured_path?: string | null;
+  resolved_path?: string | null;
+  install_hint?: string | null;
+};
+
+export type HostDependencyReport = {
+  host_os: string;
+  generated_at_unix: number;
+  checks: HostDependencyCheck[];
+};
+
 export type ServerHealthResponse = {
   node_id?: string;
   role?: string;

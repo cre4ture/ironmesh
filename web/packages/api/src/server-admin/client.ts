@@ -19,6 +19,7 @@ import type {
   DataScrubHistoryResponse,
   DataScrubScope,
   DataScrubTriggerResponse,
+  HostDependencyReport,
   LogsResponse,
   ManagedControlPlanePromotionPackage,
   ManagedRendezvousFailoverImportResponse,
@@ -463,6 +464,14 @@ export async function getRecentLogs(
   adminTokenOverride?: string
 ): Promise<LogsResponse> {
   return fetchAdminJson<LogsResponse>(`/logs?limit=${limit}`, {
+    adminTokenOverride
+  });
+}
+
+export async function getHostDependencyReport(
+  adminTokenOverride?: string
+): Promise<HostDependencyReport> {
+  return fetchAdminJson<HostDependencyReport>(apiV1("/auth/host/dependencies"), {
     adminTokenOverride
   });
 }

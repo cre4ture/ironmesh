@@ -344,6 +344,63 @@ cat '{}'
     (ffprobe_path, ffmpeg_path, poster_bytes)
 }
 
+#[cfg(unix)]
+#[test]
+fn host_dependency_report_marks_ready_and_missing_video_tools() {
+    let root = test_store_dir("host-dependency-report");
+    std::fs::create_dir_all(&root).unwrap();
+    let ffprobe_path = root.join("ffprobe");
+    std::fs::write(&ffprobe_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = std::fs::metadata(&ffprobe_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ffprobe_path, permissions).unwrap();
+    let missing_ffmpeg_path = root.join("missing-ffmpeg");
+
+    let report = MediaToolPaths {
+        ffprobe: ffprobe_path.clone(),
+        ffmpeg: missing_ffmpeg_path.clone(),
+    }
+    .host_dependency_report();
+
+    let image_check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "image-thumbnails")
+        .unwrap();
+    assert_eq!(image_check.status, HostDependencyStatus::Builtin);
+
+    let ffprobe_check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "video-metadata")
+        .unwrap();
+    assert_eq!(ffprobe_check.status, HostDependencyStatus::Ready);
+    assert_eq!(
+        ffprobe_check.resolved_path.as_deref(),
+        Some(ffprobe_path.to_string_lossy().as_ref())
+    );
+
+    let ffmpeg_check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "video-thumbnails")
+        .unwrap();
+    assert_eq!(ffmpeg_check.status, HostDependencyStatus::Missing);
+    assert_eq!(
+        ffmpeg_check.configured_path.as_deref(),
+        Some(missing_ffmpeg_path.to_string_lossy().as_ref())
+    );
+    assert!(
+        ffmpeg_check
+            .install_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ffmpeg")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[derive(Clone, Copy)]
 enum StorageTestBackend {
     Sqlite,

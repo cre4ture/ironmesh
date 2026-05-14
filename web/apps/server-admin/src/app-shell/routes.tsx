@@ -7,6 +7,7 @@ import { ClientCredentialsPage } from "../pages/ClientCredentialsPage";
 import { CertificatesPage } from "../pages/CertificatesPage";
 import { ControlPlanePage } from "../pages/ControlPlanePage";
 import { DataChangesPage } from "../pages/DataChangesPage";
+import { DependenciesPage } from "../pages/DependenciesPage";
 import { LogsPage } from "../pages/LogsPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { ExplorerPage } from "../pages/ExplorerPage";
@@ -74,6 +75,13 @@ export const serverAdminRoutes = [
     description: "Inspect current public and internal TLS state plus auto-renew health.",
     icon: IconCertificate,
     element: <CertificatesPage />
+  },
+  {
+    id: "dependencies",
+    label: "Dependencies",
+    description: "Check host runtime dependencies such as ffprobe and ffmpeg before media-heavy test rounds.",
+    icon: IconServerCog,
+    element: <DependenciesPage />
   },
   {
     id: "control-plane",
