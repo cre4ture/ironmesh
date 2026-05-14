@@ -653,11 +653,14 @@ async fn execute_buffered_request_for_transport(
             session_pool,
         } => {
             if let ClientRequestAuth::SignedIdentity(identity) = auth {
-                return execute_direct_multiplex_buffered_request(
+                let direct = DirectMultiplexSessionContext {
                     server_base_url,
                     session_pool,
                     identity,
                     connection_name,
+                };
+                return execute_direct_multiplex_buffered_request(
+                    direct,
                     method,
                     url,
                     headers,
@@ -767,11 +770,14 @@ async fn execute_streaming_object_write_request_for_transport(
             ..
         } => {
             if let ClientRequestAuth::SignedIdentity(identity) = auth {
-                return execute_direct_multiplex_streaming_object_write_request(
+                let direct = DirectMultiplexSessionContext {
                     server_base_url,
                     session_pool,
                     identity,
                     connection_name,
+                };
+                return execute_direct_multiplex_streaming_object_write_request(
+                    direct,
                     method,
                     url,
                     headers,
@@ -3418,6 +3424,14 @@ async fn execute_direct_http_streaming_object_read_request(
     })
 }
 
+#[derive(Clone, Copy)]
+struct DirectMultiplexSessionContext<'a> {
+    server_base_url: &'a str,
+    session_pool: &'a TransportSessionPool,
+    identity: &'a ClientIdentityMaterial,
+    connection_name: Option<&'a str>,
+}
+
 async fn execute_direct_multiplex_streaming_object_read_request(
     server_base_url: &str,
     session_pool: &TransportSessionPool,
@@ -3504,18 +3518,16 @@ async fn execute_relay_multiplex_streaming_object_read_request(
 }
 
 async fn execute_direct_multiplex_streaming_object_write_request(
-    server_base_url: &str,
-    session_pool: &TransportSessionPool,
-    identity: &ClientIdentityMaterial,
-    connection_name: Option<&str>,
+    direct: DirectMultiplexSessionContext<'_>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
     body: &[u8],
 ) -> Result<BufferedTransportResponse> {
     for attempt in 0..2 {
-        let session = session_pool
-            .ensure_direct_session(identity, connection_name)
+        let session = direct
+            .session_pool
+            .ensure_direct_session(direct.identity, direct.connection_name)
             .await
             .context("failed ensuring direct multiplex session")?;
         let result = execute_multiplex_streaming_object_write_request(
@@ -3529,15 +3541,15 @@ async fn execute_direct_multiplex_streaming_object_write_request(
         match result {
             Ok(response) => return Ok(response),
             Err(err) if attempt == 0 => {
-                session_pool.invalidate().await;
+                direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
-                    server_base_url,
+                    server_base_url = direct.server_base_url,
                     "retrying streamed direct object write after resetting cached session"
                 );
             }
             Err(err) => {
-                session_pool.invalidate().await;
+                direct.session_pool.invalidate().await;
                 return Err(err);
             }
         }
@@ -3545,7 +3557,7 @@ async fn execute_direct_multiplex_streaming_object_write_request(
 
     bail!(
         "streamed direct object write retried without producing a response for {}",
-        server_base_url
+        direct.server_base_url
     )
 }
 
@@ -3601,10 +3613,7 @@ async fn execute_relay_multiplex_streaming_object_write_request(
 }
 
 async fn execute_direct_multiplex_buffered_request(
-    server_base_url: &str,
-    session_pool: &TransportSessionPool,
-    identity: &ClientIdentityMaterial,
-    connection_name: Option<&str>,
+    direct: DirectMultiplexSessionContext<'_>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -3614,8 +3623,9 @@ async fn execute_direct_multiplex_buffered_request(
     let request_headers = transport_headers_from_relay_headers(headers);
 
     for attempt in 0..2 {
-        let session = session_pool
-            .ensure_direct_session(identity, connection_name)
+        let session = direct
+            .session_pool
+            .ensure_direct_session(direct.identity, direct.connection_name)
             .await
             .context("failed ensuring direct multiplex session")?;
         let request = BufferedTransportRequest::new(
@@ -3644,15 +3654,15 @@ async fn execute_direct_multiplex_buffered_request(
         match result {
             Ok(response) => return Ok(response),
             Err(err) if attempt == 0 => {
-                session_pool.invalidate().await;
+                direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
-                    server_base_url,
+                    server_base_url = direct.server_base_url,
                     "retrying direct multiplex request after resetting cached session"
                 );
             }
             Err(err) => {
-                session_pool.invalidate().await;
+                direct.session_pool.invalidate().await;
                 return Err(err);
             }
         }
@@ -3660,7 +3670,7 @@ async fn execute_direct_multiplex_buffered_request(
 
     bail!(
         "direct multiplex request retried without producing a response for {}",
-        server_base_url
+        direct.server_base_url
     )
 }
 
