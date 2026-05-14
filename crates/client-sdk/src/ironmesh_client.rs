@@ -660,11 +660,7 @@ async fn execute_buffered_request_for_transport(
                     connection_name,
                 };
                 return execute_direct_multiplex_buffered_request(
-                    direct,
-                    method,
-                    url,
-                    headers,
-                    body,
+                    direct, method, url, headers, body,
                 )
                 .await
                 .with_context(|| format!("failed to execute multiplexed {} {}", method, url));
@@ -777,11 +773,7 @@ async fn execute_streaming_object_write_request_for_transport(
                     connection_name,
                 };
                 return execute_direct_multiplex_streaming_object_write_request(
-                    direct,
-                    method,
-                    url,
-                    headers,
-                    body,
+                    direct, method, url, headers, body,
                 )
                 .await
                 .with_context(|| format!("failed to execute streamed {} {}", method, url));

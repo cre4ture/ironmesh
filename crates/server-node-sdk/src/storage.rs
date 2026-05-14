@@ -6776,7 +6776,9 @@ fn merge_cached_media_metadata_without_thumbnail(
     let (status, retry_after_unix, fallback_error) = match derived.status {
         MediaCacheStatus::Incomplete => (
             MediaCacheStatus::Incomplete,
-            Some(media_cache_incomplete_retry_after_unix(derived.generated_at_unix)),
+            Some(media_cache_incomplete_retry_after_unix(
+                derived.generated_at_unix,
+            )),
             "media source is incomplete locally; one or more chunks are missing or have the wrong size",
         ),
         MediaCacheStatus::Unsupported => (

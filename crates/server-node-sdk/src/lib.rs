@@ -6407,12 +6407,8 @@ async fn serve_direct_transport_session(
         "accepted direct transport session"
     );
 
-    let _tracked_connection = track_direct_transport_connection(
-        &state,
-        &client_identity,
-        connection_name,
-        &session_id,
-    );
+    let _tracked_connection =
+        track_direct_transport_connection(&state, &client_identity, connection_name, &session_id);
 
     loop {
         let next = session
