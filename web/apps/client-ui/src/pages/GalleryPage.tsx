@@ -62,11 +62,7 @@ export function GalleryPage() {
         ? {
             url: entry.media.thumbnail.url
           }
-        : entry.media?.media_type === "video" || entry.media?.mime_type?.startsWith("video/")
-          ? null
-          : {
-              url: binaryMediaUrl(entry.path, snapshotId)
-            },
+        : null,
       original: {
         url: binaryMediaUrl(entry.path, snapshotId)
       }
@@ -81,7 +77,7 @@ export function GalleryPage() {
         description="Browse photo and movie objects through the client web backend with shared media-aware gallery tooling."
       />
       <GallerySurface
-        previewHint="Thumbnail URLs are used when indexed media is ready, and original images or movies fall back to the inline stream route when needed."
+        previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
         allowedMediaKinds={["image", "video"]}
         basemaps={CLIENT_GALLERY_BASEMAPS}
         loadSnapshots={loadSnapshots}

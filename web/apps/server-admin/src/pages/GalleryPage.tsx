@@ -71,14 +71,11 @@ export function GalleryPage() {
         url: adminBinaryObjectUrl(entry.path, snapshotId),
         headers: previewHeaders
       };
-      const thumbnailUrl =
-        entry.media?.thumbnail?.url ||
-        (entry.media?.status === "ready" ? adminBinaryObjectUrl(entry.path, snapshotId) : null);
 
       return {
-        thumbnail: thumbnailUrl
+        thumbnail: entry.media?.thumbnail?.url
           ? {
-              url: thumbnailUrl,
+              url: entry.media.thumbnail.url,
               headers: previewHeaders
             }
           : null,
@@ -91,7 +88,8 @@ export function GalleryPage() {
   return (
     <GallerySurface
       intro="Browse the node-side store index through admin-authenticated snapshot, index, and media routes. The gallery stays shared with the client surface, while this wrapper carries the admin session or advanced token override when previews need authenticated fetches."
-      previewHint="Admin thumbnail URLs are preferred when indexed media is ready, with authenticated full-object fetches as a fallback."
+      previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
+      allowedMediaKinds={["image", "video"]}
       basemaps={ADMIN_GALLERY_BASEMAPS}
       loadSnapshots={loadSnapshots}
       loadEntries={loadEntries}

@@ -106,6 +106,12 @@ export type GalleryMediaRequests = {
   original: GalleryPreviewRequest;
 };
 
+type GalleryMissingThumbnailInfo = {
+  title: string;
+  detail: string;
+  color: string;
+};
+
 type GalleryNavigationItem = {
   key: string;
   kind: "up" | "prefix";
@@ -214,6 +220,10 @@ export function GallerySurface({
   const selectedMediaRequests = selectedEntry
     ? getMediaRequests(selectedEntry, snapshotId)
     : null;
+  const selectedMissingThumbnailInfo = selectedEntry
+    ? galleryMissingThumbnailInfo(selectedEntry)
+    : null;
+  const selectedMediaError = selectedEntry?.media?.error ?? null;
   const selectedMediaViewerKey =
     selectedEntry && selectedMediaRequests
       ? `${selectedEntry.path}::${requestSignature(selectedMediaRequests.thumbnail)}::${requestSignature(selectedMediaRequests.original)}`
@@ -648,6 +658,7 @@ export function GallerySurface({
               {mediaEntries.map((entry) => {
                 const mediaRequests = getMediaRequests(entry, snapshotId);
                 const mediaKind = galleryMediaKind(entry) ?? "image";
+                const missingThumbnailInfo = galleryMissingThumbnailInfo(entry);
                 return (
                   showMetadata ? (
                     <Card
@@ -670,6 +681,7 @@ export function GallerySurface({
                             kind={mediaKind}
                             request={mediaRequests.thumbnail ?? null}
                             alt={entry.path}
+                            missingThumbnailInfo={missingThumbnailInfo}
                           />
                         </AspectRatio>
                       </Card.Section>
@@ -726,6 +738,7 @@ export function GallerySurface({
                           kind={mediaKind}
                           request={mediaRequests.thumbnail ?? null}
                           alt={entry.path}
+                          missingThumbnailInfo={missingThumbnailInfo}
                         />
                       </AspectRatio>
                     </div>
@@ -786,6 +799,7 @@ export function GallerySurface({
                   key={selectedMediaViewerKey ?? selectedEntry.path}
                   requests={selectedMediaRequests}
                   alt={selectedEntry.path}
+                  missingThumbnailInfo={selectedMissingThumbnailInfo}
                   canNavigatePrevious={canNavigatePrevious}
                   canNavigateNext={canNavigateNext}
                   onNavigatePrevious={() => showRelativeEntry(-1)}
@@ -815,10 +829,17 @@ export function GallerySurface({
             <Text size="sm" c="dimmed">
               {selectedEntry.path}
             </Text>
+            {selectedMissingThumbnailInfo ? (
+              <Alert color={selectedMissingThumbnailInfo.color} title={selectedMissingThumbnailInfo.title}>
+                {selectedMissingThumbnailInfo.detail}
+              </Alert>
+            ) : null}
             {selectedEntry.media?.taken_at_unix ? (
               <Text size="sm">Captured {formatTakenAt(selectedEntry.media.taken_at_unix)}</Text>
             ) : null}
-            {selectedEntry.media?.error ? <Alert color="yellow">{selectedEntry.media.error}</Alert> : null}
+            {selectedMediaError && selectedMediaError !== selectedMissingThumbnailInfo?.detail ? (
+              <Alert color="yellow">{selectedMediaError}</Alert>
+            ) : null}
             <JsonBlock value={selectedEntry} />
           </Stack>
         ) : null}
@@ -1329,25 +1350,18 @@ type GalleryGridPreviewProps = {
   kind: GalleryMediaKind;
   request: GalleryPreviewRequest | null;
   alt: string;
+  missingThumbnailInfo?: GalleryMissingThumbnailInfo | null;
 };
 
-function GalleryGridPreview({ kind, request, alt }: GalleryGridPreviewProps) {
+function GalleryGridPreview({
+  kind,
+  request,
+  alt,
+  missingThumbnailInfo
+}: GalleryGridPreviewProps) {
   if (!request) {
     return (
-      <Center
-        style={{
-          width: "100%",
-          height: "100%",
-          background:
-            kind === "video"
-              ? "linear-gradient(180deg, rgba(30, 41, 59, 1) 0%, rgba(15, 23, 42, 1) 100%)"
-              : "var(--mantine-color-gray-0)"
-        }}
-      >
-        <Text size="sm" c={kind === "video" ? "gray.4" : "dimmed"}>
-          {kind === "video" ? "Movie preview" : "Preview unavailable"}
-        </Text>
-      </Center>
+      <GalleryThumbnailPlaceholder kind={kind} info={missingThumbnailInfo} />
     );
   }
 
@@ -1380,6 +1394,7 @@ function GalleryGridPreview({ kind, request, alt }: GalleryGridPreviewProps) {
 type GalleryLightboxImageProps = {
   requests: GalleryMediaRequests;
   alt: string;
+  missingThumbnailInfo?: GalleryMissingThumbnailInfo | null;
   canNavigatePrevious: boolean;
   canNavigateNext: boolean;
   onNavigatePrevious: () => void;
@@ -1389,24 +1404,21 @@ type GalleryLightboxImageProps = {
 function GalleryLightboxImage({
   requests,
   alt,
+  missingThumbnailInfo,
   canNavigatePrevious,
   canNavigateNext,
   onNavigatePrevious,
   onNavigateNext
 }: GalleryLightboxImageProps) {
-  const thumbnailRequest = requests.thumbnail ?? requests.original;
+  const thumbnailRequest = requests.thumbnail ?? null;
   const thumbnail = useResolvedPreviewRequest(thumbnailRequest);
-  const originalRequest =
-    requests.original && !sameImageRequest(thumbnailRequest, requests.original)
-      ? requests.original
-      : null;
+  const originalRequest = requests.original;
   const original = useResolvedPreviewRequest(originalRequest);
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [originalFailed, setOriginalFailed] = useState(false);
   const [originalLoaded, setOriginalLoaded] = useState(false);
   const thumbnailSignature = requestSignature(thumbnailRequest);
   const originalSignature = requestSignature(originalRequest);
-  const showingOriginal = Boolean(originalRequest);
 
   useEffect(() => {
     setThumbnailFailed(false);
@@ -1419,8 +1431,16 @@ function GalleryLightboxImage({
 
   const thumbnailVisible = Boolean(thumbnail.resolvedSrc) && !thumbnail.failed && !thumbnailFailed;
   const originalVisible = Boolean(original.resolvedSrc) && !original.failed && !originalFailed;
-  const fullImageUnavailable = showingOriginal && (original.failed || originalFailed);
-  const originalPending = showingOriginal && !fullImageUnavailable && !originalLoaded;
+  const fullImageUnavailable = original.failed || originalFailed;
+  const originalPending = !fullImageUnavailable && !originalLoaded;
+  const thumbnailLoadFailed = Boolean(thumbnailRequest) && (thumbnail.failed || thumbnailFailed);
+  const thumbnailNotice = thumbnailLoadFailed
+    ? {
+        title: "Indexed thumbnail failed to load",
+        detail: "The gallery has a thumbnail URL for this item, but fetching it failed.",
+        color: "yellow"
+      }
+    : missingThumbnailInfo;
 
   return (
     <GalleryLightboxFrame
@@ -1447,15 +1467,19 @@ function GalleryLightboxImage({
           }}
         />
       ) : (
-        <Center
+        <div
           style={{
             position: "absolute",
-            inset: 0,
-            background: "var(--mantine-color-gray-0)"
+            inset: 0
           }}
         >
-          <Loader size="sm" color="gray" />
-        </Center>
+          <GalleryThumbnailPlaceholder
+            kind="image"
+            info={thumbnailNotice}
+            showLoader={originalPending && !originalVisible}
+            fullHeight
+          />
+        </div>
       )}
 
       {originalVisible ? (
@@ -1578,6 +1602,58 @@ function GalleryLightboxVideo({
         </Center>
       )}
     </GalleryLightboxFrame>
+  );
+}
+
+type GalleryThumbnailPlaceholderProps = {
+  kind: GalleryMediaKind;
+  info?: GalleryMissingThumbnailInfo | null;
+  showLoader?: boolean;
+  fullHeight?: boolean;
+};
+
+function GalleryThumbnailPlaceholder({
+  kind,
+  info,
+  showLoader = false,
+  fullHeight = true
+}: GalleryThumbnailPlaceholderProps) {
+  const resolvedInfo = info ?? defaultMissingThumbnailInfo(kind);
+
+  return (
+    <Center
+      style={{
+        width: "100%",
+        height: fullHeight ? "100%" : undefined,
+        minHeight: fullHeight ? undefined : 0,
+        background:
+          kind === "video"
+            ? "linear-gradient(180deg, rgba(30, 41, 59, 1) 0%, rgba(15, 23, 42, 1) 100%)"
+            : "var(--mantine-color-gray-0)",
+        padding: "1rem"
+      }}
+    >
+      <Stack align="center" gap={6} maw="90%">
+        {showLoader ? <Loader size="sm" color="gray" /> : null}
+        <Text
+          size="sm"
+          fw={600}
+          ta="center"
+          c={kind === "video" ? "gray.2" : "dark"}
+          lineClamp={2}
+        >
+          {resolvedInfo.title}
+        </Text>
+        <Text
+          size="xs"
+          ta="center"
+          c={kind === "video" ? "gray.4" : "dimmed"}
+          lineClamp={4}
+        >
+          {resolvedInfo.detail}
+        </Text>
+      </Stack>
+    </Center>
   );
 }
 
@@ -1891,6 +1967,79 @@ function mediaStatusColor(status?: string | null): string {
     return "red";
   }
   return "gray";
+}
+
+function galleryMissingThumbnailInfo(entry: GalleryEntry): GalleryMissingThumbnailInfo | null {
+  if (entry.media?.thumbnail?.url) {
+    return null;
+  }
+
+  const kind = galleryMediaKind(entry);
+  const thumbnailLabel = kind === "video" ? "Poster thumbnail" : "Thumbnail";
+  const status = entry.media?.status;
+
+  if (entry.media?.error) {
+    return {
+      title: `${thumbnailLabel} unavailable`,
+      detail: entry.media.error,
+      color: mediaStatusColor(status)
+    };
+  }
+
+  if (status === "pending") {
+    return {
+      title: `${thumbnailLabel} pending`,
+      detail:
+        kind === "video"
+          ? "Video metadata or poster generation has not finished yet on this node."
+          : "Image indexing has not produced a thumbnail yet on this node.",
+      color: "yellow"
+    };
+  }
+
+  if (status === "incomplete") {
+    return {
+      title: `${thumbnailLabel} incomplete`,
+      detail: "Media indexing finished without producing a usable thumbnail.",
+      color: "orange"
+    };
+  }
+
+  if (status === "failed") {
+    return {
+      title: `${thumbnailLabel} failed`,
+      detail: "Thumbnail generation failed. Check the media error, host dependency status, or server logs.",
+      color: "red"
+    };
+  }
+
+  if (status === "ready") {
+    return {
+      title: `${thumbnailLabel} missing`,
+      detail: "Media is marked ready, but the index does not include a thumbnail URL.",
+      color: "yellow"
+    };
+  }
+
+  return {
+    title: `${thumbnailLabel} unavailable`,
+    detail: "This entry does not have an indexed thumbnail to display.",
+    color: "gray"
+  };
+}
+
+function defaultMissingThumbnailInfo(kind: GalleryMediaKind): GalleryMissingThumbnailInfo {
+  return kind === "video"
+    ? {
+        title: "Poster thumbnail unavailable",
+        detail: "This movie does not have an indexed poster thumbnail to display.",
+        color: "gray"
+      }
+    : {
+        title: "Thumbnail unavailable",
+        detail: "This item does not have an indexed thumbnail to display.",
+        color: "gray"
+      };
 }
 
 function sameImageRequest(
