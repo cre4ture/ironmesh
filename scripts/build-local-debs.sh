@@ -12,6 +12,19 @@ log() {
   printf '[build-local-debs] %s\n' "$*"
 }
 
+require_clean_repository() {
+  local status_output
+
+  status_output="$(git -C "${ROOT_DIR}" status --short --untracked-files=normal)"
+  if [[ -z "${status_output}" ]]; then
+    return 0
+  fi
+
+  printf 'local repository state is dirty; commit, stash, or clean these paths before building local Debian packages:\n' >&2
+  printf '%s\n' "${status_output}" >&2
+  exit 1
+}
+
 usage() {
   cat <<'EOF'
 Build installable local Debian binary packages from the current checkout.
@@ -84,6 +97,7 @@ while (($# > 0)); do
   esac
 done
 
+require_command git
 require_command dpkg-buildpackage
 require_command dpkg-checkbuilddeps
 require_command dpkg-parsechangelog
@@ -93,6 +107,7 @@ if [[ "${RUN_LINTIAN}" == true ]]; then
   require_command lintian
 fi
 
+require_clean_repository
 "${ROOT_DIR}/scripts/sync-debian-version.sh"
 check_build_dependencies
 
