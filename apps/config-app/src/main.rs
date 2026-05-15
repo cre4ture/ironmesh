@@ -422,6 +422,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index_html))
+        .route("/ironmesh-favicon.svg", get(app_favicon))
         .route("/app.css", get(app_css))
         .route("/app.js", get(app_js))
         .route("/api/config", get(get_config))
@@ -984,6 +985,13 @@ async fn app_js() -> impl IntoResponse {
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
         APP_JS,
     )
+}
+
+async fn app_favicon() -> impl IntoResponse {
+  (
+    [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+    APP_FAVICON,
+  )
 }
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, ApiError> {
@@ -1604,6 +1612,7 @@ const APP_HTML: &str = r###"<!doctype html>
     } catch {}
   </script>
   <title>IronMesh Desktop Config</title>
+  <link rel="icon" type="image/svg+xml" href="/ironmesh-favicon.svg" />
   <link rel="stylesheet" href="/app.css" />
 </head>
 <body>
@@ -1990,6 +1999,8 @@ const APP_HTML: &str = r###"<!doctype html>
 </body>
 </html>
 "###;
+
+const APP_FAVICON: &str = include_str!("../../../docs/assets/ironmesh-tray-mark.svg");
 
 const APP_CSS: &str = r###"
 html {
