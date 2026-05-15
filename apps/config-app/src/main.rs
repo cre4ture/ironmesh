@@ -988,10 +988,10 @@ async fn app_js() -> impl IntoResponse {
 }
 
 async fn app_favicon() -> impl IntoResponse {
-  (
-    [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
-    APP_FAVICON,
-  )
+    (
+        [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        APP_FAVICON,
+    )
 }
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, ApiError> {

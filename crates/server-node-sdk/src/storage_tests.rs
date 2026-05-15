@@ -3710,9 +3710,7 @@ run_on_all_metadata_backends!(
     metadata_import_advances_local_snapshot_state_turso
 );
 
-async fn put_object_from_chunks_rejects_corrupt_chunk_payload_impl(
-    backend: StorageTestBackend,
-) {
+async fn put_object_from_chunks_rejects_corrupt_chunk_payload_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("put-object-from-corrupt-chunks").await;
 
     let payload = sample_large_chunked_payload();
@@ -3746,8 +3744,7 @@ async fn put_object_from_chunks_rejects_corrupt_chunk_payload_impl(
         .unwrap_err();
 
     assert!(
-        err.to_string()
-            .contains("upload chunk hash mismatch hash="),
+        err.to_string().contains("upload chunk hash mismatch hash="),
         "unexpected error: {err:?}"
     );
     assert!(

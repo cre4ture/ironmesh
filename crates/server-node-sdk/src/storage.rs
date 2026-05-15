@@ -4562,8 +4562,7 @@ impl PersistentStore {
 
     async fn local_chunk_matches_ref(&self, chunk: &ChunkRef) -> Result<bool> {
         Ok(matches!(
-            validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes)
-                .await?,
+            validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes).await?,
             LocalChunkIntegrity::Valid
         ))
     }

@@ -281,9 +281,9 @@ impl UploadSessionAffinity {
             return true;
         }
 
-        self.preferred_request_base_url.as_deref().is_some_and(|base_url| {
-            endpoint.transport.request_base_url() == base_url
-        })
+        self.preferred_request_base_url
+            .as_deref()
+            .is_some_and(|base_url| endpoint.transport.request_base_url() == base_url)
     }
 }
 
@@ -1470,11 +1470,7 @@ impl IronMeshClient {
         affinities.get(upload_id).cloned()
     }
 
-    fn remember_upload_session_affinity(
-        &self,
-        upload_id: &str,
-        affinity: UploadSessionAffinity,
-    ) {
+    fn remember_upload_session_affinity(&self, upload_id: &str, affinity: UploadSessionAffinity) {
         let mut affinities = lock_upload_session_affinities(&self.upload_session_affinities);
         affinities.insert(upload_id.to_string(), affinity);
     }
@@ -4881,7 +4877,11 @@ mod tests {
     async fn spawn_upload_session_http_server(
         bind_addr: std::net::SocketAddr,
         shared: UploadSessionHttpSharedState,
-    ) -> (String, UploadSessionHttpServerState, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        UploadSessionHttpServerState,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .expect("listener should bind");
@@ -4893,8 +4893,14 @@ mod tests {
             complete_hits: Arc::new(AtomicUsize::new(0)),
         };
         let router = Router::new()
-            .route("/api/v1/store/uploads/start", post(upload_session_http_start))
-            .route("/api/v1/store/uploads/{upload_id}", get(upload_session_http_get))
+            .route(
+                "/api/v1/store/uploads/start",
+                post(upload_session_http_start),
+            )
+            .route(
+                "/api/v1/store/uploads/{upload_id}",
+                get(upload_session_http_get),
+            )
             .route(
                 "/api/v1/store/uploads/{upload_id}/chunk/{index}",
                 put(upload_session_http_chunk),
@@ -6055,7 +6061,10 @@ mod tests {
         assert_eq!(node_b_state.chunk_hits.load(Ordering::SeqCst), 0);
         assert_eq!(node_b_state.complete_hits.load(Ordering::SeqCst), 0);
         assert_eq!(node_a_secondary_state.chunk_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(node_a_secondary_state.complete_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            node_a_secondary_state.complete_hits.load(Ordering::SeqCst),
+            1
+        );
 
         node_b_server.abort();
         let _ = node_b_server.await;

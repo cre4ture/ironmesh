@@ -104,12 +104,14 @@ fn build_http_client_from_pem_with_target_node_id(
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
-    Ok(IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
-        base_url.as_str(),
-        http,
-        target_node_id,
-        server_ca_pem.map(ToString::to_string),
-    ))
+    Ok(
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            base_url.as_str(),
+            http,
+            target_node_id,
+            server_ca_pem.map(ToString::to_string),
+        ),
+    )
 }
 
 pub fn build_http_client_with_identity_from_pem(
@@ -134,13 +136,15 @@ fn build_http_client_with_identity_from_pem_with_target_node_id(
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
-    Ok(IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
-        base_url.as_str(),
-        http,
-        target_node_id,
-        server_ca_pem.map(ToString::to_string),
+    Ok(
+        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+            base_url.as_str(),
+            http,
+            target_node_id,
+            server_ca_pem.map(ToString::to_string),
+        )
+        .with_client_identity(identity.clone()),
     )
-    .with_client_identity(identity.clone()))
 }
 
 pub fn build_http_client_with_identity_from_planned_target(
