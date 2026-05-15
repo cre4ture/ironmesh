@@ -13800,11 +13800,13 @@ async fn issue_bootstrap_bundle(
 
 fn render_bootstrap_qr_png(payload: &str, high_capacity: bool) -> Result<Vec<u8>> {
     let mut builder = QRBuilder::new(payload.as_bytes());
-    builder.high_capacity(high_capacity).ec_level(if high_capacity {
-        QrEcLevel::M
-    } else {
-        QrEcLevel::H
-    });
+    builder
+        .high_capacity(high_capacity)
+        .ec_level(if high_capacity {
+            QrEcLevel::M
+        } else {
+            QrEcLevel::H
+        });
     let qr = builder
         .build()
         .map_err(|err| anyhow!("failed to build QR code: {err}"))?;

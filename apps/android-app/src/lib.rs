@@ -104,9 +104,7 @@ mod tests {
         );
         let mut builder = qrism::QRBuilder::new(payload.as_bytes());
         builder.high_capacity(true).ec_level(qrism::ECLevel::M);
-        let qr = builder
-            .build()
-            .expect("failed to build high-capacity QR");
+        let qr = builder.build().expect("failed to build high-capacity QR");
         let image = image::DynamicImage::ImageRgb8(qr.to_image(6));
 
         let decoded = decode_bootstrap_qr_image(&image).expect("failed to decode high-capacity QR");
@@ -164,9 +162,7 @@ fn payload_looks_like_bootstrap_json(payload: &str) -> bool {
     )
 }
 
-fn decode_bootstrap_qr_candidate(
-    mut decode_result: qrism::reader::DecodeResult,
-) -> Option<String> {
+fn decode_bootstrap_qr_candidate(mut decode_result: qrism::reader::DecodeResult) -> Option<String> {
     let symbol = decode_result.symbols().first_mut()?;
     let (_, payload) = symbol.decode().ok()?;
     payload_looks_like_bootstrap_json(&payload).then_some(payload)
@@ -1238,10 +1234,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_dec
             }
         },
         Err(err) => {
-            throw_java_error(
-                &mut env,
-                format!("rust decodeBootstrapQr failed: {err:#}"),
-            );
+            throw_java_error(&mut env, format!("rust decodeBootstrapQr failed: {err:#}"));
             std::ptr::null_mut()
         }
     }
