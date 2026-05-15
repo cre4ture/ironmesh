@@ -4,7 +4,7 @@ mod tests {
 
     use std::fs;
     use std::io::Cursor;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
     use bytes::Bytes;
@@ -83,6 +83,38 @@ mod tests {
 
         stop_server(&mut server).await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sdk_can_overwrite_existing_key_with_empty_bytes() -> Result<()> {
+        let bind = "127.0.0.1:19249";
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "sdk-empty-overwrite-server",
+            "sdk-empty-overwrite-client",
+        )
+        .await?;
+
+        let result = async {
+            let sdk = enrolled.build_client_async().await?;
+
+            sdk.put_large_aware("zero-byte-overwrite.txt", Bytes::from_static(b"seed"))
+                .await?;
+            sdk.put_large_aware("zero-byte-overwrite.txt", Bytes::new())
+                .await?;
+
+            let fetched = sdk.get("zero-byte-overwrite.txt").await?;
+            assert_eq!(fetched, Bytes::new());
+
+            let head = sdk.head_object("zero-byte-overwrite.txt", None, None).await?;
+            assert_eq!(head.total_size_bytes, 0);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
     }
 
     #[tokio::test]
@@ -951,6 +983,158 @@ mod tests {
 
         stop_server(&mut server).await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumable_upload_resumes_over_relay_after_direct_path_change_for_same_node()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19247";
+        let bind = "127.0.0.1:19248";
+        let cluster_id = "11111111-1111-7111-8111-111111111147";
+        let node_id = "00000000-0000-0000-0000-000000000947";
+        let client_dir = fresh_data_dir("resumable-direct-to-relay-client");
+        let server_data_dir = fresh_data_dir("resumable-direct-to-relay-server");
+        let working_dir = fresh_data_dir("resumable-direct-to-relay-work");
+        fs::create_dir_all(&client_dir)?;
+        fs::create_dir_all(&working_dir)?;
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_url = format!("http://{bind}");
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut server =
+            start_open_server_with_env(bind, &server_data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_url,
+                TEST_ADMIN_TOKEN,
+                &client_dir,
+                "relay-resume.bootstrap.json",
+                Some("relay-resume"),
+                Some(3600),
+            )
+            .await?;
+
+            let public_api_node_ids = enrolled
+                .bootstrap
+                .direct_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.usage == Some(BootstrapEndpointUse::PublicApi))
+                .filter_map(|endpoint| endpoint.node_id.map(|node_id| node_id.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(public_api_node_ids, vec![node_id.to_string()]);
+
+            let source_path = working_dir.join("source.bin");
+            let state_path = working_dir.join("upload.state.json");
+            let key = "resumable/direct-to-relay.bin";
+            let payload = vec![b'R'; (CHUNK_UPLOAD_THRESHOLD_BYTES * 2) + 257];
+            fs::write(&source_path, &payload)?;
+
+            stop_server(&mut rendezvous).await;
+
+            let direct_client = enrolled.build_client_async().await?;
+            let session = direct_client
+                .begin_upload_session(key, payload.len() as u64)
+                .await?;
+            assert!(!session.completed);
+            assert!(session.received_indexes.is_empty());
+            assert!(session.chunk_count >= 2);
+
+            let first_chunk_len = session.chunk_size_bytes.min(payload.len());
+            let first_chunk = payload[..first_chunk_len].to_vec();
+            let first_chunk_status = direct_client
+                .upload_session_chunk_bytes(&session.upload_id, 0, first_chunk)
+                .await?;
+            assert!(first_chunk_status.stored);
+            assert_eq!(first_chunk_status.received_index, 0);
+
+            let source_metadata = fs::metadata(&source_path)
+                .with_context(|| format!("failed to inspect upload source {}", source_path.display()))?;
+            let source_modified_unix_ms = source_metadata
+                .modified()
+                .context("failed to read upload source modified time")?
+                .duration_since(UNIX_EPOCH)
+                .context("upload source modified time predates unix epoch")?
+                .as_millis();
+
+            fs::write(
+                &state_path,
+                serde_json::to_vec_pretty(&json!({
+                    "upload_id": session.upload_id,
+                    "key": key,
+                    "source_size_bytes": payload.len(),
+                    "source_modified_unix_ms": source_modified_unix_ms,
+                    "chunk_size_bytes": session.chunk_size_bytes,
+                    "target_node_id": node_id,
+                    "preferred_request_base_url": base_url,
+                }))?,
+            )?;
+
+            rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let mut relay_resume_bootstrap = enrolled.bootstrap.clone();
+            for endpoint in &mut relay_resume_bootstrap.direct_endpoints {
+                if endpoint.usage == Some(BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+
+            let resume_client = {
+                let bootstrap = relay_resume_bootstrap;
+                let identity = enrolled.identity.clone();
+                tokio::task::spawn_blocking(move || bootstrap.build_client_with_identity(&identity))
+                    .await
+                    .context("relay resume client construction task panicked")??
+            };
+            assert!(resume_client.uses_relay_transport());
+
+            let resume_client_for_upload = resume_client.clone();
+            let source_path_for_upload = source_path.clone();
+            let state_path_for_upload = state_path.clone();
+            let upload_report = tokio::task::spawn_blocking(move || {
+                resume_client_for_upload.put_file_resumable(
+                    key,
+                    &source_path_for_upload,
+                    &state_path_for_upload,
+                )
+            })
+            .await
+            .context("relay resume upload task join failed")??;
+
+            assert!(matches!(upload_report.upload_mode, UploadMode::Chunked));
+            assert!(!state_path.exists());
+
+            let fetched = direct_client.get(key).await?;
+            assert_eq!(fetched, Bytes::from(payload));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&client_dir);
+        let _ = fs::remove_dir_all(&server_data_dir);
+        let _ = fs::remove_dir_all(&working_dir);
+
+        result
     }
 
     #[tokio::test]

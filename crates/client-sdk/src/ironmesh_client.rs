@@ -15,12 +15,13 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -68,6 +69,7 @@ pub struct IronMeshClient {
     transport_router: ClientEndpointRouter,
     auth: ClientRequestAuth,
     connection_name: Option<String>,
+    upload_session_affinities: Arc<Mutex<HashMap<String, UploadSessionAffinity>>>,
 }
 
 #[derive(Clone)]
@@ -81,9 +83,16 @@ enum ClientTransport {
     Direct {
         http: HttpClient,
         server_base_url: String,
+        target_node_id: Option<NodeId>,
         session_pool: TransportSessionPool,
     },
     Relay(ClientRelayTransport),
+}
+
+#[derive(Debug, Clone)]
+struct UploadSessionAffinity {
+    target_node_id: Option<NodeId>,
+    preferred_request_base_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -143,6 +152,12 @@ struct BufferedTransportResponse {
     body: Bytes,
 }
 
+#[derive(Debug)]
+struct RoutedBufferedTransportResponse {
+    route_index: usize,
+    response: BufferedTransportResponse,
+}
+
 impl ClientTransport {
     fn path_kind(&self) -> ClientEndpointPathKind {
         match self {
@@ -188,6 +203,13 @@ impl ClientTransport {
                 server_base_url, ..
             } => Some(server_base_url.as_str()),
             Self::Relay(_) => None,
+        }
+    }
+
+    fn target_node_id(&self) -> Option<NodeId> {
+        match self {
+            Self::Direct { target_node_id, .. } => *target_node_id,
+            Self::Relay(relay) => Some(relay.target_node_id),
         }
     }
 
@@ -241,6 +263,27 @@ impl ClientEndpoint {
 
     fn rewrite_url(&self, url: &Url) -> Result<Url> {
         self.transport.rewrite_url(url)
+    }
+}
+
+impl UploadSessionAffinity {
+    fn from_endpoint(endpoint: &ClientEndpoint) -> Self {
+        Self {
+            target_node_id: endpoint.transport.target_node_id(),
+            preferred_request_base_url: Some(endpoint.transport.request_base_url().to_string()),
+        }
+    }
+
+    fn matches_endpoint(&self, endpoint: &ClientEndpoint) -> bool {
+        if let Some(target_node_id) = self.target_node_id
+            && endpoint.transport.target_node_id() == Some(target_node_id)
+        {
+            return true;
+        }
+
+        self.preferred_request_base_url.as_deref().is_some_and(|base_url| {
+            endpoint.transport.request_base_url() == base_url
+        })
     }
 }
 
@@ -559,6 +602,28 @@ fn normalize_connection_name(value: &str) -> Option<String> {
     }
 }
 
+fn lock_upload_session_affinities(
+    affinities: &Mutex<HashMap<String, UploadSessionAffinity>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, UploadSessionAffinity>> {
+    match affinities.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn upload_session_affinity_from_resumable_state(
+    state: &ResumableUploadFileState,
+) -> Option<UploadSessionAffinity> {
+    if state.target_node_id.is_none() && state.preferred_request_base_url.is_none() {
+        return None;
+    }
+
+    Some(UploadSessionAffinity {
+        target_node_id: state.target_node_id,
+        preferred_request_base_url: state.preferred_request_base_url.clone(),
+    })
+}
+
 fn connection_name_header(connection_name: &str) -> RelayHttpHeader {
     RelayHttpHeader {
         name: transport_sdk::HEADER_CONNECTION_NAME.to_string(),
@@ -651,6 +716,7 @@ async fn execute_buffered_request_for_transport(
             http,
             server_base_url,
             session_pool,
+            ..
         } => {
             if let ClientRequestAuth::SignedIdentity(identity) = auth {
                 let direct = DirectMultiplexSessionContext {
@@ -717,6 +783,7 @@ async fn execute_streaming_object_read_request_for_transport(
             http,
             server_base_url,
             session_pool,
+            ..
         } => {
             if let ClientRequestAuth::SignedIdentity(identity) = auth {
                 return execute_direct_multiplex_streaming_object_read_request(
@@ -946,7 +1013,7 @@ pub struct DownloadRangeRequest<'a> {
     pub range: RequestedRange,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct UploadSessionStartRequest {
     key: String,
     total_size_bytes: u64,
@@ -958,7 +1025,7 @@ struct UploadSessionStartRequest {
     version_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct UploadSessionView {
     upload_id: String,
     key: String,
@@ -981,7 +1048,7 @@ struct UploadSessionChunkResponse {
     received_index: usize,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct UploadSessionCompleteResponse {
     snapshot_id: String,
     version_id: String,
@@ -1007,6 +1074,10 @@ struct ResumableUploadFileState {
     source_size_bytes: u64,
     source_modified_unix_ms: u128,
     chunk_size_bytes: usize,
+    #[serde(default)]
+    target_node_id: Option<NodeId>,
+    #[serde(default)]
+    preferred_request_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1189,11 +1260,26 @@ impl IronMeshClient {
         http: HttpClient,
         server_ca_pem: Option<String>,
     ) -> Self {
+        Self::from_direct_http_client_with_target_node_id_and_ca_pem(
+            server_base_url,
+            http,
+            None,
+            server_ca_pem,
+        )
+    }
+
+    pub(crate) fn from_direct_http_client_with_target_node_id_and_ca_pem(
+        server_base_url: impl Into<String>,
+        http: HttpClient,
+        target_node_id: Option<NodeId>,
+        server_ca_pem: Option<String>,
+    ) -> Self {
         let server_base_url = server_base_url.into().trim_end_matches('/').to_string();
         Self {
             transport_router: ClientEndpointRouter::new(vec![ClientEndpoint::new(
                 ClientTransport::Direct {
                     http,
+                    target_node_id,
                     session_pool: TransportSessionPool::new_direct(
                         server_base_url.clone(),
                         server_ca_pem,
@@ -1204,6 +1290,7 @@ impl IronMeshClient {
             )]),
             auth: ClientRequestAuth::None,
             connection_name: None,
+            upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1226,6 +1313,7 @@ impl IronMeshClient {
             )]),
             auth: ClientRequestAuth::None,
             connection_name: None,
+            upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1261,6 +1349,7 @@ impl IronMeshClient {
             transport_router: ClientEndpointRouter::new(endpoints),
             auth: combined_auth.unwrap_or(ClientRequestAuth::None),
             connection_name: None,
+            upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1345,20 +1434,82 @@ impl IronMeshClient {
         }
     }
 
-    async fn execute_buffered_request(
+    fn route_indices_for_upload_session(&self, upload_id: &str) -> Vec<usize> {
+        let affinity = {
+            let affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+            affinities.get(upload_id).cloned()
+        };
+        self.route_indices_for_affinity(affinity.as_ref())
+    }
+
+    fn route_indices_for_affinity(&self, affinity: Option<&UploadSessionAffinity>) -> Vec<usize> {
+        let ranked = self.transport_router.rank_indices();
+        let Some(affinity) = affinity else {
+            return ranked;
+        };
+
+        let matching = ranked
+            .iter()
+            .copied()
+            .filter(|index| {
+                self.transport_router
+                    .endpoint(*index)
+                    .is_some_and(|endpoint| affinity.matches_endpoint(endpoint))
+            })
+            .collect::<Vec<_>>();
+
+        if matching.is_empty() {
+            ranked
+        } else {
+            matching
+        }
+    }
+
+    fn upload_session_affinity(&self, upload_id: &str) -> Option<UploadSessionAffinity> {
+        let affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+        affinities.get(upload_id).cloned()
+    }
+
+    fn remember_upload_session_affinity(
+        &self,
+        upload_id: &str,
+        affinity: UploadSessionAffinity,
+    ) {
+        let mut affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+        affinities.insert(upload_id.to_string(), affinity);
+    }
+
+    fn remember_upload_session_affinity_from_route(&self, upload_id: &str, route_index: usize) {
+        let Some(endpoint) = self.transport_router.endpoint(route_index) else {
+            return;
+        };
+
+        self.remember_upload_session_affinity(
+            upload_id,
+            UploadSessionAffinity::from_endpoint(endpoint),
+        );
+    }
+
+    fn clear_upload_session_affinity(&self, upload_id: &str) {
+        let mut affinities = lock_upload_session_affinities(&self.upload_session_affinities);
+        affinities.remove(upload_id);
+    }
+
+    async fn execute_buffered_request_on_route_indices(
         &self,
         method: Method,
         url: Url,
         mut headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
-    ) -> Result<BufferedTransportResponse> {
+        route_indices: &[usize],
+    ) -> Result<RoutedBufferedTransportResponse> {
         self.maybe_spawn_background_quality_refresh();
 
         let mut auth_headers = self.request_auth_headers(&method, &url)?;
         auth_headers.append(&mut headers);
 
         let mut last_error = None;
-        for index in self.transport_router.rank_indices() {
+        for &index in route_indices {
             let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
                 continue;
             };
@@ -1406,7 +1557,10 @@ impl IronMeshClient {
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         response.body.len(),
                     );
-                    return Ok(response);
+                    return Ok(RoutedBufferedTransportResponse {
+                        route_index: index,
+                        response,
+                    });
                 }
                 Err(error) => {
                     self.transport_router
@@ -1423,6 +1577,121 @@ impl IronMeshClient {
                 url
             )
         }))
+    }
+
+    async fn execute_upload_session_chunk_on_route_indices(
+        &self,
+        upload_id: &str,
+        index: usize,
+        url: Url,
+        payload: Vec<u8>,
+        route_indices: &[usize],
+    ) -> Result<RoutedBufferedTransportResponse> {
+        if matches!(self.auth, ClientRequestAuth::None) {
+            return self
+                .execute_buffered_request_on_route_indices(
+                    Method::PUT,
+                    url,
+                    Vec::new(),
+                    Some(payload),
+                    route_indices,
+                )
+                .await;
+        }
+
+        self.maybe_spawn_background_quality_refresh();
+
+        let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+        let mut last_error = None;
+        for &route_index in route_indices {
+            let Some(endpoint) = self.transport_router.endpoint(route_index).cloned() else {
+                continue;
+            };
+            let endpoint_url = endpoint
+                .rewrite_url(&url)
+                .with_context(|| format!("failed to rewrite streamed PUT {}", url));
+            let endpoint_url = match endpoint_url {
+                Ok(endpoint_url) => endpoint_url,
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(route_index, &error.to_string());
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let started_at = std::time::Instant::now();
+            match execute_streaming_object_write_request_for_transport(
+                &endpoint.transport,
+                &self.auth,
+                self.connection_name.as_deref(),
+                &Method::PUT,
+                &endpoint_url,
+                &auth_headers,
+                &payload,
+            )
+            .await
+            {
+                Ok(candidate_response)
+                    if is_retryable_transport_status(candidate_response.status) =>
+                {
+                    self.transport_router.record_failure(
+                        route_index,
+                        &format!(
+                            "retryable HTTP {} from {}",
+                            candidate_response.status, endpoint.descriptor.locator
+                        ),
+                    );
+                    last_error = Some(anyhow!(
+                        "retryable transport response {} from {}",
+                        candidate_response.status,
+                        endpoint.descriptor.locator
+                    ));
+                }
+                Ok(candidate_response) => {
+                    self.transport_router.record_success(
+                        route_index,
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                        candidate_response.body.len(),
+                    );
+                    return Ok(RoutedBufferedTransportResponse {
+                        route_index,
+                        response: candidate_response,
+                    });
+                }
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(route_index, &error.to_string());
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!(
+                "no client transport endpoints accepted streamed upload for session={} index={}",
+                upload_id,
+                index
+            )
+        }))
+    }
+
+    async fn execute_buffered_request(
+        &self,
+        method: Method,
+        url: Url,
+        mut headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+    ) -> Result<BufferedTransportResponse> {
+        let routed = self
+            .execute_buffered_request_on_route_indices(
+                method,
+                url,
+                std::mem::take(&mut headers),
+                body,
+                &self.transport_router.rank_indices(),
+            )
+            .await?;
+        Ok(routed.response)
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
@@ -1795,15 +2064,17 @@ impl IronMeshClient {
         })
         .context("failed to encode upload session start payload")?;
 
-        let response = self
-            .execute_buffered_request(
+        let routed = self
+            .execute_buffered_request_on_route_indices(
                 Method::POST,
                 url,
                 vec![json_content_type_header()],
                 Some(payload),
+                &self.transport_router.rank_indices(),
             )
             .await
             .with_context(|| format!("failed to start upload session for key={key}"))?;
+        let response = routed.response;
         if !response.status.is_success() {
             bail!(
                 "server rejected upload session start for key={key}: {}",
@@ -1811,8 +2082,10 @@ impl IronMeshClient {
             );
         }
 
-        serde_json::from_slice::<UploadSessionView>(&response.body)
-            .with_context(|| format!("failed to parse upload session start response for {key}"))
+        let view = serde_json::from_slice::<UploadSessionView>(&response.body)
+            .with_context(|| format!("failed to parse upload session start response for {key}"))?;
+        self.remember_upload_session_affinity_from_route(&view.upload_id, routed.route_index);
+        Ok(view)
     }
 
     pub async fn begin_upload_session(
@@ -1828,16 +2101,30 @@ impl IronMeshClient {
 
     async fn get_upload_session(&self, upload_id: &str) -> Result<Option<UploadSessionView>> {
         let url = self.store_upload_session_url(upload_id)?;
-        let response = self
-            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+        let routed = self
+            .execute_buffered_request_on_route_indices(
+                Method::GET,
+                url,
+                Vec::new(),
+                None,
+                &self.route_indices_for_upload_session(upload_id),
+            )
             .await
             .with_context(|| format!("failed to query upload session {upload_id}"))?;
+        let response = routed.response;
 
         match response.status {
-            StatusCode::OK => serde_json::from_slice::<UploadSessionView>(&response.body)
-                .with_context(|| format!("failed to parse upload session {upload_id}"))
-                .map(Some),
-            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Ok(None),
+            StatusCode::OK => {
+                let view = serde_json::from_slice::<UploadSessionView>(&response.body)
+                    .with_context(|| format!("failed to parse upload session {upload_id}"))?;
+                self.remember_upload_session_affinity_from_route(upload_id, routed.route_index);
+                Ok(Some(view))
+            }
+            StatusCode::NOT_FOUND => {
+                self.clear_upload_session_affinity(upload_id);
+                Ok(None)
+            }
+            StatusCode::FORBIDDEN => Ok(None),
             status => Err(anyhow!(
                 "upload session query failed for {upload_id}: {status}"
             )),
@@ -1850,96 +2137,26 @@ impl IronMeshClient {
         index: usize,
         payload: Vec<u8>,
     ) -> Result<UploadSessionChunkResponse> {
-        self.maybe_spawn_background_quality_refresh();
-
         let url = self.store_upload_session_chunk_url(upload_id, index)?;
-        let response = if matches!(self.auth, ClientRequestAuth::None) {
-            self.execute_buffered_request(Method::PUT, url.clone(), Vec::new(), Some(payload))
-                .await
-                .with_context(|| {
-                    format!("failed to upload chunk {index} for session={upload_id}")
-                })?
-        } else {
-            let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
-            let mut last_error = None;
-            let mut response = None;
-            for route_index in self.transport_router.rank_indices() {
-                let Some(endpoint) = self.transport_router.endpoint(route_index).cloned() else {
-                    continue;
-                };
-                let endpoint_url = endpoint
-                    .rewrite_url(&url)
-                    .with_context(|| format!("failed to rewrite streamed PUT {}", url));
-                let endpoint_url = match endpoint_url {
-                    Ok(endpoint_url) => endpoint_url,
-                    Err(error) => {
-                        self.transport_router
-                            .record_failure(route_index, &error.to_string());
-                        last_error = Some(error);
-                        continue;
-                    }
-                };
-                let started_at = std::time::Instant::now();
-                match execute_streaming_object_write_request_for_transport(
-                    &endpoint.transport,
-                    &self.auth,
-                    self.connection_name.as_deref(),
-                    &Method::PUT,
-                    &endpoint_url,
-                    &auth_headers,
-                    &payload,
-                )
-                .await
-                {
-                    Ok(candidate_response)
-                        if is_retryable_transport_status(candidate_response.status) =>
-                    {
-                        self.transport_router.record_failure(
-                            route_index,
-                            &format!(
-                                "retryable HTTP {} from {}",
-                                candidate_response.status, endpoint.descriptor.locator
-                            ),
-                        );
-                        last_error = Some(anyhow!(
-                            "retryable transport response {} from {}",
-                            candidate_response.status,
-                            endpoint.descriptor.locator
-                        ));
-                    }
-                    Ok(candidate_response) => {
-                        self.transport_router.record_success(
-                            route_index,
-                            started_at.elapsed().as_secs_f64() * 1000.0,
-                            candidate_response.body.len(),
-                        );
-                        response = Some(candidate_response);
-                        break;
-                    }
-                    Err(error) => {
-                        self.transport_router
-                            .record_failure(route_index, &error.to_string());
-                        last_error = Some(error);
-                    }
-                }
-            }
-
-            response.ok_or_else(|| {
-                last_error.unwrap_or_else(|| {
-                    anyhow!(
-                        "no client transport endpoints accepted streamed upload for session={} index={}",
-                        upload_id,
-                        index
-                    )
-                })
-            })?
-        };
+        let routed = self
+            .execute_upload_session_chunk_on_route_indices(
+                upload_id,
+                index,
+                url,
+                payload,
+                &self.route_indices_for_upload_session(upload_id),
+            )
+            .await
+            .with_context(|| format!("failed to upload chunk {index} for session={upload_id}"))?;
+        let response = routed.response;
         if !response.status.is_success() {
             bail!(
                 "upload session chunk rejected for session={upload_id} index={index}: {}",
                 response.status
             );
         }
+
+        self.remember_upload_session_affinity_from_route(upload_id, routed.route_index);
 
         serde_json::from_slice::<UploadSessionChunkResponse>(&response.body).with_context(|| {
             format!("failed to parse upload session chunk response for session={upload_id}")
@@ -1964,10 +2181,17 @@ impl IronMeshClient {
         upload_id: &str,
     ) -> Result<UploadSessionCompleteResponse> {
         let url = self.store_upload_session_complete_url(upload_id)?;
-        let response = self
-            .execute_buffered_request(Method::POST, url, Vec::new(), None)
+        let routed = self
+            .execute_buffered_request_on_route_indices(
+                Method::POST,
+                url,
+                Vec::new(),
+                None,
+                &self.route_indices_for_upload_session(upload_id),
+            )
             .await
             .with_context(|| format!("failed to complete upload session {upload_id}"))?;
+        let response = routed.response;
 
         if !response.status.is_success() {
             bail!(
@@ -1976,9 +2200,13 @@ impl IronMeshClient {
             );
         }
 
-        serde_json::from_slice::<UploadSessionCompleteResponse>(&response.body).with_context(|| {
-            format!("failed to parse upload session completion response for {upload_id}")
-        })
+        let completed = serde_json::from_slice::<UploadSessionCompleteResponse>(&response.body)
+            .with_context(|| {
+                format!("failed to parse upload session completion response for {upload_id}")
+            })?;
+        self.remember_upload_session_affinity_from_route(upload_id, routed.route_index);
+        self.clear_upload_session_affinity(upload_id);
+        Ok(completed)
     }
 
     pub async fn finalize_upload_session(
@@ -2437,17 +2665,24 @@ impl IronMeshClient {
         });
 
         let mut session = match persisted {
-            Some(state) => match runtime.block_on(self.get_upload_session(&state.upload_id))? {
-                Some(session)
-                    if session.key == key && session.total_size_bytes == source_size_bytes =>
-                {
-                    session
+            Some(state) => {
+                if let Some(affinity) = upload_session_affinity_from_resumable_state(&state) {
+                    self.remember_upload_session_affinity(&state.upload_id, affinity);
                 }
-                _ => {
-                    remove_file_if_exists(state_path)?;
-                    runtime.block_on(self.start_upload_session(&key, source_size_bytes))?
+
+                match runtime.block_on(self.get_upload_session(&state.upload_id))? {
+                    Some(session)
+                        if session.key == key && session.total_size_bytes == source_size_bytes =>
+                    {
+                        session
+                    }
+                    _ => {
+                        self.clear_upload_session_affinity(&state.upload_id);
+                        remove_file_if_exists(state_path)?;
+                        runtime.block_on(self.start_upload_session(&key, source_size_bytes))?
+                    }
                 }
-            },
+            }
             None => runtime.block_on(self.start_upload_session(&key, source_size_bytes))?,
         };
 
@@ -2459,11 +2694,18 @@ impl IronMeshClient {
                 source_size_bytes,
                 source_modified_unix_ms,
                 chunk_size_bytes: session.chunk_size_bytes,
+                target_node_id: self
+                    .upload_session_affinity(&session.upload_id)
+                    .and_then(|affinity| affinity.target_node_id),
+                preferred_request_base_url: self
+                    .upload_session_affinity(&session.upload_id)
+                    .and_then(|affinity| affinity.preferred_request_base_url),
             },
         )?;
         maybe_abort_after_resumable_upload_state_persist(&key, state_path);
 
         if session.completed {
+            self.clear_upload_session_affinity(&session.upload_id);
             remove_file_if_exists(state_path)?;
             if let Some(ref completed) = session.completed_result {
                 return Ok(upload_result_from_session_complete(
@@ -2522,6 +2764,7 @@ impl IronMeshClient {
         }
 
         let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
+        self.clear_upload_session_affinity(&session.upload_id);
         remove_file_if_exists(state_path)?;
         session.completed_result = Some(completed.clone());
         Ok(upload_result_from_session_complete(
@@ -2567,6 +2810,7 @@ impl IronMeshClient {
         }
 
         let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
+        self.clear_upload_session_affinity(&session.upload_id);
         Ok(upload_result_from_session_complete(
             &key, &session, &completed,
         ))
@@ -4179,7 +4423,7 @@ mod tests {
         },
         http::{Response, header},
         response::IntoResponse,
-        routing::{get, post},
+        routing::{get, post, put},
     };
     use futures_util::{Sink, Stream};
     use std::pin::Pin;
@@ -4526,6 +4770,146 @@ mod tests {
             name,
         )
         .await
+    }
+
+    #[derive(Clone, Default)]
+    struct UploadSessionHttpSharedState {
+        sessions: Arc<Mutex<std::collections::HashMap<String, UploadSessionView>>>,
+    }
+
+    #[derive(Clone)]
+    struct UploadSessionHttpServerState {
+        shared: UploadSessionHttpSharedState,
+        start_hits: Arc<AtomicUsize>,
+        chunk_hits: Arc<AtomicUsize>,
+        complete_hits: Arc<AtomicUsize>,
+    }
+
+    async fn upload_session_http_start(
+        State(state): State<UploadSessionHttpServerState>,
+        Json(request): Json<UploadSessionStartRequest>,
+    ) -> impl IntoResponse {
+        state.start_hits.fetch_add(1, Ordering::SeqCst);
+        let chunk_size_bytes = CHUNK_UPLOAD_SIZE_BYTES;
+        let chunk_count = if request.total_size_bytes == 0 {
+            1
+        } else {
+            ((request.total_size_bytes - 1) / chunk_size_bytes as u64 + 1) as usize
+        };
+        let view = UploadSessionView {
+            upload_id: format!("upload-{}", uuid::Uuid::now_v7()),
+            key: request.key,
+            total_size_bytes: request.total_size_bytes,
+            chunk_size_bytes,
+            chunk_count,
+            received_indexes: Vec::new(),
+            completed: false,
+            completed_result: None,
+            expires_at_unix: unix_ts().saturating_add(60),
+        };
+        state
+            .shared
+            .sessions
+            .lock()
+            .await
+            .insert(view.upload_id.clone(), view.clone());
+        (StatusCode::CREATED, Json(view)).into_response()
+    }
+
+    async fn upload_session_http_get(
+        State(state): State<UploadSessionHttpServerState>,
+        AxumPath(upload_id): AxumPath<String>,
+    ) -> impl IntoResponse {
+        let sessions = state.shared.sessions.lock().await;
+        let Some(session) = sessions.get(&upload_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        Json(session.clone()).into_response()
+    }
+
+    async fn upload_session_http_chunk(
+        State(state): State<UploadSessionHttpServerState>,
+        AxumPath((upload_id, index)): AxumPath<(String, usize)>,
+        _payload: Bytes,
+    ) -> impl IntoResponse {
+        let mut sessions = state.shared.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&upload_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+
+        state.chunk_hits.fetch_add(1, Ordering::SeqCst);
+        if !session.received_indexes.contains(&index) {
+            session.received_indexes.push(index);
+            session.received_indexes.sort_unstable();
+        }
+
+        (
+            StatusCode::OK,
+            Json(UploadSessionChunkResponse {
+                stored: true,
+                received_index: index,
+            }),
+        )
+            .into_response()
+    }
+
+    async fn upload_session_http_complete(
+        State(state): State<UploadSessionHttpServerState>,
+        AxumPath(upload_id): AxumPath<String>,
+    ) -> impl IntoResponse {
+        let mut sessions = state.shared.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&upload_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+
+        state.complete_hits.fetch_add(1, Ordering::SeqCst);
+        session.completed = true;
+        let response = UploadSessionCompleteResponse {
+            snapshot_id: "snap-test".to_string(),
+            version_id: "ver-test".to_string(),
+            manifest_hash: "manifest-test".to_string(),
+            state: "confirmed".to_string(),
+            new_chunks: session.received_indexes.len(),
+            dedup_reused_chunks: 0,
+            created_new_version: true,
+            total_size_bytes: session.total_size_bytes,
+        };
+        session.completed_result = Some(response.clone());
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    async fn spawn_upload_session_http_server(
+        bind_addr: std::net::SocketAddr,
+        shared: UploadSessionHttpSharedState,
+    ) -> (String, UploadSessionHttpServerState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let state = UploadSessionHttpServerState {
+            shared,
+            start_hits: Arc::new(AtomicUsize::new(0)),
+            chunk_hits: Arc::new(AtomicUsize::new(0)),
+            complete_hits: Arc::new(AtomicUsize::new(0)),
+        };
+        let router = Router::new()
+            .route("/api/v1/store/uploads/start", post(upload_session_http_start))
+            .route("/api/v1/store/uploads/{upload_id}", get(upload_session_http_get))
+            .route(
+                "/api/v1/store/uploads/{upload_id}/chunk/{index}",
+                put(upload_session_http_chunk),
+            )
+            .route(
+                "/api/v1/store/uploads/{upload_id}/complete",
+                post(upload_session_http_complete),
+            )
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("upload session http server should run");
+        });
+        (format!("http://{addr}"), state, server)
     }
 
     #[derive(Clone)]
@@ -5597,6 +5981,86 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn upload_session_affinity_uses_same_node_after_path_change() {
+        let shared_node_a = UploadSessionHttpSharedState::default();
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+
+        let (node_a_primary_url, node_a_primary_state, node_a_primary_server) =
+            spawn_upload_session_http_server(
+                "127.0.0.1:0".parse().expect("bind addr should parse"),
+                shared_node_a.clone(),
+            )
+            .await;
+        let (node_b_url, node_b_state, node_b_server) = spawn_upload_session_http_server(
+            "127.0.0.1:0".parse().expect("bind addr should parse"),
+            UploadSessionHttpSharedState::default(),
+        )
+        .await;
+        let (node_a_secondary_url, node_a_secondary_state, node_a_secondary_server) =
+            spawn_upload_session_http_server(
+                "127.0.0.1:0".parse().expect("bind addr should parse"),
+                shared_node_a,
+            )
+            .await;
+
+        let client = IronMeshClient::combine(vec![
+            IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+                node_a_primary_url,
+                HttpClient::new(),
+                Some(node_a),
+                None,
+            ),
+            IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+                node_b_url,
+                HttpClient::new(),
+                Some(node_b),
+                None,
+            ),
+            IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+                node_a_secondary_url,
+                HttpClient::new(),
+                Some(node_a),
+                None,
+            ),
+        ])
+        .expect("combined direct client should build");
+
+        let session = client
+            .begin_upload_session("photos/path-change.bin", 5)
+            .await
+            .expect("upload session should start");
+        assert_eq!(node_a_primary_state.start_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_b_state.start_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_a_secondary_state.start_hits.load(Ordering::SeqCst), 0);
+
+        node_a_primary_server.abort();
+        let _ = node_a_primary_server.await;
+
+        let chunk = client
+            .upload_session_chunk_bytes(&session.upload_id, 0, b"hello".to_vec())
+            .await
+            .expect("chunk upload should switch to the second path on the same node");
+        assert_eq!(chunk.received_index, 0);
+
+        let completed = client
+            .finalize_upload_session(&session.upload_id)
+            .await
+            .expect("upload session completion should use the same-node fallback path");
+        assert_eq!(completed.total_size_bytes, 5);
+
+        assert_eq!(node_b_state.chunk_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_b_state.complete_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_a_secondary_state.chunk_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_a_secondary_state.complete_hits.load(Ordering::SeqCst), 1);
+
+        node_b_server.abort();
+        let _ = node_b_server.await;
+        node_a_secondary_server.abort();
+        let _ = node_a_secondary_server.await;
     }
 
     #[tokio::test]

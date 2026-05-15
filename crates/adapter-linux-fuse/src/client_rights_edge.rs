@@ -835,7 +835,7 @@ fn remote_version_forces_conflict(
     current_remote_version: Option<&str>,
 ) -> bool {
     match (base_remote_version, current_remote_version) {
-        (None, None) => false,
+        (None, _) => false,
         (Some(base), Some(current)) if base == current => false,
         _ => true,
     }
@@ -1154,6 +1154,21 @@ mod tests {
                 data: Vec::new(),
             }]
         );
+
+        let remote = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file_sized(
+                "docs/report.txt",
+                "v-remote",
+                "h-remote",
+                Some(5),
+            )],
+        };
+        let planning = state
+            .planning_snapshot(&remote)
+            .expect("planning snapshot should build");
+        assert_eq!(planning.local.len(), 1);
+        assert_eq!(planning.local[0].namespace.version, None);
 
         let _ = fs::remove_dir_all(&state_dir);
     }

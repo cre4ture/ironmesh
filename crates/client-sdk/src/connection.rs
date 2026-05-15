@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use common::NodeId;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Certificate;
 use reqwest::Client;
@@ -92,12 +93,21 @@ pub fn build_http_client_from_pem(
     server_ca_pem: Option<&str>,
     base_url_str: &str,
 ) -> Result<IronMeshClient> {
+    build_http_client_from_pem_with_target_node_id(server_ca_pem, base_url_str, None)
+}
+
+fn build_http_client_from_pem_with_target_node_id(
+    server_ca_pem: Option<&str>,
+    base_url_str: &str,
+    target_node_id: Option<NodeId>,
+) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
-    Ok(IronMeshClient::from_direct_http_client_with_ca_pem(
+    Ok(IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
         base_url.as_str(),
         http,
+        target_node_id,
         server_ca_pem.map(ToString::to_string),
     ))
 }
@@ -107,12 +117,27 @@ pub fn build_http_client_with_identity_from_pem(
     base_url_str: &str,
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
+    build_http_client_with_identity_from_pem_with_target_node_id(
+        server_ca_pem,
+        base_url_str,
+        identity,
+        None,
+    )
+}
+
+fn build_http_client_with_identity_from_pem_with_target_node_id(
+    server_ca_pem: Option<&str>,
+    base_url_str: &str,
+    identity: &ClientIdentityMaterial,
+    target_node_id: Option<NodeId>,
+) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
-    Ok(IronMeshClient::from_direct_http_client_with_ca_pem(
+    Ok(IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
         base_url.as_str(),
         http,
+        target_node_id,
         server_ca_pem.map(ToString::to_string),
     )
     .with_client_identity(identity.clone()))
@@ -123,13 +148,14 @@ pub fn build_http_client_with_identity_from_planned_target(
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
     if let Some(server_base_url) = target.server_base_url.as_deref() {
-        return build_http_client_with_identity_from_pem(
+        return build_http_client_with_identity_from_pem_with_target_node_id(
             target
                 .server_ca_pem
                 .as_deref()
                 .or(target.cluster_ca_pem.as_deref()),
             server_base_url,
             identity,
+            target.target_node_id,
         );
     }
 
@@ -204,12 +230,13 @@ pub(crate) fn build_http_client_from_planned_targets(
             continue;
         };
 
-        match build_http_client_from_pem(
+        match build_http_client_from_pem_with_target_node_id(
             target
                 .server_ca_pem
                 .as_deref()
                 .or(target.cluster_ca_pem.as_deref()),
             server_base_url,
+            target.target_node_id,
         ) {
             Ok(client) => clients.push(client),
             Err(error) => build_errors.push(error.to_string()),
@@ -239,12 +266,13 @@ pub fn build_client_with_optional_identity_from_planned_target(
         Some(identity) => build_http_client_with_identity_from_planned_target(target, identity),
         None => {
             if let Some(server_base_url) = target.server_base_url.as_deref() {
-                return build_http_client_from_pem(
+                return build_http_client_from_pem_with_target_node_id(
                     target
                         .server_ca_pem
                         .as_deref()
                         .or(target.cluster_ca_pem.as_deref()),
                     server_base_url,
+                    target.target_node_id,
                 );
             }
 

@@ -1095,9 +1095,9 @@ mod tests {
                 fs::write(&truncated_empty, b"truncate-me").with_context(|| {
                     format!("failed to seed mounted file {}", truncated_empty.display())
                 })?;
+                wait_for_object_bytes(&sdk, "truncated-empty.txt", b"truncate-me", 180).await?;
                 let file = fs::OpenOptions::new()
                     .write(true)
-                    .truncate(true)
                     .open(&truncated_empty)
                     .with_context(|| {
                         format!(
@@ -1105,6 +1105,12 @@ mod tests {
                             truncated_empty.display()
                         )
                     })?;
+                file.set_len(0).with_context(|| {
+                    format!(
+                        "failed to set mounted file length to zero {}",
+                        truncated_empty.display()
+                    )
+                })?;
                 drop(file);
                 wait_for_object_bytes(&sdk, "truncated-empty.txt", b"", 180).await?;
 
