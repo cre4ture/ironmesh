@@ -42,6 +42,7 @@ use futures_util::io::{
 use futures_util::{Sink, Stream};
 use http_body_util::BodyExt;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use qrism::{ECLevel as QrEcLevel, QRBuilder};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     SanType,
@@ -149,6 +150,7 @@ const SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 const MAX_LATENCY_DIAGNOSTIC_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_LATENCY_DIAGNOSTIC_SERVER_DELAY_MS: u64 = 5_000;
+const BOOTSTRAP_QR_IMAGE_SCALE: u32 = 8;
 pub(crate) const PUBLIC_API_V1_PREFIX: &str = "/api/v1";
 const PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/media/thumbnail";
 const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thumbnail";
@@ -4893,6 +4895,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/auth/bootstrap-bundles/issue",
             post(issue_bootstrap_bundle),
         )
+        .route("/auth/bootstrap-qr/render", post(render_bootstrap_qr))
         .route("/auth/bootstrap-claims/issue", post(issue_bootstrap_claim))
         .route("/auth/node-bootstraps/issue", post(issue_node_bootstrap))
         .route("/auth/node-enrollments/issue", post(issue_node_enrollment))
@@ -11972,6 +11975,13 @@ struct PairingTokenIssueRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct BootstrapQrRenderRequest {
+    payload: String,
+    #[serde(default)]
+    high_capacity: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct NodeBootstrapIssueRequest {
     node_id: Option<NodeId>,
     mode: Option<NodeBootstrapMode>,
@@ -13786,6 +13796,106 @@ async fn issue_bootstrap_bundle(
     .await;
 
     (StatusCode::CREATED, Json(bootstrap)).into_response()
+}
+
+fn render_bootstrap_qr_png(payload: &str, high_capacity: bool) -> Result<Vec<u8>> {
+    let mut builder = QRBuilder::new(payload.as_bytes());
+    builder.high_capacity(high_capacity).ec_level(if high_capacity {
+        QrEcLevel::M
+    } else {
+        QrEcLevel::H
+    });
+    let qr = builder
+        .build()
+        .map_err(|err| anyhow!("failed to build QR code: {err}"))?;
+    let image = qr.to_image(BOOTSTRAP_QR_IMAGE_SCALE);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .context("failed to encode QR code PNG")?;
+    Ok(cursor.into_inner())
+}
+
+async fn render_bootstrap_qr(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<BootstrapQrRenderRequest>,
+) -> impl IntoResponse {
+    let action = "auth/bootstrap-qr/render";
+    let request_summary = json!({
+        "payload_bytes": request.payload.len(),
+        "high_capacity": request.high_capacity,
+    });
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, request_summary)
+        .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let payload = request.payload.trim();
+    if payload.is_empty() {
+        let err = "QR payload is required";
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err }),
+        )
+        .await;
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": err }))).into_response();
+    }
+
+    let rendered = match render_bootstrap_qr_png(payload, request.high_capacity) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "payload_bytes": payload.len(),
+            "high_capacity": request.high_capacity,
+            "png_bytes": rendered.len(),
+        }),
+    )
+    .await;
+
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        rendered,
+    )
+        .into_response()
 }
 
 async fn issue_bootstrap_claim(

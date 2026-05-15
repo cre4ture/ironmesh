@@ -71,6 +71,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -93,8 +94,6 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
 import io.ironmesh.android.data.FolderSyncModificationRecord
@@ -109,7 +108,9 @@ import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.MainViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -327,10 +328,24 @@ private fun SettingsView(
     onOpenFiles: () -> Unit,
 ) {
     val context = LocalContext.current
+    val qrCaptureScope = rememberCoroutineScope()
     var existingProfilePermissionRequestAttempted by rememberSaveable { mutableStateOf(false) }
-    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
-        if (result.contents != null) {
-            vm.updateBootstrapInput(result.contents)
+    val scanLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { bitmap ->
+        if (bitmap == null) {
+            vm.setStatus("QR scan cancelled")
+            return@rememberLauncherForActivityResult
+        }
+
+        qrCaptureScope.launch {
+            runCatching {
+                withContext(Dispatchers.Default) {
+                    encodeBitmapToPng(bitmap)
+                }
+            }
+                .onSuccess(vm::scanBootstrapQr)
+                .onFailure { error ->
+                    vm.setStatus("Error: ${error.message}")
+                }
         }
     }
     val photoAccessPermissionLauncher = rememberLauncherForActivityResult(
@@ -374,13 +389,8 @@ private fun SettingsView(
         requestOriginalPhotoAccessIfNeeded(context, photoAccessPermissionLauncher)
     }
     val onScanQr: () -> Unit = {
-        scanLauncher.launch(
-            ScanOptions().apply {
-                setPrompt("Scan bootstrap claim QR code")
-                setBeepEnabled(false)
-                setOrientationLocked(false)
-            },
-        )
+        vm.setStatus("Capture the bootstrap QR code")
+        scanLauncher.launch(null)
     }
     val onPickLocalFolder: () -> Unit = {
         launchFolderPicker(
@@ -408,6 +418,14 @@ private fun SettingsView(
             onPickLocalFolder = onPickLocalFolder,
         )
     }
+}
+
+private fun encodeBitmapToPng(bitmap: Bitmap): ByteArray {
+    val output = ByteArrayOutputStream()
+    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+        "failed to encode camera capture"
+    }
+    return output.toByteArray()
 }
 
 @Composable

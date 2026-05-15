@@ -3,6 +3,7 @@ import {
   issueBootstrapBundle,
   issueBootstrapClaim,
   issueNodeEnrollmentFromJoinRequest,
+  renderBootstrapQrCode,
   type BootstrapBundle,
   type BootstrapClaim,
   type BootstrapClaimIssueResponse,
@@ -11,12 +12,10 @@ import {
 } from "@ironmesh/api";
 import { Alert, Badge, Button, Card, Grid, Group, NativeSelect, NumberInput, Stack, Text, TextInput, Textarea } from "@mantine/core";
 import { JsonBlock } from "@ironmesh/ui";
-import QRCode from "qrcode";
 import { useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 
 const BOOTSTRAP_QR_WIDTH = 1024;
-const BOOTSTRAP_QR_MARGIN = 12;
 const BOOTSTRAP_QR_FRAME_PADDING = 24;
 
 function shouldFallbackToFullBootstrapQr(message: string): boolean {
@@ -67,6 +66,18 @@ export function BootstrapBundlesPage() {
       return null;
     },
     [bootstrapBundle, bootstrapClaim]
+  );
+  const bootstrapQrRequest = useMemo(
+    () => {
+      if (!bootstrapQrPayload) {
+        return null;
+      }
+      return {
+        payload: bootstrapQrPayload,
+        high_capacity: bootstrapClaim === null && bootstrapBundle !== null
+      };
+    },
+    [bootstrapBundle, bootstrapClaim, bootstrapQrPayload]
   );
   const joinRequestPreview = (() => {
     try {
@@ -141,7 +152,8 @@ export function BootstrapBundlesPage() {
 
   useEffect(() => {
     let cancelled = false;
-    if (!bootstrapQrPayload) {
+    let objectUrl: string | null = null;
+    if (!bootstrapQrRequest) {
       setBootstrapBundleQrDataUrl(null);
       setBootstrapBundleQrError(null);
       return;
@@ -150,22 +162,15 @@ export function BootstrapBundlesPage() {
     setBootstrapBundleQrDataUrl(null);
     setBootstrapBundleQrError(null);
 
-    void QRCode.toString(bootstrapQrPayload, {
-      errorCorrectionLevel: "H",
-      type: "svg",
-      margin: BOOTSTRAP_QR_MARGIN,
-      width: BOOTSTRAP_QR_WIDTH,
-      color: {
-        dark: "#000000",
-        light: "#FFFFFF"
-      }
-    })
-      .then((svg: string) => {
-        if (!cancelled) {
-          setBootstrapBundleQrDataUrl(
-            `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
-          );
+    void renderBootstrapQrCode(bootstrapQrRequest, adminTokenOverride)
+      .then((blob) => {
+        const nextObjectUrl = window.URL.createObjectURL(blob);
+        if (cancelled) {
+          window.URL.revokeObjectURL(nextObjectUrl);
+          return;
         }
+        objectUrl = nextObjectUrl;
+        setBootstrapBundleQrDataUrl(nextObjectUrl);
       })
       .catch((qrError: unknown) => {
         if (!cancelled) {
@@ -175,8 +180,11 @@ export function BootstrapBundlesPage() {
 
     return () => {
       cancelled = true;
+      if (objectUrl) {
+        window.URL.revokeObjectURL(objectUrl);
+      }
     };
-  }, [bootstrapQrPayload]);
+  }, [adminTokenOverride, bootstrapQrRequest]);
 
   async function handleIssueBootstrap() {
     setPendingAction("bootstrap");
