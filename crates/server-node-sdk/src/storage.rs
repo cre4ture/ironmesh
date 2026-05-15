@@ -2478,10 +2478,21 @@ impl StoreIndexInspector {
         let mut sizes = HashMap::with_capacity(object_hashes.len());
         let mut content_fingerprints = HashMap::with_capacity(object_hashes.len());
         for (key, manifest_hash) in object_hashes {
-            if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
-                sizes.insert(key.clone(), manifest.total_size_bytes as u64);
-                content_fingerprints
-                    .insert(key.clone(), content_fingerprint_from_manifest(&manifest));
+            match self.load_manifest_by_hash(manifest_hash).await {
+                Ok(Some(manifest)) => {
+                    sizes.insert(key.clone(), manifest.total_size_bytes as u64);
+                    content_fingerprints
+                        .insert(key.clone(), content_fingerprint_from_manifest(&manifest));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        key = %key,
+                        manifest_hash = %manifest_hash,
+                        error = %err,
+                        "skipping store index metadata for unreadable manifest"
+                    );
+                }
             }
         }
         Ok((sizes, content_fingerprints))

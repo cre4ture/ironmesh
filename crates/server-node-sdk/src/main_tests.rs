@@ -6076,6 +6076,74 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_videos_turso
 );
 
+async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "docs/report.txt",
+                bytes::Bytes::from_static(b"report"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    apply_data_scrub_corruption_to_subject(
+        &state,
+        "docs/report.txt",
+        None,
+        DataScrubAutoRepairCorruptionKind::ManifestInvalid,
+    )
+    .await;
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: None,
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "docs/report.txt");
+    assert!(
+        entries[0]["content_hash"].as_str().is_some(),
+        "listing should keep the current manifest hash even when its metadata is unreadable"
+    );
+    assert!(
+        entries[0]["modified_at_unix"].as_u64().unwrap() > 0,
+        "listing should still expose modified time for the corrupted entry"
+    );
+    assert!(
+        entries[0].get("size_bytes").is_none(),
+        "size metadata should be omitted when the manifest is unreadable"
+    );
+    assert!(
+        entries[0].get("content_fingerprint").is_none(),
+        "content fingerprint should be omitted when the manifest is unreadable"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_skips_invalid_manifest_metadata_impl,
+    list_store_index_skips_invalid_manifest_metadata,
+    list_store_index_skips_invalid_manifest_metadata_turso
+);
+
 async fn metadata_import_makes_store_index_visible_without_marking_local_replica_impl(
     backend: MainTestBackend,
 ) {
