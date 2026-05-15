@@ -3710,6 +3710,63 @@ run_on_all_metadata_backends!(
     metadata_import_advances_local_snapshot_state_turso
 );
 
+async fn put_object_from_chunks_rejects_corrupt_chunk_payload_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("put-object-from-corrupt-chunks").await;
+
+    let payload = sample_large_chunked_payload();
+    let mut chunk_refs = Vec::new();
+    for chunk in payload.chunks(CHUNK_SIZE) {
+        let hash = hash_hex(chunk);
+        store.ingest_chunk(&hash, chunk).await.unwrap();
+        chunk_refs.push(UploadChunkRef {
+            hash,
+            size_bytes: chunk.len(),
+        });
+    }
+
+    let corrupt_chunk = chunk_refs
+        .first()
+        .cloned()
+        .expect("sample payload should produce at least one chunk");
+    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash);
+    let mut corrupt_payload = fs::read(&corrupt_path).await.unwrap();
+    corrupt_payload[0] ^= 0xff;
+    fs::write(&corrupt_path, &corrupt_payload).await.unwrap();
+
+    let err = store
+        .put_object_from_chunks(
+            "docs/uploaded.bin",
+            payload.len(),
+            &chunk_refs,
+            PutOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("upload chunk hash mismatch hash="),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        store
+            .list_versions("docs/uploaded.bin")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    put_object_from_chunks_rejects_corrupt_chunk_payload_impl,
+    put_object_from_chunks_rejects_corrupt_chunk_payload,
+    put_object_from_chunks_rejects_corrupt_chunk_payload_turso
+);
+
 async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl(
     backend: StorageTestBackend,
 ) {

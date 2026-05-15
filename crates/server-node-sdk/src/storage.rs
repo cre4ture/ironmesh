@@ -3379,22 +3379,31 @@ impl PersistentStore {
 
         let chunk_validation_started_at = Instant::now();
         for chunk in chunk_refs {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
-            if !fs::try_exists(&chunk_path).await? {
-                bail!(
-                    "upload manifest references missing chunk hash={}",
-                    chunk.hash
-                );
-            }
-
-            let metadata = fs::metadata(&chunk_path).await?;
-            if metadata.len() != chunk.size_bytes as u64 {
-                bail!(
-                    "upload chunk size mismatch hash={} expected={} actual={}",
-                    chunk.hash,
-                    chunk.size_bytes,
-                    metadata.len()
-                );
+            match validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes)
+                .await?
+            {
+                LocalChunkIntegrity::Valid => {}
+                LocalChunkIntegrity::Missing => {
+                    bail!(
+                        "upload manifest references missing chunk hash={}",
+                        chunk.hash
+                    );
+                }
+                LocalChunkIntegrity::SizeMismatch { actual_size_bytes } => {
+                    bail!(
+                        "upload chunk size mismatch hash={} expected={} actual={}",
+                        chunk.hash,
+                        chunk.size_bytes,
+                        actual_size_bytes
+                    );
+                }
+                LocalChunkIntegrity::HashMismatch { actual_hash } => {
+                    bail!(
+                        "upload chunk hash mismatch hash={} actual={}",
+                        chunk.hash,
+                        actual_hash
+                    );
+                }
             }
         }
         let chunk_validation_ms = chunk_validation_started_at.elapsed().as_millis();
@@ -4552,15 +4561,11 @@ impl PersistentStore {
     }
 
     async fn local_chunk_matches_ref(&self, chunk: &ChunkRef) -> Result<bool> {
-        let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
-        if !fs::try_exists(&chunk_path).await? {
-            return Ok(false);
-        }
-        let payload = fs::read(&chunk_path).await?;
-        if payload.len() != chunk.size_bytes {
-            return Ok(false);
-        }
-        Ok(hash_hex(&payload) == chunk.hash)
+        Ok(matches!(
+            validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes)
+                .await?,
+            LocalChunkIntegrity::Valid
+        ))
     }
 
     #[cfg(test)]
@@ -4574,13 +4579,11 @@ impl PersistentStore {
         };
 
         for chunk in &manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
-            let metadata = match fs::metadata(&chunk_path).await {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(err) => return Err(err.into()),
-            };
-            if metadata.len() != chunk.size_bytes as u64 {
+            if !matches!(
+                validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes)
+                    .await?,
+                LocalChunkIntegrity::Valid
+            ) {
                 return Ok(false);
             }
         }
@@ -7577,6 +7580,41 @@ fn rank_state(state: &VersionConsistencyState) -> u8 {
         VersionConsistencyState::Confirmed => 2,
         VersionConsistencyState::Provisional => 1,
     }
+}
+
+enum LocalChunkIntegrity {
+    Valid,
+    Missing,
+    SizeMismatch { actual_size_bytes: u64 },
+    HashMismatch { actual_hash: String },
+}
+
+async fn validate_local_chunk_integrity(
+    chunks_dir: &Path,
+    hash: &str,
+    expected_size_bytes: usize,
+) -> Result<LocalChunkIntegrity> {
+    let chunk_path = chunk_path_for_hash(chunks_dir, hash);
+    let payload = match fs::read(&chunk_path).await {
+        Ok(payload) => payload,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LocalChunkIntegrity::Missing);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if payload.len() != expected_size_bytes {
+        return Ok(LocalChunkIntegrity::SizeMismatch {
+            actual_size_bytes: payload.len() as u64,
+        });
+    }
+
+    let actual_hash = hash_hex(&payload);
+    if actual_hash != hash {
+        return Ok(LocalChunkIntegrity::HashMismatch { actual_hash });
+    }
+
+    Ok(LocalChunkIntegrity::Valid)
 }
 
 fn chunk_path_for_hash(chunks_dir: &Path, hash: &str) -> PathBuf {
