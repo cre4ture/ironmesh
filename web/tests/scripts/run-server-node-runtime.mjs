@@ -107,6 +107,7 @@ const child = spawn(binaryPath, [], {
     IRONMESH_DATA_DIR: dataDir,
     IRONMESH_ADMIN_TOKEN: "playwright-admin-token",
     IRONMESH_REQUIRE_CLIENT_AUTH: "false",
+    IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP: "true",
     RUST_LOG: process.env.RUST_LOG ?? "info"
   },
   stdio: "inherit"

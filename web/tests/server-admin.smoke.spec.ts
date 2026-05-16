@@ -36,7 +36,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
     .toBeGreaterThan(0);
   await page.setViewportSize({ width: 1280, height: 800 });
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
-  await expect(page.getByText(/UI build:\s*0\.1\.0 \(/)).toBeVisible();
+  await expect(page.getByText(/UI build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-5-gmocked)")).toBeVisible();
   await expect(page.getByText("0 discovered")).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
@@ -122,8 +122,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
-  await page.getByText("Setup", { exact: true }).click();
-  await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
+  await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
 
   await page.getByText("Control Plane", { exact: true }).click();
   await expect(page.getByText("https://embedded-rendezvous.local:9443", { exact: true })).toBeVisible();
@@ -422,8 +421,7 @@ test("server-admin runtime ignores auth-protected setup probes", async ({ page }
   await expect(page.getByText("Setup probe warning", { exact: true })).toHaveCount(0);
   await page.keyboard.press("Escape");
 
-  await page.getByText("Setup", { exact: true }).click();
-  await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
+  await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Setup endpoint error", { exact: true })).toHaveCount(0);
 });
 
@@ -580,12 +578,7 @@ async function installServerAdminMocks(
 
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
-      return json(route, {
-        prefix: searchParams.get("prefix") ?? "",
-        depth: Number(searchParams.get("depth") ?? "1"),
-        entry_count: galleryEntries.length,
-        entries: galleryEntries
-      });
+      return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
     }
 
     if (pathname === apiV1("/auth/media/cache/retry") && method === "POST") {
@@ -1049,6 +1042,10 @@ async function installServerAdminMocks(
       return json(route, buildCredentialList(revokedDeviceIds));
     }
 
+    if (pathname === apiV1("/auth/bootstrap-claims") && method === "GET") {
+      return json(route, buildBootstrapClaimList());
+    }
+
     if (pathname === apiV1("/auth/rendezvous-config") && method === "GET") {
       if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
         await route.fulfill({ status: 401 });
@@ -1179,6 +1176,98 @@ type AdminMockStoreEntry = {
   entry_type: "prefix" | "key";
   media?: Record<string, unknown>;
 };
+
+function buildAdminStoreIndexResponse(
+  entries: AdminMockStoreEntry[],
+  searchParams: URLSearchParams
+) {
+  const prefix = searchParams.get("prefix") ?? "";
+  const depth = Number(searchParams.get("depth") ?? "1");
+  const mediaFilter = searchParams.get("media_filter");
+
+  if (!mediaFilter) {
+    return {
+      prefix,
+      depth,
+      entry_count: entries.length,
+      entries
+    };
+  }
+
+  const filteredEntries = entries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter));
+  const totalEntryCount = filteredEntries.length;
+  const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);
+  const limitParam = searchParams.get("limit");
+  const limit = limitParam ? Math.max(1, Number(limitParam) || 1) : null;
+  const pagedEntries =
+    typeof limit === "number"
+      ? filteredEntries.slice(offset, offset + limit)
+      : filteredEntries.slice(offset);
+
+  return {
+    prefix,
+    depth,
+    entry_count: pagedEntries.length,
+    total_entry_count: totalEntryCount,
+    offset,
+    limit,
+    has_more: offset + pagedEntries.length < totalEntryCount,
+    media_summary: summarizeAdminMediaEntries(filteredEntries),
+    entries: pagedEntries
+  };
+}
+
+function matchesAdminMediaFilter(entry: AdminMockStoreEntry, mediaFilter: string): boolean {
+  const media = entry.media;
+  if (!media) {
+    return false;
+  }
+
+  if (mediaFilter === "all") {
+    return true;
+  }
+
+  return media.media_type === mediaFilter;
+}
+
+function summarizeAdminMediaEntries(entries: AdminMockStoreEntry[]) {
+  return entries.reduce(
+    (summary, entry) => {
+      const media = entry.media;
+      if (!media) {
+        return summary;
+      }
+
+      if (media.status === "ready") {
+        summary.ready_count += 1;
+      } else if (media.status === "pending") {
+        summary.pending_count += 1;
+      } else {
+        summary.incomplete_count += 1;
+      }
+
+      if (media.media_type === "image") {
+        summary.image_count += 1;
+      }
+      if (media.media_type === "video") {
+        summary.video_count += 1;
+      }
+      if (media.gps) {
+        summary.geotagged_count += 1;
+      }
+
+      return summary;
+    },
+    {
+      ready_count: 0,
+      pending_count: 0,
+      incomplete_count: 0,
+      image_count: 0,
+      video_count: 0,
+      geotagged_count: 0
+    }
+  );
+}
 
 function buildRetriedAdminMedia(
   entry: AdminMockStoreEntry,
@@ -1323,6 +1412,23 @@ function buildCredentialList(revokedDeviceIds: Set<string>) {
       revoked_by_actor: null,
       revoked_by_source_node: null,
       revoked_at_unix: null
+    }
+  ];
+}
+
+function buildBootstrapClaimList() {
+  return [
+    {
+      claim_id: "claim-001",
+      claim_fingerprint: "claim-fingerprint-001",
+      label: "MacBook Pro",
+      target_node_id: "node-alpha",
+      rendezvous_urls: ["https://node-alpha.local/rendezvous"],
+      created_at_unix: 1_900_000_000,
+      expires_at_unix: 1_900_000_300,
+      used_at_unix: null,
+      consumed_by_device_id: null,
+      status: "pending"
     }
   ];
 }

@@ -5,8 +5,8 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
 
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
-  await expect(page.getByText(/UI build:\s*0\.1\.0 \(/)).toBeVisible();
-  await expect(page.getByText(/Backend build:\s*0\.1\.0 \(/)).toBeVisible();
+  await expect(page.getByText(/UI build:\s*\S+\s+\(.+\)/)).toBeVisible();
+  await expect(page.getByText(/Backend build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByRole("heading", { name: "ironmesh Server Node" })).toHaveCount(0);
   await expect(page.getByText("Server Admin", { exact: true })).toBeVisible();
 
@@ -54,6 +54,5 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Export rendezvous-only failover package")).toBeVisible();
   await expect(page.getByText("Dedicated standalone ironmesh-rendezvous-service")).toBeVisible();
 
-  await page.getByText("Setup", { exact: true }).click();
-  await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
+  await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
 });

@@ -23,7 +23,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("banner").getByText("cli-client-web", { exact: true })).toBeVisible();
   await expect(page.getByText("Transport-aware", { exact: true })).toBeVisible();
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
-  await expect(page.getByText(/UI build:\s*0\.1\.0 \(/)).toBeVisible();
+  await expect(page.getByText(/UI build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-3-gmocked)")).toBeVisible();
   await expect(page.getByText("Active route")).toBeVisible();
   await expect(page.getByText("Direct", { exact: true })).toBeVisible();
@@ -163,6 +163,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
   await page.getByRole("button", { name: "Next item" }).click();
+  await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Next item" }).click();
   await expect(page.getByRole("dialog").getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
   await expect(page.locator("video")).toBeVisible();
   await page.keyboard.press("Escape");
@@ -239,7 +241,10 @@ test("client-ui gallery grid keeps multiple columns on narrow viewports", async 
   await thumbnailsPerRowInput.blur();
   await expect(thumbnailsPerRowInput).toHaveValue("8");
 
-  const galleryGrid = page.locator('[data-gallery-grid="true"]');
+  const galleryGrid = page
+    .locator('[data-gallery-grid="true"]')
+    .filter({ has: page.locator('[data-gallery-card="true"]') })
+    .first();
   await expect(galleryGrid).toBeVisible();
   await expect
     .poll(async () =>
@@ -567,13 +572,7 @@ async function installClientUiMocks(page: Page) {
 
     if (pathname === apiV1("/store/list") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
-      const prefix = searchParams.get("prefix") ?? "";
-      return json(route, {
-        prefix,
-        depth: Number(searchParams.get("depth") ?? "1"),
-        entry_count: storeEntries.length,
-        entries: storeEntries
-      });
+      return json(route, buildMockStoreListResponse(storeEntries, searchParams));
     }
 
     if (pathname === apiV1("/media/thumbnail") && method === "GET") {
@@ -817,6 +816,108 @@ function createMockStoreEntries(): MockStoreEntry[] {
       }
     }
   ];
+}
+
+function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URLSearchParams) {
+  const prefix = searchParams.get("prefix") ?? "";
+  const depth = Number(searchParams.get("depth") ?? "1");
+  const mediaFilter = searchParams.get("media_filter");
+
+  if (!mediaFilter) {
+    return {
+      prefix,
+      depth,
+      entry_count: entries.length,
+      entries
+    };
+  }
+
+  const filteredEntries = entries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter));
+  const sortedEntries = sortMockGalleryEntries(filteredEntries, searchParams.get("sort"));
+  const totalEntryCount = sortedEntries.length;
+  const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);
+  const limitParam = searchParams.get("limit");
+  const limit = limitParam ? Math.max(1, Number(limitParam) || 1) : null;
+  const pagedEntries =
+    typeof limit === "number"
+      ? sortedEntries.slice(offset, offset + limit)
+      : sortedEntries.slice(offset);
+
+  return {
+    prefix,
+    depth,
+    entry_count: pagedEntries.length,
+    total_entry_count: totalEntryCount,
+    offset,
+    limit,
+    has_more: offset + pagedEntries.length < totalEntryCount,
+    media_summary: summarizeMockGalleryEntries(filteredEntries),
+    entries: pagedEntries
+  };
+}
+
+function matchesMockMediaFilter(entry: MockStoreEntry, mediaFilter: string): boolean {
+  const media = entry.media;
+  if (!media) {
+    return false;
+  }
+
+  if (mediaFilter === "all") {
+    return true;
+  }
+
+  return media.media_type === mediaFilter;
+}
+
+function sortMockGalleryEntries(entries: MockStoreEntry[], sort: string | null): MockStoreEntry[] {
+  const sorted = [...entries];
+
+  if (sort === "path_asc") {
+    sorted.sort((left, right) => left.path.localeCompare(right.path));
+    return sorted;
+  }
+
+  sorted.sort((left, right) => (right.modified_at_unix ?? 0) - (left.modified_at_unix ?? 0));
+  return sorted;
+}
+
+function summarizeMockGalleryEntries(entries: MockStoreEntry[]) {
+  return entries.reduce(
+    (summary, entry) => {
+      const media = entry.media;
+      if (!media) {
+        return summary;
+      }
+
+      if (media.status === "ready") {
+        summary.ready_count += 1;
+      } else if (media.status === "pending") {
+        summary.pending_count += 1;
+      } else {
+        summary.incomplete_count += 1;
+      }
+
+      if (media.media_type === "image") {
+        summary.image_count += 1;
+      }
+      if (media.media_type === "video") {
+        summary.video_count += 1;
+      }
+      if (media.gps) {
+        summary.geotagged_count += 1;
+      }
+
+      return summary;
+    },
+    {
+      ready_count: 0,
+      pending_count: 0,
+      incomplete_count: 0,
+      image_count: 0,
+      video_count: 0,
+      geotagged_count: 0
+    }
+  );
 }
 
 function upsertMockFolderEntry(entries: MockStoreEntry[], key: string) {

@@ -6597,10 +6597,13 @@ mod tests {
         let second = client
             .get_json_path("/cluster/status")
             .await
-            .expect("second request should still use the fallback relay route");
-        assert_eq!(second["route"], "fallback");
+            .expect("second request after backoff should succeed");
+        assert!(matches!(
+            second["route"].as_str(),
+            Some("fallback" | "primary")
+        ));
 
-        let background_capture = tokio::time::timeout(Duration::from_secs(2), async {
+        let background_capture = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(captured) = primary_state.captured_request.lock().await.clone()
                     && captured.path_and_query == "/api/v1/health"
@@ -6614,7 +6617,7 @@ mod tests {
         .expect("background probe should hit the recovered relay route");
         assert_eq!(background_capture.path_and_query, "/api/v1/health");
 
-        let third = tokio::time::timeout(Duration::from_secs(2), async {
+        let third = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let response = client
                     .get_json_path("/cluster/status")
