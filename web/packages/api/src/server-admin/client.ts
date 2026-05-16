@@ -246,6 +246,26 @@ export async function renameAdminStorePath(
   });
 }
 
+export async function restoreAdminStorePathFromSnapshot(
+  snapshot: string,
+  sourcePath: string,
+  targetPath: string,
+  recursive = false,
+  adminTokenOverride?: string
+): Promise<Record<string, unknown>> {
+  return fetchAdminJson<Record<string, unknown>>(apiV1("/auth/store/restore"), {
+    method: "POST",
+    adminTokenOverride,
+    body: {
+      snapshot,
+      from_path: sourcePath,
+      to_path: targetPath,
+      recursive,
+      overwrite: false
+    }
+  });
+}
+
 export async function getClusterSummary(
   adminTokenOverride?: string
 ): Promise<ClusterSummary> {

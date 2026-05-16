@@ -45,7 +45,7 @@ export const serverAdminRoutes = [
   {
     id: "explorer",
     label: "Explorer",
-    description: "Browse prefixes, snapshots, and version history from the node side, with admin-authenticated rename and delete on current data.",
+    description: "Browse prefixes, snapshots, and version history from the node side, with admin-authenticated rename and delete on current data plus snapshot restore.",
     icon: IconFolder,
     element: <ExplorerPage />
   },

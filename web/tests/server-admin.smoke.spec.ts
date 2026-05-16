@@ -189,6 +189,40 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   expect(requestedPaths).not.toContain("/auth/bootstrap-claims/issue");
 });
 
+test("server-admin explorer restores snapshot entries", async ({ page }) => {
+  const mockState = await installServerAdminMocks(page);
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Explorer", { exact: true }).click();
+  await expect(page.getByRole("button", { name: "Refresh snapshots" })).toBeVisible();
+
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "snapshot-admin-001" }).click();
+  await page.getByRole("button", { name: "Load entries" }).click();
+
+  page.once("dialog", (dialog) => dialog.accept("restored/readme-restored.txt"));
+  await page
+    .getByRole("row", { name: /docs\/readme\.txt/ })
+    .getByRole("button", { name: "Restore..." })
+    .click();
+
+  await expect.poll(() => mockState.requestedPaths().includes(apiV1("/auth/store/restore"))).toBe(
+    true
+  );
+
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "Current data" }).click();
+  await page.getByRole("button", { name: "Load entries" }).click();
+  await expect(page.getByRole("cell", { name: "restored/readme-restored.txt" })).toBeVisible();
+});
+
 test("server-admin provisioning can target a selected rendezvous service", async ({ page }) => {
   await installServerAdminMocks(page);
 
@@ -579,6 +613,28 @@ async function installServerAdminMocks(
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
+    }
+
+    if (pathname === apiV1("/auth/store/restore") && method === "POST") {
+      const body = route.request().postDataJSON() as {
+        snapshot: string;
+        from_path: string;
+        to_path: string;
+        recursive?: boolean;
+      };
+      const restoredCount = restoreAdminMockStorePath(
+        galleryEntries,
+        body.from_path,
+        body.to_path,
+        body.recursive === true
+      );
+      return json(route, {
+        snapshot: body.snapshot,
+        source_path: body.from_path,
+        target_path: body.to_path,
+        recursive: body.recursive === true,
+        restored_count: restoredCount
+      });
     }
 
     if (pathname === apiV1("/auth/media/cache/retry") && method === "POST") {
@@ -1302,6 +1358,46 @@ function buildRetriedAdminMedia(
       size_bytes: thumbnailSizeBytes
     }
   };
+}
+
+function restoreAdminMockStorePath(
+  entries: AdminMockStoreEntry[],
+  fromPath: string,
+  toPath: string,
+  recursive: boolean
+): number {
+  const normalizedFrom = fromPath.trim();
+  const normalizedTo = toPath.trim();
+  if (!normalizedFrom || !normalizedTo) {
+    return 0;
+  }
+
+  const sourceEntries = recursive || normalizedFrom.endsWith("/")
+    ? entries.filter(
+        (entry) => entry.path === normalizedFrom || entry.path.startsWith(normalizedFrom)
+      )
+    : entries.filter((entry) => entry.path === normalizedFrom);
+
+  for (const sourceEntry of sourceEntries) {
+    const nextPath =
+      sourceEntry.path === normalizedFrom
+        ? normalizedTo
+        : `${normalizedTo}${sourceEntry.path.slice(normalizedFrom.length)}`;
+    const nextEntry: AdminMockStoreEntry = {
+      ...sourceEntry,
+      path: nextPath,
+      media: sourceEntry.media ? { ...sourceEntry.media } : undefined
+    };
+    const existingEntry = entries.find((entry) => entry.path === nextPath);
+    if (existingEntry) {
+      existingEntry.entry_type = nextEntry.entry_type;
+      existingEntry.media = nextEntry.media;
+      continue;
+    }
+    entries.push(nextEntry);
+  }
+
+  return sourceEntries.length;
 }
 
 function createDefaultAdminGalleryEntries(): AdminMockStoreEntry[] {

@@ -5,7 +5,8 @@ import {
   getAdminVersionGraph,
   listAdminSnapshots,
   listAdminStoreEntries,
-  renameAdminStorePath
+  renameAdminStorePath,
+  restoreAdminStorePathFromSnapshot
 } from "@ironmesh/api";
 import { ExplorerSurface } from "@ironmesh/ui";
 import { useCallback } from "react";
@@ -39,7 +40,7 @@ export function ExplorerPage() {
 
   return (
     <ExplorerSurface
-      intro="Browse the node-side object index with the same shared explorer surface used by the client UI. The admin wrapper uses authenticated snapshot, object, and version routes, and it enables rename and delete against current data while leaving upload and folder creation disabled."
+      intro="Browse the node-side object index with the same shared explorer surface used by the client UI. The admin wrapper uses authenticated snapshot, object, and version routes, and it enables rename and delete against current data while also allowing snapshot restore, while leaving upload and folder creation disabled."
       loadSnapshots={loadSnapshots}
       loadEntries={loadEntries}
       readValue={readValue}
@@ -50,7 +51,15 @@ export function ExplorerPage() {
       mutations={{
         deletePath: (path) => deleteAdminStorePath(path, adminTokenOverride),
         renamePath: (fromPath, toPath) =>
-          renameAdminStorePath(fromPath, toPath, false, adminTokenOverride)
+          renameAdminStorePath(fromPath, toPath, false, adminTokenOverride),
+        restoreSnapshotPath: (snapshotId, sourcePath, targetPath, recursive) =>
+          restoreAdminStorePathFromSnapshot(
+            snapshotId,
+            sourcePath,
+            targetPath,
+            recursive,
+            adminTokenOverride
+          )
       }}
     />
   );

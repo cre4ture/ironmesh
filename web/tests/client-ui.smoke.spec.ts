@@ -119,9 +119,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "scratch/" })).toHaveCount(0);
-  page.once("dialog", (dialog) => dialog.accept("quick-c.bin"));
+  page.once("dialog", (dialog) => dialog.accept("docs/nested/quick-c.bin"));
   await page.getByRole("row", { name: /quick-b\.bin/ }).getByRole("button", { name: "Rename" }).click();
-  await expect(page.getByRole("cell", { name: "quick-c.bin" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "nested/quick-c.bin" })).toBeVisible();
   await expect(page.getByRole("cell", { name: "quick-b.bin" })).toHaveCount(0);
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();

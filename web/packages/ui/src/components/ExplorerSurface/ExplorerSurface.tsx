@@ -130,7 +130,7 @@ export function ExplorerSurface({
   mutations,
   quickUpload,
   showEntriesPayload = true,
-  currentDataHint = "Delete on a prefix removes that whole subtree from current data. Rename on a prefix rewrites each stored path under it.",
+  currentDataHint = "Delete on a prefix removes that whole subtree from current data. Rename on a prefix rewrites each stored path under it, and entering a full target path can move data.",
   snapshotHint = "Restore copies the selected snapshot item into current data. Create, rename, and delete stay disabled while browsing a historical snapshot.",
   readOnlyHint = "This surface is read-only. Use it to browse prefixes, inspect object payloads, and verify version history."
 }: ExplorerSurfaceProps) {
@@ -450,33 +450,32 @@ export function ExplorerSurface({
     }
 
     const currentName = explorerEntryName(entry.path, isPrefix);
-    const requestedName =
+    const requestedTarget =
       typeof window === "undefined"
         ? currentName
         : window.prompt(
-            isPrefix ? `Rename folder "${currentName}" to:` : `Rename "${currentName}" to:`,
+            isPrefix
+              ? `Rename or move folder "${currentName}". Use a full path to move it:`
+              : `Rename or move "${currentName}". Use a full path to move it:`,
             currentName
           );
-    if (requestedName == null) {
+    if (requestedTarget == null) {
       return;
     }
 
-    const nextName = normalizeExplorerSegments(requestedName);
-    if (!nextName) {
-      setError("Name must not be empty.");
-      return;
-    }
-    if (nextName.includes("/")) {
-      setError("Rename expects a single new name, not a full path.");
-      return;
-    }
-
+    const requestedTargetPath = requestedTarget.trim();
     const targetParent = parentPrefix(fromPath);
-    const toPath = isPrefix
-      ? folderMarkerKey(joinExplorerPath(targetParent, nextName))
-      : joinExplorerPath(targetParent, nextName);
+    const toPath = requestedTargetPath.includes("/")
+      ? normalizeExplorerPath(requestedTargetPath, isPrefix)
+      : isPrefix
+        ? folderMarkerKey(joinExplorerPath(targetParent, requestedTargetPath))
+        : joinExplorerPath(targetParent, requestedTargetPath);
     if (!toPath) {
-      setError("Name must not be empty.");
+      setError("Target path must not be empty.");
+      return;
+    }
+    if (!isPrefix && toPath.endsWith("/")) {
+      setError("Target path for an object must not end with '/'.");
       return;
     }
     if (toPath === fromPath) {
@@ -487,7 +486,7 @@ export function ExplorerSurface({
       !isPrefix ||
       typeof window === "undefined" ||
       window.confirm(
-        `Rename "${fromPath}" to "${toPath}"? This rewrites each stored path under that prefix.`
+        `Rename or move "${fromPath}" to "${toPath}"? This rewrites each stored path under that prefix.`
       );
     if (!confirmed) {
       return;
