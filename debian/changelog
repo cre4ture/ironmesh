@@ -1,3 +1,15 @@
+ironmesh (1.0.13-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Pin each file upload to a single server node and reject incomplete chunk
+    sets before completion.
+  * Keep affected entries visible when a stored manifest is corrupt, show
+    connection last activity in the admin UI, and force the bright scheme for
+    issued provisioning QR payloads.
+  * Tighten local Debian package builds to require a clean git checkout.
+  * Roll the workspace release to 1.0.13.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 16 May 2026 06:09:19 +0200
+
 ironmesh (1.0.12-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add an admin Connections page, a dependency diagnostics page, and
