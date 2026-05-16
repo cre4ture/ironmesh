@@ -12081,12 +12081,15 @@ async fn retry_media_cache_response(
         metadata: Some(metadata),
     };
 
-    (StatusCode::OK, Json(build_media_index_response(
-        &query.key,
-        query.snapshot.as_deref(),
-        &lookup,
-        thumbnail_route,
-    )))
+    (
+        StatusCode::OK,
+        Json(build_media_index_response(
+            &query.key,
+            query.snapshot.as_deref(),
+            &lookup,
+            thumbnail_route,
+        )),
+    )
         .into_response()
 }
 

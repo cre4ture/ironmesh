@@ -13,8 +13,8 @@ use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
     IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult, RelayMode,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RequestedRange, StoreIndexMediaFilter,
-    StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView, UploadMode,
+    RendezvousEndpointStatus, RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexSortOrder, StoreIndexView, UploadMode,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::DownloadRangeRequest,
@@ -1104,7 +1104,10 @@ fn build_media_thumbnail_request_path(query: &WebMediaThumbnailQuery) -> Result<
 }
 
 fn build_media_cache_retry_request_path(query: &WebMediaThumbnailQuery) -> Result<String> {
-    build_relative_path(&["media", "cache", "retry"], &media_selector_query_pairs(query))
+    build_relative_path(
+        &["media", "cache", "retry"],
+        &media_selector_query_pairs(query),
+    )
 }
 
 fn parse_logical_file_range(value: &str, total_size_bytes: u64) -> Option<LogicalFileByteRange> {
@@ -1567,7 +1570,11 @@ async fn web_media_cache_retry(
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
     };
 
-    let response = match current_sdk(&state).await.post_relative_path(&retry_path).await {
+    let response = match current_sdk(&state)
+        .await
+        .post_relative_path(&retry_path)
+        .await
+    {
         Ok(response) => response,
         Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     };
