@@ -1,4 +1,5 @@
 import { fetchJson } from "../shared/http";
+import type { StoreIndexMedia } from "../shared/store-index";
 import type {
   ClientLatencyTestResponse,
   ClientRendezvousView,
@@ -133,6 +134,35 @@ export async function listStoreEntries(
     query.set("media_filter", options.mediaFilter);
   }
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
+}
+
+export async function retryStoreMediaCacheEntry(
+  key: string,
+  options?: {
+    snapshot?: string | null;
+    version?: string | null;
+    readMode?: string | null;
+  }
+): Promise<StoreIndexMedia> {
+  const trimmedKey = key.trim();
+  if (!trimmedKey) {
+    throw new Error("key must not be empty");
+  }
+
+  const query = new URLSearchParams({ key: trimmedKey });
+  if (options?.snapshot?.trim()) {
+    query.set("snapshot", options.snapshot.trim());
+  }
+  if (options?.version?.trim()) {
+    query.set("version", options.version.trim());
+  }
+  if (options?.readMode?.trim()) {
+    query.set("read_mode", options.readMode.trim());
+  }
+
+  return fetchJson<StoreIndexMedia>(`${apiV1("/media/cache/retry")}?${query.toString()}`, {
+    method: "POST"
+  });
 }
 
 export async function getStoreValue(

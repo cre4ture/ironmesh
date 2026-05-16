@@ -1,4 +1,9 @@
-import { getBinaryObjectStreamUrl, listSnapshots, listStoreEntries } from "@ironmesh/api";
+import {
+  getBinaryObjectStreamUrl,
+  listSnapshots,
+  listStoreEntries,
+  retryStoreMediaCacheEntry
+} from "@ironmesh/api";
 import {
   GallerySurface,
   PageHeader,
@@ -74,6 +79,14 @@ export function GalleryPage() {
     }),
     []
   );
+  const retryMediaEntry = useCallback(
+    (entry: GalleryEntry, snapshotId: string | null) =>
+      retryStoreMediaCacheEntry(entry.path, {
+        snapshot: snapshotId,
+        version: typeof entry.version === "string" ? entry.version : null
+      }),
+    []
+  );
 
   return (
     <>
@@ -88,6 +101,7 @@ export function GalleryPage() {
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
         getMediaRequests={getMediaRequests}
+        retryMediaEntry={retryMediaEntry}
       />
     </>
   );

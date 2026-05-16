@@ -286,6 +286,7 @@ pub fn router(config: WebUiConfig) -> Router {
 
     let api_v1 = Router::new()
         .route("/media/thumbnail", get(web_media_thumbnail))
+        .route("/media/cache/retry", post(web_media_cache_retry))
         .route("/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
         .route("/maps/logical-file", get(web_map_logical_file))
         .route("/maps/tiles/{z}/{x}/{y}", get(web_map_xyz_tile))
@@ -325,6 +326,7 @@ pub fn router(config: WebUiConfig) -> Router {
 
     let legacy_api = Router::new()
         .route("/media/thumbnail", get(web_media_thumbnail))
+        .route("/media/cache/retry", post(web_media_cache_retry))
         .route("/api/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
         .route("/api/maps/logical-file", get(web_map_logical_file))
         .route("/api/maps/tiles/{z}/{x}/{y}", get(web_map_xyz_tile))
@@ -1083,7 +1085,7 @@ fn build_versions_request_path(key: &str) -> Result<String> {
     build_relative_path(&["versions", key], &[])
 }
 
-fn build_media_thumbnail_request_path(query: &WebMediaThumbnailQuery) -> Result<String> {
+fn media_selector_query_pairs(query: &WebMediaThumbnailQuery) -> Vec<(&str, &str)> {
     let mut query_pairs = vec![("key", query.key.as_str())];
     if let Some(snapshot) = query.snapshot.as_deref() {
         query_pairs.push(("snapshot", snapshot));
@@ -1094,7 +1096,15 @@ fn build_media_thumbnail_request_path(query: &WebMediaThumbnailQuery) -> Result<
     if let Some(read_mode) = query.read_mode.as_deref() {
         query_pairs.push(("read_mode", read_mode));
     }
-    build_relative_path(&["media", "thumbnail"], &query_pairs)
+    query_pairs
+}
+
+fn build_media_thumbnail_request_path(query: &WebMediaThumbnailQuery) -> Result<String> {
+    build_relative_path(&["media", "thumbnail"], &media_selector_query_pairs(query))
+}
+
+fn build_media_cache_retry_request_path(query: &WebMediaThumbnailQuery) -> Result<String> {
+    build_relative_path(&["media", "cache", "retry"], &media_selector_query_pairs(query))
 }
 
 fn parse_logical_file_range(value: &str, total_size_bytes: u64) -> Option<LogicalFileByteRange> {
@@ -1539,6 +1549,32 @@ async fn web_media_thumbnail(
     }
     if let Some(value) = response.headers.get(CACHE_CONTROL).cloned() {
         headers.insert(CACHE_CONTROL, value);
+    }
+
+    (response.status, headers, response.body).into_response()
+}
+
+async fn web_media_cache_retry(
+    State(state): State<WebState>,
+    Query(query): Query<WebMediaThumbnailQuery>,
+) -> impl IntoResponse {
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    let retry_path = match build_media_cache_retry_request_path(&query) {
+        Ok(path) => path,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let response = match current_sdk(&state).await.post_relative_path(&retry_path).await {
+        Ok(response) => response,
+        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    };
+
+    let mut headers = HeaderMap::new();
+    if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+        headers.insert(CONTENT_TYPE, value);
     }
 
     (response.status, headers, response.body).into_response()

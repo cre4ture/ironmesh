@@ -1,4 +1,8 @@
-import { listAdminSnapshots, listAdminStoreEntries } from "@ironmesh/api";
+import {
+  listAdminSnapshots,
+  listAdminStoreEntries,
+  retryAdminMediaCacheEntry
+} from "@ironmesh/api";
 import {
   GallerySurface,
   type GalleryBasemapConfig,
@@ -89,6 +93,14 @@ export function GalleryPage() {
     },
     [previewHeaders]
   );
+  const retryMediaEntry = useCallback(
+    (entry: GalleryEntry, snapshotId: string | null) =>
+      retryAdminMediaCacheEntry(entry.path, adminTokenOverride, {
+        snapshot: snapshotId,
+        version: typeof entry.version === "string" ? entry.version : null
+      }),
+    [adminTokenOverride]
+  );
 
   return (
     <GallerySurface
@@ -99,6 +111,7 @@ export function GalleryPage() {
       loadSnapshots={loadSnapshots}
       loadEntries={loadEntries}
       getMediaRequests={getMediaRequests}
+      retryMediaEntry={retryMediaEntry}
     />
   );
 }

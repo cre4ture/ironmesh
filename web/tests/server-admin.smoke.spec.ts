@@ -279,6 +279,56 @@ test("server-admin gallery derives child folders from nested media entries", asy
   await expect(page.getByText("oppo-uli/", { exact: true }).first()).toBeVisible();
 });
 
+test("server-admin gallery retries missing video poster extraction from the fullscreen view", async ({ page }) => {
+  const mockState = await installServerAdminMocks(page, {
+    galleryEntries: [
+      {
+        path: "gallery/clip.mp4",
+        entry_type: "key",
+        media: {
+          status: "failed",
+          content_fingerprint: "fingerprint-clip",
+          media_type: "video",
+          mime_type: "video/mp4",
+          width: 1920,
+          height: 1080,
+          error: "Poster extraction failed on this node."
+        }
+      }
+    ]
+  });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  await page.getByText("gallery/clip.mp4", { exact: true }).click();
+
+  const dialog = page.getByRole("dialog");
+  const retryButton = dialog.getByRole("button", {
+    name: "Retry metadata and poster extraction"
+  });
+
+  await expect(dialog.getByText("Poster thumbnail unavailable", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Poster extraction failed on this node.", { exact: true })).toBeVisible();
+  await expect(retryButton).toBeVisible();
+
+  await retryButton.click();
+
+  await expect(retryButton).toHaveCount(0);
+  await expect(dialog.getByText("Poster thumbnail unavailable", { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText("Poster extraction failed on this node.", { exact: true })).toHaveCount(0);
+  await expect.poll(() => mockState.requestedPaths().includes(apiV1("/auth/media/cache/retry"))).toBe(
+    true
+  );
+});
+
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
   await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
 
@@ -498,6 +548,26 @@ async function installServerAdminMocks(
         entry_count: galleryEntries.length,
         entries: galleryEntries
       });
+    }
+
+    if (pathname === apiV1("/auth/media/cache/retry") && method === "POST") {
+      const key = searchParams.get("key");
+      const targetEntry = key
+        ? galleryEntries.find((entry) => entry.entry_type === "key" && entry.path === key)
+        : null;
+
+      if (!targetEntry) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json; charset=utf-8",
+          body: JSON.stringify({ error: "gallery entry not found" })
+        });
+        return;
+      }
+
+      const updatedMedia = buildRetriedAdminMedia(targetEntry, imageBody.length);
+      targetEntry.media = updatedMedia;
+      return json(route, updatedMedia);
     }
 
     if (pathname === apiV1("/auth/media/thumbnail") && method === "GET") {
@@ -1071,6 +1141,41 @@ type AdminMockStoreEntry = {
   entry_type: "prefix" | "key";
   media?: Record<string, unknown>;
 };
+
+function buildRetriedAdminMedia(
+  entry: AdminMockStoreEntry,
+  thumbnailSizeBytes: number
+): Record<string, unknown> {
+  const existingMedia = entry.media ?? {};
+  const mediaType =
+    typeof existingMedia.media_type === "string"
+      ? existingMedia.media_type
+      : entry.path.toLowerCase().endsWith(".mp4")
+        ? "video"
+        : "image";
+  const mimeType =
+    typeof existingMedia.mime_type === "string"
+      ? existingMedia.mime_type
+      : mediaType === "video"
+        ? "video/mp4"
+        : "image/png";
+
+  return {
+    ...existingMedia,
+    status: "ready",
+    media_type: mediaType,
+    mime_type: mimeType,
+    error: null,
+    thumbnail: {
+      url: `${apiV1("/auth/media/thumbnail")}?key=${encodeURIComponent(entry.path)}`,
+      profile: "grid",
+      width: 256,
+      height: mediaType === "video" ? 144 : 192,
+      format: "jpeg",
+      size_bytes: thumbnailSizeBytes
+    }
+  };
+}
 
 function createDefaultAdminGalleryEntries(): AdminMockStoreEntry[] {
   return [

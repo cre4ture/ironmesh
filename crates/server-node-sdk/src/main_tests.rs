@@ -6855,6 +6855,105 @@ run_on_main_metadata_backends!(
     get_media_thumbnail_admin_requires_auth_and_serves_image_turso
 );
 
+#[cfg(unix)]
+async fn retry_media_cache_rebuilds_video_poster_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let query = super::MediaThumbnailQuery {
+        key: "gallery/clip.mp4".to_string(),
+        snapshot: None,
+        version: None,
+        read_mode: None,
+    };
+
+    let manifest_hash = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let tools_dir = locked.root_dir().join("test-video-tools");
+        let (ffprobe_path, _) = install_fake_video_tools(&tools_dir);
+        let missing_ffmpeg = locked.root_dir().join("missing-ffmpeg");
+        locked.set_media_tool_paths_for_test(ffprobe_path, missing_ffmpeg);
+        locked
+            .put_object_versioned(
+                "gallery/clip.mp4",
+                bytes::Bytes::from(sample_large_chunked_payload()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+            .manifest_hash
+    };
+
+    let initial = axum::response::IntoResponse::into_response(
+        super::get_media_thumbnail(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(query.clone()),
+        )
+        .await,
+    );
+    assert_eq!(initial.status(), axum::http::StatusCode::NOT_FOUND);
+
+    let failed = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .expect("expected cached media metadata after failed poster generation")
+    };
+    assert!(failed.error.is_some());
+    assert!(failed.thumbnail.is_none());
+
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let tools_dir = locked.root_dir().join("test-video-tools");
+        let (ffprobe_path, ffmpeg_path) = install_fake_video_tools(&tools_dir);
+        locked.set_media_tool_paths_for_test(ffprobe_path, ffmpeg_path);
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::retry_media_cache(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(query),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "ready");
+    assert_eq!(payload["media_type"], "video");
+    assert!(
+        payload["thumbnail"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/api/v1/media/thumbnail?key=gallery%2Fclip.mp4")
+    );
+
+    let rebuilt = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .expect("expected rebuilt media metadata after retry")
+    };
+    assert_eq!(rebuilt.status, super::storage::MediaCacheStatus::Ready);
+    assert!(rebuilt.thumbnail.is_some());
+
+    cleanup_test_state(&state).await;
+}
+
+#[cfg(unix)]
+run_on_main_metadata_backends!(
+    retry_media_cache_rebuilds_video_poster_impl,
+    retry_media_cache_rebuilds_video_poster,
+    retry_media_cache_rebuilds_video_poster_turso
+);
+
 async fn media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl(
     backend: MainTestBackend,
 ) {

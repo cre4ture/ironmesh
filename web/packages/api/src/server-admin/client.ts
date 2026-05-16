@@ -1,4 +1,5 @@
 import { fetchJson } from "../shared/http";
+import type { StoreIndexMedia } from "../shared/store-index";
 import type {
   AdminMediaCacheClearResponse,
   AdminStoreGetResponse,
@@ -424,6 +425,37 @@ export async function clearAdminMediaCache(
   adminTokenOverride?: string
 ): Promise<AdminMediaCacheClearResponse> {
   return fetchAdminJson<AdminMediaCacheClearResponse>(`${apiV1("/auth/media/cache/clear")}?approve=true`, {
+    method: "POST",
+    adminTokenOverride
+  });
+}
+
+export async function retryAdminMediaCacheEntry(
+  key: string,
+  adminTokenOverride?: string,
+  options?: {
+    snapshot?: string | null;
+    version?: string | null;
+    readMode?: string | null;
+  }
+): Promise<StoreIndexMedia> {
+  const trimmedKey = key.trim();
+  if (!trimmedKey) {
+    throw new Error("key must not be empty");
+  }
+
+  const query = new URLSearchParams({ key: trimmedKey });
+  if (options?.snapshot?.trim()) {
+    query.set("snapshot", options.snapshot.trim());
+  }
+  if (options?.version?.trim()) {
+    query.set("version", options.version.trim());
+  }
+  if (options?.readMode?.trim()) {
+    query.set("read_mode", options.readMode.trim());
+  }
+
+  return fetchAdminJson<StoreIndexMedia>(`${apiV1("/auth/media/cache/retry")}?${query.toString()}`, {
     method: "POST",
     adminTokenOverride
   });

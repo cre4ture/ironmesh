@@ -4823,6 +4823,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             post(complete_upload_session_route),
         )
         .route("/media/thumbnail", get(get_media_thumbnail))
+        .route("/media/cache/retry", post(retry_media_cache))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
@@ -4876,6 +4877,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/store/delete", post(delete_object_by_query_admin))
         .route("/auth/store/rename", post(rename_object_path_admin))
         .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
+        .route("/auth/media/cache/retry", post(retry_media_cache_admin))
         .route("/auth/media/cache/clear", post(clear_media_cache_admin))
         .route("/auth/store/{key}", get(get_object_admin))
         .route("/auth/client-connections", get(list_client_connections))
@@ -11657,6 +11659,40 @@ async fn get_media_thumbnail_admin(
     get_media_thumbnail_response(&state, query).await
 }
 
+async fn retry_media_cache(
+    State(state): State<ServerState>,
+    Query(query): Query<MediaThumbnailQuery>,
+) -> impl IntoResponse {
+    retry_media_cache_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn retry_media_cache_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<MediaThumbnailQuery>,
+) -> impl IntoResponse {
+    let action = "auth/media/cache/retry";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "key": query.key.clone(),
+            "snapshot": query.snapshot.clone(),
+            "version": query.version.clone(),
+            "read_mode": query.read_mode.clone(),
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    retry_media_cache_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
 async fn get_peer_media_artifact(
     State(state): State<ServerState>,
     Query(query): Query<PeerMediaArtifactQuery>,
@@ -11963,6 +11999,94 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         ],
         payload,
     )
+        .into_response()
+}
+
+async fn retry_media_cache_response(
+    state: &ServerState,
+    query: MediaThumbnailQuery,
+    thumbnail_route: &str,
+) -> Response {
+    if query.key.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
+        Some(value) => value,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let manifest_hash = {
+        let store = read_store(state, "media_cache.retry.resolve").await;
+        match store
+            .resolve_manifest_hash_for_key(
+                &query.key,
+                query.snapshot.as_deref(),
+                query.version.as_deref(),
+                read_mode,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(StoreReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+            Err(StoreReadError::Corrupt(msg)) => {
+                tracing::error!(key = %query.key, error = %msg, "corrupt object while retrying media cache");
+                return StatusCode::CONFLICT.into_response();
+            }
+            Err(StoreReadError::Internal(err)) => {
+                tracing::error!(key = %query.key, error = %err, "internal error while resolving media cache retry");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    {
+        let store = lock_store(state, "media_cache.retry.clear").await;
+        if let Err(err) = store.clear_media_cache_for_manifest(&manifest_hash).await {
+            tracing::error!(
+                key = %query.key,
+                manifest_hash = %manifest_hash,
+                error = %err,
+                "failed to clear media cache entry before retry"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    let metadata = match ensure_media_artifact_with_remote_import(
+        state,
+        &query.key,
+        query.snapshot.as_deref(),
+        query.version.as_deref(),
+        &manifest_hash,
+        true,
+    )
+    .await
+    {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(
+                key = %query.key,
+                manifest_hash = %manifest_hash,
+                error = %err,
+                "failed to rebuild media cache entry after retry"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let lookup = MediaCacheLookup {
+        content_fingerprint: metadata.content_fingerprint.clone(),
+        metadata: Some(metadata),
+    };
+
+    (StatusCode::OK, Json(build_media_index_response(
+        &query.key,
+        query.snapshot.as_deref(),
+        &lookup,
+        thumbnail_route,
+    )))
         .into_response()
 }
 

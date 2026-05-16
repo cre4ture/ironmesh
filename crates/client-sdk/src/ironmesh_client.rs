@@ -2189,6 +2189,19 @@ impl IronMeshClient {
         runtime.block_on(self.get_relative_path(&path))
     }
 
+    pub async fn post_relative_path(&self, path: &str) -> Result<RelativePathResponse> {
+        let url = self.relative_url(path)?;
+        let response = self
+            .execute_buffered_request(Method::POST, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to request {path}"))?;
+        Ok(RelativePathResponse {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
+    }
+
     async fn start_upload_session(
         &self,
         key: &str,

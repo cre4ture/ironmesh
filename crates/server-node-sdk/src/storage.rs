@@ -5812,6 +5812,28 @@ impl PersistentStore {
         })
     }
 
+    pub async fn clear_media_cache_for_manifest(&self, manifest_hash: &str) -> Result<String> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            bail!("cannot clear media cache for tombstone manifest");
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            bail!("missing manifest for hash={manifest_hash}");
+        };
+
+        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
+        self.metadata_store
+            .delete_media_cache_record(&content_fingerprint)
+            .await?;
+
+        let thumb_dir = self.media_thumbnails_dir.join(&content_fingerprint);
+        if fs::try_exists(&thumb_dir).await? {
+            fs::remove_dir_all(&thumb_dir).await?;
+        }
+
+        Ok(content_fingerprint)
+    }
+
     pub async fn compact_tombstone_indexes(
         &self,
         retention_secs: u64,

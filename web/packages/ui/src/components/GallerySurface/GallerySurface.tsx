@@ -83,6 +83,7 @@ export type GallerySnapshot = {
 export type GalleryEntry = {
   path: string;
   entry_type: string;
+  version?: string | null;
   media?: {
     status?: string | null;
     media_type?: string | null;
@@ -196,6 +197,10 @@ type GallerySurfaceProps = {
     options?: GalleryLoadEntriesOptions
   ) => Promise<GalleryPayload>;
   getMediaRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryMediaRequests;
+  retryMediaEntry?: (
+    entry: GalleryEntry,
+    snapshotId: string | null
+  ) => Promise<GalleryEntry["media"] | null>;
 };
 
 export function GallerySurface({
@@ -205,7 +210,8 @@ export function GallerySurface({
   allowedMediaKinds,
   loadSnapshots,
   loadEntries,
-  getMediaRequests
+  getMediaRequests,
+  retryMediaEntry
 }: GallerySurfaceProps) {
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
@@ -232,6 +238,8 @@ export function GallerySurface({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [debugPayloadOpened, setDebugPayloadOpened] = useState(false);
+  const [retryingSelectedMedia, setRetryingSelectedMedia] = useState(false);
+  const [selectedMediaRetryError, setSelectedMediaRetryError] = useState<string | null>(null);
   const loadedScopeRef = useRef<GalleryLoadedScope | null>(null);
   const gridCollectionRef = useRef<GalleryGridCollection | null>(null);
   const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
@@ -344,10 +352,19 @@ export function GallerySurface({
       : null;
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < selectedTotalCount - 1;
+  const canRetrySelectedPoster =
+    Boolean(retryMediaEntry) &&
+    selectedMediaKind === "video" &&
+    selectedMissingThumbnailInfo?.title === "Poster thumbnail unavailable";
 
   useEffect(() => {
     persistBasemapId(activeBasemap?.id ?? "");
   }, [activeBasemap?.id]);
+
+  useEffect(() => {
+    setRetryingSelectedMedia(false);
+    setSelectedMediaRetryError(null);
+  }, [selectedEntry?.path, selectedMediaViewerKey]);
 
   useEffect(() => {
     if (!selection) {
@@ -663,6 +680,85 @@ export function GallerySurface({
         [pageIndex]: height
       };
     });
+  }
+
+  function replaceGalleryEntryMedia(path: string, media: GalleryEntry["media"] | null) {
+    setMapPayload((current) => {
+      if (!current) {
+        return current;
+      }
+
+      let changed = false;
+      const entries = current.entries.map((entry) => {
+        if (entry.path !== path) {
+          return entry;
+        }
+        changed = true;
+        return {
+          ...entry,
+          media
+        };
+      });
+
+      return changed
+        ? {
+            ...current,
+            entries
+          }
+        : current;
+    });
+
+    setGridPages((current) => {
+      let changed = false;
+      const next: Record<number, GalleryGridPageState> = {};
+
+      for (const [pageKey, page] of Object.entries(current)) {
+        let pageChanged = false;
+        const entries = page.entries.map((entry) => {
+          if (entry.path !== path) {
+            return entry;
+          }
+          pageChanged = true;
+          return {
+            ...entry,
+            media
+          };
+        });
+
+        next[Number(pageKey)] = pageChanged
+          ? {
+              ...page,
+              entries
+            }
+          : page;
+        changed ||= pageChanged;
+      }
+
+      return changed ? next : current;
+    });
+  }
+
+  async function handleRetrySelectedMedia() {
+    if (!retryMediaEntry || !selectedEntry) {
+      return;
+    }
+
+    const selectedPath = selectedEntry.path;
+    setRetryingSelectedMedia(true);
+    setSelectedMediaRetryError(null);
+
+    try {
+      const media = await retryMediaEntry(selectedEntry, activeSnapshotId);
+      replaceGalleryEntryMedia(selectedPath, media ?? null);
+    } catch (nextError) {
+      setSelectedMediaRetryError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Failed to retry poster extraction for this item"
+      );
+    } finally {
+      setRetryingSelectedMedia(false);
+    }
   }
 
   async function showRelativeEntry(delta: -1 | 1) {
@@ -1315,13 +1411,28 @@ export function GallerySurface({
               {selectedEntry.path}
             </Text>
             {selectedMissingThumbnailInfo ? (
-              <Alert color={selectedMissingThumbnailInfo.color} title={selectedMissingThumbnailInfo.title}>
-                {selectedMissingThumbnailInfo.detail}
-              </Alert>
+              <Stack gap="xs">
+                <Alert
+                  color={selectedMissingThumbnailInfo.color}
+                  title={selectedMissingThumbnailInfo.title}
+                >
+                  {selectedMissingThumbnailInfo.detail}
+                </Alert>
+                {canRetrySelectedPoster ? (
+                  <Button
+                    leftSection={<IconRefresh size={16} />}
+                    loading={retryingSelectedMedia}
+                    onClick={() => void handleRetrySelectedMedia()}
+                  >
+                    Retry metadata and poster extraction
+                  </Button>
+                ) : null}
+              </Stack>
             ) : null}
             {selectedEntry.media?.taken_at_unix ? (
               <Text size="sm">Captured {formatTakenAt(selectedEntry.media.taken_at_unix)}</Text>
             ) : null}
+            {selectedMediaRetryError ? <Alert color="red">{selectedMediaRetryError}</Alert> : null}
             {selectedMediaError && selectedMediaError !== selectedMissingThumbnailInfo?.detail ? (
               <Alert color="yellow">{selectedMediaError}</Alert>
             ) : null}
