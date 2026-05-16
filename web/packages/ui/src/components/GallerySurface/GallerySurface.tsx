@@ -31,12 +31,17 @@ import {
   IconPlayerPlay,
   IconRefresh
 } from "@tabler/icons-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   GalleryBasemapMap,
   type GalleryBasemapConfig,
   type GalleryMapProjection
 } from "./GalleryBasemapMap";
+import {
+  clusterScreenPoints,
+  type ClusterableScreenPoint,
+  type ScreenPointCluster
+} from "./gallery-marker-clusters";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 import {
   directChildStorePrefix,
@@ -61,6 +66,8 @@ const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
 const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
 const MAX_WORLD_MAP_THUMBNAIL_MARKERS = 120;
+const MIN_WORLD_MAP_CLUSTER_RADIUS_PX = 28;
+const MAX_WORLD_MAP_CLUSTER_RADIUS_PX = 54;
 const GALLERY_VIRTUAL_PAGE_ROW_COUNT = 8;
 const GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS = 1;
 const GALLERY_VIRTUAL_PAGE_KEEP_RADIUS = 2;
@@ -183,6 +190,8 @@ type GalleryGridCollection = {
   pageSize: number;
   pageCount: number;
 };
+
+type GalleryWorldMarkerPoint = ClusterableScreenPoint<GalleryEntry>;
 
 type GallerySurfaceProps = {
   intro?: string;
@@ -1631,6 +1640,23 @@ function resolveGalleryVirtualPageEstimatedHeight(
   return rowCount * cardHeight + Math.max(0, rowCount - 1) * gap;
 }
 
+function resolveWorldMapClusterRadius(width: number, height: number): number {
+  const longestEdge = Math.max(width, height, 560);
+  const interpolated = longestEdge / 16;
+  return Math.max(
+    MIN_WORLD_MAP_CLUSTER_RADIUS_PX,
+    Math.min(MAX_WORLD_MAP_CLUSTER_RADIUS_PX, interpolated)
+  );
+}
+
+function formatGalleryClusterCount(count: number): string {
+  if (count < 1000) {
+    return String(count);
+  }
+
+  return `${Math.floor(count / 100) / 10}k`;
+}
+
 type GalleryMapPanelProps = {
   basemaps: GalleryBasemapConfig[];
   activeBasemap: GalleryBasemapConfig | null;
@@ -1796,9 +1822,46 @@ function GalleryWorldMap({
   onSelectPath,
   onToggleFullscreen
 }: GalleryWorldMapProps) {
-  const suppressMarkerThumbnails = entries.length > MAX_WORLD_MAP_THUMBNAIL_MARKERS;
+  const [clusterDialogEntries, setClusterDialogEntries] = useState<GalleryEntry[] | null>(null);
+  const { ref: mapViewportRef, width: mapViewportWidth, height: mapViewportHeight } =
+    useElementSize();
+  const worldMapMarkerPoints = useMemo<GalleryWorldMarkerPoint[]>(() => {
+    const width = mapViewportWidth > 0 ? mapViewportWidth : 1000;
+    const height = mapViewportHeight > 0 ? mapViewportHeight : 560;
+
+    return entries.flatMap((entry) => {
+      const gps = entry.media?.gps;
+      if (!gps) {
+        return [];
+      }
+
+      const projection = projectGpsToWorldMap(gps.latitude, gps.longitude);
+      return [
+        {
+          id: entry.path,
+          item: entry,
+          x: projection.x * width,
+          y: projection.y * height
+        }
+      ];
+    });
+  }, [entries, mapViewportHeight, mapViewportWidth]);
+  const worldMapMarkerClusters = useMemo<ScreenPointCluster<GalleryEntry>[]>(
+    () =>
+      clusterScreenPoints(
+        worldMapMarkerPoints,
+        resolveWorldMapClusterRadius(mapViewportWidth, mapViewportHeight)
+      ),
+    [mapViewportHeight, mapViewportWidth, worldMapMarkerPoints]
+  );
+  const suppressMarkerThumbnails =
+    worldMapMarkerClusters.length > MAX_WORLD_MAP_THUMBNAIL_MARKERS;
+  const clusteredMarkerCount = worldMapMarkerClusters.filter(
+    (cluster) => cluster.points.length > 1
+  ).length;
   const mapViewport = (
     <div
+      ref={mapViewportRef}
       aria-label="Geotagged gallery map"
       style={{
         position: isFullscreen ? "fixed" : "relative",
@@ -1896,26 +1959,35 @@ function GalleryWorldMap({
         />
       </svg>
 
-      {entries.map((entry) => {
-        const gps = entry.media?.gps;
-        if (!gps) {
-          return null;
+      {worldMapMarkerClusters.map((cluster) => {
+        const selected = cluster.points.some((point) => point.item.path === selectedPath);
+        if (cluster.points.length === 1) {
+          const point = cluster.points[0];
+          if (!point) {
+            return null;
+          }
+
+          return (
+            <GalleryMapMarker
+              key={point.item.path}
+              entry={point.item}
+              request={!suppressMarkerThumbnails || selected ? getMarkerRequest(point.item) : null}
+              left={cluster.x}
+              top={cluster.y}
+              selected={selected}
+              onClick={() => onSelectPath(point.item.path)}
+            />
+          );
         }
 
-        const projection = projectGpsToWorldMap(gps.latitude, gps.longitude);
         return (
-          <GalleryMapMarker
-            key={entry.path}
-            entry={entry}
-            request={
-              !suppressMarkerThumbnails || selectedPath === entry.path
-                ? getMarkerRequest(entry)
-                : null
-            }
-            projectedX={projection.x}
-            projectedY={projection.y}
-            selected={selectedPath === entry.path}
-            onClick={() => onSelectPath(entry.path)}
+          <GalleryMapClusterMarker
+            key={cluster.id}
+            count={cluster.points.length}
+            left={cluster.x}
+            top={cluster.y}
+            selected={selected}
+            onClick={() => setClusterDialogEntries(cluster.points.map((point) => point.item))}
           />
         );
       })}
@@ -1948,7 +2020,21 @@ function GalleryWorldMap({
           }}
         >
           <Badge color="dark" variant="filled">
-            Showing pins for {entries.length} markers
+            {clusteredMarkerCount > 0
+              ? `Clustered ${entries.length} markers into ${worldMapMarkerClusters.length}`
+              : `Showing pins for ${worldMapMarkerClusters.length} markers`}
+          </Badge>
+        </div>
+      ) : clusteredMarkerCount > 0 ? (
+        <div
+          style={{
+            position: "absolute",
+            right: 16,
+            top: 16
+          }}
+        >
+          <Badge color="dark" variant="filled">
+            {worldMapMarkerClusters.length} visible clusters
           </Badge>
         </div>
       ) : null}
@@ -1956,56 +2042,92 @@ function GalleryWorldMap({
   );
 
   return (
-    <Card
-      withBorder={!isFullscreen}
-      radius={isFullscreen ? 0 : "md"}
-      padding={isFullscreen ? 0 : "lg"}
-      style={
-        isFullscreen
-          ? {
-              background: "transparent",
-              border: 0,
-              boxShadow: "none"
-            }
-          : undefined
-      }
-    >
-      <Stack gap="md">
-        <div style={{ display: isFullscreen ? "none" : undefined }}>
-          <Group justify="space-between" align="flex-start">
-            <div>
-              <Text fw={700}>Geo-tagged world map</Text>
-              <Text size="sm" c="dimmed">
-                Click a marker to open the fullscreen media viewer.
-              </Text>
-            </div>
-            <Group gap="xs">
-              <Badge color="grape" variant="light">
-                {entries.length} markers
-              </Badge>
-              {hiddenOnMapCount > 0 ? (
-                <Badge color="gray" variant="light">
-                  {hiddenOnMapCount} without GPS
+    <>
+      <Card
+        withBorder={!isFullscreen}
+        radius={isFullscreen ? 0 : "md"}
+        padding={isFullscreen ? 0 : "lg"}
+        style={
+          isFullscreen
+            ? {
+                background: "transparent",
+                border: 0,
+                boxShadow: "none"
+              }
+            : undefined
+        }
+      >
+        <Stack gap="md">
+          <div style={{ display: isFullscreen ? "none" : undefined }}>
+            <Group justify="space-between" align="flex-start">
+              <div>
+                <Text fw={700}>Geo-tagged world map</Text>
+                <Text size="sm" c="dimmed">
+                  Click a marker to open the fullscreen media viewer.
+                </Text>
+              </div>
+              <Group gap="xs">
+                <Badge color="grape" variant="light">
+                  {entries.length} markers
                 </Badge>
-              ) : null}
-              <Button variant="default" onClick={onToggleFullscreen}>
-                Fullscreen map
-              </Button>
+                {hiddenOnMapCount > 0 ? (
+                  <Badge color="gray" variant="light">
+                    {hiddenOnMapCount} without GPS
+                  </Badge>
+                ) : null}
+                <Button variant="default" onClick={onToggleFullscreen}>
+                  Fullscreen map
+                </Button>
+              </Group>
             </Group>
-          </Group>
-        </div>
+          </div>
 
-        {mapViewport}
-      </Stack>
-    </Card>
+          {mapViewport}
+        </Stack>
+      </Card>
+
+      <Modal
+        opened={clusterDialogEntries !== null}
+        onClose={() => setClusterDialogEntries(null)}
+        title={
+          clusterDialogEntries
+            ? `${clusterDialogEntries.length} items in map cluster`
+            : "Map cluster"
+        }
+        centered
+      >
+        <Stack gap="xs">
+          <Text size="sm" c="dimmed">
+            This atlas view groups nearby markers. Select an item to open it in the gallery viewer.
+          </Text>
+          <div style={{ maxHeight: "50vh", overflowY: "auto" }}>
+            <Stack gap="xs">
+              {clusterDialogEntries?.map((entry) => (
+                <Button
+                  key={entry.path}
+                  variant="default"
+                  fullWidth
+                  onClick={() => {
+                    setClusterDialogEntries(null);
+                    onSelectPath(entry.path);
+                  }}
+                >
+                  {entry.path}
+                </Button>
+              ))}
+            </Stack>
+          </div>
+        </Stack>
+      </Modal>
+    </>
   );
 }
 
 type GalleryMapMarkerProps = {
   entry: GalleryEntry;
   request: GalleryPreviewRequest | null;
-  projectedX: number;
-  projectedY: number;
+  left: number;
+  top: number;
   selected: boolean;
   onClick: () => void;
 };
@@ -2013,8 +2135,8 @@ type GalleryMapMarkerProps = {
 function GalleryMapMarker({
   entry,
   request,
-  projectedX,
-  projectedY,
+  left,
+  top,
   selected,
   onClick
 }: GalleryMapMarkerProps) {
@@ -2039,8 +2161,8 @@ function GalleryMapMarker({
       onClick={onClick}
       style={{
         position: "absolute",
-        left: `${projectedX * 100}%`,
-        top: `${projectedY * 100}%`,
+        left,
+        top,
         width: selected ? 58 : 50,
         height: selected ? 58 : 50,
         padding: 0,
@@ -2074,6 +2196,57 @@ function GalleryMapMarker({
           }}
         />
       )}
+    </button>
+  );
+}
+
+type GalleryMapClusterMarkerProps = {
+  count: number;
+  left: number;
+  top: number;
+  selected: boolean;
+  onClick: () => void;
+};
+
+function GalleryMapClusterMarker({
+  count,
+  left,
+  top,
+  selected,
+  onClick
+}: GalleryMapClusterMarkerProps) {
+  const markerSize = count >= 100 ? 64 : count >= 25 ? 58 : 52;
+
+  return (
+    <button
+      type="button"
+      aria-label={`Open map cluster with ${count} items`}
+      title={`${count} items in this map cluster`}
+      onClick={onClick}
+      style={{
+        position: "absolute",
+        left,
+        top,
+        width: markerSize,
+        height: markerSize,
+        padding: 0,
+        borderRadius: "50%",
+        border: selected
+          ? "3px solid rgba(255, 255, 255, 0.98)"
+          : "2px solid rgba(255, 255, 255, 0.72)",
+        outline: 0,
+        overflow: "hidden",
+        transform: "translate(-50%, -50%)",
+        background:
+          "radial-gradient(circle at 30% 24%, rgba(255, 255, 255, 0.34), rgba(39, 77, 96, 0.98) 65%, rgba(12, 33, 44, 1) 100%)",
+        boxShadow: selected ? "0 0 0 6px rgba(164, 80, 255, 0.24)" : "0 8px 22px rgba(0, 0, 0, 0.24)",
+        cursor: "pointer",
+        color: "white",
+        fontSize: count >= 100 ? "0.95rem" : "0.9rem",
+        fontWeight: 700
+      }}
+    >
+      <Center style={{ width: "100%", height: "100%" }}>{formatGalleryClusterCount(count)}</Center>
     </button>
   );
 }

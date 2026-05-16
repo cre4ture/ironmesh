@@ -1,9 +1,14 @@
-import { Alert, Badge, Button, Card, Center, Group, Loader, Stack, Text } from "@mantine/core";
+import { Alert, Badge, Button, Card, Center, Group, Loader, Modal, Stack, Text } from "@mantine/core";
 import { IconMapPin } from "@tabler/icons-react";
 import maplibregl, { type LngLatLike, type StyleSpecification } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { createDbWorker, type WorkerHttpvfs } from "sql.js-httpvfs";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  clusterScreenPoints,
+  type ClusterableScreenPoint,
+  type ScreenPointCluster
+} from "./gallery-marker-clusters";
 
 const MBTILES_PROTOCOL = "ironmesh-mbtiles";
 const SQLJS_WORKER_URL = new URL(
@@ -14,9 +19,18 @@ const SQLJS_WASM_URL = new URL("sql.js-httpvfs/dist/sql-wasm.wasm", import.meta.
 const MAP_MARKER_VIEWPORT_PADDING = 64;
 const MAX_VISIBLE_THUMBNAIL_MARKERS = 120;
 const MAX_CACHED_MARKER_IMAGES = 256;
+const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MIN = 26;
+const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX = 68;
+const BASEMAP_CLUSTER_DIALOG_ZOOM_THRESHOLD = 15;
+const BASEMAP_CLUSTER_GEO_EPSILON = 0.00001;
 const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII="
 );
+
+type GalleryBasemapMarkerPoint = ClusterableScreenPoint<GalleryBasemapMapEntry> & {
+  latitude: number;
+  longitude: number;
+};
 
 type GalleryBasemapMapEntry = {
   path: string;
@@ -155,6 +169,9 @@ export function GalleryBasemapMap({
   const [isInteracting, setIsInteracting] = useState(false);
   const [viewportVersion, setViewportVersion] = useState(0);
   const [fitSignature, setFitSignature] = useState("");
+  const [clusterDialogEntries, setClusterDialogEntries] = useState<GalleryBasemapMapEntry[] | null>(
+    null
+  );
   const serverRasterBasemap = isServerRasterBasemap(basemap) ? basemap : null;
   const localRasterBasemap = isLocalRasterBasemap(basemap) ? basemap : null;
   const usesRasterServerTiles = serverRasterBasemap !== null;
@@ -431,7 +448,7 @@ export function GalleryBasemapMap({
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;
   const mapHeight = map?.getContainer().clientHeight ?? 0;
-  const visibleMarkers = useMemo(
+  const visibleMarkerPoints = useMemo(
     () =>
       mapReady && map
         ? entries.flatMap((entry) => {
@@ -452,17 +469,65 @@ export function GalleryBasemapMap({
 
             return [
               {
+                id: entry.path,
                 entry,
-                left: projected.x,
-                top: projected.y
+                item: entry,
+                latitude: gps.latitude,
+                longitude: gps.longitude,
+                x: projected.x,
+                y: projected.y
               }
             ];
           })
         : [],
     [entries, map, mapHeight, mapReady, mapWidth, viewportVersion]
   );
+  const markerClusterRadius = map
+    ? resolveBasemapMarkerClusterRadius(map.getZoom())
+    : BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX;
+  const visibleMarkerClusters = useMemo(
+    () => clusterScreenPoints(visibleMarkerPoints, markerClusterRadius),
+    [markerClusterRadius, visibleMarkerPoints]
+  );
+  const clusteredVisibleMarkerCount = visibleMarkerClusters.filter(
+    (cluster) => cluster.points.length > 1
+  ).length;
   const suppressMarkerThumbnails =
-    isInteracting || visibleMarkers.length > MAX_VISIBLE_THUMBNAIL_MARKERS;
+    isInteracting || visibleMarkerClusters.length > MAX_VISIBLE_THUMBNAIL_MARKERS;
+
+  function handleClusterClick(cluster: ScreenPointCluster<GalleryBasemapMapEntry>) {
+    if (cluster.points.length <= 1) {
+      const point = cluster.points[0];
+      if (point) {
+        onSelectPath(point.item.path);
+      }
+      return;
+    }
+
+    const currentMap = mapRef.current;
+    if (
+      currentMap &&
+      currentMap.getZoom() < BASEMAP_CLUSTER_DIALOG_ZOOM_THRESHOLD &&
+      basemapClusterHasGeoSpread(cluster.points as GalleryBasemapMarkerPoint[])
+    ) {
+      const bounds = new maplibregl.LngLatBounds();
+      for (const point of cluster.points as GalleryBasemapMarkerPoint[]) {
+        bounds.extend([point.longitude, point.latitude]);
+      }
+
+      if (!bounds.isEmpty()) {
+        currentMap.fitBounds(bounds, {
+          padding: 96,
+          maxZoom: Math.max(currentMap.getZoom() + 2.25, 13),
+          duration: 240
+        });
+        return;
+      }
+    }
+
+    setClusterDialogEntries(cluster.points.map((point) => point.item));
+  }
+
   const mapViewport = (
     <div
       aria-label="Geotagged gallery map"
@@ -513,18 +578,35 @@ export function GalleryBasemapMap({
             pointerEvents: "none"
           }}
         >
-          {visibleMarkers.map(({ entry, left, top }) => {
-            const selected = selectedPath === entry.path;
+          {visibleMarkerClusters.map((cluster) => {
+            const selected = cluster.points.some((point) => point.item.path === selectedPath);
+            if (cluster.points.length === 1) {
+              const point = cluster.points[0];
+              if (!point) {
+                return null;
+              }
+
+              return (
+                <GalleryBasemapMarker
+                  key={point.item.path}
+                  entry={point.item}
+                  request={!suppressMarkerThumbnails || selected ? getMarkerRequest(point.item) : null}
+                  left={cluster.x}
+                  top={cluster.y}
+                  selected={selected}
+                  onClick={() => onSelectPath(point.item.path)}
+                />
+              );
+            }
 
             return (
-              <GalleryBasemapMarker
-                key={entry.path}
-                entry={entry}
-                request={!suppressMarkerThumbnails || selected ? getMarkerRequest(entry) : null}
-                left={left}
-                top={top}
+              <GalleryBasemapClusterMarker
+                key={cluster.id}
+                count={cluster.points.length}
+                left={cluster.x}
+                top={cluster.y}
                 selected={selected}
-                onClick={() => onSelectPath(entry.path)}
+                onClick={() => handleClusterClick(cluster)}
               />
             );
           })}
@@ -562,7 +644,21 @@ export function GalleryBasemapMap({
           <Badge color="dark" variant="filled">
             {isInteracting
               ? "Marker thumbnails paused while moving"
-              : `Showing pins for ${visibleMarkers.length} visible markers`}
+              : clusteredVisibleMarkerCount > 0
+                ? `Clustered ${visibleMarkerPoints.length} visible markers into ${visibleMarkerClusters.length}`
+                : `Showing pins for ${visibleMarkerClusters.length} visible markers`}
+          </Badge>
+        </div>
+      ) : clusteredVisibleMarkerCount > 0 ? (
+        <div
+          style={{
+            position: "absolute",
+            right: 12,
+            top: 12
+          }}
+        >
+          <Badge color="dark" variant="filled">
+            {visibleMarkerClusters.length} visible clusters
           </Badge>
         </div>
       ) : null}
@@ -570,40 +666,76 @@ export function GalleryBasemapMap({
   );
 
   return (
-    <Card
-      withBorder={!isFullscreen}
-      radius={isFullscreen ? 0 : "md"}
-      padding={isFullscreen ? 0 : "lg"}
-      style={
-        isFullscreen
-          ? {
-              background: "transparent",
-              border: 0,
-              boxShadow: "none"
-            }
-          : undefined
-      }
-    >
-      <Stack gap="md">
-        <div style={{ display: isFullscreen ? "none" : undefined }}>
-          <Group justify="space-between" align="flex-start" gap="sm">
-            <div>
-              <Text fw={700}>Geo-tagged world map</Text>
-              <Text size="sm" c="dimmed">
-                {basemap.label
-                  ? `Using ${basemap.label} from your self-hosted basemap dataset.`
-                  : "Using your self-hosted basemap dataset."}
-              </Text>
-            </div>
-            <Button variant="default" onClick={onToggleFullscreen}>
-              Fullscreen map
-            </Button>
-          </Group>
-        </div>
+    <>
+      <Card
+        withBorder={!isFullscreen}
+        radius={isFullscreen ? 0 : "md"}
+        padding={isFullscreen ? 0 : "lg"}
+        style={
+          isFullscreen
+            ? {
+                background: "transparent",
+                border: 0,
+                boxShadow: "none"
+              }
+            : undefined
+        }
+      >
+        <Stack gap="md">
+          <div style={{ display: isFullscreen ? "none" : undefined }}>
+            <Group justify="space-between" align="flex-start" gap="sm">
+              <div>
+                <Text fw={700}>Geo-tagged world map</Text>
+                <Text size="sm" c="dimmed">
+                  {basemap.label
+                    ? `Using ${basemap.label} from your self-hosted basemap dataset.`
+                    : "Using your self-hosted basemap dataset."}
+                </Text>
+              </div>
+              <Button variant="default" onClick={onToggleFullscreen}>
+                Fullscreen map
+              </Button>
+            </Group>
+          </div>
 
-        {mapViewport}
-      </Stack>
-    </Card>
+          {mapViewport}
+        </Stack>
+      </Card>
+
+      <Modal
+        opened={clusterDialogEntries !== null}
+        onClose={() => setClusterDialogEntries(null)}
+        title={
+          clusterDialogEntries
+            ? `${clusterDialogEntries.length} items in map cluster`
+            : "Map cluster"
+        }
+        centered
+      >
+        <Stack gap="xs">
+          <Text size="sm" c="dimmed">
+            Select an item from this cluster to open it in the gallery viewer.
+          </Text>
+          <div style={{ maxHeight: "50vh", overflowY: "auto" }}>
+            <Stack gap="xs">
+              {clusterDialogEntries?.map((entry) => (
+                <Button
+                  key={entry.path}
+                  variant="default"
+                  fullWidth
+                  onClick={() => {
+                    setClusterDialogEntries(null);
+                    onSelectPath(entry.path);
+                  }}
+                >
+                  {entry.path}
+                </Button>
+              ))}
+            </Stack>
+          </div>
+        </Stack>
+      </Modal>
+    </>
   );
 }
 
@@ -685,8 +817,100 @@ function GalleryBasemapMarker({
   );
 }
 
+type GalleryBasemapClusterMarkerProps = {
+  count: number;
+  left: number;
+  top: number;
+  selected: boolean;
+  onClick: () => void;
+};
+
+function GalleryBasemapClusterMarker({
+  count,
+  left,
+  top,
+  selected,
+  onClick
+}: GalleryBasemapClusterMarkerProps) {
+  const markerSize = count >= 100 ? 64 : count >= 25 ? 58 : 52;
+
+  return (
+    <button
+      type="button"
+      aria-label={`Open map cluster with ${count} items`}
+      title={`${count} items in this map cluster`}
+      onClick={onClick}
+      style={{
+        position: "absolute",
+        left,
+        top,
+        width: markerSize,
+        height: markerSize,
+        padding: 0,
+        borderRadius: "50%",
+        border: selected
+          ? "3px solid rgba(255, 255, 255, 0.98)"
+          : "2px solid rgba(255, 255, 255, 0.72)",
+        outline: 0,
+        overflow: "hidden",
+        transform: "translate(-50%, -50%)",
+        background:
+          "radial-gradient(circle at 30% 24%, rgba(255, 255, 255, 0.34), rgba(39, 77, 96, 0.98) 65%, rgba(12, 33, 44, 1) 100%)",
+        boxShadow: selected ? "0 0 0 6px rgba(164, 80, 255, 0.24)" : "0 8px 22px rgba(0, 0, 0, 0.24)",
+        cursor: "pointer",
+        pointerEvents: "auto",
+        color: "white",
+        fontSize: count >= 100 ? "0.95rem" : "0.9rem",
+        fontWeight: 700
+      }}
+    >
+      <Center style={{ width: "100%", height: "100%" }}>{formatClusterCount(count)}</Center>
+    </button>
+  );
+}
+
 function isServerRasterBasemap(basemap: GalleryBasemapConfig): basemap is GalleryRasterBasemapConfig {
   return basemap.kind === "raster" && Boolean(basemap.metadataUrl && basemap.tileUrlTemplate);
+}
+
+function resolveBasemapMarkerClusterRadius(zoom: number): number {
+  const normalizedZoom = Number.isFinite(zoom) ? zoom : 0;
+  const interpolated = BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX - normalizedZoom * 4.2;
+  return Math.max(
+    BASEMAP_MARKER_CLUSTER_RADIUS_PX_MIN,
+    Math.min(BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX, interpolated)
+  );
+}
+
+function basemapClusterHasGeoSpread(points: GalleryBasemapMarkerPoint[]): boolean {
+  if (points.length < 2) {
+    return false;
+  }
+
+  let minLatitude = points[0]?.latitude ?? 0;
+  let maxLatitude = minLatitude;
+  let minLongitude = points[0]?.longitude ?? 0;
+  let maxLongitude = minLongitude;
+
+  for (const point of points) {
+    minLatitude = Math.min(minLatitude, point.latitude);
+    maxLatitude = Math.max(maxLatitude, point.latitude);
+    minLongitude = Math.min(minLongitude, point.longitude);
+    maxLongitude = Math.max(maxLongitude, point.longitude);
+  }
+
+  return (
+    maxLatitude - minLatitude > BASEMAP_CLUSTER_GEO_EPSILON ||
+    maxLongitude - minLongitude > BASEMAP_CLUSTER_GEO_EPSILON
+  );
+}
+
+function formatClusterCount(count: number): string {
+  if (count < 1000) {
+    return String(count);
+  }
+
+  return `${Math.floor(count / 100) / 10}k`;
 }
 
 function isLocalRasterBasemap(basemap: GalleryBasemapConfig): basemap is GalleryRasterBasemapConfig {

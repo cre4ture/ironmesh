@@ -329,6 +329,44 @@ test("server-admin gallery retries missing video poster extraction from the full
   );
 });
 
+test("server-admin gallery clusters nearby map markers", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    galleryEntries: createClusteredAdminGalleryEntries(12)
+  });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 visible clusters", { exact: true })).toBeVisible();
+
+  const clusterButton = page.getByRole("button", {
+    name: "Open map cluster with 12 items"
+  });
+  await expect(clusterButton).toBeVisible();
+  await clusterButton.click();
+
+  await expect(page.getByRole("dialog").getByText("12 items in map cluster", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "gallery/cluster-03.png", exact: true }).click();
+
+  await expect(
+    page.getByRole("dialog").getByText("12 items in map cluster", { exact: true })
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("dialog").getByText("gallery/cluster-03.png", { exact: true })
+  ).toBeVisible();
+});
+
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
   await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
 
@@ -1229,6 +1267,37 @@ function createDefaultAdminGalleryEntries(): AdminMockStoreEntry[] {
       }
     }
   ];
+}
+
+function createClusteredAdminGalleryEntries(count: number): AdminMockStoreEntry[] {
+  return Array.from({ length: count }, (_, index) => {
+    const path = `gallery/cluster-${String(index + 1).padStart(2, "0")}.png`;
+    return {
+      path,
+      entry_type: "key",
+      media: {
+        status: "ready",
+        content_fingerprint: `fingerprint-cluster-${index + 1}`,
+        media_type: "image",
+        mime_type: "image/png",
+        width: 1024,
+        height: 768,
+        taken_at_unix: 1_712_345_678 + index,
+        gps: {
+          latitude: 47.3769,
+          longitude: 8.5417
+        },
+        thumbnail: {
+          url: `${apiV1("/auth/media/thumbnail")}?key=${encodeURIComponent(path)}`,
+          profile: "grid",
+          width: 256,
+          height: 192,
+          format: "jpeg",
+          size_bytes: 1234
+        }
+      }
+    };
+  });
 }
 
 function buildCredentialList(revokedDeviceIds: Set<string>) {
