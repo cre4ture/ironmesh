@@ -9,15 +9,70 @@ import {
   type NodeEnrollmentPackage,
   type RendezvousConfigView
 } from "@ironmesh/api";
-import { Alert, Badge, Button, Card, Grid, Group, NativeSelect, NumberInput, Stack, Text, TextInput, Textarea } from "@mantine/core";
-import { JsonBlock } from "@ironmesh/ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Grid,
+  Group,
+  NativeSelect,
+  NumberInput,
+  Stack,
+  Text,
+  TextInput,
+  Textarea,
+  useMantineColorScheme
+} from "@mantine/core";
+import { JsonBlock, ironmeshColorSchemeStorageKey } from "@ironmesh/ui";
 import QRCode from "qrcode";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 
 const BOOTSTRAP_QR_WIDTH = 1024;
 const BOOTSTRAP_QR_MARGIN = 12;
 const BOOTSTRAP_QR_FRAME_PADDING = 24;
+const MANTINE_COLOR_SCHEME_ATTRIBUTE = "data-mantine-color-scheme";
+const PROVISIONING_THEME_RESTORE_KEY = "ironmesh-provisioning-theme-restore";
+const PROVISIONING_THEME_ACTIVE_KEY = "ironmesh-provisioning-theme-active";
+
+type StoredColorScheme = "light" | "dark" | "auto";
+
+function resolveDocumentColorScheme(colorScheme: StoredColorScheme): "light" | "dark" {
+  if (colorScheme === "auto") {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+
+  return colorScheme;
+}
+
+function applyDocumentColorScheme(colorScheme: StoredColorScheme) {
+  const resolvedColorScheme = resolveDocumentColorScheme(colorScheme);
+
+  try {
+    window.localStorage.setItem(ironmeshColorSchemeStorageKey, colorScheme);
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: ironmeshColorSchemeStorageKey,
+        newValue: colorScheme,
+        storageArea: window.localStorage
+      })
+    );
+  } catch {
+    // Ignore storage sync failures and still update the current document theme.
+  }
+
+  document.documentElement.setAttribute(MANTINE_COLOR_SCHEME_ATTRIBUTE, resolvedColorScheme);
+}
+
+function readStoredRestoreColorScheme(): StoredColorScheme | null {
+  try {
+    const value = window.sessionStorage.getItem(PROVISIONING_THEME_RESTORE_KEY);
+    return value === "light" || value === "dark" || value === "auto" ? value : null;
+  } catch {
+    return null;
+  }
+}
 
 function shouldFallbackToFullBootstrapQr(message: string): boolean {
   return (
@@ -37,6 +92,7 @@ function normalizeRendezvousUrl(value: string): string {
 
 export function BootstrapBundlesPage() {
   const { adminTokenOverride } = useAdminAccess();
+  const { colorScheme } = useMantineColorScheme();
   const [deviceLabel, setDeviceLabel] = useState("desktop-client");
   const [expiresInSecs, setExpiresInSecs] = useState<number | string>(3600);
   const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
@@ -52,6 +108,8 @@ export function BootstrapBundlesPage() {
   const [bootstrapBundleQrError, setBootstrapBundleQrError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<"bootstrap" | "join-enrollment" | null>(null);
+  const currentColorSchemeRef = useRef<StoredColorScheme>(colorScheme);
+  const restoreColorSchemeRef = useRef<StoredColorScheme | null>(null);
 
   const bootstrapBundle: BootstrapBundle | null = issuedBootstrap?.bootstrap_bundle ?? fallbackBootstrapBundle;
   const bootstrapClaim: BootstrapClaim | null = issuedBootstrap?.bootstrap_claim ?? null;
@@ -68,6 +126,12 @@ export function BootstrapBundlesPage() {
     },
     [bootstrapBundle, bootstrapClaim]
   );
+  const shouldForceBrightTheme = bootstrapQrPayload !== null;
+
+  useEffect(() => {
+    currentColorSchemeRef.current = colorScheme;
+  }, [colorScheme]);
+
   const joinRequestPreview = (() => {
     try {
       const parsed = JSON.parse(joinRequestRaw);
@@ -177,6 +241,40 @@ export function BootstrapBundlesPage() {
       cancelled = true;
     };
   }, [bootstrapQrPayload]);
+
+  useEffect(() => {
+    if (!shouldForceBrightTheme) {
+      return;
+    }
+
+    const restoreColorScheme = readStoredRestoreColorScheme() ?? currentColorSchemeRef.current;
+    restoreColorSchemeRef.current = restoreColorScheme;
+
+    try {
+      window.sessionStorage.setItem(PROVISIONING_THEME_RESTORE_KEY, restoreColorScheme);
+      window.sessionStorage.setItem(PROVISIONING_THEME_ACTIVE_KEY, "1");
+    } catch {
+      // Ignore storage write failures and still apply the temporary light theme.
+    }
+
+    applyDocumentColorScheme("light");
+
+    return () => {
+      const nextColorScheme = restoreColorSchemeRef.current;
+      restoreColorSchemeRef.current = null;
+
+      try {
+        window.sessionStorage.removeItem(PROVISIONING_THEME_ACTIVE_KEY);
+        window.sessionStorage.removeItem(PROVISIONING_THEME_RESTORE_KEY);
+      } catch {
+        // Ignore storage cleanup failures and still restore the preferred theme.
+      }
+
+      if (nextColorScheme) {
+        applyDocumentColorScheme(nextColorScheme);
+      }
+    };
+  }, [shouldForceBrightTheme]);
 
   async function handleIssueBootstrap() {
     setPendingAction("bootstrap");

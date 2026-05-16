@@ -210,6 +210,34 @@ test("server-admin provisioning can target a selected rendezvous service", async
   await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0);
 });
 
+test("server-admin provisioning forces a bright theme while the QR is visible and restores it after navigation", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("ironmesh-color-scheme", "dark");
+  });
+  await installServerAdminMocks(page);
+
+  await page.goto("/");
+  await expect(page.locator(":root")).toHaveAttribute("data-mantine-color-scheme", "dark");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Provisioning", { exact: true }).click();
+  await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
+
+  await expect(page.locator("pre").filter({ hasText: '"relay_mode": "relay-preferred"' })).toBeVisible();
+  await expect(page.locator(":root")).toHaveAttribute("data-mantine-color-scheme", "light", {
+    timeout: 15000
+  });
+
+  await page.getByText("Dashboard", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.locator(":root")).toHaveAttribute("data-mantine-color-scheme", "dark");
+});
+
 test("server-admin gallery derives child folders from nested media entries", async ({ page }) => {
   await installServerAdminMocks(page, {
     galleryEntries: [
