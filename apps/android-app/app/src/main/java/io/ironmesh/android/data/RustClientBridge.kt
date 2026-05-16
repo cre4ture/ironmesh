@@ -16,9 +16,6 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
-    external fun decodeBootstrapQr(imageBytes: ByteArray): String
-
-    @JvmStatic
     external fun putObject(
         connectionInput: String,
         key: String,

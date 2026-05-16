@@ -31,7 +31,6 @@ image = { version = "0.25", default-features = false, features = ["bmp", "gif", 
 percent-encoding = "2"
 pbkdf2 = "0.12"
 rand = "0.8"
-qrism = "0.1.0"
 reqwest.workspace = true
 rcgen = { version = "0.14", features = ["crypto", "pem", "ring", "x509-parser"] }
 rendezvous-server = { path = "../rendezvous-server" }

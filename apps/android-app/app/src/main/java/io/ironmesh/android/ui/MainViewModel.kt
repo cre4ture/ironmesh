@@ -140,30 +140,6 @@ class MainViewModel(
         uiState.value = uiState.value.copy(bootstrapInput = value)
     }
 
-    fun scanBootstrapQr(imageBytes: ByteArray) {
-        uiState.value = uiState.value.copy(loading = true, status = "Scanning bootstrap QR...")
-        viewModelScope.launch {
-            runCatching {
-                withContext(Dispatchers.Default) {
-                    repository.decodeBootstrapQr(imageBytes)
-                }
-            }
-                .onSuccess { payload ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        bootstrapInput = payload,
-                        status = "Bootstrap QR scanned",
-                    )
-                }
-                .onFailure { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        status = "Error: ${error.message}",
-                    )
-                }
-        }
-    }
-
     fun updateDeviceLabelInput(value: String) {
         uiState.value = uiState.value.copy(deviceLabelInput = value)
     }

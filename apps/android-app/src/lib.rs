@@ -82,35 +82,6 @@ mod tests {
         assert!(status.service_message.contains("1 with errors"));
         assert!(status.active_summary.contains("Photos: running"));
     }
-
-    #[test]
-    fn decode_bootstrap_qr_image_reads_standard_qr() {
-        let payload = r#"{"claim_id":"claim-1","cluster_id":"cluster-1"}"#;
-        let mut builder = qrism::QRBuilder::new(payload.as_bytes());
-        builder.ec_level(qrism::ECLevel::H);
-        let qr = builder.build().expect("failed to build standard QR");
-        let image = image::DynamicImage::ImageRgb8(qr.to_image(6));
-
-        let decoded = decode_bootstrap_qr_image(&image).expect("failed to decode standard QR");
-
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn decode_bootstrap_qr_image_reads_high_capacity_qr() {
-        let payload = format!(
-            "{{\"cluster_id\":\"cluster-1\",\"bundle\":\"{}\"}}",
-            "segment-".repeat(256)
-        );
-        let mut builder = qrism::QRBuilder::new(payload.as_bytes());
-        builder.high_capacity(true).ec_level(qrism::ECLevel::M);
-        let qr = builder.build().expect("failed to build high-capacity QR");
-        let image = image::DynamicImage::ImageRgb8(qr.to_image(6));
-
-        let decoded = decode_bootstrap_qr_image(&image).expect("failed to decode high-capacity QR");
-
-        assert_eq!(decoded, payload);
-    }
 }
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
@@ -120,7 +91,6 @@ use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jstring};
-use qrism::{detect_hc_qr, detect_qr};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -153,34 +123,6 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     RUNTIME
         .get()
         .ok_or_else(|| anyhow::anyhow!("runtime initialization race"))
-}
-
-fn payload_looks_like_bootstrap_json(payload: &str) -> bool {
-    matches!(
-        serde_json::from_str::<serde_json::Value>(payload),
-        Ok(serde_json::Value::Object(_))
-    )
-}
-
-fn decode_bootstrap_qr_candidate(mut decode_result: qrism::reader::DecodeResult) -> Option<String> {
-    let symbol = decode_result.symbols().first_mut()?;
-    let (_, payload) = symbol.decode().ok()?;
-    payload_looks_like_bootstrap_json(&payload).then_some(payload)
-}
-
-fn decode_bootstrap_qr_image(image: &image::DynamicImage) -> Result<String> {
-    if let Some(payload) = decode_bootstrap_qr_candidate(detect_qr(image)) {
-        return Ok(payload);
-    }
-    if let Some(payload) = decode_bootstrap_qr_candidate(detect_hc_qr(image)) {
-        return Ok(payload);
-    }
-    anyhow::bail!("no bootstrap QR payload found in image")
-}
-
-fn decode_bootstrap_qr_image_bytes(image_bytes: &[u8]) -> Result<String> {
-    let image = image::load_from_memory(image_bytes).context("failed to decode QR image bytes")?;
-    decode_bootstrap_qr_image(&image)
 }
 
 struct WebUiServer {
@@ -1201,40 +1143,6 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enr
                 &mut env,
                 format!("rust enrollWithBootstrap failed: {err:#}"),
             );
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// # Safety
-/// This function is intended to be called from Java via JNI.
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_decodeBootstrapQr(
-    mut env: JNIEnv,
-    _class: JClass,
-    image_bytes: JByteArray,
-) -> jstring {
-    let result = (|| -> Result<String> {
-        let image_bytes = env
-            .convert_byte_array(&image_bytes)
-            .context("failed to read QR image bytes from Java")?;
-        decode_bootstrap_qr_image_bytes(&image_bytes)
-    })();
-
-    match result {
-        Ok(payload) => match env.new_string(payload) {
-            Ok(value) => value.into_raw(),
-            Err(err) => {
-                throw_java_error(
-                    &mut env,
-                    format!("rust decodeBootstrapQr failed to create java string: {err:#}"),
-                );
-                std::ptr::null_mut()
-            }
-        },
-        Err(err) => {
-            throw_java_error(&mut env, format!("rust decodeBootstrapQr failed: {err:#}"));
             std::ptr::null_mut()
         }
     }

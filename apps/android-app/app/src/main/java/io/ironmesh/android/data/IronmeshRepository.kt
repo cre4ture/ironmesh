@@ -74,10 +74,6 @@ class IronmeshRepository {
         )
     }
 
-    fun decodeBootstrapQr(imageBytes: ByteArray): String {
-        return RustClientBridge.decodeBootstrapQr(imageBytes)
-    }
-
     suspend fun verifyEnrollmentAccess(
         authState: DeviceAuthState,
     ) {

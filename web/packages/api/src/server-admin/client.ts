@@ -623,26 +623,6 @@ export async function issueBootstrapClaim(
   });
 }
 
-export async function renderBootstrapQrCode(
-  request: {
-    payload: string;
-    high_capacity?: boolean | null;
-  },
-  adminTokenOverride?: string
-): Promise<Blob> {
-  const response = await fetch(apiV1("/auth/bootstrap-qr/render"), {
-    method: "POST",
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: buildAdminHeaders(adminTokenOverride, { "content-type": "application/json" }),
-    body: JSON.stringify(request)
-  });
-  if (!response.ok) {
-    throw new Error(await readAdminErrorMessage(response));
-  }
-  return response.blob();
-}
-
 export async function issueNodeEnrollmentFromJoinRequest(
   request: {
     join_request: Record<string, unknown>;
