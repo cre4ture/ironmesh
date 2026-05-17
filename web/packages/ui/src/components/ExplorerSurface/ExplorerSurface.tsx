@@ -20,6 +20,14 @@ import { IconRefresh } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 import {
+  MediaLightboxModal,
+  MediaThumbnailPreview,
+  resolveMediaKind,
+  type MediaKind,
+  type MediaLightboxItem,
+  type MediaPreviewRequest
+} from "../MediaViewer/MediaViewer";
+import {
   normalizeStorePath,
   normalizeStorePrefix,
   parentStorePrefix,
@@ -130,6 +138,11 @@ export type ExplorerSurfaceProps = {
 
 type ExplorerSortField = "path" | "type" | "size" | "modified";
 type ExplorerSortDirection = "asc" | "desc";
+type ExplorerMediaViewerSource = "browser" | "versions";
+type ExplorerMediaViewerState = {
+  source: ExplorerMediaViewerSource;
+  index: number;
+};
 
 export function ExplorerSurface({
   intro,
@@ -158,6 +171,7 @@ export function ExplorerSurface({
   const [versionKey, setVersionKey] = useState("");
   const [versionsPayload, setVersionsPayload] = useState<ExplorerVersionGraph | null>(null);
   const [versionHistoryOpened, setVersionHistoryOpened] = useState(false);
+  const [mediaViewerState, setMediaViewerState] = useState<ExplorerMediaViewerState | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sortField, setSortField] = useState<ExplorerSortField>("path");
@@ -665,6 +679,53 @@ export function ExplorerSurface({
       : readOnlyHint;
   const currentVersionId = versionsPayload?.preferred_head_version_id?.trim() || null;
   const versionEntries = versionsPayload?.versions ?? [];
+  const versionSourceKey = (versionsPayload?.key ?? versionKey).trim();
+  const browserMediaItems = useMemo(
+    () =>
+      sortedEntries.flatMap((entry) => {
+        const item = buildExplorerEntryLightboxItem(entry, snapshotId, getDownloadUrl);
+        return item ? [item] : [];
+      }),
+    [getDownloadUrl, snapshotId, sortedEntries]
+  );
+  const browserMediaIndexByPath = useMemo(
+    () => new Map(browserMediaItems.map((item, index) => [item.key, index] as const)),
+    [browserMediaItems]
+  );
+  const versionMediaItems = useMemo(
+    () =>
+      versionEntries.flatMap((version) => {
+        const item = buildExplorerVersionLightboxItem(version, versionSourceKey, getDownloadUrl);
+        return item ? [item] : [];
+      }),
+    [getDownloadUrl, versionEntries, versionSourceKey]
+  );
+  const versionMediaIndexById = useMemo(
+    () => new Map(versionMediaItems.map((item, index) => [item.key, index] as const)),
+    [versionMediaItems]
+  );
+  const activeMediaItems = mediaViewerState?.source === "versions" ? versionMediaItems : browserMediaItems;
+  const activeMediaItem = mediaViewerState ? activeMediaItems[mediaViewerState.index] ?? null : null;
+
+  useEffect(() => {
+    if (mediaViewerState && !activeMediaItem) {
+      setMediaViewerState(null);
+    }
+  }, [activeMediaItem, mediaViewerState]);
+
+  function openBrowserMediaViewer(path: string) {
+    const mediaIndex = browserMediaIndexByPath.get(path);
+    if (typeof mediaIndex === "number") {
+      setMediaViewerState({ source: "browser", index: mediaIndex });
+    }
+  }
+
+  function openVersionMediaViewer(versionId: string) {
+    const mediaIndex = versionMediaIndexById.get(versionId);
+    if (typeof mediaIndex === "number") {
+      setMediaViewerState({ source: "versions", index: mediaIndex });
+    }
+  }
 
   return (
     <>
@@ -843,13 +904,21 @@ export function ExplorerSurface({
                   const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
                   const displayPath = explorerDisplayPath(entry, prefix);
                   const historyTargetKey = normalizeExplorerPath(entry.path, isPrefix);
+                  const browserMediaIndex = isPrefix ? null : browserMediaIndexByPath.get(entry.path) ?? null;
+                  const browserMediaItem =
+                    browserMediaIndex === null ? null : browserMediaItems[browserMediaIndex] ?? null;
                   return (
                     <Table.Tr key={entry.path}>
                       {showThumbnails ? (
                         <Table.Td>
                           <ExplorerThumbnailCell
-                            url={thumbnailUrlForExplorerMedia(entry.media)}
-                            alt={`Thumbnail for ${displayPath}`}
+                            item={browserMediaItem}
+                            label={`Thumbnail for ${displayPath}`}
+                            onClick={
+                              browserMediaIndex === null
+                                ? undefined
+                                : () => openBrowserMediaViewer(entry.path)
+                            }
                           />
                         </Table.Td>
                       ) : null}
@@ -1021,45 +1090,56 @@ export function ExplorerSurface({
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
-                  {versionEntries.map((version) => (
-                    <Table.Tr key={version.version_id}>
-                      {showThumbnails ? (
+                  {versionEntries.map((version) => {
+                    const versionMediaIndex = versionMediaIndexById.get(version.version_id) ?? null;
+                    const versionMediaItem =
+                      versionMediaIndex === null ? null : versionMediaItems[versionMediaIndex] ?? null;
+
+                    return (
+                      <Table.Tr key={version.version_id}>
+                        {showThumbnails ? (
+                          <Table.Td>
+                            <ExplorerThumbnailCell
+                              item={versionMediaItem}
+                              label={`Thumbnail for version ${version.version_id}`}
+                              onClick={
+                                versionMediaIndex === null
+                                  ? undefined
+                                  : () => openVersionMediaViewer(version.version_id)
+                              }
+                            />
+                          </Table.Td>
+                        ) : null}
                         <Table.Td>
-                          <ExplorerThumbnailCell
-                            url={thumbnailUrlForExplorerMedia(version.media)}
-                            alt={`Thumbnail for version ${version.version_id}`}
-                          />
+                          <Code>{version.version_id}</Code>
                         </Table.Td>
-                      ) : null}
-                      <Table.Td>
-                        <Code>{version.version_id}</Code>
-                      </Table.Td>
-                      <Table.Td>{normalizeExplorerVersionType(version)}</Table.Td>
-                      <Table.Td>{formatExplorerSize(version.size_bytes)}</Table.Td>
-                      <Table.Td>
-                        {formatExplorerModifiedAt(version.modified_at_unix ?? version.created_at_unix)}
-                      </Table.Td>
-                      <Table.Td>
-                        <Group gap="xs" wrap="nowrap">
-                          <Button size="xs" variant="light" onClick={() => void readVersion(version.version_id)}>
-                            Read
-                          </Button>
-                          {canRestoreVersion &&
-                          currentVersionId != null &&
-                          version.version_id !== currentVersionId ? (
-                            <Button
-                              size="xs"
-                              variant="default"
-                              loading={loading === `restore-version:${version.version_id}`}
-                              onClick={() => void restoreVersion(version)}
-                            >
-                              Restore
+                        <Table.Td>{normalizeExplorerVersionType(version)}</Table.Td>
+                        <Table.Td>{formatExplorerSize(version.size_bytes)}</Table.Td>
+                        <Table.Td>
+                          {formatExplorerModifiedAt(version.modified_at_unix ?? version.created_at_unix)}
+                        </Table.Td>
+                        <Table.Td>
+                          <Group gap="xs" wrap="nowrap">
+                            <Button size="xs" variant="light" onClick={() => void readVersion(version.version_id)}>
+                              Read
                             </Button>
-                          ) : null}
-                        </Group>
-                      </Table.Td>
-                    </Table.Tr>
-                  ))}
+                            {canRestoreVersion &&
+                            currentVersionId != null &&
+                            version.version_id !== currentVersionId ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === `restore-version:${version.version_id}`}
+                                onClick={() => void restoreVersion(version)}
+                              >
+                                Restore
+                              </Button>
+                            ) : null}
+                          </Group>
+                        </Table.Td>
+                      </Table.Tr>
+                    );
+                  })}
                 </Table.Tbody>
               </Table>
             </Table.ScrollContainer>
@@ -1068,6 +1148,25 @@ export function ExplorerSurface({
           </Stack>
         </Drawer>
       ) : null}
+
+      <MediaLightboxModal
+        opened={activeMediaItem !== null}
+        onClose={() => setMediaViewerState(null)}
+        itemCount={activeMediaItems.length}
+        selectedIndex={mediaViewerState?.index ?? -1}
+        selectedItem={activeMediaItem}
+        getItemAtIndex={(index) => activeMediaItems[index] ?? null}
+        onSelectIndex={(index) => {
+          setMediaViewerState((current) =>
+            current
+              ? {
+                  ...current,
+                  index
+                }
+              : current
+          );
+        }}
+      />
     </>
   );
 }
@@ -1260,35 +1359,178 @@ function thumbnailUrlForExplorerMedia(media: Record<string, unknown> | null | un
   return typeof url === "string" && url.trim() ? url : null;
 }
 
-function ExplorerThumbnailCell({ url, alt }: { url: string | null; alt: string }) {
+function ExplorerThumbnailCell({
+  item,
+  label,
+  onClick
+}: {
+  item: MediaLightboxItem | null;
+  label: string;
+  onClick?: () => void;
+}) {
+  const content = item ? (
+    <MediaThumbnailPreview
+      kind={item.kind}
+      request={item.requests.thumbnail ?? null}
+      alt={label}
+      missingThumbnailInfo={item.missingThumbnailInfo}
+    />
+  ) : (
+    <Text size="xs" c="dimmed">
+      —
+    </Text>
+  );
+
+  const sharedStyle = {
+    width: 52,
+    height: 52,
+    borderRadius: 8,
+    overflow: "hidden",
+    background: "var(--mantine-color-gray-0)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center"
+  } as const;
+
+  if (!item || !onClick) {
+    return <div style={sharedStyle}>{content}</div>;
+  }
+
   return (
-    <div
+    <button
+      type="button"
+      aria-label={label}
+      onClick={onClick}
       style={{
-        width: 52,
-        height: 52,
-        borderRadius: 8,
-        overflow: "hidden",
-        background: "var(--mantine-color-gray-0)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center"
+        ...sharedStyle,
+        padding: 0,
+        border: 0,
+        cursor: "pointer"
       }}
     >
-      {url ? (
-        <img
-          src={url}
-          alt={alt}
-          loading="lazy"
-          decoding="async"
-          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-        />
-      ) : (
-        <Text size="xs" c="dimmed">
-          —
-        </Text>
-      )}
-    </div>
+      {content}
+    </button>
   );
+}
+
+function buildExplorerEntryLightboxItem(
+  entry: ExplorerEntry,
+  snapshotId: string | null,
+  getDownloadUrl:
+    | ((key: string, snapshotId: string | null, versionId?: string | null) => string | null)
+    | undefined
+): MediaLightboxItem | null {
+  if (!getDownloadUrl || entry.entry_type === "prefix" || entry.path.endsWith("/")) {
+    return null;
+  }
+
+  const kind = explorerMediaKind(entry.path, entry.media);
+  if (!kind) {
+    return null;
+  }
+
+  const originalUrl = getDownloadUrl(entry.path, snapshotId, null);
+  if (!originalUrl) {
+    return null;
+  }
+
+  return {
+    key: entry.path,
+    title: storeEntryName(entry.path, false),
+    description: entry.path,
+    alt: entry.path,
+    kind,
+    requests: {
+      thumbnail: thumbnailRequestForExplorerMedia(entry.media),
+      original: { url: originalUrl }
+    },
+    status: explorerMediaString(entry.media, "status"),
+    mimeType: explorerMediaString(entry.media, "mime_type"),
+    width: explorerMediaNumber(entry.media, "width"),
+    height: explorerMediaNumber(entry.media, "height"),
+    takenAtUnix: explorerMediaNumber(entry.media, "taken_at_unix")
+  };
+}
+
+function buildExplorerVersionLightboxItem(
+  version: ExplorerVersionEntry,
+  sourceKey: string,
+  getDownloadUrl:
+    | ((key: string, snapshotId: string | null, versionId?: string | null) => string | null)
+    | undefined
+): MediaLightboxItem | null {
+  if (!getDownloadUrl || !sourceKey) {
+    return null;
+  }
+
+  const kind = explorerMediaKind(sourceKey, version.media);
+  if (!kind) {
+    return null;
+  }
+
+  const originalUrl = getDownloadUrl(sourceKey, null, version.version_id);
+  if (!originalUrl) {
+    return null;
+  }
+
+  return {
+    key: version.version_id,
+    title: version.version_id,
+    description: sourceKey,
+    alt: `${sourceKey} ${version.version_id}`,
+    kind,
+    requests: {
+      thumbnail: thumbnailRequestForExplorerMedia(version.media),
+      original: { url: originalUrl }
+    },
+    status: explorerMediaString(version.media, "status"),
+    mimeType: explorerMediaString(version.media, "mime_type"),
+    width: explorerMediaNumber(version.media, "width"),
+    height: explorerMediaNumber(version.media, "height"),
+    takenAtUnix: version.modified_at_unix ?? version.created_at_unix ?? null
+  };
+}
+
+function thumbnailRequestForExplorerMedia(
+  media: Record<string, unknown> | null | undefined
+): MediaPreviewRequest | null {
+  const url = thumbnailUrlForExplorerMedia(media);
+  return url ? { url } : null;
+}
+
+function explorerMediaKind(
+  path: string,
+  media: Record<string, unknown> | null | undefined
+): MediaKind | null {
+  return resolveMediaKind(
+    path,
+    explorerMediaString(media, "media_type"),
+    explorerMediaString(media, "mime_type")
+  );
+}
+
+function explorerMediaString(
+  media: Record<string, unknown> | null | undefined,
+  key: string
+): string | null {
+  if (!media || typeof media !== "object") {
+    return null;
+  }
+
+  const value = media[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function explorerMediaNumber(
+  media: Record<string, unknown> | null | undefined,
+  key: string
+): number | null {
+  if (!media || typeof media !== "object") {
+    return null;
+  }
+
+  const value = media[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function parentPrefix(path: string): string {

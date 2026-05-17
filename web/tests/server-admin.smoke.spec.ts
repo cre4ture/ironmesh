@@ -118,8 +118,15 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "gallery/cat.png", exact: true })).toHaveAttribute(
+    "aria-current",
+    "true"
+  );
   await page.getByRole("button", { name: "Next item" }).click();
-  await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "gallery/dog.jpg", exact: true })).toHaveAttribute(
+    "aria-current",
+    "true"
+  );
   await page.keyboard.press("Escape");
 
   await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
@@ -275,8 +282,17 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
   await page.keyboard.press("Escape");
   await page.getByText("Show thumbnails", { exact: true }).click();
   await page.getByRole("button", { name: "Version history" }).click();
-  await expect(page.getByAltText("Thumbnail for gallery/cat.png")).toBeVisible();
-  await expect(page.getByAltText("Thumbnail for version version-cat-001")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Thumbnail for version version-cat-001" })).toBeVisible();
+  await page.getByRole("button", { name: "Thumbnail for version version-cat-001" }).click();
+  await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "gallery/cat.png version-cat-001", exact: true })
+  ).toHaveAttribute("aria-current", "true");
+  await page.getByRole("button", { name: "Next item" }).click();
+  await expect(
+    page.getByRole("button", { name: "gallery/cat.png version-cat-000", exact: true })
+  ).toHaveAttribute("aria-current", "true");
   await expect.poll(() => mockState.requestedPaths().includes(apiV1("/auth/media/thumbnail"))).toBe(
     true
   );

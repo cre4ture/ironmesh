@@ -42,6 +42,13 @@ import {
   type ScreenPointCluster
 } from "./gallery-marker-clusters";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  MediaLightboxModal,
+  type MediaLightboxItem,
+  type MediaMissingThumbnailInfo,
+  type MediaPreviewRequest,
+  type MediaPreviewRequests
+} from "../MediaViewer/MediaViewer";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 import {
   directChildStorePrefix,
@@ -131,21 +138,11 @@ export type GalleryMediaSummary = {
   geotagged_count: number;
 };
 
-export type GalleryPreviewRequest = {
-  url: string;
-  headers?: Record<string, string>;
-};
+export type GalleryPreviewRequest = MediaPreviewRequest;
 
-export type GalleryMediaRequests = {
-  thumbnail?: GalleryPreviewRequest | null;
-  original: GalleryPreviewRequest;
-};
+export type GalleryMediaRequests = MediaPreviewRequests;
 
-type GalleryMissingThumbnailInfo = {
-  title: string;
-  detail: string;
-  color: string;
-};
+type GalleryMissingThumbnailInfo = MediaMissingThumbnailInfo;
 
 type GalleryNavigationItem = {
   key: string;
@@ -346,19 +343,14 @@ export function GallerySurface({
       ? mapMediaEntries[selectedIndex] ?? null
       : getGalleryGridEntryAtIndex(gridPages, gridCollection, selectedIndex);
   const selectedTotalCount = selection?.source === "map" ? mapMediaEntries.length : totalMediaCount;
-  const selectedMediaKind = selectedEntry ? galleryMediaKind(selectedEntry) : null;
   const activeSnapshotId = loadedScope?.snapshotId ?? snapshotId;
-  const selectedMediaRequests = selectedEntry
-    ? getMediaRequests(selectedEntry, activeSnapshotId)
-    : null;
-  const selectedMissingThumbnailInfo = selectedEntry
-    ? galleryMissingThumbnailInfo(selectedEntry)
-    : null;
+  const selectedMediaItem = useMemo(
+    () => buildGalleryLightboxItem(selectedEntry, activeSnapshotId, getMediaRequests),
+    [activeSnapshotId, getMediaRequests, selectedEntry]
+  );
+  const selectedMediaKind = selectedMediaItem?.kind ?? null;
+  const selectedMissingThumbnailInfo = selectedMediaItem?.missingThumbnailInfo ?? null;
   const selectedMediaError = selectedEntry?.media?.error ?? null;
-  const selectedMediaViewerKey =
-    selectedEntry && selectedMediaRequests
-      ? `${selectedEntry.path}::${requestSignature(selectedMediaRequests.thumbnail)}::${requestSignature(selectedMediaRequests.original)}`
-      : null;
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < selectedTotalCount - 1;
   const canRetrySelectedPoster =
@@ -373,7 +365,7 @@ export function GallerySurface({
   useEffect(() => {
     setRetryingSelectedMedia(false);
     setSelectedMediaRetryError(null);
-  }, [selectedEntry?.path, selectedMediaViewerKey]);
+  }, [selectedEntry?.path, selectedMediaItem?.key]);
 
   useEffect(() => {
     if (!selection) {
@@ -449,27 +441,6 @@ export function GallerySurface({
 
     void reloadAppliedEntries();
   }, [galleryVirtualPageSize, mediaFilter, sortOrder, viewMode]);
-
-  useEffect(() => {
-    if (selectedIndex < 0) {
-      return;
-    }
-
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "ArrowLeft" && canNavigatePrevious) {
-        event.preventDefault();
-        void showRelativeEntry(-1);
-      }
-
-      if (event.key === "ArrowRight" && canNavigateNext) {
-        event.preventDefault();
-        void showRelativeEntry(1);
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canNavigateNext, canNavigatePrevious, selectedIndex, selection, totalMediaCount]);
 
   async function refreshSnapshots() {
     setLoading("snapshots");
@@ -770,12 +741,11 @@ export function GallerySurface({
     }
   }
 
-  async function showRelativeEntry(delta: -1 | 1) {
+  async function showEntryAtIndex(nextIndex: number) {
     if (!selection) {
       return;
     }
 
-    const nextIndex = selection.index + delta;
     if (nextIndex < 0 || nextIndex >= selectedTotalCount) {
       return;
     }
@@ -808,6 +778,24 @@ export function GallerySurface({
         path: nextEntry.path
       });
     }
+  }
+
+  async function showRelativeEntry(delta: -1 | 1) {
+    if (!selection) {
+      return;
+    }
+
+    await showEntryAtIndex(selection.index + delta);
+  }
+
+  function getSelectedMediaItemAtIndex(index: number): MediaLightboxItem | null {
+    if (selection?.source === "map") {
+      const entry = mapMediaEntries[index] ?? null;
+      return buildGalleryLightboxItem(entry, activeSnapshotId, getMediaRequests);
+    }
+
+    const entry = getGalleryGridEntryAtIndex(gridPages, gridCollection, index);
+    return buildGalleryLightboxItem(entry, activeSnapshotId, getMediaRequests);
   }
 
   const galleryGridStyle = {
@@ -1355,100 +1343,45 @@ export function GallerySurface({
         <JsonBlock value={galleryDebugValue} />
       </Modal>
 
-      <Modal
-        opened={selectedEntry !== null}
+      <MediaLightboxModal
+        opened={selectedMediaItem !== null}
         onClose={() => setSelection(null)}
-        title={
-          selectedEntry
-            ? `${fileName(selectedEntry.path)} (${selectedIndex + 1} of ${selectedTotalCount})`
-            : "Media preview"
-        }
-        fullScreen
-        styles={{
-          body: {
-            paddingTop: 0
-          }
-        }}
-      >
-        {selectedEntry && selectedMediaRequests && selectedMediaKind ? (
-          <Stack gap="md">
-            <div style={{ height: "calc(100vh - 17rem)", minHeight: "24rem" }}>
-              {selectedMediaKind === "video" ? (
-                <GalleryLightboxVideo
-                  key={selectedMediaViewerKey ?? selectedEntry.path}
-                  request={selectedMediaRequests.original}
-                  posterRequest={selectedMediaRequests.thumbnail ?? null}
-                  alt={selectedEntry.path}
-                  canNavigatePrevious={canNavigatePrevious}
-                  canNavigateNext={canNavigateNext}
-                  onNavigatePrevious={() => showRelativeEntry(-1)}
-                  onNavigateNext={() => showRelativeEntry(1)}
-                />
-              ) : (
-                <GalleryLightboxImage
-                  key={selectedMediaViewerKey ?? selectedEntry.path}
-                  requests={selectedMediaRequests}
-                  alt={selectedEntry.path}
-                  missingThumbnailInfo={selectedMissingThumbnailInfo}
-                  canNavigatePrevious={canNavigatePrevious}
-                  canNavigateNext={canNavigateNext}
-                  onNavigatePrevious={() => showRelativeEntry(-1)}
-                  onNavigateNext={() => showRelativeEntry(1)}
-                />
-              )}
-            </div>
-            <Group gap="xs">
-              <Badge variant="light">
-                {selectedIndex + 1} / {selectedTotalCount}
-              </Badge>
-              <Badge color={selectedMediaKind === "video" ? "violet" : "blue"} variant="light">
-                {selectedMediaKind === "video" ? "movie" : "photo"}
-              </Badge>
-              <Badge color={mediaStatusColor(selectedEntry.media?.status)} variant="light">
-                {selectedEntry.media?.status ?? "uncached"}
-              </Badge>
-              {selectedEntry.media?.mime_type ? (
-                <Badge variant="light">{selectedEntry.media.mime_type}</Badge>
-              ) : null}
-              {selectedEntry.media?.width && selectedEntry.media?.height ? (
-                <Badge variant="light">
-                  {selectedEntry.media.width} x {selectedEntry.media.height}
-                </Badge>
-              ) : null}
-            </Group>
-            <Text size="sm" c="dimmed">
-              {selectedEntry.path}
-            </Text>
-            {selectedMissingThumbnailInfo ? (
-              <Stack gap="xs">
-                <Alert
-                  color={selectedMissingThumbnailInfo.color}
-                  title={selectedMissingThumbnailInfo.title}
-                >
-                  {selectedMissingThumbnailInfo.detail}
-                </Alert>
-                {canRetrySelectedPoster ? (
-                  <Button
-                    leftSection={<IconRefresh size={16} />}
-                    loading={retryingSelectedMedia}
-                    onClick={() => void handleRetrySelectedMedia()}
+        itemCount={selectedTotalCount}
+        selectedIndex={selectedIndex}
+        selectedItem={selectedMediaItem}
+        getItemAtIndex={getSelectedMediaItemAtIndex}
+        onSelectIndex={showEntryAtIndex}
+        renderDetails={() =>
+          selectedEntry ? (
+            <Stack gap="xs">
+              {selectedMissingThumbnailInfo ? (
+                <Stack gap="xs">
+                  <Alert
+                    color={selectedMissingThumbnailInfo.color}
+                    title={selectedMissingThumbnailInfo.title}
                   >
-                    Retry metadata and poster extraction
-                  </Button>
-                ) : null}
-              </Stack>
-            ) : null}
-            {selectedEntry.media?.taken_at_unix ? (
-              <Text size="sm">Captured {formatTakenAt(selectedEntry.media.taken_at_unix)}</Text>
-            ) : null}
-            {selectedMediaRetryError ? <Alert color="red">{selectedMediaRetryError}</Alert> : null}
-            {selectedMediaError && selectedMediaError !== selectedMissingThumbnailInfo?.detail ? (
-              <Alert color="yellow">{selectedMediaError}</Alert>
-            ) : null}
-            <JsonBlock value={selectedEntry} />
-          </Stack>
-        ) : null}
-      </Modal>
+                    {selectedMissingThumbnailInfo.detail}
+                  </Alert>
+                  {canRetrySelectedPoster ? (
+                    <Button
+                      leftSection={<IconRefresh size={16} />}
+                      loading={retryingSelectedMedia}
+                      onClick={() => void handleRetrySelectedMedia()}
+                    >
+                      Retry metadata and poster extraction
+                    </Button>
+                  ) : null}
+                </Stack>
+              ) : null}
+              {selectedMediaRetryError ? <Alert color="red">{selectedMediaRetryError}</Alert> : null}
+              {selectedMediaError && selectedMediaError !== selectedMissingThumbnailInfo?.detail ? (
+                <Alert color="yellow">{selectedMediaError}</Alert>
+              ) : null}
+              <JsonBlock value={selectedEntry} />
+            </Stack>
+          ) : null
+        }
+      />
     </Stack>
   );
 }
@@ -2837,23 +2770,61 @@ function galleryMediaKind(entry: GalleryEntry): GalleryMediaKind | null {
     return null;
   }
 
-  if (entry.media?.mime_type?.startsWith("image/")) {
+  return buildGalleryLightboxItemKind(entry.path, entry.media?.media_type, entry.media?.mime_type);
+}
+
+function buildGalleryLightboxItem(
+  entry: GalleryEntry | null,
+  snapshotId: string | null,
+  getMediaRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryMediaRequests
+): MediaLightboxItem | null {
+  if (!entry) {
+    return null;
+  }
+
+  const kind = galleryMediaKind(entry);
+  if (!kind) {
+    return null;
+  }
+
+  return {
+    key: entry.path,
+    title: fileName(entry.path),
+    description: entry.path,
+    alt: entry.path,
+    kind,
+    requests: getMediaRequests(entry, snapshotId),
+    missingThumbnailInfo: galleryMissingThumbnailInfo(entry),
+    status: entry.media?.status ?? null,
+    mimeType: entry.media?.mime_type ?? null,
+    width: entry.media?.width ?? null,
+    height: entry.media?.height ?? null,
+    takenAtUnix: entry.media?.taken_at_unix ?? null
+  };
+}
+
+function buildGalleryLightboxItemKind(
+  path: string,
+  mediaType?: string | null,
+  mimeType?: string | null
+): GalleryMediaKind | null {
+  if (mimeType?.startsWith("image/")) {
     return "image";
   }
 
-  if (entry.media?.mime_type?.startsWith("video/")) {
+  if (mimeType?.startsWith("video/")) {
     return "video";
   }
 
-  if (entry.media?.media_type === "image") {
+  if (mediaType === "image") {
     return "image";
   }
 
-  if (entry.media?.media_type === "video") {
+  if (mediaType === "video") {
     return "video";
   }
 
-  const lowerPath = entry.path.toLowerCase();
+  const lowerPath = path.toLowerCase();
   if (imageExtensions.some((extension) => lowerPath.endsWith(extension))) {
     return "image";
   }

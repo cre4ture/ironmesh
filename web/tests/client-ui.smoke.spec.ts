@@ -115,8 +115,30 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.keyboard.press("Escape");
   await page.getByText("Show thumbnails", { exact: true }).click();
   await page.getByRole("button", { name: "Version history" }).click();
-  await expect(page.getByAltText("Thumbnail for gallery/cat.png")).toBeVisible();
-  await expect(page.getByAltText("Thumbnail for version version-cat-001")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Thumbnail for version version-cat-001" })).toBeVisible();
+  await page.getByRole("button", { name: "Thumbnail for version version-cat-001" }).click();
+  await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "gallery/cat.png version-cat-001", exact: true })
+  ).toHaveAttribute("aria-current", "true");
+  await page.getByRole("button", { name: "Next item" }).click();
+  await expect(
+    page.getByRole("button", { name: "gallery/cat.png version-cat-000", exact: true })
+  ).toHaveAttribute("aria-current", "true");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
+  await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
+  await expect(page.getByRole("button", { name: "gallery/cat.png", exact: true })).toHaveAttribute(
+    "aria-current",
+    "true"
+  );
+  await page.getByRole("button", { name: "Next item" }).click();
+  await expect(page.getByRole("button", { name: "gallery/clip.mp4", exact: true })).toHaveAttribute(
+    "aria-current",
+    "true"
+  );
   await page.keyboard.press("Escape");
   await page.getByRole("row", { name: /docs\/readme\.txt/ }).getByRole("button", { name: "Read" }).click();
   await expect(page.getByText("hello from the mocked store")).toBeVisible();
@@ -201,10 +223,20 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "gallery/cat.png", exact: true })).toHaveAttribute(
+    "aria-current",
+    "true"
+  );
   await page.getByRole("button", { name: "Next item" }).click();
-  await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "gallery/dog.jpg", exact: true })).toHaveAttribute(
+    "aria-current",
+    "true"
+  );
   await page.getByRole("button", { name: "Next item" }).click();
-  await expect(page.getByRole("dialog").getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "gallery/clip.mp4", exact: true })).toHaveAttribute(
+    "aria-current",
+    "true"
+  );
   await expect(page.locator("video")).toBeVisible();
   await page.keyboard.press("Escape");
   await page.goBack();
