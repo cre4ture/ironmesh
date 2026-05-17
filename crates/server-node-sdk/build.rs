@@ -165,7 +165,6 @@ fn main() {
             .join("ironmesh-favicon.svg")
             .display()
     );
-    println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=IRONMESH_PREBUILT_WEB_DIR");
     if let Some(prebuilt_web_dir) = prebuilt_web_dir.as_deref() {
         println!(
