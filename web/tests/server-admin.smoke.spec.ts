@@ -272,7 +272,9 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
     .poll(() => mockState.requestedPaths().includes(apiV1("/auth/versions/gallery%2Fcat.png")))
     .toBe(true);
 
+  await page.keyboard.press("Escape");
   await page.getByText("Show thumbnails", { exact: true }).click();
+  await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByAltText("Thumbnail for gallery/cat.png")).toBeVisible();
   await expect(page.getByAltText("Thumbnail for version version-cat-001")).toBeVisible();
   await expect.poll(() => mockState.requestedPaths().includes(apiV1("/auth/media/thumbnail"))).toBe(

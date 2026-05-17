@@ -4,6 +4,7 @@ import {
   Card,
   Code,
   Divider,
+  Drawer,
   Grid,
   Group,
   NumberInput,
@@ -156,6 +157,7 @@ export function ExplorerSurface({
   const [newFolderName, setNewFolderName] = useState("");
   const [versionKey, setVersionKey] = useState("");
   const [versionsPayload, setVersionsPayload] = useState<ExplorerVersionGraph | null>(null);
+  const [versionHistoryOpened, setVersionHistoryOpened] = useState(false);
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sortField, setSortField] = useState<ExplorerSortField>("path");
@@ -571,6 +573,7 @@ export function ExplorerSurface({
       return;
     }
 
+    setVersionHistoryOpened(true);
     await loadVersionGraph(targetKey);
   }
 
@@ -664,7 +667,8 @@ export function ExplorerSurface({
   const versionEntries = versionsPayload?.versions ?? [];
 
   return (
-    <Stack gap="lg">
+    <>
+      <Stack gap="lg">
       {intro ? (
         <Text c="dimmed" size="sm">
           {intro}
@@ -673,421 +677,398 @@ export function ExplorerSurface({
 
       {error ? <Alert color="red">{error}</Alert> : null}
 
-      <Grid>
-        <Grid.Col span={{ base: 12, xl: 7 }}>
-          <Card withBorder radius="md" padding="lg">
-            <Stack gap="sm">
-              <Group justify="space-between" align="flex-start">
-                <Text fw={700}>Object browser</Text>
-                <Group gap="sm">
-                  <Button
-                    variant="default"
-                    loading={loading === "snapshots"}
-                    onClick={() => void refreshSnapshots()}
-                  >
-                    Refresh snapshots
-                  </Button>
-                  <Button
-                    leftSection={<IconRefresh size={16} />}
-                    loading={loading === "entries"}
-                    onClick={() => void refreshEntries()}
-                  >
-                    Refresh entries
-                  </Button>
-                </Group>
-              </Group>
-              <Grid>
-                <Grid.Col span={{ base: 12, md: 6 }}>
-                  <TextInput
-                    label="Prefix"
-                    value={prefix}
-                    onChange={(event) => setPrefix(event.currentTarget.value)}
-                    placeholder="docs/"
-                  />
-                </Grid.Col>
-                <Grid.Col span={{ base: 12, md: 3 }}>
-                  <NumberInput
-                    label="Depth"
-                    min={1}
-                    value={depth}
-                    onChange={(value) =>
-                      setDepth(typeof value === "number" && value > 0 ? value : 1)
-                    }
-                  />
-                </Grid.Col>
-                <Grid.Col span={{ base: 12, md: 3 }}>
-                  <Select
-                    label="Snapshot"
-                    data={[
-                      { value: "", label: "Current data" },
-                      ...snapshots.map((snapshot) => ({
-                        value: snapshot.id,
-                        label: snapshot.id
-                      }))
-                    ]}
-                    value={snapshotId ?? ""}
-                    onChange={(value) => setSnapshotId(value || null)}
-                  />
-                </Grid.Col>
-              </Grid>
-              <Group justify="space-between" align="center">
-                <Group gap="sm">
-                  <Button onClick={() => void refreshEntries()}>Load entries</Button>
-                  <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
-                    Up one prefix
-                  </Button>
-                  <Button variant="subtle" onClick={() => void refreshEntries("")}>
-                    Root
-                  </Button>
-                </Group>
-                <Switch
-                  label="Show thumbnails"
-                  checked={showThumbnails}
-                  onChange={(event) => setShowThumbnails(event.currentTarget.checked)}
-                />
-              </Group>
-              {canCreateFolder || quickUpload ? (
-                <Grid>
-                  <Grid.Col span={{ base: 12, md: 8 }}>
-                    <TextInput
-                      label="New folder name"
-                      value={newFolderName}
-                      onChange={(event) => setNewFolderName(event.currentTarget.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          if (canCreateFolder) {
-                            void createFolder();
-                          }
-                        }
-                      }}
-                      placeholder="new-folder"
-                      disabled={!canCreateFolder}
-                    />
-                  </Grid.Col>
-                  <Grid.Col span={{ base: 12, md: 4 }}>
-                    <Group grow wrap="nowrap" mt="xl">
-                      {canCreateFolder ? (
-                        <Button
-                          loading={loading === "create-folder"}
-                          disabled={!canCreateFolder}
-                          onClick={() => void createFolder()}
-                        >
-                          New folder
-                        </Button>
-                      ) : null}
-                      {quickUpload ? (
-                        <Button
-                          size="sm"
-                          variant="default"
-                          disabled={snapshotId != null}
-                          onClick={openQuickUploadPicker}
-                        >
-                          {quickUpload.buttonLabel ?? "Upload"}
-                        </Button>
-                      ) : null}
-                    </Group>
-                    {quickUpload ? (
-                      <input
-                        ref={quickUploadInputRef}
-                        type="file"
-                        multiple
-                        hidden
-                        data-explorer-upload-input="true"
-                        onChange={(event) => {
-                          const files = Array.from(event.currentTarget.files ?? []);
-                          event.currentTarget.value = "";
-                          queueFilesToCurrentPrefix(files);
-                        }}
-                      />
-                    ) : null}
-                  </Grid.Col>
-                </Grid>
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="sm">
+          <Group justify="space-between" align="flex-start">
+            <Text fw={700}>Object browser</Text>
+            <Group gap="sm">
+              {loadVersions ? (
+                <Button variant="default" onClick={() => setVersionHistoryOpened(true)}>
+                  Version history
+                </Button>
               ) : null}
-              <Text c="dimmed" size="sm">
-                {helperText}
-              </Text>
-              <Table.ScrollContainer minWidth={720}>
-                <Table striped highlightOnHover withTableBorder>
-                  <Table.Thead>
-                    <Table.Tr>
-                      {showThumbnails ? <Table.Th>Thumb</Table.Th> : null}
-                      <Table.Th>
-                        {renderExplorerHeader("Path", "path", sortField, sortDirection, toggleSort)}
-                      </Table.Th>
-                      <Table.Th>
-                        {renderExplorerHeader("Type", "type", sortField, sortDirection, toggleSort)}
-                      </Table.Th>
-                      <Table.Th>
-                        {renderExplorerHeader("Size", "size", sortField, sortDirection, toggleSort)}
-                      </Table.Th>
-                      <Table.Th>
-                        {renderExplorerHeader(
-                          "Modified",
-                          "modified",
-                          sortField,
-                          sortDirection,
-                          toggleSort
-                        )}
-                      </Table.Th>
-                      <Table.Th>Action</Table.Th>
-                    </Table.Tr>
-                  </Table.Thead>
-                  <Table.Tbody>
-                    {sortedEntries.map((entry) => {
-                      const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
-                      const displayPath = explorerDisplayPath(entry, prefix);
-                      const historyTargetKey = normalizeExplorerPath(entry.path, isPrefix);
-                      return (
-                        <Table.Tr key={entry.path}>
-                          {showThumbnails ? (
-                            <Table.Td>
-                              <ExplorerThumbnailCell
-                                url={thumbnailUrlForExplorerMedia(entry.media)}
-                                alt={`Thumbnail for ${displayPath}`}
-                              />
-                            </Table.Td>
-                          ) : null}
-                          <Table.Td>
-                            <Code>{displayPath}</Code>
-                          </Table.Td>
-                          <Table.Td>{isPrefix ? "prefix" : entry.entry_type}</Table.Td>
-                          <Table.Td>{formatExplorerSize(isPrefix ? null : entry.size_bytes)}</Table.Td>
-                          <Table.Td>{formatExplorerModifiedAt(entry.modified_at_unix)}</Table.Td>
-                          <Table.Td>
-                            {isPrefix ? (
-                              <Group gap="xs" wrap="nowrap">
-                                <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
-                                  Open
-                                </Button>
-                                {loadVersions ? (
-                                  <Button
-                                    size="xs"
-                                    variant="default"
-                                    loading={loading === "versions" && versionKey === historyTargetKey}
-                                    onClick={() => void showEntryHistory(entry)}
-                                  >
-                                    History
-                                  </Button>
-                                ) : null}
-                                {canRestoreSnapshot ? (
-                                  <Button
-                                    size="xs"
-                                    variant="default"
-                                    loading={
-                                      loading ===
-                                      `restore-entry:${normalizeExplorerPath(entry.path, true)}`
-                                    }
-                                    onClick={() => void restoreEntry(entry)}
-                                  >
-                                    Restore...
-                                  </Button>
-                                ) : null}
-                                {canRenameCurrentStore ? (
-                                  <Button
-                                    size="xs"
-                                    variant="default"
-                                    loading={
-                                      loading ===
-                                      `rename-entry:${normalizeExplorerPath(entry.path, true)}`
-                                    }
-                                    onClick={() => void renameEntry(entry)}
-                                  >
-                                    Rename
-                                  </Button>
-                                ) : null}
-                                {canDeleteCurrentStore ? (
-                                  <Button
-                                    size="xs"
-                                    color="red"
-                                    variant="default"
-                                    loading={
-                                      loading ===
-                                      `delete-entry:${normalizeExplorerPath(entry.path, true)}`
-                                    }
-                                    onClick={() => void deleteEntry(entry)}
-                                  >
-                                    Delete
-                                  </Button>
-                                ) : null}
-                              </Group>
-                            ) : (
-                              <Group gap="xs" wrap="nowrap">
-                                <Button
-                                  size="xs"
-                                  variant="light"
-                                  loading={loading === `read-entry:${entry.path}`}
-                                  onClick={() => void readEntry(entry)}
-                                >
-                                  Read
-                                </Button>
-                                {getDownloadUrl ? (
-                                  <Button size="xs" variant="default" onClick={() => downloadEntry(entry)}>
-                                    Download
-                                  </Button>
-                                ) : null}
-                                {loadVersions ? (
-                                  <Button
-                                    size="xs"
-                                    variant="default"
-                                    loading={loading === "versions" && versionKey === historyTargetKey}
-                                    onClick={() => void showEntryHistory(entry)}
-                                  >
-                                    History
-                                  </Button>
-                                ) : null}
-                                {canRestoreSnapshot ? (
-                                  <Button
-                                    size="xs"
-                                    variant="default"
-                                    loading={
-                                      loading ===
-                                      `restore-entry:${normalizeExplorerPath(entry.path, false)}`
-                                    }
-                                    onClick={() => void restoreEntry(entry)}
-                                  >
-                                    Restore...
-                                  </Button>
-                                ) : null}
-                                {canRenameCurrentStore ? (
-                                  <Button
-                                    size="xs"
-                                    variant="default"
-                                    loading={
-                                      loading ===
-                                      `rename-entry:${normalizeExplorerPath(entry.path, false)}`
-                                    }
-                                    onClick={() => void renameEntry(entry)}
-                                  >
-                                    Rename
-                                  </Button>
-                                ) : null}
-                                {canDeleteCurrentStore ? (
-                                  <Button
-                                    size="xs"
-                                    color="red"
-                                    variant="default"
-                                    loading={
-                                      loading ===
-                                      `delete-entry:${normalizeExplorerPath(entry.path, false)}`
-                                    }
-                                    onClick={() => void deleteEntry(entry)}
-                                  >
-                                    Delete
-                                  </Button>
-                                ) : null}
-                              </Group>
-                            )}
-                          </Table.Td>
-                        </Table.Tr>
-                      );
-                    })}
-                  </Table.Tbody>
-                </Table>
-              </Table.ScrollContainer>
-              {showEntriesPayload && entriesPayload ? <JsonBlock value={entriesPayload} /> : null}
-            </Stack>
-          </Card>
-        </Grid.Col>
-
-        <Grid.Col span={{ base: 12, xl: 5 }}>
-          <Stack gap="lg">
-            <Card withBorder radius="md" padding="lg">
-              <Stack gap="sm">
-                <Text fw={700}>Selected payload</Text>
-                <JsonBlock value={selectedPayload} />
-              </Stack>
-            </Card>
-
-            {loadVersions ? (
-              <Card withBorder radius="md" padding="lg">
-                <Stack gap="sm">
-                  <Text fw={700}>Version history</Text>
-                  <TextInput
-                    label="Key"
-                    value={versionKey}
-                    onChange={(event) => setVersionKey(event.currentTarget.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        void loadVersionGraph();
+              <Button
+                variant="default"
+                loading={loading === "snapshots"}
+                onClick={() => void refreshSnapshots()}
+              >
+                Refresh snapshots
+              </Button>
+              <Button
+                leftSection={<IconRefresh size={16} />}
+                loading={loading === "entries"}
+                onClick={() => void refreshEntries()}
+              >
+                Refresh entries
+              </Button>
+            </Group>
+          </Group>
+          <Grid>
+            <Grid.Col span={{ base: 12, md: 6 }}>
+              <TextInput
+                label="Prefix"
+                value={prefix}
+                onChange={(event) => setPrefix(event.currentTarget.value)}
+                placeholder="docs/"
+              />
+            </Grid.Col>
+            <Grid.Col span={{ base: 12, md: 3 }}>
+              <NumberInput
+                label="Depth"
+                min={1}
+                value={depth}
+                onChange={(value) => setDepth(typeof value === "number" && value > 0 ? value : 1)}
+              />
+            </Grid.Col>
+            <Grid.Col span={{ base: 12, md: 3 }}>
+              <Select
+                label="Snapshot"
+                data={[
+                  { value: "", label: "Current data" },
+                  ...snapshots.map((snapshot) => ({
+                    value: snapshot.id,
+                    label: snapshot.id
+                  }))
+                ]}
+                value={snapshotId ?? ""}
+                onChange={(value) => setSnapshotId(value || null)}
+              />
+            </Grid.Col>
+          </Grid>
+          <Group justify="space-between" align="center">
+            <Group gap="sm">
+              <Button onClick={() => void refreshEntries()}>Load entries</Button>
+              <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
+                Up one prefix
+              </Button>
+              <Button variant="subtle" onClick={() => void refreshEntries("")}>
+                Root
+              </Button>
+            </Group>
+            <Switch
+              label="Show thumbnails"
+              checked={showThumbnails}
+              onChange={(event) => setShowThumbnails(event.currentTarget.checked)}
+            />
+          </Group>
+          {canCreateFolder || quickUpload ? (
+            <Grid>
+              <Grid.Col span={{ base: 12, md: 8 }}>
+                <TextInput
+                  label="New folder name"
+                  value={newFolderName}
+                  onChange={(event) => setNewFolderName(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      if (canCreateFolder) {
+                        void createFolder();
                       }
+                    }
+                  }}
+                  placeholder="new-folder"
+                  disabled={!canCreateFolder}
+                />
+              </Grid.Col>
+              <Grid.Col span={{ base: 12, md: 4 }}>
+                <Group grow wrap="nowrap" mt="xl">
+                  {canCreateFolder ? (
+                    <Button
+                      loading={loading === "create-folder"}
+                      disabled={!canCreateFolder}
+                      onClick={() => void createFolder()}
+                    >
+                      New folder
+                    </Button>
+                  ) : null}
+                  {quickUpload ? (
+                    <Button
+                      size="sm"
+                      variant="default"
+                      disabled={snapshotId != null}
+                      onClick={openQuickUploadPicker}
+                    >
+                      {quickUpload.buttonLabel ?? "Upload"}
+                    </Button>
+                  ) : null}
+                </Group>
+                {quickUpload ? (
+                  <input
+                    ref={quickUploadInputRef}
+                    type="file"
+                    multiple
+                    hidden
+                    data-explorer-upload-input="true"
+                    onChange={(event) => {
+                      const files = Array.from(event.currentTarget.files ?? []);
+                      event.currentTarget.value = "";
+                      queueFilesToCurrentPrefix(files);
                     }}
-                    placeholder="docs/readme.txt"
                   />
-                  <Button loading={loading === "versions"} onClick={() => void loadVersionGraph()}>
-                    Load versions
-                  </Button>
-                  <Table.ScrollContainer minWidth={720}>
-                    <Table striped highlightOnHover withTableBorder>
-                      <Table.Thead>
-                        <Table.Tr>
-                          {showThumbnails ? <Table.Th>Thumb</Table.Th> : null}
-                          <Table.Th>Version ID</Table.Th>
-                          <Table.Th>Type</Table.Th>
-                          <Table.Th>Size</Table.Th>
-                          <Table.Th>Modified</Table.Th>
-                          <Table.Th>Action</Table.Th>
-                        </Table.Tr>
-                      </Table.Thead>
-                      <Table.Tbody>
-                        {versionEntries.map((version) => (
-                          <Table.Tr key={version.version_id}>
-                            {showThumbnails ? (
-                              <Table.Td>
-                                <ExplorerThumbnailCell
-                                  url={thumbnailUrlForExplorerMedia(version.media)}
-                                  alt={`Thumbnail for version ${version.version_id}`}
-                                />
-                              </Table.Td>
+                ) : null}
+              </Grid.Col>
+            </Grid>
+          ) : null}
+          <Text c="dimmed" size="sm">
+            {helperText}
+          </Text>
+          <Table.ScrollContainer minWidth={720}>
+            <Table striped highlightOnHover withTableBorder>
+              <Table.Thead>
+                <Table.Tr>
+                  {showThumbnails ? <Table.Th>Thumb</Table.Th> : null}
+                  <Table.Th>
+                    {renderExplorerHeader("Path", "path", sortField, sortDirection, toggleSort)}
+                  </Table.Th>
+                  <Table.Th>
+                    {renderExplorerHeader("Type", "type", sortField, sortDirection, toggleSort)}
+                  </Table.Th>
+                  <Table.Th>
+                    {renderExplorerHeader("Size", "size", sortField, sortDirection, toggleSort)}
+                  </Table.Th>
+                  <Table.Th>
+                    {renderExplorerHeader(
+                      "Modified",
+                      "modified",
+                      sortField,
+                      sortDirection,
+                      toggleSort
+                    )}
+                  </Table.Th>
+                  <Table.Th>Action</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {sortedEntries.map((entry) => {
+                  const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+                  const displayPath = explorerDisplayPath(entry, prefix);
+                  const historyTargetKey = normalizeExplorerPath(entry.path, isPrefix);
+                  return (
+                    <Table.Tr key={entry.path}>
+                      {showThumbnails ? (
+                        <Table.Td>
+                          <ExplorerThumbnailCell
+                            url={thumbnailUrlForExplorerMedia(entry.media)}
+                            alt={`Thumbnail for ${displayPath}`}
+                          />
+                        </Table.Td>
+                      ) : null}
+                      <Table.Td>
+                        <Code>{displayPath}</Code>
+                      </Table.Td>
+                      <Table.Td>{isPrefix ? "prefix" : entry.entry_type}</Table.Td>
+                      <Table.Td>{formatExplorerSize(isPrefix ? null : entry.size_bytes)}</Table.Td>
+                      <Table.Td>{formatExplorerModifiedAt(entry.modified_at_unix)}</Table.Td>
+                      <Table.Td>
+                        {isPrefix ? (
+                          <Group gap="xs" wrap="nowrap">
+                            <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
+                              Open
+                            </Button>
+                            {loadVersions ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === "versions" && versionKey === historyTargetKey}
+                                onClick={() => void showEntryHistory(entry)}
+                              >
+                                History
+                              </Button>
                             ) : null}
-                            <Table.Td>
-                              <Code>{version.version_id}</Code>
-                            </Table.Td>
-                            <Table.Td>{normalizeExplorerVersionType(version)}</Table.Td>
-                            <Table.Td>{formatExplorerSize(version.size_bytes)}</Table.Td>
-                            <Table.Td>
-                              {formatExplorerModifiedAt(
-                                version.modified_at_unix ?? version.created_at_unix
-                              )}
-                            </Table.Td>
-                            <Table.Td>
-                              <Group gap="xs" wrap="nowrap">
-                                <Button
-                                  size="xs"
-                                  variant="light"
-                                  onClick={() => void readVersion(version.version_id)}
-                                >
-                                  Read
-                                </Button>
-                                {canRestoreVersion &&
-                                currentVersionId != null &&
-                                version.version_id !== currentVersionId ? (
-                                  <Button
-                                    size="xs"
-                                    variant="default"
-                                    loading={loading === `restore-version:${version.version_id}`}
-                                    onClick={() => void restoreVersion(version)}
-                                  >
-                                    Restore
-                                  </Button>
-                                ) : null}
-                              </Group>
-                            </Table.Td>
-                          </Table.Tr>
-                        ))}
-                      </Table.Tbody>
-                    </Table>
-                  </Table.ScrollContainer>
-                  <Divider />
-                  <JsonBlock value={versionsPayload ?? { message: "No version graph loaded yet." }} />
-                </Stack>
-              </Card>
-            ) : null}
+                            {canRestoreSnapshot ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === `restore-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                onClick={() => void restoreEntry(entry)}
+                              >
+                                Restore...
+                              </Button>
+                            ) : null}
+                            {canRenameCurrentStore ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                onClick={() => void renameEntry(entry)}
+                              >
+                                Rename
+                              </Button>
+                            ) : null}
+                            {canDeleteCurrentStore ? (
+                              <Button
+                                size="xs"
+                                color="red"
+                                variant="default"
+                                loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                onClick={() => void deleteEntry(entry)}
+                              >
+                                Delete
+                              </Button>
+                            ) : null}
+                          </Group>
+                        ) : (
+                          <Group gap="xs" wrap="nowrap">
+                            <Button
+                              size="xs"
+                              variant="light"
+                              loading={loading === `read-entry:${entry.path}`}
+                              onClick={() => void readEntry(entry)}
+                            >
+                              Read
+                            </Button>
+                            {getDownloadUrl ? (
+                              <Button size="xs" variant="default" onClick={() => downloadEntry(entry)}>
+                                Download
+                              </Button>
+                            ) : null}
+                            {loadVersions ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === "versions" && versionKey === historyTargetKey}
+                                onClick={() => void showEntryHistory(entry)}
+                              >
+                                History
+                              </Button>
+                            ) : null}
+                            {canRestoreSnapshot ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === `restore-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                onClick={() => void restoreEntry(entry)}
+                              >
+                                Restore...
+                              </Button>
+                            ) : null}
+                            {canRenameCurrentStore ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                onClick={() => void renameEntry(entry)}
+                              >
+                                Rename
+                              </Button>
+                            ) : null}
+                            {canDeleteCurrentStore ? (
+                              <Button
+                                size="xs"
+                                color="red"
+                                variant="default"
+                                loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                onClick={() => void deleteEntry(entry)}
+                              >
+                                Delete
+                              </Button>
+                            ) : null}
+                          </Group>
+                        )}
+                      </Table.Td>
+                    </Table.Tr>
+                  );
+                })}
+              </Table.Tbody>
+            </Table>
+          </Table.ScrollContainer>
+          {showEntriesPayload && entriesPayload ? <JsonBlock value={entriesPayload} /> : null}
+        </Stack>
+      </Card>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="sm">
+          <Text fw={700}>Selected payload</Text>
+          <JsonBlock value={selectedPayload} />
+        </Stack>
+      </Card>
+      </Stack>
+
+      {loadVersions ? (
+        <Drawer
+          opened={versionHistoryOpened}
+          onClose={() => setVersionHistoryOpened(false)}
+          position="right"
+          title="Version history"
+          size="xl"
+        >
+          <Stack gap="sm">
+            <TextInput
+              label="Key"
+              value={versionKey}
+              onChange={(event) => setVersionKey(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void loadVersionGraph();
+                }
+              }}
+              placeholder="docs/readme.txt"
+            />
+            <Button loading={loading === "versions"} onClick={() => void loadVersionGraph()}>
+              Load versions
+            </Button>
+            <Table.ScrollContainer minWidth={720}>
+              <Table striped highlightOnHover withTableBorder>
+                <Table.Thead>
+                  <Table.Tr>
+                    {showThumbnails ? <Table.Th>Thumb</Table.Th> : null}
+                    <Table.Th>Version ID</Table.Th>
+                    <Table.Th>Type</Table.Th>
+                    <Table.Th>Size</Table.Th>
+                    <Table.Th>Modified</Table.Th>
+                    <Table.Th>Action</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {versionEntries.map((version) => (
+                    <Table.Tr key={version.version_id}>
+                      {showThumbnails ? (
+                        <Table.Td>
+                          <ExplorerThumbnailCell
+                            url={thumbnailUrlForExplorerMedia(version.media)}
+                            alt={`Thumbnail for version ${version.version_id}`}
+                          />
+                        </Table.Td>
+                      ) : null}
+                      <Table.Td>
+                        <Code>{version.version_id}</Code>
+                      </Table.Td>
+                      <Table.Td>{normalizeExplorerVersionType(version)}</Table.Td>
+                      <Table.Td>{formatExplorerSize(version.size_bytes)}</Table.Td>
+                      <Table.Td>
+                        {formatExplorerModifiedAt(version.modified_at_unix ?? version.created_at_unix)}
+                      </Table.Td>
+                      <Table.Td>
+                        <Group gap="xs" wrap="nowrap">
+                          <Button size="xs" variant="light" onClick={() => void readVersion(version.version_id)}>
+                            Read
+                          </Button>
+                          {canRestoreVersion &&
+                          currentVersionId != null &&
+                          version.version_id !== currentVersionId ? (
+                            <Button
+                              size="xs"
+                              variant="default"
+                              loading={loading === `restore-version:${version.version_id}`}
+                              onClick={() => void restoreVersion(version)}
+                            >
+                              Restore
+                            </Button>
+                          ) : null}
+                        </Group>
+                      </Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+            <Divider />
+            <JsonBlock value={versionsPayload ?? { message: "No version graph loaded yet." }} />
           </Stack>
-        </Grid.Col>
-      </Grid>
-    </Stack>
+        </Drawer>
+      ) : null}
+    </>
   );
 }
 

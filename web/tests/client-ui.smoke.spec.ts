@@ -112,9 +112,12 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     )
     .toBe(true);
   await expect(page.getByText('"target_path": "gallery/cat.png"')).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByText("Show thumbnails", { exact: true }).click();
+  await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByAltText("Thumbnail for gallery/cat.png")).toBeVisible();
   await expect(page.getByAltText("Thumbnail for version version-cat-001")).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByRole("row", { name: /docs\/readme\.txt/ }).getByRole("button", { name: "Read" }).click();
   await expect(page.getByText("hello from the mocked store")).toBeVisible();
   const explorerDownload = page.waitForEvent("download");
@@ -157,9 +160,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("row", { name: /quick-b\.bin/ }).getByRole("button", { name: "Rename" }).click();
   await expect(page.getByRole("cell", { name: "nested/quick-c.bin" })).toBeVisible();
   await expect(page.getByRole("cell", { name: "quick-b.bin" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Version history" }).click();
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
   await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
+  await page.keyboard.press("Escape");
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
