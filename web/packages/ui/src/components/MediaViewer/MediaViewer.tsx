@@ -83,6 +83,7 @@ export function MediaLightboxModal({
   onSelectIndex,
   renderDetails
 }: MediaLightboxModalProps) {
+  const [isSlideshowMode, setIsSlideshowMode] = useState(false);
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
   const stripIndexes = useMemo(
@@ -91,12 +92,24 @@ export function MediaLightboxModal({
   );
 
   useEffect(() => {
+    if (!opened) {
+      setIsSlideshowMode(false);
+    }
+  }, [opened]);
+
+  useEffect(() => {
     if (!opened || selectedIndex < 0) {
       return;
     }
 
     function handleKeyDown(event: KeyboardEvent) {
       if (isTextInputTarget(event.target)) {
+        return;
+      }
+
+      if (event.key === "Escape" && isSlideshowMode) {
+        event.preventDefault();
+        setIsSlideshowMode(false);
         return;
       }
 
@@ -113,30 +126,54 @@ export function MediaLightboxModal({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canNavigateNext, canNavigatePrevious, onSelectIndex, opened, selectedIndex]);
+  }, [
+    canNavigateNext,
+    canNavigatePrevious,
+    isSlideshowMode,
+    onSelectIndex,
+    opened,
+    selectedIndex
+  ]);
 
   return (
     <Modal
       opened={opened}
       onClose={onClose}
       title={
-        selectedItem
-          ? `${selectedItem.title} (${selectedIndex + 1} of ${itemCount})`
-          : "Media preview"
+        isSlideshowMode
+          ? null
+          : selectedItem
+            ? `${selectedItem.title} (${selectedIndex + 1} of ${itemCount})`
+            : "Media preview"
       }
+      withCloseButton={!isSlideshowMode}
+      closeOnEscape={!isSlideshowMode}
       fullScreen
       styles={{
+        content: {
+          background: isSlideshowMode ? "var(--mantine-color-dark-9)" : undefined
+        },
+        header: {
+          display: isSlideshowMode ? "none" : undefined
+        },
         body: {
+          padding: isSlideshowMode ? 0 : undefined,
           paddingTop: 0
         }
       }}
     >
       {selectedItem ? (
-        <Stack gap="md">
-          <div style={{ height: "calc(100vh - 21rem)", minHeight: "20rem" }}>
+        <Stack gap={isSlideshowMode ? 0 : "md"}>
+          <div
+            style={{
+              height: isSlideshowMode ? "100dvh" : "calc(100vh - 21rem)",
+              minHeight: isSlideshowMode ? undefined : "20rem"
+            }}
+          >
             {selectedItem.kind === "video" ? (
               <MediaLightboxVideo
                 item={selectedItem}
+                mediaOnly={isSlideshowMode}
                 canNavigatePrevious={canNavigatePrevious}
                 canNavigateNext={canNavigateNext}
                 onNavigatePrevious={() => void onSelectIndex(selectedIndex - 1)}
@@ -145,6 +182,7 @@ export function MediaLightboxModal({
             ) : (
               <MediaLightboxImage
                 item={selectedItem}
+                mediaOnly={isSlideshowMode}
                 canNavigatePrevious={canNavigatePrevious}
                 canNavigateNext={canNavigateNext}
                 onNavigatePrevious={() => void onSelectIndex(selectedIndex - 1)}
@@ -152,43 +190,57 @@ export function MediaLightboxModal({
               />
             )}
           </div>
-          {itemCount > 1 ? (
-            <MediaLightboxThumbnailStrip
-              selectedIndex={selectedIndex}
-              selectedItem={selectedItem}
-              indexes={stripIndexes}
-              getItemAtIndex={getItemAtIndex}
-              onSelectIndex={onSelectIndex}
-            />
+          {!isSlideshowMode ? (
+            <>
+              {itemCount > 1 ? (
+                <MediaLightboxThumbnailStrip
+                  selectedIndex={selectedIndex}
+                  selectedItem={selectedItem}
+                  indexes={stripIndexes}
+                  getItemAtIndex={getItemAtIndex}
+                  onSelectIndex={onSelectIndex}
+                />
+              ) : null}
+              <Group justify="space-between" align="center" gap="sm">
+                <Group gap="xs">
+                  <Badge variant="light">
+                    {selectedIndex + 1} / {itemCount}
+                  </Badge>
+                  <Badge color={selectedItem.kind === "video" ? "violet" : "blue"} variant="light">
+                    {selectedItem.kind === "video" ? "movie" : "photo"}
+                  </Badge>
+                  {selectedItem.status?.trim() ? (
+                    <Badge color={mediaStatusColor(selectedItem.status)} variant="light">
+                      {selectedItem.status.trim()}
+                    </Badge>
+                  ) : null}
+                  {selectedItem.mimeType?.trim() ? (
+                    <Badge variant="light">{selectedItem.mimeType.trim()}</Badge>
+                  ) : null}
+                  {selectedItem.width && selectedItem.height ? (
+                    <Badge variant="light">
+                      {selectedItem.width} x {selectedItem.height}
+                    </Badge>
+                  ) : null}
+                </Group>
+                <Button
+                  variant="default"
+                  size="xs"
+                  leftSection={<IconPlayerPlay size={14} />}
+                  onClick={() => setIsSlideshowMode(true)}
+                >
+                  Start slideshow
+                </Button>
+              </Group>
+              <Text size="sm" c="dimmed">
+                {selectedItem.description}
+              </Text>
+              {selectedItem.takenAtUnix ? (
+                <Text size="sm">Captured {formatTakenAt(selectedItem.takenAtUnix)}</Text>
+              ) : null}
+              {renderDetails ? renderDetails(selectedItem) : null}
+            </>
           ) : null}
-          <Group gap="xs">
-            <Badge variant="light">
-              {selectedIndex + 1} / {itemCount}
-            </Badge>
-            <Badge color={selectedItem.kind === "video" ? "violet" : "blue"} variant="light">
-              {selectedItem.kind === "video" ? "movie" : "photo"}
-            </Badge>
-            {selectedItem.status?.trim() ? (
-              <Badge color={mediaStatusColor(selectedItem.status)} variant="light">
-                {selectedItem.status.trim()}
-              </Badge>
-            ) : null}
-            {selectedItem.mimeType?.trim() ? (
-              <Badge variant="light">{selectedItem.mimeType.trim()}</Badge>
-            ) : null}
-            {selectedItem.width && selectedItem.height ? (
-              <Badge variant="light">
-                {selectedItem.width} x {selectedItem.height}
-              </Badge>
-            ) : null}
-          </Group>
-          <Text size="sm" c="dimmed">
-            {selectedItem.description}
-          </Text>
-          {selectedItem.takenAtUnix ? (
-            <Text size="sm">Captured {formatTakenAt(selectedItem.takenAtUnix)}</Text>
-          ) : null}
-          {renderDetails ? renderDetails(selectedItem) : null}
         </Stack>
       ) : null}
     </Modal>
@@ -372,6 +424,7 @@ export function mediaStatusColor(status?: string | null): string {
 
 type MediaLightboxImageProps = {
   item: MediaLightboxItem;
+  mediaOnly: boolean;
   canNavigatePrevious: boolean;
   canNavigateNext: boolean;
   onNavigatePrevious: () => void;
@@ -380,6 +433,7 @@ type MediaLightboxImageProps = {
 
 function MediaLightboxImage({
   item,
+  mediaOnly,
   canNavigatePrevious,
   canNavigateNext,
   onNavigatePrevious,
@@ -419,6 +473,7 @@ function MediaLightboxImage({
 
   return (
     <MediaLightboxFrame
+      showNavigationControls={!mediaOnly}
       canNavigatePrevious={canNavigatePrevious}
       canNavigateNext={canNavigateNext}
       onNavigatePrevious={onNavigatePrevious}
@@ -511,6 +566,7 @@ function MediaLightboxImage({
 
 type MediaLightboxVideoProps = {
   item: MediaLightboxItem;
+  mediaOnly: boolean;
   canNavigatePrevious: boolean;
   canNavigateNext: boolean;
   onNavigatePrevious: () => void;
@@ -519,6 +575,7 @@ type MediaLightboxVideoProps = {
 
 function MediaLightboxVideo({
   item,
+  mediaOnly,
   canNavigatePrevious,
   canNavigateNext,
   onNavigatePrevious,
@@ -529,6 +586,7 @@ function MediaLightboxVideo({
 
   return (
     <MediaLightboxFrame
+      showNavigationControls={!mediaOnly}
       canNavigatePrevious={canNavigatePrevious}
       canNavigateNext={canNavigateNext}
       onNavigatePrevious={onNavigatePrevious}
@@ -579,6 +637,7 @@ type MediaLightboxFrameProps = {
   onNavigatePrevious: () => void;
   onNavigateNext: () => void;
   navigationPlacement?: "overlay" | "below";
+  showNavigationControls?: boolean;
 };
 
 function MediaLightboxFrame({
@@ -587,10 +646,11 @@ function MediaLightboxFrame({
   canNavigateNext,
   onNavigatePrevious,
   onNavigateNext,
-  navigationPlacement = "overlay"
+  navigationPlacement = "overlay",
+  showNavigationControls = true
 }: MediaLightboxFrameProps) {
   const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
-  const useFooterNavigation = navigationPlacement === "below";
+  const useFooterNavigation = navigationPlacement === "below" && showNavigationControls;
 
   return (
     <div
@@ -645,7 +705,7 @@ function MediaLightboxFrame({
         }}
       >
         {children}
-        {!useFooterNavigation ? (
+        {showNavigationControls && !useFooterNavigation ? (
           <>
             <MediaLightboxEdgeButton
               direction="previous"
