@@ -475,6 +475,46 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    galleryEntries: createGeoSpreadClusteredAdminGalleryEntries(12)
+  });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 visible clusters", { exact: true })).toBeVisible();
+
+  const clusterButton = page.getByRole("button", {
+    name: "Open map cluster with 12 items"
+  });
+  const clusterDialogTitle = page
+    .getByRole("dialog")
+    .getByText("12 items in map cluster", { exact: true });
+
+  await expect(clusterButton).toBeVisible();
+  await clusterButton.click();
+  await expect(clusterDialogTitle).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(clusterDialogTitle).toHaveCount(0);
+
+  await clusterButton.click({ modifiers: ["Control"] });
+  await expect(clusterDialogTitle).toHaveCount(0);
+  await expect(page.getByText("1 visible clusters", { exact: true })).toHaveCount(0);
+});
+
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
   await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
 
@@ -1644,6 +1684,41 @@ function createClusteredAdminGalleryEntries(count: number): AdminMockStoreEntry[
         gps: {
           latitude: 47.3769,
           longitude: 8.5417
+        },
+        thumbnail: {
+          url: `${apiV1("/auth/media/thumbnail")}?key=${encodeURIComponent(path)}`,
+          profile: "grid",
+          width: 256,
+          height: 192,
+          format: "jpeg",
+          size_bytes: 1234
+        }
+      }
+    };
+  });
+}
+
+function createGeoSpreadClusteredAdminGalleryEntries(count: number): AdminMockStoreEntry[] {
+  const centerOffset = (count - 1) / 2;
+
+  return Array.from({ length: count }, (_, index) => {
+    const path = `gallery/spread-cluster-${String(index + 1).padStart(2, "0")}.png`;
+    const offset = (index - centerOffset) * 0.0003;
+
+    return {
+      path,
+      entry_type: "key",
+      media: {
+        status: "ready",
+        content_fingerprint: `fingerprint-spread-cluster-${index + 1}`,
+        media_type: "image",
+        mime_type: "image/png",
+        width: 1024,
+        height: 768,
+        taken_at_unix: 1_712_445_678 + index,
+        gps: {
+          latitude: 47.3769 + offset,
+          longitude: 8.5417 + offset * 0.8
         },
         thumbnail: {
           url: `${apiV1("/auth/media/thumbnail")}?key=${encodeURIComponent(path)}`,

@@ -519,7 +519,10 @@ export function GalleryBasemapMap({
   const suppressMarkerThumbnails =
     isInteracting || visibleMarkerClusters.length > MAX_VISIBLE_THUMBNAIL_MARKERS;
 
-  function handleClusterClick(cluster: ScreenPointCluster<GalleryBasemapMapEntry>) {
+  function handleClusterClick(
+    cluster: ScreenPointCluster<GalleryBasemapMapEntry>,
+    allowAutoZoom: boolean
+  ) {
     if (cluster.points.length <= 1) {
       const point = cluster.points[0];
       if (point) {
@@ -530,6 +533,7 @@ export function GalleryBasemapMap({
 
     const currentMap = mapRef.current;
     if (
+      allowAutoZoom &&
       currentMap &&
       currentMap.getZoom() < BASEMAP_CLUSTER_DIALOG_ZOOM_THRESHOLD &&
       basemapClusterHasGeoSpread(cluster.points as GalleryBasemapMarkerPoint[])
@@ -630,7 +634,7 @@ export function GalleryBasemapMap({
                 left={cluster.x}
                 top={cluster.y}
                 selected={selected}
-                onClick={() => handleClusterClick(cluster)}
+                onClick={(ctrlKey) => handleClusterClick(cluster, ctrlKey)}
               />
             );
           })}
@@ -846,7 +850,7 @@ type GalleryBasemapClusterMarkerProps = {
   left: number;
   top: number;
   selected: boolean;
-  onClick: () => void;
+  onClick: (ctrlKey: boolean) => void;
 };
 
 function GalleryBasemapClusterMarker({
@@ -862,8 +866,8 @@ function GalleryBasemapClusterMarker({
     <button
       type="button"
       aria-label={`Open map cluster with ${count} items`}
-      title={`${count} items in this map cluster`}
-      onClick={onClick}
+      title={`${count} items in this map cluster. Ctrl-click to zoom to the cluster bounds.`}
+      onClick={(event) => onClick(event.ctrlKey)}
       style={{
         position: "absolute",
         left,
