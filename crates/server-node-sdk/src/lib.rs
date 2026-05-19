@@ -166,7 +166,8 @@ use cluster::{
     ReplicationPlan, ReplicationPolicy,
 };
 use setup::{
-    ManagedRendezvousFailoverExportParams, ManagedRendezvousFailoverPackage, ManagedSignerBackup,
+    ManagedRendezvousFailoverDeploymentTarget, ManagedRendezvousFailoverExportParams,
+    ManagedRendezvousFailoverPackage, ManagedSignerBackup,
     export_managed_rendezvous_failover_package, export_managed_signer_backup,
     import_managed_rendezvous_failover_package, import_managed_signer_backup,
     issue_managed_rendezvous_tls_identity_from_ca, managed_rendezvous_cert_path,
@@ -179,11 +180,10 @@ use storage::{
     DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions,
-    ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationChunkInfo, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
-    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
-    promote_cached_media_metadata_to_incomplete,
+    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
+    RepairAttemptRecord, ReplicationChunkInfo, SnapshotRestoreMutationResult, StorageStatsSample,
+    StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
+    media_cache_retry_due, promote_cached_media_metadata_to_incomplete,
 };
 #[derive(Clone)]
 struct ServerState {
@@ -12278,11 +12278,7 @@ async fn list_versions_admin(
     list_versions_response(&state, &key, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
 }
 
-async fn list_versions_response(
-    state: &ServerState,
-    key: &str,
-    thumbnail_route: &str,
-) -> Response {
+async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route: &str) -> Response {
     let store = read_store(state, "versions.list").await;
     match store.list_versions(key).await {
         Ok(Some(summary)) => {
@@ -12585,8 +12581,10 @@ struct ManagedSignerBackupImportRequest {
 #[derive(Debug, Deserialize)]
 struct ManagedRendezvousFailoverExportRequest {
     passphrase: String,
-    target_node_id: NodeId,
+    target_node_id: Option<NodeId>,
     public_url: Option<String>,
+    #[serde(default)]
+    deployment_target: ManagedRendezvousFailoverDeploymentTarget,
 }
 
 #[derive(Debug, Deserialize)]
@@ -15107,6 +15105,7 @@ async fn export_managed_rendezvous_failover_handler(
         json!({
             "target_node_id": request.target_node_id,
             "public_url": request.public_url,
+            "deployment_target": request.deployment_target,
         }),
     )
     .await
@@ -15119,6 +15118,33 @@ async fn export_managed_rendezvous_failover_handler(
         .public_url
         .clone()
         .or_else(|| current_rendezvous_urls(&state).first().cloned());
+    let deployment_target = request.deployment_target;
+    let target_node_id = match (deployment_target, request.target_node_id) {
+        (ManagedRendezvousFailoverDeploymentTarget::EmbeddedNode, Some(target_node_id)) => {
+            Some(target_node_id)
+        }
+        (ManagedRendezvousFailoverDeploymentTarget::EmbeddedNode, None) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": "target_node_id is required for embedded-node rendezvous failover exports" }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "target_node_id is required for embedded-node rendezvous failover exports" })),
+            )
+                .into_response();
+        }
+        (ManagedRendezvousFailoverDeploymentTarget::StandaloneService, target_node_id) => {
+            target_node_id
+        }
+    };
     let Some(public_url) = public_url else {
         append_admin_audit(
             &state,
@@ -15223,8 +15249,9 @@ async fn export_managed_rendezvous_failover_handler(
         match export_managed_rendezvous_failover_package(ManagedRendezvousFailoverExportParams {
             cluster_id: state.cluster_id,
             source_node_id: state.node_id,
-            target_node_id: request.target_node_id,
+            target_node_id,
             public_url: &public_url,
+            deployment_target,
             client_ca_cert_pem: ca_cert_pem,
             cert_pem: &cert_pem,
             key_pem: &key_pem,
@@ -15262,6 +15289,8 @@ async fn export_managed_rendezvous_failover_handler(
         json!({
             "target_node_id": package.target_node_id,
             "public_url": package.public_url,
+            "deployment_target": package.deployment_target,
+            "includes_cluster_ca_cert": package.includes_cluster_ca_cert,
             "exported_at_unix": package.exported_at_unix,
         }),
     )
@@ -15314,7 +15343,25 @@ async fn import_managed_rendezvous_failover_handler(
         )
             .into_response();
     }
-    if request.package.target_node_id != state.node_id {
+    let Some(target_node_id) = request.package.target_node_id else {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed rendezvous failover package does not target an embedded node" }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "managed rendezvous failover package does not target an embedded node" })),
+        )
+            .into_response();
+    };
+    if target_node_id != state.node_id {
         append_admin_audit(
             &state,
             action,
@@ -15422,7 +15469,7 @@ async fn import_managed_rendezvous_failover_handler(
         "success",
         json!({
             "source_node_id": request.package.source_node_id,
-            "target_node_id": request.package.target_node_id,
+            "target_node_id": target_node_id,
             "public_url": request.package.public_url,
             "restart_required": true,
         }),
@@ -15435,7 +15482,7 @@ async fn import_managed_rendezvous_failover_handler(
             status: "imported".to_string(),
             cluster_id: state.cluster_id,
             source_node_id: request.package.source_node_id,
-            target_node_id: request.package.target_node_id,
+            target_node_id,
             public_url: request.package.public_url,
             restart_required: true,
             cert_path: managed_rendezvous_cert_path(&state.data_dir)
@@ -15608,8 +15655,9 @@ async fn export_managed_control_plane_promotion_handler(
         match export_managed_rendezvous_failover_package(ManagedRendezvousFailoverExportParams {
             cluster_id: state.cluster_id,
             source_node_id: state.node_id,
-            target_node_id: request.target_node_id,
+            target_node_id: Some(request.target_node_id),
             public_url: &public_url,
+            deployment_target: ManagedRendezvousFailoverDeploymentTarget::EmbeddedNode,
             client_ca_cert_pem: ca_cert_pem,
             cert_pem: &cert_pem,
             key_pem: &key_pem,
@@ -15706,7 +15754,25 @@ async fn import_managed_control_plane_promotion_handler(
         )
             .into_response();
     }
-    if request.package.rendezvous_failover.target_node_id != state.node_id {
+    let Some(target_node_id) = request.package.rendezvous_failover.target_node_id else {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed control-plane promotion package does not target an embedded node" }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "managed control-plane promotion package does not target an embedded node" })),
+        )
+            .into_response();
+    };
+    if target_node_id != state.node_id {
         append_admin_audit(
             &state,
             action,
@@ -15836,7 +15902,7 @@ async fn import_managed_control_plane_promotion_handler(
         "success",
         json!({
             "source_node_id": request.package.rendezvous_failover.source_node_id,
-            "target_node_id": request.package.rendezvous_failover.target_node_id,
+            "target_node_id": target_node_id,
             "public_url": request.package.rendezvous_failover.public_url,
             "restart_required": true,
         }),
@@ -15849,7 +15915,7 @@ async fn import_managed_control_plane_promotion_handler(
             status: "imported".to_string(),
             cluster_id: state.cluster_id,
             source_node_id: request.package.rendezvous_failover.source_node_id,
-            target_node_id: request.package.rendezvous_failover.target_node_id,
+            target_node_id,
             public_url: request.package.rendezvous_failover.public_url.clone(),
             restart_required: true,
             signer_ca_cert_path: managed_signer_ca_cert_path(&state.data_dir)

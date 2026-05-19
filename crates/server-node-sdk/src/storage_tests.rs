@@ -2533,7 +2533,10 @@ async fn restore_version_same_path_creates_new_head_impl(backend: StorageTestBac
         .iter()
         .find(|record| record.version_id == preferred_head_id)
         .expect("preferred head should exist in versions");
-    assert_eq!(restored_head.parent_version_ids, vec![second.version_id.clone()]);
+    assert_eq!(
+        restored_head.parent_version_ids,
+        vec![second.version_id.clone()]
+    );
     assert_eq!(
         restored_head.copied_from_version_id.as_deref(),
         Some(first.version_id.as_str())

@@ -5,6 +5,7 @@ import {
   importManagedControlPlanePromotion,
   importManagedRendezvousFailover,
   type ControlPlanePromotionImportResponse,
+  type ManagedRendezvousFailoverDeploymentTarget,
   type ManagedControlPlanePromotionPackage,
   type ManagedRendezvousFailoverImportResponse,
   type ManagedRendezvousFailoverPackage,
@@ -20,6 +21,7 @@ import {
   Grid,
   Group,
   PasswordInput,
+  Radio,
   Stack,
   Text,
   TextInput,
@@ -56,6 +58,8 @@ export function ControlPlanePage() {
   const [rendezvousPassphrase, setRendezvousPassphrase] = useState("");
   const [rendezvousTargetNodeId, setRendezvousTargetNodeId] = useState("");
   const [rendezvousPublicUrl, setRendezvousPublicUrl] = useState("");
+  const [rendezvousDeploymentTarget, setRendezvousDeploymentTarget] =
+    useState<ManagedRendezvousFailoverDeploymentTarget>("embedded_node");
   const [exportedRendezvousPackage, setExportedRendezvousPackage] = useState<ManagedRendezvousFailoverPackage | null>(null);
   const [rendezvousImportPassphrase, setRendezvousImportPassphrase] = useState("");
   const [rendezvousPackageRaw, setRendezvousPackageRaw] = useState("");
@@ -144,8 +148,11 @@ export function ControlPlanePage() {
       const payload = await exportManagedRendezvousFailover(
         {
           passphrase: rendezvousPassphrase,
-          target_node_id: rendezvousTargetNodeId,
-          public_url: rendezvousPublicUrl.trim() || null
+          target_node_id: standaloneRendezvousExport
+            ? null
+            : rendezvousTargetNodeId.trim() || null,
+          public_url: rendezvousPublicUrl.trim() || null,
+          deployment_target: rendezvousDeploymentTarget
         },
         adminTokenOverride
       );
@@ -156,6 +163,9 @@ export function ControlPlanePage() {
       setPendingAction(null);
     }
   }
+
+  const standaloneRendezvousExport =
+    rendezvousDeploymentTarget === "standalone_service";
 
   async function handleImportRendezvousFailover() {
     setPendingAction("rendezvous-import");
@@ -362,20 +372,45 @@ export function ControlPlanePage() {
                 <Badge variant="light">{exportedRendezvousPackage ? "package ready" : "source node action"}</Badge>
               </Group>
               <Text c="dimmed">
-                Use this when you only want to move the embedded rendezvous listener to another cluster node and keep
-                the signer where it is.
+                {standaloneRendezvousExport
+                  ? "Use this when a dedicated standalone ironmesh-rendezvous-service should take over the public rendezvous endpoint while the signer stays on this node."
+                  : "Use this when you only want to move the embedded rendezvous listener to another cluster node and keep the signer where it is."}
               </Text>
+              <Radio.Group
+                label="Package target"
+                value={rendezvousDeploymentTarget}
+                onChange={(value) => setRendezvousDeploymentTarget(value as ManagedRendezvousFailoverDeploymentTarget)}
+              >
+                <Stack gap={6} mt="xs">
+                  <Radio
+                    value="embedded_node"
+                    label="Promoted cluster node"
+                    description="Import on another approved server node, restart it, and move the stable rendezvous hostname or VIP there."
+                  />
+                  <Radio
+                    value="standalone_service"
+                    label="Standalone ironmesh-rendezvous-service"
+                    description="Exports a standalone-friendly package with inline cluster certificate material so the service only needs this JSON package plus the passphrase."
+                  />
+                </Stack>
+              </Radio.Group>
               <PasswordInput
                 label="Passphrase"
                 value={rendezvousPassphrase}
                 onChange={(event) => setRendezvousPassphrase(event.currentTarget.value)}
               />
-              <TextInput
-                label="Target node ID"
-                value={rendezvousTargetNodeId}
-                onChange={(event) => setRendezvousTargetNodeId(event.currentTarget.value)}
-                placeholder="00000000-0000-0000-0000-000000000000"
-              />
+              {standaloneRendezvousExport ? (
+                <Text size="sm" c="dimmed">
+                  No target node ID is needed for the standalone service package.
+                </Text>
+              ) : (
+                <TextInput
+                  label="Target node ID"
+                  value={rendezvousTargetNodeId}
+                  onChange={(event) => setRendezvousTargetNodeId(event.currentTarget.value)}
+                  placeholder="00000000-0000-0000-0000-000000000000"
+                />
+              )}
               <TextInput
                 label="Public rendezvous URL override"
                 value={rendezvousPublicUrl}
@@ -387,7 +422,9 @@ export function ControlPlanePage() {
                   onClick={() => void handleExportRendezvousFailover()}
                   loading={pendingAction === "rendezvous-export"}
                 >
-                  Export rendezvous failover package
+                  {standaloneRendezvousExport
+                    ? "Export standalone rendezvous package"
+                    : "Export rendezvous failover package"}
                 </Button>
               </Group>
               <JsonBlock value={exportedRendezvousPackage ?? { status: "no rendezvous failover package exported yet" }} />
@@ -543,19 +580,23 @@ export function ControlPlanePage() {
             <Badge color="blue" variant="light">advanced/manual</Badge>
           </Group>
           <Text c="dimmed">
-            A pure standalone <code>ironmesh-rendezvous-service</code> is still the advanced operator path. The current UI now
-            covers both supported node-to-node transfer workflows, but it does not yet automate direct import into the
-            standalone service itself.
+            A pure standalone <code>ironmesh-rendezvous-service</code> is still the advanced operator path, but the
+            export card above can now emit a standalone-targeted rendezvous package with inline cluster certificate
+            material.
           </Text>
           <Text size="sm" c="dimmed">
-            Today the supported guided options are:
+            Recommended standalone flow:
           </Text>
-          <Text size="sm" c="dimmed">1. Move embedded rendezvous to another approved node with the rendezvous-only failover package.</Text>
-          <Text size="sm" c="dimmed">2. Move signer plus embedded rendezvous together with the full control-plane promotion package.</Text>
           <Text size="sm" c="dimmed">
-            For a dedicated standalone service, keep the same stable public rendezvous URL or VIP, provision the
-            service separately with the right TLS and trust material, add its URL in the editor above on the
-            participating server nodes, and treat signer/cert material cutover as a manual operator step for now.
+            1. Choose <code>Standalone ironmesh-rendezvous-service</code> in the export card and export the package JSON.
+          </Text>
+          <Text size="sm" c="dimmed">
+            2. Start the standalone service with that package file, the passphrase, and the same stable public
+            rendezvous URL or VIP.
+          </Text>
+          <Text size="sm" c="dimmed">
+            3. Add or keep the stable rendezvous URL in the editor above on participating server nodes so clients can
+            keep finding the service after cutover.
           </Text>
         </Stack>
       </Card>

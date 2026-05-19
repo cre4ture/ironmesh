@@ -20,20 +20,34 @@ pub(crate) struct ManagedRendezvousFailoverPackage {
     pub version: u32,
     pub cluster_id: ClusterId,
     pub source_node_id: NodeId,
-    pub target_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<NodeId>,
     pub exported_at_unix: u64,
     pub public_url: String,
+    #[serde(default)]
+    pub deployment_target: ManagedRendezvousFailoverDeploymentTarget,
+    #[serde(default)]
+    pub includes_cluster_ca_cert: bool,
     pub pbkdf2_rounds: u32,
     pub salt_b64: String,
     pub nonce_b64: String,
     pub ciphertext_b64: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedRendezvousFailoverDeploymentTarget {
+    #[default]
+    EmbeddedNode,
+    StandaloneService,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ManagedRendezvousFailoverPlaintext {
     cluster_id: ClusterId,
     source_node_id: NodeId,
-    target_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_node_id: Option<NodeId>,
     exported_at_unix: u64,
     public_url: String,
     #[serde(default)]
@@ -171,7 +185,7 @@ fn build_test_failover_package(
 ) -> ManagedRendezvousFailoverPackage {
     let cluster_id = uuid::Uuid::now_v7();
     let source_node_id = uuid::Uuid::now_v7();
-    let target_node_id = uuid::Uuid::now_v7();
+    let target_node_id = Some(uuid::Uuid::now_v7());
     let exported_at_unix = 1_773_904_240;
     let pbkdf2_rounds = 600_000;
     let salt = [7u8; MANAGED_RENDEZVOUS_FAILOVER_SALT_LEN];
@@ -201,6 +215,8 @@ fn build_test_failover_package(
         target_node_id,
         exported_at_unix,
         public_url: public_url.to_string(),
+        deployment_target: ManagedRendezvousFailoverDeploymentTarget::EmbeddedNode,
+        includes_cluster_ca_cert: client_ca_cert_pem.is_some(),
         pbkdf2_rounds,
         salt_b64: BASE64_STANDARD.encode(salt),
         nonce_b64: BASE64_STANDARD.encode(nonce),
@@ -297,6 +313,74 @@ mod tests {
         );
         assert!(object.contains_key("cert_pem"));
         assert!(object.contains_key("key_pem"));
+    }
+
+    #[test]
+    fn standalone_failover_package_can_omit_target_node_id() {
+        let mut package = build_test_failover_package(
+            "https://creax.de:44042",
+            Some("-----BEGIN CERTIFICATE-----\nclient-ca\n-----END CERTIFICATE-----\n"),
+            "cert",
+            "key",
+            "correct horse battery staple",
+        );
+        package.target_node_id = None;
+        package.deployment_target = ManagedRendezvousFailoverDeploymentTarget::StandaloneService;
+
+        let salt = BASE64_STANDARD
+            .decode(package.salt_b64.as_bytes())
+            .expect("salt should decode");
+        let nonce = BASE64_STANDARD
+            .decode(package.nonce_b64.as_bytes())
+            .expect("nonce should decode");
+        let ciphertext = BASE64_STANDARD
+            .decode(package.ciphertext_b64.as_bytes())
+            .expect("ciphertext should decode");
+        let key = derive_rendezvous_failover_key(
+            "correct horse battery staple",
+            &salt,
+            package.pbkdf2_rounds,
+        );
+        let cipher = Aes256GcmSiv::new_from_slice(&key).expect("cipher should initialize");
+        let plaintext_json = cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .expect("ciphertext should decrypt");
+        let mut payload = serde_json::from_slice::<serde_json::Value>(&plaintext_json)
+            .expect("payload should parse as JSON");
+        payload
+            .as_object_mut()
+            .expect("payload should serialize as an object")
+            .remove("target_node_id");
+        let rewritten_plaintext = serde_json::to_vec(&payload).expect("payload should serialize");
+        let rewritten_ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), rewritten_plaintext.as_ref())
+            .expect("rewritten payload should encrypt");
+        package.ciphertext_b64 = BASE64_STANDARD.encode(rewritten_ciphertext);
+
+        let json = serde_json::to_value(&package).expect("failover package should serialize");
+        let object = json
+            .as_object()
+            .expect("failover package should serialize as an object");
+        assert!(!object.contains_key("target_node_id"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "ironmesh-rendezvous-failover-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should create");
+        let path = dir.join("failover.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&package).expect("package should serialize"),
+        )
+        .expect("test failover package should write");
+
+        let decrypted = load_rendezvous_failover_package(&path, "correct horse battery staple")
+            .expect("standalone package should decrypt");
+
+        assert_eq!(decrypted.package.target_node_id, None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

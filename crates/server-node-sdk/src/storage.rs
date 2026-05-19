@@ -6438,10 +6438,7 @@ impl PersistentStore {
         target_path: &str,
         overwrite: bool,
     ) -> Result<PathMutationResult> {
-        let Some(source) = self
-            .version_restore_source(source_path, version_id)
-            .await?
-        else {
+        let Some(source) = self.version_restore_source(source_path, version_id).await? else {
             return Ok(PathMutationResult::SourceMissing);
         };
 

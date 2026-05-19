@@ -604,13 +604,19 @@ export type ManagedControlPlanePromotionPackage = {
   rendezvous_failover: Record<string, unknown>;
 };
 
+export type ManagedRendezvousFailoverDeploymentTarget =
+  | "embedded_node"
+  | "standalone_service";
+
 export type ManagedRendezvousFailoverPackage = {
   version: number;
   cluster_id: string;
   source_node_id: string;
-  target_node_id: string;
+  target_node_id?: string;
   exported_at_unix: number;
   public_url: string;
+  deployment_target?: ManagedRendezvousFailoverDeploymentTarget;
+  includes_cluster_ca_cert?: boolean;
   pbkdf2_rounds: number;
   salt_b64: string;
   nonce_b64: string;

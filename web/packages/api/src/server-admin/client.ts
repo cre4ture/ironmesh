@@ -781,8 +781,9 @@ export async function updateRendezvousConfig(
 export async function exportManagedRendezvousFailover(
   request: {
     passphrase: string;
-    target_node_id: string;
+    target_node_id?: string | null;
     public_url?: string | null;
+    deployment_target?: "embedded_node" | "standalone_service";
   },
   adminTokenOverride?: string
 ): Promise<ManagedRendezvousFailoverPackage> {

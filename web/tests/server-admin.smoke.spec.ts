@@ -172,24 +172,42 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "rendezvous-b.local:9443" }).first()).toBeVisible();
 
-  await page.getByRole("textbox", { name: "Target node ID" }).first().fill("node-beta");
+  await page.getByLabel("Standalone ironmesh-rendezvous-service").click();
+  await expect(page.getByRole("textbox", { name: "Target node ID" })).toHaveCount(1);
+  await expect(page.getByText("No target node ID is needed for the standalone service package.")).toBeVisible();
   await page.getByLabel("Passphrase").first().fill("rendezvous-passphrase");
-  await page.getByRole("button", { name: "Export rendezvous failover package" }).click();
+  await page.getByRole("button", { name: "Export standalone rendezvous package" }).click();
   await expect(page.getByText("https://node-beta.local/rendezvous")).toBeVisible();
+  await expect(page.locator("pre").filter({ hasText: '"deployment_target": "standalone_service"' })).toBeVisible();
+  await expect(page.locator("pre").filter({ hasText: '"includes_cluster_ca_cert": true' })).toBeVisible();
 
   const rendezvousPackageJson = JSON.stringify({
     version: 1,
     cluster_id: "cluster-alpha",
     source_node_id: "node-alpha",
-    target_node_id: "node-beta",
-    public_url: "https://node-beta.local/rendezvous"
+    public_url: "https://node-beta.local/rendezvous",
+    deployment_target: "standalone_service",
+    includes_cluster_ca_cert: true
   });
   await page.getByLabel("Rendezvous failover package JSON").fill(rendezvousPackageJson);
   await page.getByLabel("Passphrase").nth(1).fill("rendezvous-passphrase");
   await page.getByRole("button", { name: "Import rendezvous failover package" }).click();
+  await expect(page.getByText("does not target an embedded node")).toBeVisible();
+
+  const embeddedRendezvousPackageJson = JSON.stringify({
+    version: 1,
+    cluster_id: "cluster-alpha",
+    source_node_id: "node-alpha",
+    target_node_id: "node-beta",
+    public_url: "https://node-beta.local/rendezvous",
+    deployment_target: "embedded_node",
+    includes_cluster_ca_cert: true
+  });
+  await page.getByLabel("Rendezvous failover package JSON").fill(embeddedRendezvousPackageJson);
+  await page.getByRole("button", { name: "Import rendezvous failover package" }).click();
   await expect(page.getByText("tls/rendezvous.key")).toBeVisible();
 
-  await page.getByRole("textbox", { name: "Target node ID" }).nth(1).fill("node-beta");
+  await page.getByRole("textbox", { name: "Target node ID" }).fill("node-beta");
   await page.getByLabel("Passphrase").nth(2).fill("promotion-passphrase");
   await page.getByRole("button", { name: "Export promotion package" }).click();
   await expect(page.getByText("signer_backup")).toBeVisible();
@@ -1357,16 +1375,50 @@ async function installServerAdminMocks(
     }
 
     if (pathname === apiV1("/auth/managed-rendezvous/failover/export") && method === "POST") {
+      const body = route.request().postDataJSON() as {
+        deployment_target?: "embedded_node" | "standalone_service";
+        target_node_id?: string | null;
+      };
+      if (
+        body.deployment_target === "standalone_service" &&
+        body.target_node_id !== undefined &&
+        body.target_node_id !== null &&
+        body.target_node_id !== ""
+      ) {
+        return route.fulfill({
+          status: 400,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "standalone exports should not send target_node_id" })
+        });
+      }
       return json(route, {
         version: 1,
         cluster_id: "cluster-alpha",
         source_node_id: "node-alpha",
-        target_node_id: "node-beta",
-        public_url: "https://node-beta.local/rendezvous"
+        ...(body.deployment_target === "standalone_service"
+          ? {}
+          : { target_node_id: "node-beta" }),
+        public_url: "https://node-beta.local/rendezvous",
+        deployment_target: body.deployment_target ?? "embedded_node",
+        includes_cluster_ca_cert: true
       });
     }
 
     if (pathname === apiV1("/auth/managed-rendezvous/failover/import") && method === "POST") {
+      const body = route.request().postDataJSON() as {
+        package?: {
+          target_node_id?: string;
+        };
+      };
+      if (!body.package?.target_node_id) {
+        return route.fulfill({
+          status: 400,
+          contentType: "application/json",
+          body: JSON.stringify({
+            error: "managed rendezvous failover package does not target an embedded node"
+          })
+        });
+      }
       return json(route, {
         status: "imported",
         cluster_id: "cluster-alpha",

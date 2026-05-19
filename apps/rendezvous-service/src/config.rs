@@ -52,7 +52,7 @@ pub struct LoadedRendezvousFailoverMetadata {
     pub package_path: PathBuf,
     pub cluster_id: ClusterId,
     pub source_node_id: NodeId,
-    pub target_node_id: NodeId,
+    pub target_node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone)]

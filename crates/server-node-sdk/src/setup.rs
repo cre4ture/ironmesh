@@ -119,20 +119,34 @@ pub(crate) struct ManagedRendezvousFailoverPackage {
     pub version: u32,
     pub cluster_id: ClusterId,
     pub source_node_id: NodeId,
-    pub target_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<NodeId>,
     pub exported_at_unix: u64,
     pub public_url: String,
+    #[serde(default)]
+    pub deployment_target: ManagedRendezvousFailoverDeploymentTarget,
+    #[serde(default)]
+    pub includes_cluster_ca_cert: bool,
     pub pbkdf2_rounds: u32,
     pub salt_b64: String,
     pub nonce_b64: String,
     pub ciphertext_b64: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedRendezvousFailoverDeploymentTarget {
+    #[default]
+    EmbeddedNode,
+    StandaloneService,
+}
+
 pub(crate) struct ManagedRendezvousFailoverExportParams<'a> {
     pub cluster_id: ClusterId,
     pub source_node_id: NodeId,
-    pub target_node_id: NodeId,
+    pub target_node_id: Option<NodeId>,
     pub public_url: &'a str,
+    pub deployment_target: ManagedRendezvousFailoverDeploymentTarget,
     pub client_ca_cert_pem: &'a str,
     pub cert_pem: &'a str,
     pub key_pem: &'a str,
@@ -143,7 +157,8 @@ pub(crate) struct ManagedRendezvousFailoverExportParams<'a> {
 struct ManagedRendezvousFailoverPlaintext {
     cluster_id: ClusterId,
     source_node_id: NodeId,
-    target_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_node_id: Option<NodeId>,
     exported_at_unix: u64,
     public_url: String,
     #[serde(default)]
@@ -1312,6 +1327,8 @@ pub(crate) fn export_managed_rendezvous_failover_package(
         target_node_id: params.target_node_id,
         exported_at_unix,
         public_url: params.public_url.to_string(),
+        deployment_target: params.deployment_target,
+        includes_cluster_ca_cert: true,
         pbkdf2_rounds: MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS,
         salt_b64: BASE64_STANDARD.encode(salt),
         nonce_b64: BASE64_STANDARD.encode(nonce),
@@ -1379,14 +1396,20 @@ pub(crate) fn import_managed_rendezvous_failover_package(
             expected_cluster_id
         );
     }
-    if let Some(expected_node_id) = expected_node_id
-        && plaintext.target_node_id != expected_node_id
-    {
-        bail!(
-            "managed rendezvous failover targets node {} but this node is {}",
-            plaintext.target_node_id,
-            expected_node_id
-        );
+    if let Some(expected_node_id) = expected_node_id {
+        match plaintext.target_node_id {
+            Some(target_node_id) if target_node_id == expected_node_id => {}
+            Some(target_node_id) => {
+                bail!(
+                    "managed rendezvous failover targets node {} but this node is {}",
+                    target_node_id,
+                    expected_node_id
+                );
+            }
+            None => {
+                bail!("managed rendezvous failover package does not target an embedded node");
+            }
+        }
     }
 
     write_managed_rendezvous_material(
@@ -1400,9 +1423,9 @@ pub(crate) fn import_managed_rendezvous_failover_package(
     let mut managed_state = ensure_managed_setup_state(&state_path)?;
     managed_state.updated_at_unix = unix_ts();
     managed_state.cluster_id.get_or_insert(plaintext.cluster_id);
-    managed_state
-        .node_id
-        .get_or_insert(plaintext.target_node_id);
+    if let Some(target_node_id) = plaintext.target_node_id {
+        managed_state.node_id.get_or_insert(target_node_id);
+    }
     managed_state.managed_rendezvous_bind_addr = Some(bind_addr.to_string());
     managed_state.managed_rendezvous_public_url = Some(plaintext.public_url);
     write_managed_setup_state(&state_path, &managed_state)
@@ -2289,8 +2312,9 @@ mod tests {
             export_managed_rendezvous_failover_package(ManagedRendezvousFailoverExportParams {
                 cluster_id,
                 source_node_id,
-                target_node_id,
+                target_node_id: Some(target_node_id),
                 public_url: "https://rendezvous.example:9443",
+                deployment_target: ManagedRendezvousFailoverDeploymentTarget::EmbeddedNode,
                 client_ca_cert_pem: "cluster-ca-cert",
                 cert_pem: "rendezvous-cert",
                 key_pem: "rendezvous-key",
@@ -2337,6 +2361,30 @@ mod tests {
     }
 
     #[test]
+    fn managed_rendezvous_failover_can_mark_standalone_service_exports() {
+        let package =
+            export_managed_rendezvous_failover_package(ManagedRendezvousFailoverExportParams {
+                cluster_id: ClusterId::new_v4(),
+                source_node_id: NodeId::new_v4(),
+                target_node_id: None,
+                public_url: "https://rendezvous.example:9443",
+                deployment_target: ManagedRendezvousFailoverDeploymentTarget::StandaloneService,
+                client_ca_cert_pem: "cluster-ca-cert",
+                cert_pem: "rendezvous-cert",
+                key_pem: "rendezvous-key",
+                passphrase: "correct horse battery staple",
+            })
+            .unwrap();
+
+        assert_eq!(
+            package.deployment_target,
+            ManagedRendezvousFailoverDeploymentTarget::StandaloneService
+        );
+        assert!(package.includes_cluster_ca_cert);
+        assert_eq!(package.target_node_id, None);
+    }
+
+    #[test]
     fn managed_rendezvous_failover_rejects_wrong_target_node() {
         let dir = temp_dir("managed-rendezvous-failover-target");
         let cluster_id = ClusterId::new_v4();
@@ -2344,8 +2392,9 @@ mod tests {
             export_managed_rendezvous_failover_package(ManagedRendezvousFailoverExportParams {
                 cluster_id,
                 source_node_id: NodeId::new_v4(),
-                target_node_id: NodeId::new_v4(),
+                target_node_id: Some(NodeId::new_v4()),
                 public_url: "https://rendezvous.example:9443",
+                deployment_target: ManagedRendezvousFailoverDeploymentTarget::EmbeddedNode,
                 client_ca_cert_pem: "cluster-ca-cert",
                 cert_pem: "rendezvous-cert",
                 key_pem: "rendezvous-key",

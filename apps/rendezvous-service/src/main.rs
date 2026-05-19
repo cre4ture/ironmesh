@@ -22,7 +22,7 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
             failover_package = %failover.package_path.display(),
             cluster_id = %failover.cluster_id,
             source_node_id = %failover.source_node_id,
-            target_node_id = %failover.target_node_id,
+            target_node_id = ?failover.target_node_id,
             "loaded managed rendezvous failover package for standalone service"
         );
     }
