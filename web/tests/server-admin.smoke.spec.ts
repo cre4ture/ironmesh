@@ -128,6 +128,39 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
     "true"
   );
   await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+  const galleryDialog = page.getByRole("dialog");
+  await expect(galleryDialog.getByRole("button", { name: "Version history" })).toBeVisible();
+  await galleryDialog.getByRole("button", { name: "Version history" }).click();
+  await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
+  page.once("dialog", (dialog) => {
+    void dialog.accept("restored/gallery-cat-from-gallery.png");
+  });
+  await page
+    .getByRole("row", { name: /version-cat-000/ })
+    .getByRole("button", { name: "Restore" })
+    .click();
+  await expect
+    .poll(() =>
+      mockState.restoredVersions().some(
+        (entry) =>
+          entry.key === "gallery/cat.png" &&
+          entry.versionId === "version-cat-000" &&
+          entry.targetPath === "restored/gallery-cat-from-gallery.png"
+      )
+    )
+    .toBe(true);
+  await expect(page.getByText('Restored version "version-cat-000" to "restored/gallery-cat-from-gallery.png".')).toBeVisible();
+  const galleryVersionThumbnail = page.getByRole("button", {
+    name: "Thumbnail for version version-cat-001"
+  });
+  await expect(galleryVersionThumbnail).toBeVisible();
+  await galleryVersionThumbnail.click();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("button", { name: "gallery/cat.png version-cat-001", exact: true })
+  ).toHaveAttribute("aria-current", "true");
+  await page.keyboard.press("Escape");
 
   await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
 
@@ -289,6 +322,7 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
   await expect(
     page.getByRole("button", { name: "gallery/cat.png version-cat-001", exact: true })
   ).toHaveAttribute("aria-current", "true");
+  await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Next item" }).click();
   await expect(
     page.getByRole("button", { name: "gallery/cat.png version-cat-000", exact: true })

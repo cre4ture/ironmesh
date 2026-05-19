@@ -1,7 +1,9 @@
 import {
   getBinaryObjectStreamUrl,
+  getVersionGraph,
   listSnapshots,
   listStoreEntries,
+  restoreStoreVersion,
   retryStoreMediaCacheEntry
 } from "@ironmesh/api";
 import {
@@ -67,14 +69,14 @@ export function GalleryPage() {
     []
   );
   const getMediaRequests = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null): GalleryMediaRequests => ({
+    (entry: GalleryEntry, snapshotId: string | null, versionId?: string | null): GalleryMediaRequests => ({
       thumbnail: entry.media?.thumbnail?.url
         ? {
             url: entry.media.thumbnail.url
           }
         : null,
       original: {
-        url: binaryMediaUrl(entry.path, snapshotId)
+        url: binaryMediaUrl(entry.path, snapshotId, versionId)
       }
     }),
     []
@@ -101,14 +103,22 @@ export function GalleryPage() {
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
         getMediaRequests={getMediaRequests}
+        loadVersions={getVersionGraph}
+        restoreVersion={(key, versionId, targetPath) =>
+          restoreStoreVersion(key, versionId, targetPath)
+        }
         retryMediaEntry={retryMediaEntry}
       />
     </>
   );
 }
 
-function binaryMediaUrl(key: string, snapshotId: string | null): string {
-  return getBinaryObjectStreamUrl(key, snapshotId);
+function binaryMediaUrl(
+  key: string,
+  snapshotId: string | null,
+  versionId?: string | null
+): string {
+  return getBinaryObjectStreamUrl(key, snapshotId, versionId);
 }
 
 function logicalMapFileUrl(manifestKey: string): string {

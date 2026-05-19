@@ -59,6 +59,7 @@ type MediaLightboxModalProps = {
   selectedItem: MediaLightboxItem | null;
   getItemAtIndex: (index: number) => MediaLightboxItem | null;
   onSelectIndex: (index: number) => void | Promise<void>;
+  extraActions?: ReactNode;
   renderDetails?: (item: MediaLightboxItem) => ReactNode;
 };
 
@@ -81,6 +82,7 @@ export function MediaLightboxModal({
   selectedItem,
   getItemAtIndex,
   onSelectIndex,
+  extraActions,
   renderDetails
 }: MediaLightboxModalProps) {
   const [isSlideshowMode, setIsSlideshowMode] = useState(false);
@@ -223,14 +225,17 @@ export function MediaLightboxModal({
                     </Badge>
                   ) : null}
                 </Group>
-                <Button
-                  variant="default"
-                  size="xs"
-                  leftSection={<IconPlayerPlay size={14} />}
-                  onClick={() => setIsSlideshowMode(true)}
-                >
-                  Start slideshow
-                </Button>
+                <Group gap="xs" wrap="nowrap">
+                  {extraActions}
+                  <Button
+                    variant="default"
+                    size="xs"
+                    leftSection={<IconPlayerPlay size={14} />}
+                    onClick={() => setIsSlideshowMode(true)}
+                  >
+                    Start slideshow
+                  </Button>
+                </Group>
               </Group>
               <Text size="sm" c="dimmed">
                 {selectedItem.description}

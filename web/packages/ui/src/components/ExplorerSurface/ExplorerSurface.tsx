@@ -574,6 +574,17 @@ export function ExplorerSurface({
     }
   }
 
+  async function openVersionHistoryDrawer(targetKey: string) {
+    const normalizedTargetKey = targetKey.trim();
+    if (!normalizedTargetKey) {
+      setError("Path must not be empty.");
+      return;
+    }
+
+    setVersionHistoryOpened(true);
+    await loadVersionGraph(normalizedTargetKey);
+  }
+
   async function showEntryHistory(entry: ExplorerEntry) {
     if (!loadVersions) {
       setError("Version history is not available on this surface.");
@@ -587,8 +598,7 @@ export function ExplorerSurface({
       return;
     }
 
-    setVersionHistoryOpened(true);
-    await loadVersionGraph(targetKey);
+    await openVersionHistoryDrawer(targetKey);
   }
 
   async function readVersion(versionId: string) {
@@ -706,6 +716,12 @@ export function ExplorerSurface({
   );
   const activeMediaItems = mediaViewerState?.source === "versions" ? versionMediaItems : browserMediaItems;
   const activeMediaItem = mediaViewerState ? activeMediaItems[mediaViewerState.index] ?? null : null;
+  const activeMediaHistoryKey =
+    mediaViewerState?.source === "versions"
+      ? versionSourceKey || null
+      : mediaViewerState?.source === "browser" && activeMediaItem
+        ? normalizeExplorerPath(activeMediaItem.key, false)
+        : null;
 
   useEffect(() => {
     if (mediaViewerState && !activeMediaItem) {
@@ -1060,6 +1076,7 @@ export function ExplorerSurface({
           position="right"
           title="Version history"
           size="xl"
+          zIndex={400}
         >
           <Stack gap="sm">
             <TextInput
@@ -1166,6 +1183,17 @@ export function ExplorerSurface({
               : current
           );
         }}
+        extraActions={
+          loadVersions && activeMediaHistoryKey ? (
+            <Button
+              variant="default"
+              size="xs"
+              onClick={() => void openVersionHistoryDrawer(activeMediaHistoryKey)}
+            >
+              Version history
+            </Button>
+          ) : null
+        }
       />
     </>
   );

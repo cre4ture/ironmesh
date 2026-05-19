@@ -6,6 +6,8 @@ import {
   Card,
   Center,
   Code,
+  Divider,
+  Drawer,
   Grid,
   Group,
   Loader,
@@ -15,6 +17,7 @@ import {
   SimpleGrid,
   Stack,
   Switch,
+  Table,
   Text,
   TextInput,
   ThemeIcon
@@ -46,12 +49,14 @@ import {
   MediaLightboxModal,
   type MediaLightboxItem,
   type MediaMissingThumbnailInfo,
+  MediaThumbnailPreview,
   type MediaPreviewRequest,
   type MediaPreviewRequests
 } from "../MediaViewer/MediaViewer";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 import {
   directChildStorePrefix,
+  normalizeStorePath,
   normalizeStorePrefix,
   parentStorePrefix,
   storeEntryName
@@ -144,6 +149,23 @@ export type GalleryMediaRequests = MediaPreviewRequests;
 
 type GalleryMissingThumbnailInfo = MediaMissingThumbnailInfo;
 
+export type GalleryVersionEntry = {
+  version_id: string;
+  entry_type?: string;
+  size_bytes?: number | null;
+  modified_at_unix?: number | null;
+  created_at_unix?: number | null;
+  media?: GalleryEntry["media"];
+  [key: string]: unknown;
+};
+
+export type GalleryVersionGraph = {
+  key?: string;
+  preferred_head_version_id?: string | null;
+  versions: GalleryVersionEntry[];
+  [key: string]: unknown;
+};
+
 type GalleryNavigationItem = {
   key: string;
   kind: "up" | "prefix";
@@ -211,7 +233,13 @@ type GallerySurfaceProps = {
     snapshotId: string | null,
     options?: GalleryLoadEntriesOptions
   ) => Promise<GalleryPayload>;
-  getMediaRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryMediaRequests;
+  getMediaRequests: (
+    entry: GalleryEntry,
+    snapshotId: string | null,
+    versionId?: string | null
+  ) => GalleryMediaRequests;
+  loadVersions?: (key: string) => Promise<GalleryVersionGraph>;
+  restoreVersion?: (key: string, versionId: string, targetPath: string) => Promise<unknown>;
   retryMediaEntry?: (
     entry: GalleryEntry,
     snapshotId: string | null
@@ -226,6 +254,8 @@ export function GallerySurface({
   loadSnapshots,
   loadEntries,
   getMediaRequests,
+  loadVersions,
+  restoreVersion,
   retryMediaEntry
 }: GallerySurfaceProps) {
   const [prefix, setPrefix] = useState("");
@@ -246,12 +276,17 @@ export function GallerySurface({
   const [gridPageHeights, setGridPageHeights] = useState<Record<number, number>>({});
   const [gridActivePageIndex, setGridActivePageIndex] = useState(0);
   const [selection, setSelection] = useState<GallerySelection | null>(null);
+  const [versionHistoryOpened, setVersionHistoryOpened] = useState(false);
+  const [versionKey, setVersionKey] = useState("");
+  const [versionsPayload, setVersionsPayload] = useState<GalleryVersionGraph | null>(null);
+  const [versionPreviewIndex, setVersionPreviewIndex] = useState<number | null>(null);
   const [sortOrder, setSortOrder] = useState<GallerySortOrder>("captured_desc");
   const [mediaFilter, setMediaFilter] = useState<GalleryMediaFilter>(
     allowedMediaKinds && allowedMediaKinds.length > 1 ? "all" : allowedMediaKinds?.[0] ?? "image"
   );
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [debugPayloadOpened, setDebugPayloadOpened] = useState(false);
   const [retryingSelectedMedia, setRetryingSelectedMedia] = useState(false);
   const [selectedMediaRetryError, setSelectedMediaRetryError] = useState<string | null>(null);
@@ -350,7 +385,7 @@ export function GallerySurface({
   const imageCount = activeMediaSummary.image_count;
   const videoCount = activeMediaSummary.video_count;
   const hiddenOnMapCount = Math.max(0, totalMediaCount - activeMediaSummary.geotagged_count);
-  const selectedIndex = selection?.index ?? -1;
+  const selectedGalleryIndex = selection?.index ?? -1;
   const selectedMapPaths =
     selection?.source === "map"
       ? resolveGalleryMapSelectionPaths(
@@ -361,8 +396,8 @@ export function GallerySurface({
       : [];
   const selectedEntry =
     selection?.source === "map"
-      ? mapMediaEntriesByPath.get(selectedMapPaths[selectedIndex] ?? "") ?? null
-      : getGalleryGridEntryAtIndex(gridPages, gridCollection, selectedIndex);
+      ? mapMediaEntriesByPath.get(selectedMapPaths[selectedGalleryIndex] ?? "") ?? null
+      : getGalleryGridEntryAtIndex(gridPages, gridCollection, selectedGalleryIndex);
   const selectedTotalCount =
     selection?.source === "map" ? selectedMapPaths.length : totalMediaCount;
   const activeSnapshotId = loadedScope?.snapshotId ?? snapshotId;
@@ -370,11 +405,39 @@ export function GallerySurface({
     () => buildGalleryLightboxItem(selectedEntry, activeSnapshotId, getMediaRequests),
     [activeSnapshotId, getMediaRequests, selectedEntry]
   );
+  const versionEntries = versionsPayload?.versions ?? [];
+  const versionSourceKey = (versionsPayload?.key ?? versionKey).trim();
+  const currentVersionId = versionsPayload?.preferred_head_version_id?.trim() || null;
+  const versionMediaItems = useMemo(
+    () =>
+      versionEntries.flatMap((version) => {
+        const item = buildGalleryVersionLightboxItem(version, versionSourceKey, getMediaRequests);
+        return item ? [item] : [];
+      }),
+    [getMediaRequests, versionEntries, versionSourceKey]
+  );
+  const versionMediaIndexById = useMemo(
+    () => new Map(versionMediaItems.map((item, index) => [item.key, index] as const)),
+    [versionMediaItems]
+  );
+  const activeMediaItem =
+    versionPreviewIndex === null ? selectedMediaItem : versionMediaItems[versionPreviewIndex] ?? null;
+  const activeMediaIndex = versionPreviewIndex ?? selectedGalleryIndex;
+  const activeMediaItemCount = versionPreviewIndex === null ? selectedTotalCount : versionMediaItems.length;
+  const activeMediaHistoryKey =
+    versionPreviewIndex === null
+      ? selectedEntry?.path ?? null
+      : versionSourceKey || null;
+  const activeVersionEntry =
+    versionPreviewIndex === null || !activeMediaItem
+      ? null
+      : versionEntries.find((version) => version.version_id === activeMediaItem.key) ?? null;
   const selectedMediaKind = selectedMediaItem?.kind ?? null;
   const selectedMissingThumbnailInfo = selectedMediaItem?.missingThumbnailInfo ?? null;
   const selectedMediaError = selectedEntry?.media?.error ?? null;
-  const canNavigatePrevious = selectedIndex > 0;
-  const canNavigateNext = selectedIndex >= 0 && selectedIndex < selectedTotalCount - 1;
+  const activeMediaMissingThumbnailInfo = activeMediaItem?.missingThumbnailInfo ?? null;
+  const activeMediaError =
+    versionPreviewIndex === null ? selectedMediaError : activeVersionEntry?.media?.error ?? null;
   const canRetrySelectedPoster =
     Boolean(retryMediaEntry) &&
     selectedMediaKind === "video" &&
@@ -388,6 +451,12 @@ export function GallerySurface({
     setRetryingSelectedMedia(false);
     setSelectedMediaRetryError(null);
   }, [selectedEntry?.path, selectedMediaItem?.key]);
+
+  useEffect(() => {
+    if (versionPreviewIndex !== null && !versionMediaItems[versionPreviewIndex]) {
+      setVersionPreviewIndex(null);
+    }
+  }, [versionMediaItems, versionPreviewIndex]);
 
   useEffect(() => {
     if (!selection) {
@@ -479,6 +548,7 @@ export function GallerySurface({
   async function refreshSnapshots() {
     setLoading("snapshots");
     setError(null);
+    setNotice(null);
     try {
       const payload = await loadSnapshots();
       setSnapshots(payload);
@@ -510,12 +580,99 @@ export function GallerySurface({
     await loadGalleryScope(scope, false);
   }
 
+  async function loadVersionGraph(nextKey?: string) {
+    if (!loadVersions) {
+      setError("Version history is not available on this surface.");
+      return;
+    }
+
+    const targetKey = (nextKey ?? versionKey).trim();
+    if (!targetKey) {
+      setError("Enter a key to load version history.");
+      return;
+    }
+
+    setLoading("versions");
+    setError(null);
+    setNotice(null);
+    setVersionKey(targetKey);
+    setVersionPreviewIndex(null);
+    try {
+      const payload = await loadVersions(targetKey);
+      setVersionsPayload(payload);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed loading versions");
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  async function openVersionHistoryDrawer(targetKey: string) {
+    const normalizedTargetKey = targetKey.trim();
+    if (!normalizedTargetKey) {
+      setError("Path must not be empty.");
+      return;
+    }
+
+    setVersionHistoryOpened(true);
+    await loadVersionGraph(normalizedTargetKey);
+  }
+
+  async function restoreGalleryVersion(version: GalleryVersionEntry) {
+    if (!restoreVersion) {
+      setError("Version restore is not available on this surface.");
+      return;
+    }
+
+    const sourceKey = (versionsPayload?.key ?? versionKey).trim();
+    if (!sourceKey) {
+      setError("Enter a key before restoring a version.");
+      return;
+    }
+
+    const requestedTargetPath =
+      typeof window === "undefined"
+        ? sourceKey
+        : window.prompt(
+            `Restore version "${version.version_id}" into current data at path:`,
+            sourceKey
+          );
+    if (requestedTargetPath == null) {
+      return;
+    }
+
+    const targetPath = normalizeStorePath(requestedTargetPath, false);
+    if (!targetPath) {
+      setError("Target path must not be empty.");
+      return;
+    }
+    if (targetPath.endsWith("/")) {
+      setError("Target path for a version restore must not end with '/'.");
+      return;
+    }
+
+    setLoading(`restore-version:${version.version_id}`);
+    setError(null);
+    setNotice(null);
+    try {
+      await restoreVersion(sourceKey, version.version_id, targetPath);
+      await refreshEntries();
+      await loadVersionGraph(sourceKey);
+      setNotice(`Restored version "${version.version_id}" to "${targetPath}".`);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed restoring version");
+    } finally {
+      setLoading(null);
+    }
+  }
+
   async function loadGalleryScope(targetScope: GalleryLoadedScope, syncPrefixInput: boolean) {
     const requestVersion = galleryRequestVersionRef.current + 1;
     galleryRequestVersionRef.current = requestVersion;
     setLoading("entries");
     setError(null);
     setSelection(null);
+    setVersionPreviewIndex(null);
     setNavigationPayload(null);
     setMapPayload(null);
     setGridCollection(null);
@@ -1058,6 +1215,7 @@ export function GallerySurface({
       ) : null}
 
       {error ? <Alert color="red">{error}</Alert> : null}
+      {notice ? <Alert color="green">{notice}</Alert> : null}
 
       <Grid>
         <Grid.Col span={12}>
@@ -1386,26 +1544,150 @@ export function GallerySurface({
         <JsonBlock value={galleryDebugValue} />
       </Modal>
 
+      {loadVersions ? (
+        <Drawer
+          opened={versionHistoryOpened}
+          onClose={() => setVersionHistoryOpened(false)}
+          position="right"
+          title="Version history"
+          size="xl"
+          zIndex={400}
+        >
+          <Stack gap="sm">
+            <TextInput
+              label="Key"
+              value={versionKey}
+              onChange={(event) => setVersionKey(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void loadVersionGraph();
+                }
+              }}
+              placeholder="gallery/cat.png"
+            />
+            <Button loading={loading === "versions"} onClick={() => void loadVersionGraph()}>
+              Load versions
+            </Button>
+            <Table.ScrollContainer minWidth={720}>
+              <Table striped highlightOnHover withTableBorder>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Thumb</Table.Th>
+                    <Table.Th>Version ID</Table.Th>
+                    <Table.Th>Type</Table.Th>
+                    <Table.Th>Size</Table.Th>
+                    <Table.Th>Modified</Table.Th>
+                    <Table.Th>Action</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {versionEntries.map((version) => {
+                    const versionMediaIndex = versionMediaIndexById.get(version.version_id) ?? null;
+                    const versionMediaItem =
+                      versionMediaIndex === null ? null : versionMediaItems[versionMediaIndex] ?? null;
+
+                    return (
+                      <Table.Tr key={version.version_id}>
+                        <Table.Td>
+                          <GalleryVersionThumbnailCell
+                            item={versionMediaItem}
+                            label={`Thumbnail for version ${version.version_id}`}
+                            onClick={
+                              versionMediaIndex === null
+                                ? undefined
+                                : () => setVersionPreviewIndex(versionMediaIndex)
+                            }
+                          />
+                        </Table.Td>
+                        <Table.Td>
+                          <Code>{version.version_id}</Code>
+                        </Table.Td>
+                        <Table.Td>{normalizeGalleryVersionType(version)}</Table.Td>
+                        <Table.Td>{formatGalleryVersionSize(version.size_bytes)}</Table.Td>
+                        <Table.Td>
+                          {formatGalleryVersionModifiedAt(
+                            version.modified_at_unix ?? version.created_at_unix
+                          )}
+                        </Table.Td>
+                        <Table.Td>
+                          <Group gap="xs" wrap="nowrap">
+                            <Button
+                              size="xs"
+                              variant="light"
+                              disabled={versionMediaIndex === null}
+                              onClick={() => {
+                                if (versionMediaIndex !== null) {
+                                  setVersionPreviewIndex(versionMediaIndex);
+                                }
+                              }}
+                            >
+                              Preview
+                            </Button>
+                            {restoreVersion &&
+                            currentVersionId != null &&
+                            version.version_id !== currentVersionId ? (
+                              <Button
+                                size="xs"
+                                variant="default"
+                                loading={loading === `restore-version:${version.version_id}`}
+                                onClick={() => void restoreGalleryVersion(version)}
+                              >
+                                Restore
+                              </Button>
+                            ) : null}
+                          </Group>
+                        </Table.Td>
+                      </Table.Tr>
+                    );
+                  })}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+            <Divider />
+            <JsonBlock value={versionsPayload ?? { message: "No version graph loaded yet." }} />
+          </Stack>
+        </Drawer>
+      ) : null}
+
       <MediaLightboxModal
-        opened={selectedMediaItem !== null}
-        onClose={() => setSelection(null)}
-        itemCount={selectedTotalCount}
-        selectedIndex={selectedIndex}
-        selectedItem={selectedMediaItem}
-        getItemAtIndex={getSelectedMediaItemAtIndex}
-        onSelectIndex={showEntryAtIndex}
+        opened={activeMediaItem !== null}
+        onClose={() => {
+          setVersionPreviewIndex(null);
+          setSelection(null);
+        }}
+        itemCount={activeMediaItemCount}
+        selectedIndex={activeMediaIndex}
+        selectedItem={activeMediaItem}
+        getItemAtIndex={(index) =>
+          versionPreviewIndex === null ? getSelectedMediaItemAtIndex(index) : versionMediaItems[index] ?? null
+        }
+        onSelectIndex={(index) =>
+          versionPreviewIndex === null ? showEntryAtIndex(index) : setVersionPreviewIndex(index)
+        }
+        extraActions={
+          loadVersions && activeMediaHistoryKey ? (
+            <Button
+              variant="default"
+              size="xs"
+              onClick={() => void openVersionHistoryDrawer(activeMediaHistoryKey)}
+            >
+              Version history
+            </Button>
+          ) : null
+        }
         renderDetails={() =>
-          selectedEntry ? (
+          activeMediaItem ? (
             <Stack gap="xs">
-              {selectedMissingThumbnailInfo ? (
+              {activeMediaMissingThumbnailInfo ? (
                 <Stack gap="xs">
                   <Alert
-                    color={selectedMissingThumbnailInfo.color}
-                    title={selectedMissingThumbnailInfo.title}
+                    color={activeMediaMissingThumbnailInfo.color}
+                    title={activeMediaMissingThumbnailInfo.title}
                   >
-                    {selectedMissingThumbnailInfo.detail}
+                    {activeMediaMissingThumbnailInfo.detail}
                   </Alert>
-                  {canRetrySelectedPoster ? (
+                  {versionPreviewIndex === null && canRetrySelectedPoster ? (
                     <Button
                       leftSection={<IconRefresh size={16} />}
                       loading={retryingSelectedMedia}
@@ -1416,11 +1698,13 @@ export function GallerySurface({
                   ) : null}
                 </Stack>
               ) : null}
-              {selectedMediaRetryError ? <Alert color="red">{selectedMediaRetryError}</Alert> : null}
-              {selectedMediaError && selectedMediaError !== selectedMissingThumbnailInfo?.detail ? (
-                <Alert color="yellow">{selectedMediaError}</Alert>
+              {versionPreviewIndex === null && selectedMediaRetryError ? (
+                <Alert color="red">{selectedMediaRetryError}</Alert>
               ) : null}
-              <JsonBlock value={selectedEntry} />
+              {activeMediaError && activeMediaError !== activeMediaMissingThumbnailInfo?.detail ? (
+                <Alert color="yellow">{activeMediaError}</Alert>
+              ) : null}
+              <JsonBlock value={versionPreviewIndex === null ? selectedEntry : activeVersionEntry} />
             </Stack>
           ) : null
         }
@@ -2858,10 +3142,68 @@ function galleryMediaKind(entry: GalleryEntry): GalleryMediaKind | null {
   return buildGalleryLightboxItemKind(entry.path, entry.media?.media_type, entry.media?.mime_type);
 }
 
+function GalleryVersionThumbnailCell({
+  item,
+  label,
+  onClick
+}: {
+  item: MediaLightboxItem | null;
+  label: string;
+  onClick?: () => void;
+}) {
+  const content = item ? (
+    <MediaThumbnailPreview
+      kind={item.kind}
+      request={item.requests.thumbnail ?? null}
+      alt={label}
+      missingThumbnailInfo={item.missingThumbnailInfo}
+    />
+  ) : (
+    <Text size="xs" c="dimmed">
+      —
+    </Text>
+  );
+
+  const sharedStyle = {
+    width: 52,
+    height: 52,
+    borderRadius: 8,
+    overflow: "hidden",
+    background: "var(--mantine-color-gray-0)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center"
+  } as const;
+
+  if (!item || !onClick) {
+    return <div style={sharedStyle}>{content}</div>;
+  }
+
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      onClick={onClick}
+      style={{
+        ...sharedStyle,
+        padding: 0,
+        border: 0,
+        cursor: "pointer"
+      }}
+    >
+      {content}
+    </button>
+  );
+}
+
 function buildGalleryLightboxItem(
   entry: GalleryEntry | null,
   snapshotId: string | null,
-  getMediaRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryMediaRequests
+  getMediaRequests: (
+    entry: GalleryEntry,
+    snapshotId: string | null,
+    versionId?: string | null
+  ) => GalleryMediaRequests
 ): MediaLightboxItem | null {
   if (!entry) {
     return null;
@@ -2885,6 +3227,51 @@ function buildGalleryLightboxItem(
     width: entry.media?.width ?? null,
     height: entry.media?.height ?? null,
     takenAtUnix: entry.media?.taken_at_unix ?? null
+  };
+}
+
+function buildGalleryVersionLightboxItem(
+  version: GalleryVersionEntry,
+  sourceKey: string,
+  getMediaRequests: (
+    entry: GalleryEntry,
+    snapshotId: string | null,
+    versionId?: string | null
+  ) => GalleryMediaRequests
+): MediaLightboxItem | null {
+  if (!sourceKey) {
+    return null;
+  }
+
+  const previewEntry = buildGalleryVersionPreviewEntry(version, sourceKey);
+  const kind = galleryMediaKind(previewEntry);
+  if (!kind) {
+    return null;
+  }
+
+  return {
+    key: version.version_id,
+    title: version.version_id,
+    description: sourceKey,
+    alt: `${sourceKey} ${version.version_id}`,
+    kind,
+    requests: getMediaRequests(previewEntry, null, version.version_id),
+    missingThumbnailInfo: galleryMissingThumbnailInfo(previewEntry),
+    status: previewEntry.media?.status ?? null,
+    mimeType: previewEntry.media?.mime_type ?? null,
+    width: previewEntry.media?.width ?? null,
+    height: previewEntry.media?.height ?? null,
+    takenAtUnix:
+      previewEntry.media?.taken_at_unix ?? version.modified_at_unix ?? version.created_at_unix ?? null
+  };
+}
+
+function buildGalleryVersionPreviewEntry(version: GalleryVersionEntry, sourceKey: string): GalleryEntry {
+  return {
+    path: sourceKey,
+    entry_type: normalizeGalleryVersionType(version),
+    version: version.version_id,
+    media: version.media ?? null
   };
 }
 
@@ -2917,6 +3304,41 @@ function buildGalleryLightboxItemKind(
     return "video";
   }
   return null;
+}
+
+function normalizeGalleryVersionType(version: GalleryVersionEntry): string {
+  if (typeof version.entry_type === "string" && version.entry_type.trim()) {
+    return version.entry_type.trim();
+  }
+
+  return "key";
+}
+
+function formatGalleryVersionModifiedAt(value: number | null | undefined): string {
+  if (!value) {
+    return "—";
+  }
+
+  return new Date(value * 1000).toLocaleString();
+}
+
+function formatGalleryVersionSize(value: number | null | undefined): string {
+  if (value === null || value === undefined) {
+    return "—";
+  }
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const rounded = size >= 10 ? size.toFixed(0) : size.toFixed(1);
+  return `${rounded} ${units[unitIndex]}`;
 }
 
 function isGalleryPrefixEntry(entry: GalleryEntry): boolean {

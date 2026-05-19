@@ -1,6 +1,8 @@
 import {
+  getAdminVersionGraph,
   listAdminSnapshots,
   listAdminStoreEntries,
+  restoreAdminStoreVersion,
   retryAdminMediaCacheEntry
 } from "@ironmesh/api";
 import {
@@ -74,10 +76,18 @@ export function GalleryPage() {
     ) => listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride, options),
     [adminTokenOverride]
   );
+  const loadVersions = useCallback(
+    (key: string) => getAdminVersionGraph(key, adminTokenOverride),
+    [adminTokenOverride]
+  );
   const getMediaRequests = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null): GalleryMediaRequests => {
+    (
+      entry: GalleryEntry,
+      snapshotId: string | null,
+      versionId?: string | null
+    ): GalleryMediaRequests => {
       const original = {
-        url: adminBinaryObjectUrl(entry.path, snapshotId),
+        url: adminBinaryObjectUrl(entry.path, snapshotId, versionId),
         headers: previewHeaders
       };
 
@@ -111,15 +121,26 @@ export function GalleryPage() {
       loadSnapshots={loadSnapshots}
       loadEntries={loadEntries}
       getMediaRequests={getMediaRequests}
+      loadVersions={loadVersions}
+      restoreVersion={(key, versionId, targetPath) =>
+        restoreAdminStoreVersion(key, versionId, targetPath, adminTokenOverride)
+      }
       retryMediaEntry={retryMediaEntry}
     />
   );
 }
 
-function adminBinaryObjectUrl(key: string, snapshotId: string | null): string {
+function adminBinaryObjectUrl(
+  key: string,
+  snapshotId: string | null,
+  versionId?: string | null
+): string {
   const query = new URLSearchParams();
   if (snapshotId) {
     query.set("snapshot", snapshotId);
+  }
+  if (versionId?.trim()) {
+    query.set("version", versionId.trim());
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return `/api/v1/auth/store/${encodeURIComponent(key)}${suffix}`;

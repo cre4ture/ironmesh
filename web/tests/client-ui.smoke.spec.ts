@@ -122,11 +122,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(
     page.getByRole("button", { name: "gallery/cat.png version-cat-001", exact: true })
   ).toHaveAttribute("aria-current", "true");
+  await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Next item" }).click();
   await expect(
     page.getByRole("button", { name: "gallery/cat.png version-cat-000", exact: true })
   ).toHaveAttribute("aria-current", "true");
-  await page.keyboard.press("Escape");
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
   await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
@@ -134,14 +134,22 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     "aria-current",
     "true"
   );
-  await expect(page.getByRole("button", { name: "Start slideshow" })).toBeVisible();
-  await page.getByRole("button", { name: "Start slideshow" }).click();
+  const mediaViewerDialog = page
+    .getByRole("dialog")
+    .filter({ has: page.getByLabel("Media viewer thumbnails") });
+  await expect(mediaViewerDialog.getByRole("button", { name: "Version history" })).toBeVisible();
+  await mediaViewerDialog.getByRole("button", { name: "Version history" }).click();
+  await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
+  await page.keyboard.press("Escape");
+  await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
+  await expect(mediaViewerDialog.getByRole("button", { name: "Start slideshow" })).toBeVisible();
+  await mediaViewerDialog.getByRole("button", { name: "Start slideshow" }).click();
   await expect(page.getByLabel("Media viewer thumbnails")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Next item" })).toHaveCount(0);
   await page.keyboard.press("ArrowRight");
   await page.keyboard.press("Escape");
   await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start slideshow" })).toBeVisible();
+  await expect(mediaViewerDialog.getByRole("button", { name: "Start slideshow" })).toBeVisible();
   await expect(page.getByRole("button", { name: "gallery/clip.mp4", exact: true })).toHaveAttribute(
     "aria-current",
     "true"
@@ -205,6 +213,41 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await thumbnailsPerRowInput.fill("8");
   await thumbnailsPerRowInput.blur();
   await expect(thumbnailsPerRowInput).toHaveValue("8");
+  await page.getByText("cat.png", { exact: true }).click();
+  const galleryDialog = page
+    .getByRole("dialog")
+    .filter({ has: page.getByLabel("Media viewer thumbnails") });
+  await expect(galleryDialog.getByRole("button", { name: "Version history" })).toBeVisible();
+  await galleryDialog.getByRole("button", { name: "Version history" }).click();
+  await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
+  page.once("dialog", (dialog) => {
+    void dialog.accept("gallery/restored-cat-from-gallery.png");
+  });
+  await page
+    .getByRole("row", { name: /version-cat-000/ })
+    .getByRole("button", { name: "Restore" })
+    .click();
+  await expect
+    .poll(() =>
+      uploadMetrics.restoredVersions().some(
+        (entry) =>
+          entry.key === "gallery/cat.png" &&
+          entry.versionId === "version-cat-000" &&
+          entry.targetPath === "gallery/restored-cat-from-gallery.png"
+      )
+    )
+    .toBe(true);
+  await expect(page.getByText('Restored version "version-cat-000" to "gallery/restored-cat-from-gallery.png".')).toBeVisible();
+  const galleryVersionThumbnail = page.getByRole("button", {
+    name: "Thumbnail for version version-cat-001"
+  });
+  await expect(galleryVersionThumbnail).toBeVisible();
+  await galleryVersionThumbnail.click();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("button", { name: "gallery/cat.png version-cat-001", exact: true })
+  ).toHaveAttribute("aria-current", "true");
+  await page.keyboard.press("Escape");
   await page.getByText("clip.mp4", { exact: true }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.locator("video")).toBeVisible();
