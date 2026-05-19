@@ -32,6 +32,10 @@ type GalleryBasemapMarkerPoint = ClusterableScreenPoint<GalleryBasemapMapEntry> 
   longitude: number;
 };
 
+type GalleryBasemapOcclusionTransform = {
+  isLocationOccluded?: (location: maplibregl.LngLat) => boolean;
+};
+
 type GalleryBasemapMapEntry = {
   path: string;
   entry_type: string;
@@ -448,63 +452,39 @@ export function GalleryBasemapMap({
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;
   const mapHeight = map?.getContainer().clientHeight ?? 0;
-  const visibleSelectionPaths = useMemo(
+  const projectedMarkerPoints = useMemo(
     () =>
       mapReady && map
         ? entries.flatMap((entry) => {
-            const gps = entry.media?.gps;
-            if (!gps) {
-              return [];
-            }
-
-            const projected = map.project([gps.longitude, gps.latitude]);
-            if (
-              projected.x < 0 ||
-              projected.y < 0 ||
-              projected.x > mapWidth ||
-              projected.y > mapHeight
-            ) {
-              return [];
-            }
-
-            return [entry.path];
+            const projectedPoint = projectVisibleBasemapMarkerPoint(map, entry);
+            return projectedPoint ? [projectedPoint] : [];
           })
+        : [],
+    [entries, map, mapReady, viewportVersion]
+  );
+  const visibleSelectionPaths = useMemo(
+    () =>
+      mapReady && map
+        ? projectedMarkerPoints.flatMap((point) =>
+            point.x < 0 || point.y < 0 || point.x > mapWidth || point.y > mapHeight
+              ? []
+              : [point.item.path]
+          )
         : entries.map((entry) => entry.path),
-    [entries, map, mapHeight, mapReady, mapWidth, viewportVersion]
+    [entries, map, mapHeight, mapReady, mapWidth, projectedMarkerPoints]
   );
   const visibleMarkerPoints = useMemo(
     () =>
       mapReady && map
-        ? entries.flatMap((entry) => {
-            const gps = entry.media?.gps;
-            if (!gps) {
-              return [];
-            }
-
-            const projected = map.project([gps.longitude, gps.latitude]);
-            if (
-              projected.x < -MAP_MARKER_VIEWPORT_PADDING ||
-              projected.y < -MAP_MARKER_VIEWPORT_PADDING ||
-              projected.x > mapWidth + MAP_MARKER_VIEWPORT_PADDING ||
-              projected.y > mapHeight + MAP_MARKER_VIEWPORT_PADDING
-            ) {
-              return [];
-            }
-
-            return [
-              {
-                id: entry.path,
-                entry,
-                item: entry,
-                latitude: gps.latitude,
-                longitude: gps.longitude,
-                x: projected.x,
-                y: projected.y
-              }
-            ];
-          })
+        ? projectedMarkerPoints.filter(
+            (point) =>
+              point.x >= -MAP_MARKER_VIEWPORT_PADDING &&
+              point.y >= -MAP_MARKER_VIEWPORT_PADDING &&
+              point.x <= mapWidth + MAP_MARKER_VIEWPORT_PADDING &&
+              point.y <= mapHeight + MAP_MARKER_VIEWPORT_PADDING
+          )
         : [],
-    [entries, map, mapHeight, mapReady, mapWidth, viewportVersion]
+    [map, mapHeight, mapReady, mapWidth, projectedMarkerPoints]
   );
   const markerClusterRadius = map
     ? resolveBasemapMarkerClusterRadius(map.getZoom())
@@ -931,6 +911,37 @@ function basemapClusterHasGeoSpread(points: GalleryBasemapMarkerPoint[]): boolea
     maxLatitude - minLatitude > BASEMAP_CLUSTER_GEO_EPSILON ||
     maxLongitude - minLongitude > BASEMAP_CLUSTER_GEO_EPSILON
   );
+}
+
+function projectVisibleBasemapMarkerPoint(
+  map: maplibregl.Map,
+  entry: GalleryBasemapMapEntry
+): GalleryBasemapMarkerPoint | null {
+  const gps = entry.media?.gps;
+  if (!gps || isBasemapLocationOccluded(map, gps.longitude, gps.latitude)) {
+    return null;
+  }
+
+  const projected = map.project([gps.longitude, gps.latitude]);
+  return {
+    id: entry.path,
+    item: entry,
+    latitude: gps.latitude,
+    longitude: gps.longitude,
+    x: projected.x,
+    y: projected.y
+  };
+}
+
+function isBasemapLocationOccluded(
+  map: maplibregl.Map,
+  longitude: number,
+  latitude: number
+): boolean {
+  // Match MapLibre Marker's globe occlusion behavior by using the same internal transform hook.
+  const transform = (map as maplibregl.Map & { transform?: GalleryBasemapOcclusionTransform })
+    .transform;
+  return transform?.isLocationOccluded?.(new maplibregl.LngLat(longitude, latitude)) ?? false;
 }
 
 function formatClusterCount(count: number): string {
