@@ -126,6 +126,9 @@ export function MediaLightboxModal({
   const [isSlideshowMode, setIsSlideshowMode] = useState(false);
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
+  const selectedItemPreviewSignature = selectedItem
+    ? mediaPreviewRequestSignature(selectedItem.requests.original)
+    : "";
   const stripIndexes = useMemo(
     () => buildLightboxStripIndexes(selectedIndex, itemCount, LIGHTBOX_STRIP_RADIUS),
     [itemCount, selectedIndex]
@@ -212,6 +215,7 @@ export function MediaLightboxModal({
           >
             {selectedItem.kind === "video" ? (
               <MediaLightboxVideo
+                key={`video:${selectedItem.key}:${selectedItemPreviewSignature}`}
                 item={selectedItem}
                 mediaOnly={isSlideshowMode}
                 canNavigatePrevious={canNavigatePrevious}
@@ -221,6 +225,7 @@ export function MediaLightboxModal({
               />
             ) : (
               <MediaLightboxImage
+                key={`image:${selectedItem.key}:${selectedItemPreviewSignature}`}
                 item={selectedItem}
                 mediaOnly={isSlideshowMode}
                 canNavigatePrevious={canNavigatePrevious}
@@ -725,6 +730,7 @@ function MediaLightboxImage({
       >
         {thumbnailVisible ? (
           <img
+            key={thumbnailSignature}
             src={thumbnail.resolvedSrc ?? undefined}
             alt={item.alt}
             loading="eager"
@@ -769,6 +775,7 @@ function MediaLightboxImage({
 
         {originalVisible ? (
           <img
+            key={originalSignature}
             src={original.resolvedSrc ?? undefined}
             alt={item.alt}
             loading="eager"
