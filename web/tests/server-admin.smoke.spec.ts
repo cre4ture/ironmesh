@@ -523,7 +523,7 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
     page.getByRole("dialog").getByText("12 items in map cluster", { exact: true })
   ).toHaveCount(0);
   await expect(
-    page.getByRole("dialog").getByText("gallery/cluster-03.png", { exact: true })
+    page.getByRole("dialog").getByRole("button", { name: "gallery/cluster-03.png", exact: true })
   ).toBeVisible();
 });
 

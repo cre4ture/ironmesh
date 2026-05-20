@@ -211,7 +211,8 @@ impl ManagedInstanceStore {
 
     pub fn remove_client_cli(&mut self, id: &str) -> bool {
         let initial_len = self.client_cli_instances.len();
-        self.client_cli_instances.retain(|candidate| candidate.id != id);
+        self.client_cli_instances
+            .retain(|candidate| candidate.id != id);
         initial_len != self.client_cli_instances.len()
     }
 
@@ -638,10 +639,17 @@ impl ClientCliInstance {
         if self.label.trim().is_empty() {
             bail!("client-cli instance label must not be empty");
         }
-        if let Some(bind) = self.bind.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        if let Some(bind) = self
+            .bind
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
         {
             bind.parse::<SocketAddr>().with_context(|| {
-                format!("client-cli bind address '{}' must be a valid host:port", bind)
+                format!(
+                    "client-cli bind address '{}' must be a valid host:port",
+                    bind
+                )
             })?;
         }
         Ok(())
@@ -979,7 +987,10 @@ pub fn launch_os_integration_instance(
     }
 }
 
-pub fn launch_client_cli_instance(instance: &ClientCliInstance, package_root: &Path) -> LaunchOutcome {
+pub fn launch_client_cli_instance(
+    instance: &ClientCliInstance,
+    package_root: &Path,
+) -> LaunchOutcome {
     spawn_instance(
         "client-cli",
         &instance.id,
@@ -1727,11 +1738,11 @@ mod tests {
         let loaded = ManagedInstanceStore::load_or_default(&path).expect("store should load");
 
         assert_eq!(loaded.version, MANAGED_INSTANCE_STORE_VERSION);
-    assert_eq!(loaded.client_cli_instances.len(), 1);
+        assert_eq!(loaded.client_cli_instances.len(), 1);
         assert_eq!(loaded.os_integration_instances.len(), 1);
         assert!(loaded.folder_agent_instances.is_empty());
-    assert_eq!(loaded.client_cli_instances[0].id, "client-1");
-    assert_eq!(loaded.client_cli_instances[0].label, "Client UI");
+        assert_eq!(loaded.client_cli_instances[0].id, "client-1");
+        assert_eq!(loaded.client_cli_instances[0].label, "Client UI");
         assert_eq!(loaded.os_integration_instances[0].id, "os-1");
         assert_eq!(loaded.os_integration_instances[0].label, "Docs");
 

@@ -390,11 +390,11 @@ test("client-ui gallery grid keeps multiple columns on narrow viewports", async 
   const galleryGrid = page
     .locator('[data-gallery-grid="true"]')
     .filter({ has: page.locator('[data-gallery-card="true"]') })
-    .first();
+    .last();
   await expect(galleryGrid).toBeVisible();
   await expect
     .poll(async () =>
-      page.locator('[data-gallery-card="true"]').evaluateAll((nodes) => {
+      galleryGrid.locator('[data-gallery-card="true"]').evaluateAll((nodes) => {
         if (nodes.length === 0) {
           return 0;
         }

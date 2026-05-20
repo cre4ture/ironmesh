@@ -15,17 +15,16 @@ use client_sdk::enroll_connection_input_blocking;
 #[cfg(windows)]
 use desktop_client_config::default_desktop_status_file_path;
 use desktop_client_config::{
-  ClientCliInstance, ClientIdentityConfig, CONFIG_APP_EXE, DESKTOP_CLIENT_CONFIG_REVISION,
-  DESKTOP_CLIENT_CONFIG_VERSION, FolderAgentInstance, LaunchOutcome, LaunchReport,
-  ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance,
-  PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE,
-  STARTUP_INTEGRATION_VALUE, ServiceRuntimeStatus, StopOutcome,
-  default_instance_store_path, default_launch_report_path, default_service_log_dir,
-  generate_instance_id, launch_client_cli_instance, launch_enabled_instances,
-  launch_folder_agent_instance, launch_os_integration_instance,
-  launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
-  package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
-  service_runtime_statuses, stop_service_from_report,
+    CONFIG_APP_EXE, ClientCliInstance, ClientIdentityConfig, DESKTOP_CLIENT_CONFIG_REVISION,
+    DESKTOP_CLIENT_CONFIG_VERSION, FolderAgentInstance, LaunchOutcome, LaunchReport,
+    ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance,
+    PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
+    ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
+    default_service_log_dir, generate_instance_id, launch_client_cli_instance,
+    launch_enabled_instances, launch_folder_agent_instance, launch_os_integration_instance,
+    launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
+    package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
+    service_runtime_statuses, stop_service_from_report,
 };
 use desktop_status::{
     DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
@@ -70,11 +69,11 @@ enum Command {
         #[command(subcommand)]
         command: GnomeCommand,
     },
-  #[command(hide = true)]
-  Internal {
-    #[command(subcommand)]
-    command: InternalCommand,
-  },
+    #[command(hide = true)]
+    Internal {
+        #[command(subcommand)]
+        command: InternalCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,22 +86,22 @@ enum GnomeCommand {
 
 #[derive(Debug, Subcommand)]
 enum InternalCommand {
-  #[command(name = "wait-and-relaunch-background", hide = true)]
-  WaitAndRelaunchBackground(WaitAndRelaunchBackgroundArgs),
+    #[command(name = "wait-and-relaunch-background", hide = true)]
+    WaitAndRelaunchBackground(WaitAndRelaunchBackgroundArgs),
 }
 
 #[derive(Debug, Clone, Args)]
 struct WaitAndRelaunchBackgroundArgs {
-  #[arg(long)]
-  wait_for_pid: u32,
-  #[arg(long)]
-  bind: String,
-  #[arg(long, default_value_t = false)]
-  no_desktop_status: bool,
-  #[arg(long)]
-  desktop_status_file: Option<PathBuf>,
-  #[arg(long, default_value_t = 30_000)]
-  timeout_ms: u64,
+    #[arg(long)]
+    wait_for_pid: u32,
+    #[arg(long)]
+    bind: String,
+    #[arg(long, default_value_t = false)]
+    no_desktop_status: bool,
+    #[arg(long)]
+    desktop_status_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
 }
 
 #[derive(Clone)]
@@ -116,44 +115,44 @@ struct AppState {
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct BackgroundRestartConfig {
-  bind: String,
-  no_desktop_status: bool,
-  desktop_status_file: Option<PathBuf>,
+    bind: String,
+    no_desktop_status: bool,
+    desktop_status_file: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 impl BackgroundRestartConfig {
-  fn from_cli(cli: &Cli) -> Self {
-    Self {
-      bind: cli.bind.clone(),
-      no_desktop_status: cli.no_desktop_status,
-      desktop_status_file: cli.desktop_status_file.clone(),
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            bind: cli.bind.clone(),
+            no_desktop_status: cli.no_desktop_status,
+            desktop_status_file: cli.desktop_status_file.clone(),
+        }
     }
-  }
 
-  fn command_args(&self) -> Vec<String> {
-    let mut args = vec![
-      "--bind".to_string(),
-      self.bind.clone(),
-      "--background".to_string(),
-      "--skip-initial-service-launch".to_string(),
-    ];
-    if self.no_desktop_status {
-      args.push("--no-desktop-status".to_string());
+    fn command_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "--bind".to_string(),
+            self.bind.clone(),
+            "--background".to_string(),
+            "--skip-initial-service-launch".to_string(),
+        ];
+        if self.no_desktop_status {
+            args.push("--no-desktop-status".to_string());
+        }
+        if let Some(path) = self.desktop_status_file.as_ref() {
+            args.push("--desktop-status-file".to_string());
+            args.push(path.display().to_string());
+        }
+        args
     }
-    if let Some(path) = self.desktop_status_file.as_ref() {
-      args.push("--desktop-status-file".to_string());
-      args.push(path.display().to_string());
-    }
-    args
-  }
 }
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ExecutableIdentity {
-  device_id: u64,
-  inode: u64,
+    device_id: u64,
+    inode: u64,
 }
 
 struct ServiceStatusTelemetry {
@@ -437,57 +436,57 @@ impl UpsertFolderAgentInstanceRequest {
     }
 }
 
-    #[derive(Debug, Deserialize)]
-    struct UpsertClientCliInstanceRequest {
-      id: Option<String>,
-      label: String,
-      #[serde(default = "default_enabled")]
-      enabled: bool,
-      bind: Option<String>,
-      server_base_url: Option<String>,
-      bootstrap_file: Option<String>,
-      #[serde(default)]
-      client_identity_id: Option<String>,
-      client_identity_file: Option<String>,
-      server_ca_pem_file: Option<String>,
-    }
+#[derive(Debug, Deserialize)]
+struct UpsertClientCliInstanceRequest {
+    id: Option<String>,
+    label: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    bind: Option<String>,
+    server_base_url: Option<String>,
+    bootstrap_file: Option<String>,
+    #[serde(default)]
+    client_identity_id: Option<String>,
+    client_identity_file: Option<String>,
+    server_ca_pem_file: Option<String>,
+}
 
-    impl UpsertClientCliInstanceRequest {
-      fn into_instance(self, store: &ManagedInstanceStore) -> Result<ClientCliInstance, ApiError> {
+impl UpsertClientCliInstanceRequest {
+    fn into_instance(self, store: &ManagedInstanceStore) -> Result<ClientCliInstance, ApiError> {
         let client_identity_id = normalize_optional_string(self.client_identity_id);
         let managed_identity = resolve_client_identity(store, client_identity_id.as_deref())?;
         let bootstrap_file = managed_identity
-          .map(|identity| identity.bootstrap_file.clone())
-          .or_else(|| normalize_optional_string(self.bootstrap_file));
+            .map(|identity| identity.bootstrap_file.clone())
+            .or_else(|| normalize_optional_string(self.bootstrap_file));
         let server_base_url = if managed_identity.is_some() {
-          None
+            None
         } else {
-          normalize_optional_string(self.server_base_url)
+            normalize_optional_string(self.server_base_url)
         };
         let client_identity_file = managed_identity
-          .map(|identity| identity.client_identity_file.clone())
-          .or_else(|| normalize_optional_string(self.client_identity_file));
+            .map(|identity| identity.client_identity_file.clone())
+            .or_else(|| normalize_optional_string(self.client_identity_file));
         let server_ca_pem_file = managed_identity
-          .and_then(|identity| identity.server_ca_pem_file.clone())
-          .or_else(|| normalize_optional_string(self.server_ca_pem_file));
+            .and_then(|identity| identity.server_ca_pem_file.clone())
+            .or_else(|| normalize_optional_string(self.server_ca_pem_file));
         let instance = ClientCliInstance {
-          id: normalize_optional_string(self.id)
-            .unwrap_or_else(|| generate_instance_id("client-cli")),
-          label: required_field("client service label", self.label)?,
-          enabled: self.enabled,
-          bind: normalize_optional_string(self.bind),
-          server_base_url,
-          bootstrap_file,
-          server_ca_pem_file,
-          client_identity_id,
-          client_identity_file,
+            id: normalize_optional_string(self.id)
+                .unwrap_or_else(|| generate_instance_id("client-cli")),
+            label: required_field("client service label", self.label)?,
+            enabled: self.enabled,
+            bind: normalize_optional_string(self.bind),
+            server_base_url,
+            bootstrap_file,
+            server_ca_pem_file,
+            client_identity_id,
+            client_identity_file,
         };
         instance
-          .validate()
-          .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            .validate()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
         Ok(instance)
-      }
     }
+}
 
 #[derive(Debug)]
 struct ApiError {
@@ -550,7 +549,10 @@ async fn main() -> Result<()> {
         .route("/app.js", get(app_js))
         .route("/api/config", get(get_config))
         .route("/api/client-identities", post(upsert_client_identity))
-        .route("/api/client-cli-instances", post(upsert_client_cli_instance))
+        .route(
+            "/api/client-cli-instances",
+            post(upsert_client_cli_instance),
+        )
         .route(
             "/api/os-integration-instances",
             post(upsert_os_integration_instance),
@@ -572,8 +574,8 @@ async fn main() -> Result<()> {
             delete(delete_client_identity),
         )
         .route(
-          "/api/client-cli-instances/{id}",
-          delete(delete_client_cli_instance),
+            "/api/client-cli-instances/{id}",
+            delete(delete_client_cli_instance),
         )
         .route(
             "/api/services/{kind}/{id}/start",
@@ -654,23 +656,23 @@ async fn main() -> Result<()> {
 fn run_command(cli: &Cli, command: &Command) -> Result<()> {
     match command {
         Command::Gnome { command } => run_gnome_command(cli, command),
-    Command::Internal { command } => run_internal_command(command),
+        Command::Internal { command } => run_internal_command(command),
     }
 }
 
 fn run_internal_command(command: &InternalCommand) -> Result<()> {
-  #[cfg(not(target_os = "linux"))]
-  {
-    let _ = command;
-    bail!("internal handoff commands are only supported on Linux")
-  }
-
-  #[cfg(target_os = "linux")]
-  {
-    match command {
-      InternalCommand::WaitAndRelaunchBackground(args) => wait_and_relaunch_background(args),
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+        bail!("internal handoff commands are only supported on Linux")
     }
-  }
+
+    #[cfg(target_os = "linux")]
+    {
+        match command {
+            InternalCommand::WaitAndRelaunchBackground(args) => wait_and_relaunch_background(args),
+        }
+    }
 }
 
 fn run_gnome_command(cli: &Cli, command: &GnomeCommand) -> Result<()> {
@@ -699,70 +701,70 @@ fn run_gnome_command(cli: &Cli, command: &GnomeCommand) -> Result<()> {
     }
 }
 
-    #[cfg(target_os = "linux")]
-    fn wait_and_relaunch_background(args: &WaitAndRelaunchBackgroundArgs) -> Result<()> {
-      wait_for_pid_exit(args.wait_for_pid, Duration::from_millis(args.timeout_ms))?;
-      let restart_config = BackgroundRestartConfig {
+#[cfg(target_os = "linux")]
+fn wait_and_relaunch_background(args: &WaitAndRelaunchBackgroundArgs) -> Result<()> {
+    wait_for_pid_exit(args.wait_for_pid, Duration::from_millis(args.timeout_ms))?;
+    let restart_config = BackgroundRestartConfig {
         bind: args.bind.clone(),
         no_desktop_status: args.no_desktop_status,
         desktop_status_file: args.desktop_status_file.clone(),
-      };
-      let package_root = package_root_from_current_exe()?;
-      spawn_background_config_app_process(
+    };
+    let package_root = package_root_from_current_exe()?;
+    spawn_background_config_app_process(
         &package_root.join(CONFIG_APP_EXE),
         &restart_config.command_args(),
-      )
-    }
+    )
+}
 
-    #[cfg(target_os = "linux")]
-    fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
-      let started_at = std::time::Instant::now();
-      while started_at.elapsed() < timeout {
+#[cfg(target_os = "linux")]
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let started_at = std::time::Instant::now();
+    while started_at.elapsed() < timeout {
         if !linux_process_exists(pid) {
-          return Ok(());
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
-      }
-      if linux_process_exists(pid) {
+    }
+    if linux_process_exists(pid) {
         bail!("process {pid} did not exit within {:?}", timeout);
-      }
-      Ok(())
     }
+    Ok(())
+}
 
-    #[cfg(target_os = "linux")]
-    fn linux_process_exists(pid: u32) -> bool {
-      Path::new("/proc").join(pid.to_string()).exists()
-    }
+#[cfg(target_os = "linux")]
+fn linux_process_exists(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
 
-    #[cfg(target_os = "linux")]
-    fn spawn_background_config_app_process(
-      executable_path: &Path,
-      command_args: &[String],
-    ) -> Result<()> {
-      let mut command = ProcessCommand::new(executable_path);
-      command
+#[cfg(target_os = "linux")]
+fn spawn_background_config_app_process(
+    executable_path: &Path,
+    command_args: &[String],
+) -> Result<()> {
+    let mut command = ProcessCommand::new(executable_path);
+    command
         .args(command_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-      let mut child = command.spawn().with_context(|| {
+    let mut child = command.spawn().with_context(|| {
         format!(
-          "failed spawning background config app {}",
-          executable_path.display()
+            "failed spawning background config app {}",
+            executable_path.display()
         )
-      })?;
-      std::thread::sleep(Duration::from_millis(500));
-      if let Some(status) = child.try_wait().with_context(|| {
+    })?;
+    std::thread::sleep(Duration::from_millis(500));
+    if let Some(status) = child.try_wait().with_context(|| {
         format!(
-          "failed checking background config app {}",
-          executable_path.display()
+            "failed checking background config app {}",
+            executable_path.display()
         )
-      })? {
+    })? {
         bail!("background config app exited immediately with {status}");
-      }
-      Ok(())
     }
+    Ok(())
+}
 
 fn resolve_desktop_status_file(cli: &Cli) -> Option<PathBuf> {
     if let Some(path) = cli.desktop_status_file.clone() {
@@ -862,16 +864,16 @@ fn merged_service_statuses(
     service_documents: &[ServiceStatusTelemetry],
 ) -> Vec<DesktopServiceStatus> {
     let mut services = Vec::new();
-  for instance in &store.client_cli_instances {
-    services.push(merged_service_status(
-      "client-cli",
-      &instance.id,
-      &instance.label,
-      instance.enabled,
-      runtime_statuses,
-      service_documents,
-    ));
-  }
+    for instance in &store.client_cli_instances {
+        services.push(merged_service_status(
+            "client-cli",
+            &instance.id,
+            &instance.label,
+            instance.enabled,
+            runtime_statuses,
+            service_documents,
+        ));
+    }
     for instance in &store.os_integration_instances {
         services.push(merged_service_status(
             "os-integration",
@@ -1260,21 +1262,21 @@ async fn upsert_client_identity(
     }))
 }
 
-    async fn upsert_client_cli_instance(
-      State(state): State<AppState>,
-      Json(request): Json<UpsertClientCliInstanceRequest>,
-    ) -> Result<Json<ConfigResponse>, ApiError> {
-      let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+async fn upsert_client_cli_instance(
+    State(state): State<AppState>,
+    Json(request): Json<UpsertClientCliInstanceRequest>,
+) -> Result<Json<ConfigResponse>, ApiError> {
+    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-      let instance = request.into_instance(&store)?;
-      store.upsert_client_cli(instance);
-      store
+    let instance = request.into_instance(&store)?;
+    store.upsert_client_cli(instance);
+    store
         .save(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-      Ok(Json(
+    Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
-      ))
-    }
+    ))
+}
 
 async fn upsert_os_integration_instance(
     State(state): State<AppState>,
@@ -1350,25 +1352,25 @@ async fn delete_os_integration_instance(
     ))
 }
 
-  async fn delete_client_cli_instance(
+async fn delete_client_cli_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
-  ) -> Result<Json<ConfigResponse>, ApiError> {
+) -> Result<Json<ConfigResponse>, ApiError> {
     let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
-      .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?;
     if !store.remove_client_cli(&id) {
-      return Err(ApiError::bad_request(format!(
-        "client-cli instance '{}' was not found",
-        id
-      )));
+        return Err(ApiError::bad_request(format!(
+            "client-cli instance '{}' was not found",
+            id
+        )));
     }
     store
-      .save(&state.instance_store_path)
-      .map_err(ApiError::internal)?;
+        .save(&state.instance_store_path)
+        .map_err(ApiError::internal)?;
     Ok(Json(
-      load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state).map_err(ApiError::internal)?,
     ))
-  }
+}
 
 async fn delete_folder_agent_instance(
     AxumPath(id): AxumPath<String>,
@@ -1502,16 +1504,16 @@ async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<Launch
 }
 
 async fn shutdown_app(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
-  request_shutdown(&state).await;
+    request_shutdown(&state).await;
 
     Ok(Json(json!({ "status": "shutting_down" })))
 }
 
 async fn request_shutdown(state: &AppState) {
-  let mut shutdown_tx = state.shutdown_tx.lock().await;
-  if let Some(sender) = shutdown_tx.take() {
-    let _ = sender.send(());
-  }
+    let mut shutdown_tx = state.shutdown_tx.lock().await;
+    if let Some(sender) = shutdown_tx.take() {
+        let _ = sender.send(());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1558,87 +1560,93 @@ fn spawn_linux_package_handoff_task(state: AppState, restart_config: BackgroundR
 
 #[cfg(target_os = "linux")]
 fn spawn_background_handoff_helper(
-  executable_path: &Path,
-  restart_config: &BackgroundRestartConfig,
-  wait_for_pid: u32,
+    executable_path: &Path,
+    restart_config: &BackgroundRestartConfig,
+    wait_for_pid: u32,
 ) -> Result<()> {
-  let mut args = vec![
-    "internal".to_string(),
-    "wait-and-relaunch-background".to_string(),
-    "--wait-for-pid".to_string(),
-    wait_for_pid.to_string(),
-    "--bind".to_string(),
-    restart_config.bind.clone(),
-  ];
-  if restart_config.no_desktop_status {
-    args.push("--no-desktop-status".to_string());
-  }
-  if let Some(path) = restart_config.desktop_status_file.as_ref() {
-    args.push("--desktop-status-file".to_string());
-    args.push(path.display().to_string());
-  }
-  args.push("--timeout-ms".to_string());
-  args.push("30000".to_string());
+    let mut args = vec![
+        "internal".to_string(),
+        "wait-and-relaunch-background".to_string(),
+        "--wait-for-pid".to_string(),
+        wait_for_pid.to_string(),
+        "--bind".to_string(),
+        restart_config.bind.clone(),
+    ];
+    if restart_config.no_desktop_status {
+        args.push("--no-desktop-status".to_string());
+    }
+    if let Some(path) = restart_config.desktop_status_file.as_ref() {
+        args.push("--desktop-status-file".to_string());
+        args.push(path.display().to_string());
+    }
+    args.push("--timeout-ms".to_string());
+    args.push("30000".to_string());
 
-  spawn_detached_process_checked(executable_path, &args, "background handoff helper")
+    spawn_detached_process_checked(executable_path, &args, "background handoff helper")
 }
 
 #[cfg(target_os = "linux")]
 fn process_executable_replaced(pid: u32, executable_path: &Path) -> Result<bool> {
-  if !linux_process_exists(pid) {
-    return Ok(false);
-  }
+    if !linux_process_exists(pid) {
+        return Ok(false);
+    }
 
-  let running_identity = match process_executable_identity(pid) {
-    Ok(identity) => identity,
-    Err(_error) if !linux_process_exists(pid) => return Ok(false),
-    Err(error) => return Err(error),
-  };
-  let packaged_identity = executable_identity_for_path(executable_path)?;
-  Ok(running_identity != packaged_identity)
+    let running_identity = match process_executable_identity(pid) {
+        Ok(identity) => identity,
+        Err(_error) if !linux_process_exists(pid) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let packaged_identity = executable_identity_for_path(executable_path)?;
+    Ok(running_identity != packaged_identity)
 }
 
 #[cfg(target_os = "linux")]
 fn process_executable_identity(pid: u32) -> Result<ExecutableIdentity> {
-  executable_identity_for_path(&Path::new("/proc").join(pid.to_string()).join("exe"))
-    .with_context(|| format!("failed reading executable metadata for pid {pid}"))
+    executable_identity_for_path(&Path::new("/proc").join(pid.to_string()).join("exe"))
+        .with_context(|| format!("failed reading executable metadata for pid {pid}"))
 }
 
 #[cfg(target_os = "linux")]
 fn executable_identity_for_path(path: &Path) -> Result<ExecutableIdentity> {
-  use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt;
 
-  let metadata = std::fs::metadata(path)
-    .with_context(|| format!("failed reading executable metadata {}", path.display()))?;
-  Ok(ExecutableIdentity {
-    device_id: metadata.dev(),
-    inode: metadata.ino(),
-  })
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed reading executable metadata {}", path.display()))?;
+    Ok(ExecutableIdentity {
+        device_id: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn spawn_detached_process_checked(
-  executable_path: &Path,
-  command_args: &[String],
-  process_label: &str,
+    executable_path: &Path,
+    command_args: &[String],
+    process_label: &str,
 ) -> Result<()> {
-  let mut command = ProcessCommand::new(executable_path);
-  command
-    .args(command_args)
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    let mut command = ProcessCommand::new(executable_path);
+    command
+        .args(command_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
-  let mut child = command.spawn().with_context(|| {
-    format!("failed spawning {process_label} {}", executable_path.display())
-  })?;
-  std::thread::sleep(Duration::from_millis(500));
-  if let Some(status) = child.try_wait().with_context(|| {
-    format!("failed checking {process_label} {}", executable_path.display())
-  })? {
-    bail!("{process_label} exited immediately with {status}");
-  }
-  Ok(())
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed spawning {process_label} {}",
+            executable_path.display()
+        )
+    })?;
+    std::thread::sleep(Duration::from_millis(500));
+    if let Some(status) = child.try_wait().with_context(|| {
+        format!(
+            "failed checking {process_label} {}",
+            executable_path.display()
+        )
+    })? {
+        bail!("{process_label} exited immediately with {status}");
+    }
+    Ok(())
 }
 
 fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
@@ -1665,7 +1673,7 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
 
 fn normalize_service_kind(kind: &str) -> Result<&'static str, ApiError> {
     match kind.trim() {
-    "client" | "client-cli" => Ok("client-cli"),
+        "client" | "client-cli" => Ok("client-cli"),
         "os" | "os-integration" => Ok("os-integration"),
         "folder" | "folder-agent" => Ok("folder-agent"),
         other => Err(ApiError::bad_request(format!(
@@ -1680,10 +1688,10 @@ fn ensure_service_instance_exists(
     id: &str,
 ) -> Result<(), ApiError> {
     let exists = match kind {
-    "client-cli" => store
-      .client_cli_instances
-      .iter()
-      .any(|candidate| candidate.id == id),
+        "client-cli" => store
+            .client_cli_instances
+            .iter()
+            .any(|candidate| candidate.id == id),
         "os-integration" => store
             .os_integration_instances
             .iter()
@@ -1710,12 +1718,12 @@ fn launch_configured_service(
     package_root: &Path,
 ) -> Result<LaunchOutcome, ApiError> {
     match kind {
-    "client-cli" => store
-      .client_cli_instances
-      .iter()
-      .find(|candidate| candidate.id == id)
-      .map(|instance| launch_client_cli_instance(instance, package_root))
-      .ok_or_else(|| ApiError::bad_request(format!("{kind} instance '{id}' was not found"))),
+        "client-cli" => store
+            .client_cli_instances
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .map(|instance| launch_client_cli_instance(instance, package_root))
+            .ok_or_else(|| ApiError::bad_request(format!("{kind} instance '{id}' was not found"))),
         "os-integration" => store
             .os_integration_instances
             .iter()
