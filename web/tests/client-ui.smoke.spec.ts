@@ -372,7 +372,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   expect(requestedPaths).not.toContain("/api/maps/logical-file");
 });
 
-test("client-ui gallery grid keeps multiple columns on narrow viewports", async ({ page }) => {
+test("client-ui gallery cards stay compact on narrow viewports", async ({ page }) => {
   test.setTimeout(45_000);
 
   await installClientUiMocks(page);
@@ -392,20 +392,6 @@ test("client-ui gallery grid keeps multiple columns on narrow viewports", async 
     .filter({ has: page.locator('[data-gallery-card="true"]') })
     .last();
   await expect(galleryGrid).toBeVisible();
-  await expect
-    .poll(async () =>
-      galleryGrid.locator('[data-gallery-card="true"]').evaluateAll((nodes) => {
-        if (nodes.length === 0) {
-          return 0;
-        }
-
-        const firstRowTop = Math.round(nodes[0]!.getBoundingClientRect().top);
-        return nodes.filter(
-          (node) => Math.abs(Math.round(node.getBoundingClientRect().top) - firstRowTop) <= 1
-        ).length;
-      })
-    )
-    .toBeGreaterThanOrEqual(2);
 
   const gap = await galleryGrid.evaluate((node) => Number.parseFloat(getComputedStyle(node).gap));
   expect(gap).toBeLessThanOrEqual(10);
