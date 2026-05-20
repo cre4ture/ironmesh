@@ -1,3 +1,16 @@
+ironmesh (1.0.15-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add admin explorer move, rename, and restore actions plus a right-side
+    gallery version-history drawer.
+  * Expand the fullscreen media viewer with slideshow mode, image zooming,
+    scoped map-opened navigation, and improved dense-cluster map behavior.
+  * Serve the CLI client web UI from the desktop config app, restart Linux
+    desktop client config automatically after upgrades, and ship an explicit
+    standalone rendezvous-service export package.
+  * Refresh smoke-test coverage and roll the workspace release to 1.0.15.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 20 May 2026 07:30:28 +0200
+
 ironmesh (1.0.14-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add per-item gallery poster retry, cluster dense gallery map markers,
