@@ -15,7 +15,28 @@ pub(crate) struct ReplicationRepairReport {
     pub(crate) skipped_max_retries: usize,
     #[serde(default)]
     pub(crate) skipped_details: Vec<ReplicationRepairSkippedItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) detailed_log: Vec<ReplicationRepairLogEntry>,
     pub(crate) last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReplicationRepairLogEntry {
+    pub(crate) report_node_id: NodeId,
+    pub(crate) event: String,
+    pub(crate) detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_node_id: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_node_id: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,6 +153,14 @@ pub(crate) async fn execute_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ReplicationRepairReport {
+    execute_replication_repair_inner_with_context(state, batch_size_override, None).await
+}
+
+pub(crate) async fn execute_replication_repair_inner_with_context(
+    state: &ServerState,
+    batch_size_override: Option<usize>,
+    run_id: Option<&str>,
+) -> ReplicationRepairReport {
     sync_availability_views_once(state).await;
     let keys = planning_replication_subjects(state).await;
 
@@ -141,13 +170,29 @@ pub(crate) async fn execute_replication_repair_inner(
         (cluster.replication_plan(&keys), cluster.list_nodes())
     };
 
-    execute_replication_repair_plan(state, plan, nodes, batch_size_override, false).await
+    execute_replication_repair_plan(state, plan, nodes, batch_size_override, false, run_id).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn execute_planned_targeted_replication_repair_inner(
     state: &ServerState,
     subjects: Vec<String>,
     batch_size_override: Option<usize>,
+) -> (ReplicationPlan, ReplicationRepairReport) {
+    execute_planned_targeted_replication_repair_inner_with_context(
+        state,
+        subjects,
+        batch_size_override,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn execute_planned_targeted_replication_repair_inner_with_context(
+    state: &ServerState,
+    subjects: Vec<String>,
+    batch_size_override: Option<usize>,
+    run_id: Option<&str>,
 ) -> (ReplicationPlan, ReplicationRepairReport) {
     let mut subjects = subjects
         .into_iter()
@@ -172,17 +217,39 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner(
                 .max(1),
         )
     });
-    let report =
-        execute_replication_repair_plan(state, plan.clone(), nodes, batch_size_override, false)
-            .await;
+    let report = execute_replication_repair_plan(
+        state,
+        plan.clone(),
+        nodes,
+        batch_size_override,
+        false,
+        run_id,
+    )
+    .await;
 
     (plan, report)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn execute_targeted_replication_repair_inner(
+    state: &ServerState,
+    subjects: Vec<String>,
+    batch_size_override: Option<usize>,
+) -> ReplicationRepairReport {
+    execute_targeted_replication_repair_inner_with_context(
+        state,
+        subjects,
+        batch_size_override,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
     state: &ServerState,
     mut subjects: Vec<String>,
     batch_size_override: Option<usize>,
+    run_id: Option<&str>,
 ) -> ReplicationRepairReport {
     let mut attempted_transfers = 0usize;
     let mut successful_transfers = 0usize;
@@ -191,6 +258,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
     let mut skipped_backoff = 0usize;
     let mut skipped_max_retries = 0usize;
     let mut skipped_details = Vec::new();
+    let mut detailed_log = Vec::new();
     let mut last_error = None;
     let mut repair_state_dirty = false;
     let mut local_availability_refresh_needed = false;
@@ -211,13 +279,69 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
     });
     subjects.dedup();
 
+    let repair_run_id = run_id.unwrap_or("untracked");
+    info!(
+        repair_run_id,
+        subject_count = subjects.len(),
+        max_transfers,
+        max_retries = max_attempts,
+        backoff_secs,
+        "targeted scrub repair run started"
+    );
+    push_repair_log_entry(
+        &mut detailed_log,
+        state.node_id,
+        "targeted_repair_started",
+        "starting targeted scrub repair run",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "subject_count": subjects.len(),
+            "max_transfers": max_transfers,
+            "max_retries": max_attempts,
+            "backoff_secs": backoff_secs,
+        })),
+    );
+
     for subject in subjects {
         if attempted_transfers >= max_transfers {
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "batch_limit_reached",
+                "stopping targeted scrub repair because the transfer batch limit was reached",
+                Some(subject.clone()),
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                Some(serde_json::json!({
+                    "attempted_transfers": attempted_transfers,
+                    "max_transfers": max_transfers,
+                })),
+            );
             break;
         }
 
         let Some((key, version_id)) = parse_replication_subject(&subject) else {
             skipped_items += 1;
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "subject_skipped",
+                "replication subject could not be parsed into key and version components",
+                Some(subject.clone()),
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                Some(serde_json::json!({
+                    "reason": "invalid_subject",
+                })),
+            );
             push_repair_skipped_detail(
                 &mut skipped_details,
                 state.node_id,
@@ -232,6 +356,19 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
             continue;
         };
 
+        push_repair_log_entry(
+            &mut detailed_log,
+            state.node_id,
+            "subject_selected",
+            "evaluating targeted scrub repair subject",
+            Some(subject.clone()),
+            Some(key.clone()),
+            version_id.clone(),
+            None,
+            Some(state.node_id),
+            None,
+        );
+
         let source_node = {
             let mut cluster = state.cluster.lock().await;
             cluster.update_health_and_detect_offline_transition();
@@ -243,6 +380,20 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
 
         let Some(source_node) = source_node else {
             skipped_items += 1;
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "subject_skipped",
+                "targeted scrub repair could not find a healthy online source node",
+                Some(subject.clone()),
+                Some(key.clone()),
+                version_id.clone(),
+                None,
+                Some(state.node_id),
+                Some(serde_json::json!({
+                    "reason": "source_node_unavailable",
+                })),
+            );
             push_repair_skipped_detail(
                 &mut skipped_details,
                 state.node_id,
@@ -263,6 +414,26 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
             if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                 if previous.attempts > max_attempts {
                     skipped_max_retries += 1;
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "subject_skipped",
+                        format!(
+                            "transfer skipped after {} failed attempts (max_retries={max_attempts})",
+                            previous.attempts
+                        ),
+                        Some(subject.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(source_node.node_id),
+                        Some(state.node_id),
+                        Some(serde_json::json!({
+                            "reason": "max_retries_exhausted",
+                            "failed_attempts": previous.attempts,
+                            "max_retries": max_attempts,
+                            "last_failure_unix": previous.last_failure_unix,
+                        })),
+                    );
                     push_repair_skipped_detail(
                         &mut skipped_details,
                         state.node_id,
@@ -285,6 +456,28 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                     jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
                 if elapsed < required_backoff {
                     skipped_backoff += 1;
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "subject_skipped",
+                        format!(
+                            "retry backoff active for another {}s after {} failed attempts",
+                            required_backoff.saturating_sub(elapsed),
+                            previous.attempts
+                        ),
+                        Some(subject.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(source_node.node_id),
+                        Some(state.node_id),
+                        Some(serde_json::json!({
+                            "reason": "backoff_active",
+                            "failed_attempts": previous.attempts,
+                            "last_failure_unix": previous.last_failure_unix,
+                            "elapsed_since_failure_secs": elapsed,
+                            "required_backoff_secs": required_backoff,
+                        })),
+                    );
                     push_repair_skipped_detail(
                         &mut skipped_details,
                         state.node_id,
@@ -308,6 +501,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
         await_repair_busy_threshold(state).await;
         attempted_transfers += 1;
         info!(
+            repair_run_id,
             subject = %subject,
             key = %key,
             version_id = ?version_id,
@@ -316,9 +510,39 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
             attempted_transfers,
             "targeted scrub repair starting local pull"
         );
+        push_repair_log_entry(
+            &mut detailed_log,
+            state.node_id,
+            "local_pull_started",
+            "starting targeted scrub repair local pull",
+            Some(subject.clone()),
+            Some(key.clone()),
+            version_id.clone(),
+            Some(source_node.node_id),
+            Some(state.node_id),
+            Some(serde_json::json!({
+                "attempted_transfers": attempted_transfers,
+            })),
+        );
 
-        match pull_bundle_from_source(&source_node, &key, version_id.as_deref(), state).await {
+        match pull_bundle_from_source(&source_node, &key, version_id.as_deref(), state, run_id)
+            .await
+        {
             Ok(imported_version_id) => {
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "local_verify_started",
+                    "starting targeted scrub repair post-pull verification",
+                    Some(subject.clone()),
+                    Some(key.clone()),
+                    version_id.clone(),
+                    Some(source_node.node_id),
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                        "imported_version_id": imported_version_id,
+                    })),
+                );
                 match verify_local_repair_subject(state, &subject).await {
                     Ok(()) => {
                         successful_transfers += 1;
@@ -331,6 +555,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                         local_availability_refresh_needed = true;
 
                         info!(
+                            repair_run_id,
                             subject = %subject,
                             key = %key,
                             version_id = ?version_id,
@@ -339,12 +564,27 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                             imported_version_id = %imported_version_id,
                             "targeted scrub repair completed local pull"
                         );
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "local_pull_completed",
+                            "targeted scrub repair local pull and verification completed",
+                            Some(subject.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(source_node.node_id),
+                            Some(state.node_id),
+                            Some(serde_json::json!({
+                                "imported_version_id": imported_version_id,
+                            })),
+                        );
                     }
                     Err(err) => {
                         let error_text = format!("{err:#}");
                         failed_transfers += 1;
                         last_error = Some(error_text.clone());
                         warn!(
+                            repair_run_id,
                             subject = %subject,
                             key = %key,
                             version_id = ?version_id,
@@ -352,6 +592,21 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                             target_node_id = %state.node_id,
                             error = %error_text,
                             "targeted scrub repair verification failed"
+                        );
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "local_verify_failed",
+                            "targeted scrub repair verification failed after local pull",
+                            Some(subject.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(source_node.node_id),
+                            Some(state.node_id),
+                            Some(serde_json::json!({
+                                "imported_version_id": imported_version_id,
+                                "error": error_text,
+                            })),
                         );
 
                         let mut repair_state = state.repair_state.lock().await;
@@ -373,6 +628,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                 failed_transfers += 1;
                 last_error = Some(error_text.clone());
                 warn!(
+                    repair_run_id,
                     subject = %subject,
                     key = %key,
                     version_id = ?version_id,
@@ -380,6 +636,20 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                     target_node_id = %state.node_id,
                     error = %error_text,
                     "targeted scrub repair local pull failed"
+                );
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "local_pull_failed",
+                    "targeted scrub repair local pull failed",
+                    Some(subject.clone()),
+                    Some(key.clone()),
+                    version_id.clone(),
+                    Some(source_node.node_id),
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                        "error": error_text,
+                    })),
                 );
 
                 let mut repair_state = state.repair_state.lock().await;
@@ -401,13 +671,62 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
 
     if local_availability_refresh_needed {
         refresh_local_availability_view_once(state).await;
+        push_repair_log_entry(
+            &mut detailed_log,
+            state.node_id,
+            "local_availability_refreshed",
+            "refreshed local availability view after targeted scrub repair",
+            None,
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            None,
+        );
     }
 
-    if repair_state_dirty && let Err(err) = persist_repair_state(state).await {
-        warn!(error = %err, "failed persisting repair attempts after targeted scrub repair");
+    if repair_state_dirty {
+        match persist_repair_state(state).await {
+            Ok(()) => {
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "repair_attempt_state_persisted",
+                    "persisted targeted scrub repair attempt state",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    None,
+                );
+            }
+            Err(err) => {
+                warn!(
+                    repair_run_id,
+                    error = %err,
+                    "failed persisting repair attempts after targeted scrub repair"
+                );
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "repair_attempt_state_persist_failed",
+                    "failed persisting targeted scrub repair attempt state",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                        "error": err.to_string(),
+                    })),
+                );
+            }
+        }
     }
 
     info!(
+        repair_run_id,
         attempted_transfers,
         successful_transfers,
         failed_transfers,
@@ -415,6 +734,25 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
         skipped_backoff,
         skipped_max_retries,
         "targeted scrub repair local phase finished"
+    );
+    push_repair_log_entry(
+        &mut detailed_log,
+        state.node_id,
+        "targeted_repair_finished",
+        "finished targeted scrub repair run",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "attempted_transfers": attempted_transfers,
+            "successful_transfers": successful_transfers,
+            "failed_transfers": failed_transfers,
+            "skipped_items": skipped_items,
+            "skipped_backoff": skipped_backoff,
+            "skipped_max_retries": skipped_max_retries,
+        })),
     );
 
     ReplicationRepairReport {
@@ -425,6 +763,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
         skipped_backoff,
         skipped_max_retries,
         skipped_details,
+        detailed_log,
         last_error,
     }
 }
@@ -435,10 +774,16 @@ async fn execute_replication_repair_plan(
     nodes: Vec<NodeDescriptor>,
     batch_size_override: Option<usize>,
     verify_local_pulls: bool,
+    run_id: Option<&str>,
 ) -> ReplicationRepairReport {
     let node_by_id: HashMap<NodeId, NodeDescriptor> =
         nodes.into_iter().map(|node| (node.node_id, node)).collect();
 
+    let plan_generated_at_unix = plan.generated_at_unix;
+    let plan_under_replicated = plan.under_replicated;
+    let plan_over_replicated = plan.over_replicated;
+    let plan_cleanup_deferred_items = plan.cleanup_deferred_items;
+    let plan_cleanup_deferred_extra_nodes = plan.cleanup_deferred_extra_nodes;
     let mut attempted_transfers = 0usize;
     let mut successful_transfers = 0usize;
     let mut failed_transfers = 0usize;
@@ -446,6 +791,7 @@ async fn execute_replication_repair_plan(
     let mut skipped_backoff = 0usize;
     let mut skipped_max_retries = 0usize;
     let mut skipped_details = Vec::new();
+    let mut detailed_log = Vec::new();
     let mut last_error = None;
     let mut replicas_state_dirty = false;
     let mut repair_state_dirty = false;
@@ -454,8 +800,10 @@ async fn execute_replication_repair_plan(
     let backoff_secs = state.repair_config.backoff_secs;
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
+    let repair_run_id = run_id.unwrap_or("untracked");
 
     let mut plan_items = plan.items;
+    let plan_item_count = plan_items.len();
     plan_items.sort_by(|a, b| {
         let a_versioned = parse_replication_subject(&a.key)
             .and_then(|(_, version_id)| version_id)
@@ -468,13 +816,80 @@ async fn execute_replication_repair_plan(
             .then_with(|| a.key.cmp(&b.key))
     });
 
+    info!(
+        repair_run_id,
+        plan_item_count,
+        plan_generated_at_unix,
+        under_replicated = plan_under_replicated,
+        over_replicated = plan_over_replicated,
+        cleanup_deferred_items = plan_cleanup_deferred_items,
+        cleanup_deferred_extra_nodes = plan_cleanup_deferred_extra_nodes,
+        max_transfers,
+        max_retries = max_attempts,
+        backoff_secs,
+        verify_local_pulls,
+        "replication repair run started"
+    );
+    push_repair_log_entry(
+        &mut detailed_log,
+        state.node_id,
+        "repair_run_started",
+        "starting replication repair run",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "plan_item_count": plan_item_count,
+            "plan_generated_at_unix": plan_generated_at_unix,
+            "under_replicated": plan_under_replicated,
+            "over_replicated": plan_over_replicated,
+            "cleanup_deferred_items": plan_cleanup_deferred_items,
+            "cleanup_deferred_extra_nodes": plan_cleanup_deferred_extra_nodes,
+            "max_transfers": max_transfers,
+            "max_retries": max_attempts,
+            "backoff_secs": backoff_secs,
+            "verify_local_pulls": verify_local_pulls,
+        })),
+    );
+
     for item in plan_items {
         if attempted_transfers >= max_transfers {
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "batch_limit_reached",
+                "stopping replication repair because the transfer batch limit was reached",
+                Some(item.key.clone()),
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "attempted_transfers": attempted_transfers,
+                    "max_transfers": max_transfers,
+                })),
+            );
             break;
         }
 
         let Some((key, version_id)) = parse_replication_subject(&item.key) else {
             skipped_items += 1;
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "subject_skipped",
+                "replication subject could not be parsed into key and version components",
+                Some(item.key.clone()),
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "reason": "invalid_subject",
+                })),
+            );
             push_repair_skipped_detail(
                 &mut skipped_details,
                 state.node_id,
@@ -498,6 +913,7 @@ async fn execute_replication_repair_plan(
         let mut repair_source_node_id = None;
 
         info!(
+            repair_run_id,
             subject = %item.key,
             key = %key,
             version_id = ?version_id,
@@ -507,6 +923,29 @@ async fn execute_replication_repair_plan(
             attempted_transfers,
             max_transfers,
             "replication repair processing subject"
+        );
+        push_repair_log_entry(
+            &mut detailed_log,
+            state.node_id,
+            "subject_evaluated",
+            "processing replication repair subject",
+            Some(item.key.clone()),
+            Some(key.clone()),
+            version_id.clone(),
+            None,
+            None,
+            Some(serde_json::json!({
+                "local_missing": local_missing,
+                "remote_target_count": remote_target_count,
+                "current_nodes": item.current_nodes,
+                "missing_nodes": item.missing_nodes,
+                "extra_nodes": item.extra_nodes,
+                "current_replica_count": item.current_nodes.len(),
+                "cleanup_option": item.cleanup_option,
+                "deferred_extra_nodes": item.deferred_extra_nodes,
+                "attempted_transfers": attempted_transfers,
+                "max_transfers": max_transfers,
+            })),
         );
 
         let mut bundle = {
@@ -529,6 +968,21 @@ async fn execute_replication_repair_plan(
                 .find_map(|node_id| node_by_id.get(node_id))
             else {
                 skipped_items += 1;
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "subject_skipped",
+                    "local node is missing the subject and no online source node was available",
+                    Some(item.key.clone()),
+                    Some(key.clone()),
+                    version_id.clone(),
+                    None,
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                        "reason": "source_node_unavailable",
+                        "local_missing": true,
+                    })),
+                );
                 push_repair_skipped_detail(
                     &mut skipped_details,
                     state.node_id,
@@ -552,6 +1006,26 @@ async fn execute_replication_repair_plan(
                 if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                     if previous.attempts > max_attempts {
                         skipped_max_retries += 1;
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "subject_skipped",
+                            format!(
+                                "transfer skipped after {} failed attempts (max_retries={max_attempts})",
+                                previous.attempts
+                            ),
+                            Some(item.key.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(source_node.node_id),
+                            Some(state.node_id),
+                            Some(serde_json::json!({
+                                "reason": "max_retries_exhausted",
+                                "failed_attempts": previous.attempts,
+                                "max_retries": max_attempts,
+                                "last_failure_unix": previous.last_failure_unix,
+                            })),
+                        );
                         push_repair_skipped_detail(
                             &mut skipped_details,
                             state.node_id,
@@ -574,6 +1048,28 @@ async fn execute_replication_repair_plan(
                         jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
                     if elapsed < required_backoff {
                         skipped_backoff += 1;
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "subject_skipped",
+                            format!(
+                                "retry backoff active for another {}s after {} failed attempts",
+                                required_backoff.saturating_sub(elapsed),
+                                previous.attempts
+                            ),
+                            Some(item.key.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(source_node.node_id),
+                            Some(state.node_id),
+                            Some(serde_json::json!({
+                                "reason": "backoff_active",
+                                "failed_attempts": previous.attempts,
+                                "last_failure_unix": previous.last_failure_unix,
+                                "elapsed_since_failure_secs": elapsed,
+                                "required_backoff_secs": required_backoff,
+                            })),
+                        );
                         push_repair_skipped_detail(
                             &mut skipped_details,
                             state.node_id,
@@ -598,6 +1094,7 @@ async fn execute_replication_repair_plan(
             attempted_transfers += 1;
 
             info!(
+                repair_run_id,
                 subject = %item.key,
                 key = %key,
                 version_id = ?version_id,
@@ -606,8 +1103,24 @@ async fn execute_replication_repair_plan(
                 attempted_transfers,
                 "replication repair starting local pull"
             );
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "local_pull_started",
+                "starting replication repair local pull",
+                Some(item.key.clone()),
+                Some(key.clone()),
+                version_id.clone(),
+                Some(source_node.node_id),
+                Some(state.node_id),
+                Some(serde_json::json!({
+                    "attempted_transfers": attempted_transfers,
+                })),
+            );
 
-            match pull_bundle_from_source(source_node, &key, version_id.as_deref(), state).await {
+            match pull_bundle_from_source(source_node, &key, version_id.as_deref(), state, run_id)
+                .await
+            {
                 Ok(imported_version_id) => {
                     if verify_local_pulls
                         && let Err(err) = verify_local_repair_subject(state, &item.key).await
@@ -616,6 +1129,7 @@ async fn execute_replication_repair_plan(
                         failed_transfers += 1;
                         last_error = Some(error_text.clone());
                         warn!(
+                            repair_run_id,
                             subject = %item.key,
                             key = %key,
                             version_id = ?version_id,
@@ -623,6 +1137,21 @@ async fn execute_replication_repair_plan(
                             target_node_id = %state.node_id,
                             error = %error_text,
                             "replication repair local pull verification failed"
+                        );
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "local_verify_failed",
+                            "replication repair local pull verification failed",
+                            Some(item.key.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(source_node.node_id),
+                            Some(state.node_id),
+                            Some(serde_json::json!({
+                                "imported_version_id": imported_version_id,
+                                "error": error_text,
+                            })),
                         );
 
                         let mut repair_state = state.repair_state.lock().await;
@@ -641,6 +1170,7 @@ async fn execute_replication_repair_plan(
 
                     successful_transfers += 1;
                     info!(
+                        repair_run_id,
                         subject = %item.key,
                         key = %key,
                         version_id = ?version_id,
@@ -648,6 +1178,20 @@ async fn execute_replication_repair_plan(
                         target_node_id = %state.node_id,
                         imported_version_id = %imported_version_id,
                         "replication repair completed local pull"
+                    );
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "local_pull_completed",
+                        "replication repair local pull completed",
+                        Some(item.key.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(source_node.node_id),
+                        Some(state.node_id),
+                        Some(serde_json::json!({
+                            "imported_version_id": imported_version_id,
+                        })),
                     );
                     publish_namespace_change(state);
 
@@ -680,6 +1224,7 @@ async fn execute_replication_repair_plan(
                     failed_transfers += 1;
                     last_error = Some(error_text.clone());
                     warn!(
+                        repair_run_id,
                         subject = %item.key,
                         key = %key,
                         version_id = ?version_id,
@@ -687,6 +1232,20 @@ async fn execute_replication_repair_plan(
                         target_node_id = %state.node_id,
                         error = %error_text,
                         "replication repair local pull failed"
+                    );
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "local_pull_failed",
+                        "replication repair local pull failed",
+                        Some(item.key.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(source_node.node_id),
+                        Some(state.node_id),
+                        Some(serde_json::json!({
+                            "error": error_text,
+                        })),
                     );
 
                     let mut repair_state = state.repair_state.lock().await;
@@ -708,6 +1267,25 @@ async fn execute_replication_repair_plan(
 
         let Some(bundle) = bundle else {
             skipped_items += 1;
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "subject_skipped",
+                if local_missing {
+                    "replication bundle remained unavailable after attempting local repair import"
+                } else {
+                    "replication bundle was not available on the reporting node"
+                },
+                Some(item.key.clone()),
+                Some(key.clone()),
+                version_id.clone(),
+                repair_source_node_id,
+                local_missing.then_some(state.node_id),
+                Some(serde_json::json!({
+                    "reason": "bundle_unavailable",
+                    "local_missing": local_missing,
+                })),
+            );
             push_repair_skipped_detail(
                 &mut skipped_details,
                 state.node_id,
@@ -728,11 +1306,40 @@ async fn execute_replication_repair_plan(
 
         for target in item.missing_nodes {
             if attempted_transfers >= max_transfers {
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "batch_limit_reached",
+                    "stopping subject target pushes because the transfer batch limit was reached",
+                    Some(item.key.clone()),
+                    Some(key.clone()),
+                    version_id.clone(),
+                    Some(state.node_id),
+                    Some(target),
+                    Some(serde_json::json!({
+                        "attempted_transfers": attempted_transfers,
+                        "max_transfers": max_transfers,
+                    })),
+                );
                 break;
             }
 
             let Some(node) = node_by_id.get(&target) else {
                 failed_transfers += 1;
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "target_push_failed",
+                    "replication repair could not resolve the target node descriptor",
+                    Some(item.key.clone()),
+                    Some(key.clone()),
+                    version_id.clone(),
+                    Some(state.node_id),
+                    Some(target),
+                    Some(serde_json::json!({
+                        "error": "target node descriptor missing",
+                    })),
+                );
                 continue;
             };
 
@@ -747,6 +1354,26 @@ async fn execute_replication_repair_plan(
                 if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                     if previous.attempts > max_attempts {
                         skipped_max_retries += 1;
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "subject_skipped",
+                            format!(
+                                "transfer skipped after {} failed attempts (max_retries={max_attempts})",
+                                previous.attempts
+                            ),
+                            Some(item.key.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(state.node_id),
+                            Some(target),
+                            Some(serde_json::json!({
+                                "reason": "max_retries_exhausted",
+                                "failed_attempts": previous.attempts,
+                                "max_retries": max_attempts,
+                                "last_failure_unix": previous.last_failure_unix,
+                            })),
+                        );
                         push_repair_skipped_detail(
                             &mut skipped_details,
                             state.node_id,
@@ -769,6 +1396,28 @@ async fn execute_replication_repair_plan(
                         jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
                     if elapsed < required_backoff {
                         skipped_backoff += 1;
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "subject_skipped",
+                            format!(
+                                "retry backoff active for another {}s after {} failed attempts",
+                                required_backoff.saturating_sub(elapsed),
+                                previous.attempts
+                            ),
+                            Some(item.key.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(state.node_id),
+                            Some(target),
+                            Some(serde_json::json!({
+                                "reason": "backoff_active",
+                                "failed_attempts": previous.attempts,
+                                "last_failure_unix": previous.last_failure_unix,
+                                "elapsed_since_failure_secs": elapsed,
+                                "required_backoff_secs": required_backoff,
+                            })),
+                        );
                         push_repair_skipped_detail(
                             &mut skipped_details,
                             state.node_id,
@@ -793,6 +1442,7 @@ async fn execute_replication_repair_plan(
 
             attempted_transfers += 1;
             info!(
+                repair_run_id,
                 subject = %item.key,
                 key = %key,
                 version_id = ?version_id,
@@ -803,12 +1453,31 @@ async fn execute_replication_repair_plan(
                 attempted_transfers,
                 "replication repair starting target push"
             );
-            let transfer_result = replicate_bundle_to_target(node, &bundle, state).await;
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "target_push_started",
+                "starting replication repair target push",
+                Some(item.key.clone()),
+                Some(key.clone()),
+                version_id.clone(),
+                Some(state.node_id),
+                Some(target),
+                Some(serde_json::json!({
+                    "attempted_transfers": attempted_transfers,
+                    "chunk_count": bundle.manifest.chunks.len(),
+                    "total_size_bytes": bundle.manifest.total_size_bytes,
+                    "manifest_hash": bundle.manifest_hash,
+                    "bundle_version_id": bundle.version_id,
+                })),
+            );
+            let transfer_result = replicate_bundle_to_target(node, &bundle, state, run_id).await;
 
             match transfer_result {
                 Ok(remote_version_id) => {
                     successful_transfers += 1;
                     info!(
+                        repair_run_id,
                         subject = %item.key,
                         key = %key,
                         version_id = ?version_id,
@@ -816,6 +1485,20 @@ async fn execute_replication_repair_plan(
                         target_node_id = %target,
                         remote_version_id = %remote_version_id,
                         "replication repair completed target push"
+                    );
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "target_push_completed",
+                        "replication repair target push completed",
+                        Some(item.key.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(state.node_id),
+                        Some(target),
+                        Some(serde_json::json!({
+                            "remote_version_id": remote_version_id,
+                        })),
                     );
 
                     let mut cluster = state.cluster.lock().await;
@@ -839,6 +1522,7 @@ async fn execute_replication_repair_plan(
                     failed_transfers += 1;
                     last_error = Some(error_text.clone());
                     warn!(
+                        repair_run_id,
                         subject = %item.key,
                         key = %key,
                         version_id = ?version_id,
@@ -846,6 +1530,20 @@ async fn execute_replication_repair_plan(
                         target_node_id = %target,
                         error = %error_text,
                         "replication repair target push failed"
+                    );
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "target_push_failed",
+                        "replication repair target push failed",
+                        Some(item.key.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(state.node_id),
+                        Some(target),
+                        Some(serde_json::json!({
+                            "error": error_text,
+                        })),
                     );
 
                     let mut repair_state = state.repair_state.lock().await;
@@ -866,18 +1564,88 @@ async fn execute_replication_repair_plan(
         }
     }
 
-    if replicas_state_dirty && let Err(err) = persist_cluster_replicas_state(state).await {
-        warn!(
-            error = %err,
-            "failed to persist cluster replicas after repair run"
-        );
+    if replicas_state_dirty {
+        match persist_cluster_replicas_state(state).await {
+            Ok(()) => {
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "replica_state_persisted",
+                    "persisted cluster replica state after repair run",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    None,
+                );
+            }
+            Err(err) => {
+                warn!(
+                    repair_run_id,
+                    error = %err,
+                    "failed to persist cluster replicas after repair run"
+                );
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "replica_state_persist_failed",
+                    "failed to persist cluster replica state after repair run",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                        "error": err.to_string(),
+                    })),
+                );
+            }
+        }
     }
 
-    if repair_state_dirty && let Err(err) = persist_repair_state(state).await {
-        warn!(error = %err, "failed persisting repair attempts after repair run");
+    if repair_state_dirty {
+        match persist_repair_state(state).await {
+            Ok(()) => {
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "repair_attempt_state_persisted",
+                    "persisted repair attempt state after repair run",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    None,
+                );
+            }
+            Err(err) => {
+                warn!(
+                    repair_run_id,
+                    error = %err,
+                    "failed persisting repair attempts after repair run"
+                );
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "repair_attempt_state_persist_failed",
+                    "failed to persist repair attempt state after repair run",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                        "error": err.to_string(),
+                    })),
+                );
+            }
+        }
     }
 
     info!(
+        repair_run_id,
         attempted_transfers,
         successful_transfers,
         failed_transfers,
@@ -885,6 +1653,25 @@ async fn execute_replication_repair_plan(
         skipped_backoff,
         skipped_max_retries,
         "replication repair local phase finished"
+    );
+    push_repair_log_entry(
+        &mut detailed_log,
+        state.node_id,
+        "repair_run_finished",
+        "finished replication repair run",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "attempted_transfers": attempted_transfers,
+            "successful_transfers": successful_transfers,
+            "failed_transfers": failed_transfers,
+            "skipped_items": skipped_items,
+            "skipped_backoff": skipped_backoff,
+            "skipped_max_retries": skipped_max_retries,
+        })),
     );
 
     ReplicationRepairReport {
@@ -895,13 +1682,23 @@ async fn execute_replication_repair_plan(
         skipped_backoff,
         skipped_max_retries,
         skipped_details,
+        detailed_log,
         last_error,
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn execute_cluster_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
+) -> ClusterReplicationRepairReport {
+    execute_cluster_replication_repair_inner_with_context(state, batch_size_override, None).await
+}
+
+pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
+    state: &ServerState,
+    batch_size_override: Option<usize>,
+    run_id: Option<&str>,
 ) -> ClusterReplicationRepairReport {
     let mut node_reports = Vec::new();
     let mut totals = ReplicationRepairReport {
@@ -912,17 +1709,36 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
         skipped_backoff: 0,
         skipped_max_retries: 0,
         skipped_details: Vec::new(),
+        detailed_log: Vec::new(),
         last_error: None,
     };
     let mut failed_nodes = 0usize;
+    let repair_run_id = run_id.unwrap_or("untracked");
 
     info!(
+        repair_run_id,
         batch_size_override = ?batch_size_override,
         "cluster replication repair starting local phase"
     );
+    push_repair_log_entry(
+        &mut totals.detailed_log,
+        state.node_id,
+        "cluster_repair_started",
+        "starting cluster replication repair run",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "batch_size_override": batch_size_override,
+        })),
+    );
 
-    let local_report = execute_replication_repair_inner(state, batch_size_override).await;
+    let local_report =
+        execute_replication_repair_inner_with_context(state, batch_size_override, run_id).await;
     info!(
+        repair_run_id,
         attempted_transfers = local_report.attempted_transfers,
         successful_transfers = local_report.successful_transfers,
         failed_transfers = local_report.failed_transfers,
@@ -961,9 +1777,24 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
         let path =
             build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
         info!(
+            repair_run_id,
             peer_node_id = %peer.node_id,
             path = %path,
             "cluster replication repair starting peer local phase request"
+        );
+        push_repair_log_entry(
+            &mut totals.detailed_log,
+            state.node_id,
+            "peer_local_phase_request_started",
+            "starting cluster repair peer local phase request",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(peer.node_id),
+            Some(serde_json::json!({
+                "path": path,
+            })),
         );
         match execute_peer_request(
             state,
@@ -979,6 +1810,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
                 match response.json::<ReplicationRepairReport>() {
                     Ok(report) => {
                         info!(
+                            repair_run_id,
                             peer_node_id = %peer.node_id,
                             attempted_transfers = report.attempted_transfers,
                             successful_transfers = report.successful_transfers,
@@ -987,6 +1819,25 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
                             skipped_backoff = report.skipped_backoff,
                             skipped_max_retries = report.skipped_max_retries,
                             "cluster replication repair finished peer local phase request"
+                        );
+                        push_repair_log_entry(
+                            &mut totals.detailed_log,
+                            state.node_id,
+                            "peer_local_phase_request_completed",
+                            "cluster repair peer local phase request completed",
+                            None,
+                            None,
+                            None,
+                            Some(state.node_id),
+                            Some(peer.node_id),
+                            Some(serde_json::json!({
+                                "attempted_transfers": report.attempted_transfers,
+                                "successful_transfers": report.successful_transfers,
+                                "failed_transfers": report.failed_transfers,
+                                "skipped_items": report.skipped_items,
+                                "skipped_backoff": report.skipped_backoff,
+                                "skipped_max_retries": report.skipped_max_retries,
+                            })),
                         );
                         accumulate_repair_report(&mut totals, &report);
                         node_reports.push(ClusterReplicationRepairNodeReport {
@@ -1006,9 +1857,24 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
                         failed_nodes += 1;
                         let error = format!("failed decoding peer repair report: {err}");
                         warn!(
+                            repair_run_id,
                             peer_node_id = %peer.node_id,
                             error = %error,
                             "cluster replication repair peer local phase decode failed"
+                        );
+                        push_repair_log_entry(
+                            &mut totals.detailed_log,
+                            state.node_id,
+                            "peer_local_phase_request_failed",
+                            "failed decoding cluster repair peer local phase response",
+                            None,
+                            None,
+                            None,
+                            Some(state.node_id),
+                            Some(peer.node_id),
+                            Some(serde_json::json!({
+                                "error": error,
+                            })),
                         );
                         totals.last_error = Some(error.clone());
                         node_reports.push(ClusterReplicationRepairNodeReport {
@@ -1030,9 +1896,25 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
                 failed_nodes += 1;
                 let error = format!("peer repair request returned HTTP {}", response.status);
                 warn!(
+                    repair_run_id,
                     peer_node_id = %peer.node_id,
                     status = response.status,
                     "cluster replication repair peer local phase returned non-success status"
+                );
+                push_repair_log_entry(
+                    &mut totals.detailed_log,
+                    state.node_id,
+                    "peer_local_phase_request_failed",
+                    "cluster repair peer local phase request returned non-success status",
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    Some(peer.node_id),
+                    Some(serde_json::json!({
+                        "error": error,
+                        "status": response.status,
+                    })),
                 );
                 totals.last_error = Some(error.clone());
                 node_reports.push(ClusterReplicationRepairNodeReport {
@@ -1052,9 +1934,24 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
                 failed_nodes += 1;
                 let error = format!("peer repair request failed: {err:#}");
                 warn!(
+                    repair_run_id,
                     peer_node_id = %peer.node_id,
                     error = %error,
                     "cluster replication repair peer local phase request failed"
+                );
+                push_repair_log_entry(
+                    &mut totals.detailed_log,
+                    state.node_id,
+                    "peer_local_phase_request_failed",
+                    "cluster repair peer local phase request failed",
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    Some(peer.node_id),
+                    Some(serde_json::json!({
+                        "error": error,
+                    })),
                 );
                 totals.last_error = Some(error.clone());
                 node_reports.push(ClusterReplicationRepairNodeReport {
@@ -1072,6 +1969,28 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
             }
         }
     }
+
+    push_repair_log_entry(
+        &mut totals.detailed_log,
+        state.node_id,
+        "cluster_repair_finished",
+        "finished cluster replication repair run",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "nodes_contacted": node_reports.len(),
+            "failed_nodes": failed_nodes,
+            "attempted_transfers": totals.attempted_transfers,
+            "successful_transfers": totals.successful_transfers,
+            "failed_transfers": totals.failed_transfers,
+            "skipped_items": totals.skipped_items,
+            "skipped_backoff": totals.skipped_backoff,
+            "skipped_max_retries": totals.skipped_max_retries,
+        })),
+    );
 
     ClusterReplicationRepairReport {
         totals,
@@ -1105,9 +2024,38 @@ fn accumulate_repair_report(
     totals
         .skipped_details
         .extend(report.skipped_details.iter().cloned());
+    totals
+        .detailed_log
+        .extend(report.detailed_log.iter().cloned());
     if report.last_error.is_some() {
         totals.last_error = report.last_error.clone();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_repair_log_entry(
+    detailed_log: &mut Vec<ReplicationRepairLogEntry>,
+    report_node_id: NodeId,
+    event: impl Into<String>,
+    detail: impl Into<String>,
+    subject: Option<String>,
+    key: Option<String>,
+    version_id: Option<String>,
+    source_node_id: Option<NodeId>,
+    target_node_id: Option<NodeId>,
+    context: Option<serde_json::Value>,
+) {
+    detailed_log.push(ReplicationRepairLogEntry {
+        report_node_id,
+        event: event.into(),
+        detail: detail.into(),
+        subject,
+        key,
+        version_id,
+        source_node_id,
+        target_node_id,
+        context,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1165,10 +2113,13 @@ async fn pull_bundle_from_source(
     key: &str,
     version_id: Option<&str>,
     state: &ServerState,
+    run_id: Option<&str>,
 ) -> Result<String> {
     let transfer_started = Instant::now();
     let export_path = build_replication_export_path(key, version_id);
+    let repair_run_id = run_id.unwrap_or("untracked");
     info!(
+        repair_run_id,
         source_node_id = %source_node.node_id,
         key = %key,
         version_id = ?version_id,
@@ -1188,6 +2139,7 @@ async fn pull_bundle_from_source(
     let chunk_count = bundle.manifest.chunks.len();
 
     info!(
+        repair_run_id,
         source_node_id = %source_node.node_id,
         key = %bundle.key,
         version_id = ?bundle.version_id,
@@ -1202,6 +2154,7 @@ async fn pull_bundle_from_source(
             let chunk_index = chunk_offset + 1;
             if should_log_repair_chunk_progress(chunk_index, chunk_count) {
                 info!(
+                    repair_run_id,
                     source_node_id = %source_node.node_id,
                     key = %bundle.key,
                     version_id = ?bundle.version_id,
@@ -1228,6 +2181,7 @@ async fn pull_bundle_from_source(
     }
 
     info!(
+        repair_run_id,
         source_node_id = %source_node.node_id,
         key = %bundle.key,
         version_id = ?bundle.version_id,
@@ -1249,6 +2203,7 @@ async fn pull_bundle_from_source(
         )
         .await?;
     info!(
+        repair_run_id,
         source_node_id = %source_node.node_id,
         key = %bundle.key,
         version_id = ?bundle.version_id,
@@ -1289,10 +2244,13 @@ async fn replicate_bundle_to_target(
     target_node: &NodeDescriptor,
     bundle: &ReplicationExportBundle,
     state: &ServerState,
+    run_id: Option<&str>,
 ) -> Result<String> {
     let transfer_started = Instant::now();
     let chunk_count = bundle.manifest.chunks.len();
+    let repair_run_id = run_id.unwrap_or("untracked");
     info!(
+        repair_run_id,
         target_node_id = %target_node.node_id,
         key = %bundle.key,
         version_id = ?bundle.version_id,
@@ -1338,6 +2296,7 @@ async fn replicate_bundle_to_target(
         }
 
         info!(
+            repair_run_id,
             target_node_id = %target_node.node_id,
             key = %bundle.key,
             version_id = ?bundle.version_id,
@@ -1356,6 +2315,7 @@ async fn replicate_bundle_to_target(
             let chunk_index = chunk_offset + 1;
             if should_log_repair_chunk_progress(chunk_index, chunk_count) {
                 info!(
+                    repair_run_id,
                     target_node_id = %target_node.node_id,
                     key = %bundle.key,
                     version_id = ?bundle.version_id,
@@ -1415,6 +2375,7 @@ async fn replicate_bundle_to_target(
         }
 
         info!(
+            repair_run_id,
             target_node_id = %target_node.node_id,
             key = %bundle.key,
             version_id = ?bundle.version_id,
@@ -1474,6 +2435,7 @@ async fn replicate_bundle_to_target(
         parent_version_ids_json.as_deref(),
     );
     info!(
+        repair_run_id,
         target_node_id = %target_node.node_id,
         key = %bundle.key,
         version_id = ?bundle.version_id,
@@ -1509,6 +2471,7 @@ async fn replicate_bundle_to_target(
 
     let report = response.json::<ReplicationManifestPushReport>()?;
     info!(
+        repair_run_id,
         target_node_id = %target_node.node_id,
         key = %bundle.key,
         version_id = ?bundle.version_id,

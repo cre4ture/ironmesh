@@ -5540,6 +5540,19 @@ async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTes
     assert_eq!(report.failed_transfers, 0);
     assert_eq!(report.skipped_max_retries, expected_skips.len());
     assert_eq!(report.skipped_details.len(), expected_skips.len());
+    assert!(
+        report.detailed_log.iter().any(|entry| {
+            entry.event == "subject_skipped"
+                && entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("reason"))
+                    .and_then(|value| value.as_str())
+                    == Some("max_retries_exhausted")
+        }),
+        "expected detailed_log to capture max-retries skip events: {:?}",
+        report.detailed_log
+    );
 
     for (subject, target_node_id) in expected_skips {
         assert!(
@@ -8778,6 +8791,24 @@ async fn tracked_local_replication_repair_persists_history_impl(backend: MainTes
         Some(report.attempted_transfers)
     );
     assert!(repair_runs[0].report.is_some());
+    let detailed_log = repair_runs[0]
+        .report
+        .as_ref()
+        .and_then(|report| report.get("detailed_log"))
+        .and_then(|value| value.as_array())
+        .expect("repair run history should retain the detailed_log payload");
+    assert!(
+        detailed_log.iter().any(|entry| {
+            entry.get("event").and_then(|value| value.as_str()) == Some("repair_run_started")
+        }),
+        "expected repair_run_started event in retained repair report: {detailed_log:?}"
+    );
+    assert!(
+        detailed_log.iter().any(|entry| {
+            entry.get("event").and_then(|value| value.as_str()) == Some("repair_run_finished")
+        }),
+        "expected repair_run_finished event in retained repair report: {detailed_log:?}"
+    );
     assert!(state.repair_activity.lock().await.active_runs.is_empty());
 
     cleanup_test_state(&state).await;
@@ -8858,6 +8889,32 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         .get("skipped_details")
         .and_then(|value| value.as_array())
         .expect("cluster repair response should include skipped_details");
+    let detailed_log = repair_report
+        .get("detailed_log")
+        .and_then(|value| value.as_array())
+        .expect("cluster repair response should include detailed_log");
+    assert!(
+        detailed_log.iter().any(|entry| {
+            matches!(
+                entry.get("event").and_then(|value| value.as_str()),
+                Some("peer_local_phase_request_started")
+                    | Some("peer_local_phase_request_completed")
+                    | Some("peer_local_phase_request_failed")
+            )
+        }),
+        "expected cluster repair report to include peer-request activity in detailed_log: {repair_report:?}"
+    );
+    assert!(
+        detailed_log.iter().any(|entry| {
+            entry.get("event").and_then(|value| value.as_str()) == Some("subject_skipped")
+                && entry
+                    .get("context")
+                    .and_then(|value| value.get("reason"))
+                    .and_then(|value| value.as_str())
+                    == Some("max_retries_exhausted")
+        }),
+        "expected cluster repair report to retain detailed skip reasons in detailed_log: {repair_report:?}"
+    );
     for (subject, target_node_id) in &expected_skips {
         assert!(
             skipped_details.iter().any(|detail| {

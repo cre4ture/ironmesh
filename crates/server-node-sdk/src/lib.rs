@@ -8096,7 +8096,12 @@ async fn execute_tracked_local_replication_repair(
     };
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let report = replication::execute_replication_repair_inner(state, batch_size_override).await;
+    let report = replication::execute_replication_repair_inner_with_context(
+        state,
+        batch_size_override,
+        Some(&tracker.run_id),
+    )
+    .await;
     finish_repair_run_tracking(
         state,
         tracker,
@@ -8124,10 +8129,11 @@ async fn execute_tracked_targeted_local_replication_repair(
     };
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let report = replication::execute_targeted_replication_repair_inner(
+    let report = replication::execute_targeted_replication_repair_inner_with_context(
         state,
         subjects.clone(),
         Some(subjects.len().max(1)),
+        Some(&tracker.run_id),
     )
     .await;
     finish_repair_run_tracking(
@@ -8150,7 +8156,13 @@ async fn execute_tracked_targeted_replication_repair(
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
     let (plan, report) =
-        replication::execute_planned_targeted_replication_repair_inner(state, subjects, None).await;
+        replication::execute_planned_targeted_replication_repair_inner_with_context(
+            state,
+            subjects,
+            None,
+            Some(&tracker.run_id),
+        )
+        .await;
     finish_repair_run_tracking(
         state,
         tracker,
@@ -8176,8 +8188,12 @@ async fn execute_tracked_cluster_replication_repair(
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Cluster, trigger)
             .await;
-    let report =
-        replication::execute_cluster_replication_repair_inner(state, batch_size_override).await;
+    let report = replication::execute_cluster_replication_repair_inner_with_context(
+        state,
+        batch_size_override,
+        Some(&tracker.run_id),
+    )
+    .await;
     finish_repair_run_tracking(
         state,
         tracker,
@@ -8231,7 +8247,12 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
             return;
         }
 
-        let report = replication::execute_replication_repair_inner(&state, None).await;
+        let report = replication::execute_replication_repair_inner_with_context(
+            &state,
+            None,
+            Some(&tracker.run_id),
+        )
+        .await;
         {
             let mut status = state.startup_repair_status.lock().await;
             *status = StartupRepairStatus::Completed;
