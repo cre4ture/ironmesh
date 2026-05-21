@@ -1731,6 +1731,7 @@ function GalleryVirtualPageSlot({
   children
 }: GalleryVirtualPageSlotProps) {
   const slotRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const element = slotRef.current;
@@ -1760,7 +1761,7 @@ function GalleryVirtualPageSlot({
       return;
     }
 
-    const element = slotRef.current;
+    const element = contentRef.current;
     if (!element) {
       return;
     }
@@ -1785,8 +1786,10 @@ function GalleryVirtualPageSlot({
   }, [index, measure, onMeasured, children]);
 
   return (
-    <div ref={slotRef} style={{ minHeight }}>
-      {children}
+    <div ref={slotRef} data-gallery-virtual-page-slot="true" style={{ minHeight }}>
+      <div ref={contentRef} data-gallery-virtual-page-content="true">
+        {children}
+      </div>
     </div>
   );
 }

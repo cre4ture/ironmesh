@@ -436,6 +436,49 @@ test("client-ui gallery cards stay compact on narrow viewports", async ({ page }
   await expect(page.locator('[data-gallery-card-metadata="true"]')).toHaveCount(0);
 });
 
+test("client-ui gallery virtual pages do not keep oversized spacer heights after sidebar resizing", async ({
+  page
+}) => {
+  test.setTimeout(45_000);
+
+  await installClientUiMocks(page, {
+    storeEntries: createGalleryPaginationMockStoreEntries(72)
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  const thumbnailsPerRowInput = page.getByLabel("Thumbnails per row");
+  await thumbnailsPerRowInput.fill("8");
+  await thumbnailsPerRowInput.blur();
+  await expect(thumbnailsPerRowInput).toHaveValue("8");
+
+  await expect
+    .poll(() => maxGalleryVirtualPageGap(page), {
+      message: "expected loaded gallery pages to collapse to their rendered grid height"
+    })
+    .toBeLessThanOrEqual(2);
+
+  const desktopSidebarToggle = page.getByRole("button", { name: "Toggle navigation sidebar" });
+  await desktopSidebarToggle.click();
+
+  await expect
+    .poll(() => maxGalleryVirtualPageGap(page), {
+      message: "expected gallery page heights to re-measure after widening the content area"
+    })
+    .toBeLessThanOrEqual(2);
+
+  await desktopSidebarToggle.click();
+
+  await expect
+    .poll(() => maxGalleryVirtualPageGap(page), {
+      message: "expected gallery page heights to re-measure after restoring the sidebar"
+    })
+    .toBeLessThanOrEqual(2);
+});
+
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
   test.setTimeout(45_000);
 
@@ -475,7 +518,11 @@ test("client-ui desktop navigation can collapse and scroll on short viewports", 
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
 });
 
-async function installClientUiMocks(page: Page) {
+type InstallClientUiMocksOptions = {
+  storeEntries?: MockStoreEntry[];
+};
+
+async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOptions) {
   const imageBody = tinyPngBuffer();
   const movieBody = Buffer.from("mock-movie-payload");
   const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
@@ -488,7 +535,7 @@ async function installClientUiMocks(page: Page) {
   const activeUploadIds = new Set<string>();
   const deletedUploadSessionIds = new Set<string>();
   const requestedPaths = new Set<string>();
-  const storeEntries = createMockStoreEntries();
+  const storeEntries = options?.storeEntries ?? createMockStoreEntries();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
 
@@ -875,6 +922,27 @@ async function installClientUiMocks(page: Page) {
   };
 }
 
+async function maxGalleryVirtualPageGap(page: Page): Promise<number> {
+  return page.locator('[data-gallery-virtual-page-slot="true"]').evaluateAll((nodes) => {
+    const gaps = nodes
+      .map((node) => {
+        const slot = node as HTMLElement;
+        const pageGrid = slot.querySelector('[data-gallery-grid="true"]');
+        if (!(pageGrid instanceof HTMLElement)) {
+          return null;
+        }
+
+        return Math.max(
+          0,
+          slot.getBoundingClientRect().height - pageGrid.getBoundingClientRect().height
+        );
+      })
+      .filter((gap): gap is number => gap !== null);
+
+    return gaps.length > 0 ? Math.max(...gaps) : Number.POSITIVE_INFINITY;
+  });
+}
+
 async function json(route: Route, payload: unknown) {
   await route.fulfill({
     status: 200,
@@ -967,6 +1035,38 @@ function createMockStoreEntries(): MockStoreEntry[] {
         height: 1080
       }
     }
+  ];
+}
+
+function createGalleryPaginationMockStoreEntries(mediaCount: number): MockStoreEntry[] {
+  return [
+    ...createMockStoreEntries(),
+    ...Array.from({ length: mediaCount }, (_, index) => {
+      const path = `gallery/paginated-${String(index + 1).padStart(3, "0")}.jpg`;
+      return {
+        path,
+        entry_type: "key" as const,
+        size_bytes: 256_000 + index,
+        modified_at_unix: 1_712_200_000 - index,
+        media: {
+          status: "ready",
+          content_fingerprint: `fingerprint-paginated-${index + 1}`,
+          media_type: "image",
+          mime_type: "image/jpeg",
+          width: 1600,
+          height: 1200,
+          taken_at_unix: 1_712_100_000 - index,
+          thumbnail: {
+            url: `/media/thumbnail?key=${encodeURIComponent(path)}`,
+            profile: "grid",
+            width: 256,
+            height: 192,
+            format: "jpeg",
+            size_bytes: 1234
+          }
+        }
+      };
+    })
   ];
 }
 
