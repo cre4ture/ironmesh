@@ -1189,6 +1189,8 @@ trait MetadataStore: Send + Sync {
     async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()>;
     async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()>;
     async fn list_cached_chunk_records(&self) -> Result<Vec<CachedChunkRecord>>;
+    #[cfg(test)]
+    async fn has_media_cache_record(&self, content_fingerprint: &str) -> Result<bool>;
     async fn mark_manifest_locally_owned(
         &self,
         manifest_hash: &str,

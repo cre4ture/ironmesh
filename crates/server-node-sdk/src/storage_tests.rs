@@ -580,64 +580,6 @@ async fn persist_raw_media_cache_record(
     }
 }
 
-async fn media_cache_record_exists(
-    backend: StorageTestBackend,
-    metadata_db_path: &Path,
-    content_fingerprint: &str,
-) -> bool {
-    match backend {
-        StorageTestBackend::Sqlite => {
-            let db = rusqlite::Connection::open(metadata_db_path).unwrap();
-            db.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM media_cache WHERE content_fingerprint = ?1
-                 )",
-                rusqlite::params![content_fingerprint],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-                != 0
-        }
-        #[cfg(feature = "turso-metadata")]
-        StorageTestBackend::Turso => {
-            let db = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
-                .build()
-                .await
-                .unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM media_cache WHERE content_fingerprint = ?1",
-                    (content_fingerprint,),
-                )
-                .await
-                .unwrap();
-            let row = rows.next().await.unwrap().expect("expected count row");
-            match row.get_value(0).unwrap() {
-                turso::Value::Integer(value) => value != 0,
-                other => panic!("unexpected count type: {other:?}"),
-            }
-        }
-    }
-}
-
-async fn wait_for_media_cache_record_deletion(
-    backend: StorageTestBackend,
-    metadata_db_path: &Path,
-    content_fingerprint: &str,
-) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if !media_cache_record_exists(backend, metadata_db_path, content_fingerprint).await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("invalid media cache row should be deleted");
-}
-
 #[test]
 fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
     let mut index = empty_version_index("k");
@@ -3352,12 +3294,13 @@ async fn lookup_media_cache_deletes_invalid_metadata_records_impl(backend: Stora
         .unwrap()
         .unwrap();
     assert!(lookup.metadata.is_none());
-    wait_for_media_cache_record_deletion(
-        backend,
-        &store.metadata_db_path,
-        &metadata.content_fingerprint,
-    )
-    .await;
+    assert!(
+        !store
+            .metadata_store
+            .has_media_cache_record(&metadata.content_fingerprint)
+            .await
+            .unwrap()
+    );
 
     let rebuilt = store
         .ensure_media_cache(&put.manifest_hash)

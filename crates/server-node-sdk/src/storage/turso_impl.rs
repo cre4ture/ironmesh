@@ -478,6 +478,24 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn has_media_cache_record(&self, content_fingerprint: &str) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT COUNT(*) FROM media_cache WHERE content_fingerprint = ?1",
+                (content_fingerprint,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        match row.get_value(0)? {
+            turso::Value::Integer(value) => Ok(value != 0),
+            other => bail!("unexpected count type: {other:?}"),
+        }
+    }
+
     async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()> {
         self.connection
             .execute(

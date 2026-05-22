@@ -463,6 +463,19 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn has_media_cache_record(&self, content_fingerprint: &str) -> Result<bool> {
+        let db = self.metadata_conn()?;
+        let exists = db.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM media_cache WHERE content_fingerprint = ?1
+             )",
+            params![content_fingerprint],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()> {
         let db = self.metadata_conn()?;
         db.execute(
