@@ -254,9 +254,7 @@ mod tests {
                 .and_then(|value| value.as_array())
                 .and_then(|statuses| {
                     statuses.iter().find(|status| {
-                        status
-                            .get("instance_kind")
-                            .and_then(|value| value.as_str())
+                        status.get("instance_kind").and_then(|value| value.as_str())
                             == Some("folder-agent")
                             && status.get("id").and_then(|value| value.as_str())
                                 == Some("folder-log-test")
@@ -300,7 +298,9 @@ mod tests {
                 .get("launch")
                 .context("service start response missing launch outcome")?;
             assert_eq!(
-                outcome.get("instance_kind").and_then(|value| value.as_str()),
+                outcome
+                    .get("instance_kind")
+                    .and_then(|value| value.as_str()),
                 Some("folder-agent")
             );
             assert_eq!(
@@ -308,7 +308,10 @@ mod tests {
                 Some("folder-log-test")
             );
             assert!(
-                outcome.get("error").and_then(|value| value.as_str()).is_some(),
+                outcome
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .is_some(),
                 "missing executable should be reported as a launch error"
             );
 
@@ -370,9 +373,7 @@ mod tests {
                 .and_then(|value| value.as_array())
                 .and_then(|statuses| {
                     statuses.iter().find(|status| {
-                        status
-                            .get("instance_kind")
-                            .and_then(|value| value.as_str())
+                        status.get("instance_kind").and_then(|value| value.as_str())
                             == Some("folder-agent")
                             && status.get("id").and_then(|value| value.as_str())
                                 == Some("folder-log-test")
@@ -381,7 +382,9 @@ mod tests {
                 .context("config response missing folder-agent service status after stop")?;
             let log_file_string = log_file.to_string_lossy().to_string();
             assert_eq!(
-                service_status.get("log_file").and_then(|value| value.as_str()),
+                service_status
+                    .get("log_file")
+                    .and_then(|value| value.as_str()),
                 Some(log_file_string.as_str())
             );
             assert_eq!(

@@ -16,8 +16,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::framework::{
-        EnrolledTestClient, TEST_ADMIN_TOKEN, fresh_data_dir,
-        issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client, issue_bootstrap_claim,
+        EnrolledTestClient, TEST_ADMIN_TOKEN, fresh_data_dir, issue_bootstrap_bundle,
+        issue_bootstrap_bundle_and_enroll_client, issue_bootstrap_claim,
         latest_snapshot_id_for_client, register_node, start_authenticated_server,
         start_open_server_with_config, start_open_server_with_env, start_rendezvous_service,
         stop_server, wait_for_online_nodes, wait_for_rendezvous_registered_endpoints,
@@ -106,7 +106,9 @@ mod tests {
             let fetched = sdk.get("zero-byte-overwrite.txt").await?;
             assert_eq!(fetched, Bytes::new());
 
-            let head = sdk.head_object("zero-byte-overwrite.txt", None, None).await?;
+            let head = sdk
+                .head_object("zero-byte-overwrite.txt", None, None)
+                .await?;
             assert_eq!(head.total_size_bytes, 0);
 
             Ok::<(), anyhow::Error>(())
@@ -181,8 +183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn android_style_claim_enrollment_uses_credential_issuer_direct_endpoint()
-    -> Result<()> {
+    async fn android_style_claim_enrollment_uses_credential_issuer_direct_endpoint() -> Result<()> {
         let rendezvous_bind = "127.0.0.1:19244";
         let bind_b = "127.0.0.1:19245";
         let bind_a = "127.0.0.1:19246";
@@ -206,10 +207,10 @@ mod tests {
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
-        let mut node_b = start_open_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env)
-            .await?;
-        let mut node_a = start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env)
-            .await?;
+        let mut node_b =
+            start_open_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env).await?;
+        let mut node_a =
+            start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env).await?;
 
         let result = async {
             let http = reqwest::Client::new();
@@ -245,8 +246,9 @@ mod tests {
                 .connection_bootstrap_json
                 .clone()
                 .context("claim enrollment response did not include connection_bootstrap_json")?;
-            let persisted_bootstrap = ConnectionBootstrap::from_json_str(&connection_bootstrap_json)
-                .context("failed to parse Android-style persisted claim bootstrap")?;
+            let persisted_bootstrap =
+                ConnectionBootstrap::from_json_str(&connection_bootstrap_json)
+                    .context("failed to parse Android-style persisted claim bootstrap")?;
             let public_direct_node_ids = persisted_bootstrap
                 .direct_endpoints
                 .iter()
@@ -1064,8 +1066,9 @@ mod tests {
             assert!(first_chunk_status.stored);
             assert_eq!(first_chunk_status.received_index, 0);
 
-            let source_metadata = fs::metadata(&source_path)
-                .with_context(|| format!("failed to inspect upload source {}", source_path.display()))?;
+            let source_metadata = fs::metadata(&source_path).with_context(|| {
+                format!("failed to inspect upload source {}", source_path.display())
+            })?;
             let source_modified_unix_ms = source_metadata
                 .modified()
                 .context("failed to read upload source modified time")?

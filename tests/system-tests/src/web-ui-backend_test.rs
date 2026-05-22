@@ -10,7 +10,7 @@ mod tests {
         wait_for_rendezvous_registered_endpoints, wait_for_url_status,
     };
     use anyhow::{Context, Result};
-    use client_sdk::BootstrapEndpointUse;
+    use client_sdk::{BootstrapEndpointUse, build_http_client_with_identity_from_pem};
     use reqwest::StatusCode;
     use std::fs;
     use std::process::Stdio;
@@ -1635,6 +1635,353 @@ mod tests {
 
         stop_server(&mut web).await;
         stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn web_ui_backend_latency_test_succeeds_when_runtime_is_relay_only() -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19395";
+        let server_bind = "127.0.0.1:19396";
+        let web_bind = "127.0.0.1:19397";
+        let cluster_id = "11111111-1111-7111-8111-111111119395";
+        let node_id = "00000000-0000-0000-0000-000000009395";
+        let admin_token = "admin-secret";
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let server_base = format!("http://{server_bind}");
+        let web_base = format!("http://{web_bind}");
+        let data_dir = fresh_data_dir("web-ui-relay-latency-node");
+        let client_dir = fresh_data_dir("web-ui-relay-latency-client");
+
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut server =
+            start_open_server_with_env(server_bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let mut bootstrap = issue_bootstrap_bundle(
+                &http,
+                &server_base,
+                admin_token,
+                Some("relay-latency-web-ui"),
+                Some(3600),
+            )
+            .await?;
+            let bootstrap_path = client_dir.join("relay-latency-web.bootstrap.json");
+            bootstrap.write_to_path(&bootstrap_path)?;
+            let bootstrap_arg = bootstrap_path.to_string_lossy().into_owned();
+
+            let enroll_output = run_cli(&[
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "enroll",
+                "--label",
+                "relay-latency-web-ui",
+            ])
+            .await?;
+            assert!(
+                enroll_output.contains("enrolled device"),
+                "unexpected enroll output: {enroll_output}"
+            );
+
+            for endpoint in &mut bootstrap.direct_endpoints {
+                if endpoint.usage == Some(BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+            bootstrap.write_to_path(&bootstrap_path)?;
+
+            let mut web = start_web_backend_with_args(
+                web_bind,
+                &["--bootstrap-file", bootstrap_arg.as_str()],
+            )
+            .await?;
+
+            let result = async {
+                let rendezvous_refresh: serde_json::Value = http
+                    .post(format!("{web_base}/api/rendezvous/refresh"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let transport_mode = rendezvous_refresh
+                    .get("transport_mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                assert_eq!(transport_mode, "relay");
+
+                let latency_response: serde_json::Value = http
+                    .post(format!("{web_base}/api/latency-test"))
+                    .json(&serde_json::json!({
+                        "sample_count": 2,
+                        "warmup_count": 0,
+                        "response_bytes": 64,
+                        "pause_between_samples_ms": 0,
+                        "server_delay_ms": 0,
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+
+                let targets = latency_response
+                    .get("targets")
+                    .and_then(|value| value.as_array())
+                    .context("latency test response missing targets array")?;
+                assert!(
+                    !targets.is_empty(),
+                    "expected latency probe targets, got {latency_response}"
+                );
+
+                let current_target = targets
+                    .iter()
+                    .find(|target| {
+                        target.get("path_id").and_then(|value| value.as_str()) == Some("current")
+                    })
+                    .context("latency test response missing current target")?;
+                assert_eq!(
+                    current_target
+                        .get("transport_mode")
+                        .and_then(|value| value.as_str()),
+                    Some("relay"),
+                    "expected relay current target, got {latency_response}"
+                );
+                assert!(
+                    current_target
+                        .get("error")
+                        .is_none_or(serde_json::Value::is_null),
+                    "expected current relay target to succeed, got {latency_response}"
+                );
+                assert_eq!(
+                    current_target
+                        .get("result")
+                        .and_then(|value| value.get("summary"))
+                        .and_then(|value| value.get("success_count"))
+                        .and_then(|value| value.as_u64()),
+                    Some(2),
+                    "expected two successful relay samples, got {latency_response}"
+                );
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_server(&mut web).await;
+            result
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        stop_server(&mut rendezvous).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
+        result
+    }
+
+    #[tokio::test]
+    async fn web_ui_backend_latency_test_succeeds_when_runtime_is_direct_and_compares_relay_targets()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19398";
+        let server_bind = "127.0.0.1:19399";
+        let web_bind = "127.0.0.1:19400";
+        let cluster_id = "11111111-1111-7111-8111-111111119398";
+        let node_id = "00000000-0000-0000-0000-000000009398";
+        let admin_token = "admin-secret";
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let server_base = format!("http://{server_bind}");
+        let web_base = format!("http://{web_bind}");
+        let data_dir = fresh_data_dir("web-ui-direct-latency-node");
+        let client_dir = fresh_data_dir("web-ui-direct-latency-client");
+
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut server =
+            start_open_server_with_env(server_bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &server_base,
+                admin_token,
+                &client_dir,
+                "direct-latency-web.bootstrap.json",
+                Some("direct-latency-web-ui"),
+                Some(3600),
+            )
+            .await?;
+            assert!(
+                enrolled.bootstrap_path.exists(),
+                "expected persisted bootstrap at {}",
+                enrolled.bootstrap_path.display()
+            );
+
+            let direct_client =
+                build_http_client_with_identity_from_pem(None, &server_base, &enrolled.identity)?;
+            assert!(
+                !direct_client.uses_relay_transport(),
+                "expected injected web runtime client to stay on a direct path"
+            );
+
+            let _web_resource_guards = lock_test_resources([tcp_resource_key(web_bind)]).await;
+            let listener = tokio::net::TcpListener::bind(web_bind)
+                .await
+                .context("failed binding in-process web backend listener")?;
+            let app = web_ui_backend::router(
+                web_ui_backend::WebUiConfig::from_client(direct_client)
+                    .with_service_name("system-test-web")
+                    .with_connection_bootstrap(enrolled.bootstrap.clone())
+                    .with_client_identity(enrolled.identity.clone()),
+            );
+            let web = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("in-process web backend should run");
+            });
+            wait_for_url_status(&format!("http://{web_bind}/api/ping"), StatusCode::OK, 40).await?;
+
+            let result = async {
+                let rendezvous_refresh: serde_json::Value = http
+                    .post(format!("{web_base}/api/rendezvous/refresh"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let transport_mode = rendezvous_refresh
+                    .get("transport_mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                assert_eq!(transport_mode, "direct");
+
+                let latency_response: serde_json::Value = http
+                    .post(format!("{web_base}/api/latency-test"))
+                    .json(&serde_json::json!({
+                        "sample_count": 2,
+                        "warmup_count": 0,
+                        "response_bytes": 64,
+                        "pause_between_samples_ms": 0,
+                        "server_delay_ms": 0,
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+
+                let targets = latency_response
+                    .get("targets")
+                    .and_then(|value| value.as_array())
+                    .context("latency test response missing targets array")?;
+                assert!(
+                    !targets.is_empty(),
+                    "expected latency probe targets, got {latency_response}"
+                );
+
+                let current_target = targets
+                    .iter()
+                    .find(|target| {
+                        target.get("path_id").and_then(|value| value.as_str()) == Some("current")
+                    })
+                    .context("latency test response missing current target")?;
+                assert_eq!(
+                    current_target
+                        .get("transport_mode")
+                        .and_then(|value| value.as_str()),
+                    Some("direct"),
+                    "expected direct current target, got {latency_response}"
+                );
+                assert!(
+                    current_target
+                        .get("error")
+                        .is_none_or(serde_json::Value::is_null),
+                    "expected current direct target to succeed, got {latency_response}"
+                );
+                assert_eq!(
+                    current_target
+                        .get("result")
+                        .and_then(|value| value.get("summary"))
+                        .and_then(|value| value.get("success_count"))
+                        .and_then(|value| value.as_u64()),
+                    Some(2),
+                    "expected two successful direct samples, got {latency_response}"
+                );
+
+                let relay_target = targets
+                    .iter()
+                    .find(|target| {
+                        target
+                            .get("transport_mode")
+                            .and_then(|value| value.as_str())
+                            == Some("relay")
+                    })
+                    .context("latency test response missing relay comparison target")?;
+                assert!(
+                    relay_target
+                        .get("error")
+                        .is_none_or(serde_json::Value::is_null),
+                    "expected relay comparison target to succeed, got {latency_response}"
+                );
+                assert_eq!(
+                    relay_target
+                        .get("result")
+                        .and_then(|value| value.get("summary"))
+                        .and_then(|value| value.get("success_count"))
+                        .and_then(|value| value.as_u64()),
+                    Some(2),
+                    "expected two successful relay samples, got {latency_response}"
+                );
+
+                assert!(
+                    latency_response
+                        .get("comparison")
+                        .and_then(|value| value.as_object())
+                        .is_some(),
+                    "expected direct-vs-relay comparison payload, got {latency_response}"
+                );
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            web.abort();
+            let _ = web.await;
+            result
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        stop_server(&mut rendezvous).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
         result
     }
 
