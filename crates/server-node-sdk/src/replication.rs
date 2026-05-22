@@ -22,6 +22,7 @@ pub(crate) struct ReplicationRepairReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationRepairLogEntry {
+    pub(crate) captured_at_unix: u64,
     pub(crate) report_node_id: NodeId,
     pub(crate) event: String,
     pub(crate) detail: String,
@@ -525,8 +526,15 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
             })),
         );
 
-        match pull_bundle_from_source(&source_node, &key, version_id.as_deref(), state, run_id)
-            .await
+        match pull_bundle_from_source(
+            &source_node,
+            &key,
+            version_id.as_deref(),
+            state,
+            run_id,
+            &mut detailed_log,
+        )
+        .await
         {
             Ok(imported_version_id) => {
                 push_repair_log_entry(
@@ -1118,8 +1126,15 @@ async fn execute_replication_repair_plan(
                 })),
             );
 
-            match pull_bundle_from_source(source_node, &key, version_id.as_deref(), state, run_id)
-                .await
+            match pull_bundle_from_source(
+                source_node,
+                &key,
+                version_id.as_deref(),
+                state,
+                run_id,
+                &mut detailed_log,
+            )
+            .await
             {
                 Ok(imported_version_id) => {
                     if verify_local_pulls
@@ -1471,7 +1486,8 @@ async fn execute_replication_repair_plan(
                     "bundle_version_id": bundle.version_id,
                 })),
             );
-            let transfer_result = replicate_bundle_to_target(node, &bundle, state, run_id).await;
+            let transfer_result =
+                replicate_bundle_to_target(node, &bundle, state, run_id, &mut detailed_log).await;
 
             match transfer_result {
                 Ok(remote_version_id) => {
@@ -2045,7 +2061,8 @@ fn push_repair_log_entry(
     target_node_id: Option<NodeId>,
     context: Option<serde_json::Value>,
 ) {
-    detailed_log.push(ReplicationRepairLogEntry {
+    let entry = ReplicationRepairLogEntry {
+        captured_at_unix: unix_ts(),
         report_node_id,
         event: event.into(),
         detail: detail.into(),
@@ -2055,7 +2072,9 @@ fn push_repair_log_entry(
         source_node_id,
         target_node_id,
         context,
-    });
+    };
+    append_active_repair_log_entry(&entry);
+    detailed_log.push(entry);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2114,10 +2133,15 @@ async fn pull_bundle_from_source(
     version_id: Option<&str>,
     state: &ServerState,
     run_id: Option<&str>,
+    detailed_log: &mut Vec<ReplicationRepairLogEntry>,
 ) -> Result<String> {
     let transfer_started = Instant::now();
     let export_path = build_replication_export_path(key, version_id);
     let repair_run_id = run_id.unwrap_or("untracked");
+    let subject = match version_id {
+        Some(version_id) => format!("{key}@{version_id}"),
+        None => key.to_string(),
+    };
     info!(
         repair_run_id,
         source_node_id = %source_node.node_id,
@@ -2125,6 +2149,20 @@ async fn pull_bundle_from_source(
         version_id = ?version_id,
         path = %export_path,
         "replication repair pull export request starting"
+    );
+    push_repair_log_entry(
+        detailed_log,
+        state.node_id,
+        "pull_export_request_started",
+        "requesting replica export bundle from source node",
+        Some(subject.clone()),
+        Some(key.to_string()),
+        version_id.map(str::to_string),
+        Some(source_node.node_id),
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "path": export_path,
+        })),
     );
     let bundle = execute_peer_request(
         state,
@@ -2148,6 +2186,23 @@ async fn pull_bundle_from_source(
         total_size_bytes = bundle.manifest.total_size_bytes,
         "replication repair pull export ready"
     );
+    push_repair_log_entry(
+        detailed_log,
+        state.node_id,
+        "pull_export_ready",
+        "received replica export bundle from source node",
+        Some(subject.clone()),
+        Some(bundle.key.clone()),
+        bundle.version_id.clone(),
+        Some(source_node.node_id),
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "manifest_hash": bundle.manifest_hash.clone(),
+            "chunk_count": chunk_count,
+            "total_size_bytes": bundle.manifest.total_size_bytes,
+            "tombstone": bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH,
+        })),
+    );
 
     if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
         for (chunk_offset, chunk) in bundle.manifest.chunks.iter().enumerate() {
@@ -2162,6 +2217,22 @@ async fn pull_bundle_from_source(
                     chunk_count,
                     chunk_hash = %chunk.hash,
                     "replication repair pull chunk progress"
+                );
+                push_repair_log_entry(
+                    detailed_log,
+                    state.node_id,
+                    "pull_chunk_progress",
+                    "downloading replica chunk from source node",
+                    Some(subject.clone()),
+                    Some(bundle.key.clone()),
+                    bundle.version_id.clone(),
+                    Some(source_node.node_id),
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                        "chunk_index": chunk_index,
+                        "chunk_count": chunk_count,
+                        "chunk_hash": chunk.hash.clone(),
+                    })),
                 );
             }
             let payload = execute_peer_request(
@@ -2188,6 +2259,20 @@ async fn pull_bundle_from_source(
         manifest_hash = %bundle.manifest_hash,
         "replication repair pull importing manifest"
     );
+    push_repair_log_entry(
+        detailed_log,
+        state.node_id,
+        "pull_manifest_import_started",
+        "importing pulled replica manifest locally",
+        Some(subject.clone()),
+        Some(bundle.key.clone()),
+        bundle.version_id.clone(),
+        Some(source_node.node_id),
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "manifest_hash": bundle.manifest_hash.clone(),
+        })),
+    );
     let mut store = lock_store(state, "replication_pull.import_manifest").await;
     let _ = store
         .drop_replica_subject(&bundle.key, bundle.version_id.as_deref())
@@ -2211,6 +2296,22 @@ async fn pull_bundle_from_source(
         chunk_count,
         elapsed_ms = transfer_started.elapsed().as_millis(),
         "replication repair pull completed"
+    );
+    push_repair_log_entry(
+        detailed_log,
+        state.node_id,
+        "pull_completed",
+        "finished pulling replica bundle from source node",
+        Some(subject),
+        Some(bundle.key),
+        bundle.version_id,
+        Some(source_node.node_id),
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "imported_version_id": imported_version_id.clone(),
+            "chunk_count": chunk_count,
+            "elapsed_ms": transfer_started.elapsed().as_millis(),
+        })),
     );
     Ok(imported_version_id)
 }
@@ -2245,10 +2346,15 @@ async fn replicate_bundle_to_target(
     bundle: &ReplicationExportBundle,
     state: &ServerState,
     run_id: Option<&str>,
+    detailed_log: &mut Vec<ReplicationRepairLogEntry>,
 ) -> Result<String> {
     let transfer_started = Instant::now();
     let chunk_count = bundle.manifest.chunks.len();
     let repair_run_id = run_id.unwrap_or("untracked");
+    let subject = match bundle.version_id.as_deref() {
+        Some(version_id) => format!("{}@{version_id}", bundle.key),
+        None => bundle.key.clone(),
+    };
     info!(
         repair_run_id,
         target_node_id = %target_node.node_id,
@@ -2259,6 +2365,23 @@ async fn replicate_bundle_to_target(
         total_size_bytes = bundle.manifest.total_size_bytes,
         tombstone = bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH,
         "replication repair target push starting"
+    );
+    push_repair_log_entry(
+        detailed_log,
+        state.node_id,
+        "target_transfer_started",
+        "starting replica transfer to target node",
+        Some(subject.clone()),
+        Some(bundle.key.clone()),
+        bundle.version_id.clone(),
+        Some(state.node_id),
+        Some(target_node.node_id),
+        Some(serde_json::json!({
+            "manifest_hash": bundle.manifest_hash.clone(),
+            "chunk_count": chunk_count,
+            "total_size_bytes": bundle.manifest.total_size_bytes,
+            "tombstone": bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH,
+        })),
     );
 
     if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
@@ -2303,6 +2426,20 @@ async fn replicate_bundle_to_target(
             elapsed_ms = transfer_started.elapsed().as_millis(),
             "replication repair tombstone push completed"
         );
+        push_repair_log_entry(
+            detailed_log,
+            state.node_id,
+            "target_tombstone_push_completed",
+            "finished tombstone replication to target node",
+            Some(subject),
+            Some(bundle.key.clone()),
+            bundle.version_id.clone(),
+            Some(state.node_id),
+            Some(target_node.node_id),
+            Some(serde_json::json!({
+                "elapsed_ms": transfer_started.elapsed().as_millis(),
+            })),
+        );
 
         return bundle
             .version_id
@@ -2323,6 +2460,22 @@ async fn replicate_bundle_to_target(
                     chunk_count,
                     chunk_hash = %chunk.hash,
                     "replication repair target push chunk progress"
+                );
+                push_repair_log_entry(
+                    detailed_log,
+                    state.node_id,
+                    "target_push_chunk_progress",
+                    "uploading replica chunk to target node",
+                    Some(subject.clone()),
+                    Some(bundle.key.clone()),
+                    bundle.version_id.clone(),
+                    Some(state.node_id),
+                    Some(target_node.node_id),
+                    Some(serde_json::json!({
+                        "chunk_index": chunk_index,
+                        "chunk_count": chunk_count,
+                        "chunk_hash": chunk.hash.clone(),
+                    })),
                 );
             }
             let payload = {
@@ -2382,6 +2535,21 @@ async fn replicate_bundle_to_target(
             chunk_count,
             total_size_bytes = bundle.manifest.total_size_bytes,
             "replication repair assembled inline object for target push"
+        );
+        push_repair_log_entry(
+            detailed_log,
+            state.node_id,
+            "target_inline_object_assembled",
+            "assembled inline object payload for target node",
+            Some(subject.clone()),
+            Some(bundle.key.clone()),
+            bundle.version_id.clone(),
+            Some(state.node_id),
+            Some(target_node.node_id),
+            Some(serde_json::json!({
+                "chunk_count": chunk_count,
+                "total_size_bytes": bundle.manifest.total_size_bytes,
+            })),
         );
 
         let state_query = match bundle.state {
@@ -2443,6 +2611,21 @@ async fn replicate_bundle_to_target(
         path = %manifest_path,
         "replication repair target push manifest starting"
     );
+    push_repair_log_entry(
+        detailed_log,
+        state.node_id,
+        "target_manifest_push_started",
+        "pushing replica manifest to target node",
+        Some(subject.clone()),
+        Some(bundle.key.clone()),
+        bundle.version_id.clone(),
+        Some(state.node_id),
+        Some(target_node.node_id),
+        Some(serde_json::json!({
+            "manifest_hash": bundle.manifest_hash.clone(),
+            "path": manifest_path.clone(),
+        })),
+    );
     let response = execute_peer_request(
         state,
         target_node,
@@ -2479,6 +2662,22 @@ async fn replicate_bundle_to_target(
         chunk_count,
         elapsed_ms = transfer_started.elapsed().as_millis(),
         "replication repair target push completed"
+    );
+    push_repair_log_entry(
+        detailed_log,
+        state.node_id,
+        "target_transfer_completed",
+        "finished replica transfer to target node",
+        Some(subject),
+        Some(bundle.key.clone()),
+        bundle.version_id.clone(),
+        Some(state.node_id),
+        Some(target_node.node_id),
+        Some(serde_json::json!({
+            "remote_version_id": report.version_id.clone(),
+            "chunk_count": chunk_count,
+            "elapsed_ms": transfer_started.elapsed().as_millis(),
+        })),
     );
     Ok(report.version_id)
 }

@@ -7792,6 +7792,81 @@ run_on_main_metadata_backends!(
     data_scrub_activity_and_history_do_not_wait_on_active_scrub_turso
 );
 
+async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+
+    let activity = tokio::time::timeout(
+        Duration::from_millis(250),
+        super::with_active_repair_log_tracking(&tracker, async {
+            super::append_active_repair_log_entry(&super::replication::ReplicationRepairLogEntry {
+                captured_at_unix: 1_900_000_000,
+                report_node_id: state.node_id,
+                event: "test_progress".to_string(),
+                detail: "repair run emitted a live progress event".to_string(),
+                subject: Some("photos/cover.jpg".to_string()),
+                key: Some("photos/cover.jpg".to_string()),
+                version_id: None,
+                source_node_id: Some(NodeId::new_v4()),
+                target_node_id: Some(state.node_id),
+                context: Some(serde_json::json!({
+                    "step": "chunk_progress",
+                })),
+            });
+            super::local_repair_activity_payload(&state).await
+        }),
+    )
+    .await
+    .expect("repair activity payload should not wait on the active run")
+    .unwrap();
+
+    assert_eq!(activity.state, super::RepairActivityState::Running);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(activity.active_runs[0].run_id, tracker.run_id);
+    assert_eq!(
+        activity.active_runs[0].last_log_at_unix,
+        Some(1_900_000_000)
+    );
+    assert_eq!(activity.active_runs[0].live_log.len(), 1);
+    assert_eq!(activity.active_runs[0].live_log[0].event, "test_progress");
+    assert_eq!(
+        activity.active_runs[0].live_log[0].detail,
+        "repair run emitted a live progress event"
+    );
+    assert!(activity.latest_run.is_none());
+
+    super::finish_repair_run_tracking(
+        &state,
+        tracker,
+        super::RepairPlanSummary {
+            generated_at_unix: 1_900_000_000,
+            under_replicated: 0,
+            over_replicated: 0,
+            cleanup_deferred_items: 0,
+            cleanup_deferred_extra_nodes: 0,
+            item_count: 0,
+        },
+        super::RepairRunStatus::Completed,
+        None,
+        None,
+    )
+    .await;
+    assert!(state.repair_activity.lock().await.active_runs.is_empty());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    repair_activity_payload_includes_live_log_for_active_run_impl,
+    repair_activity_payload_includes_live_log_for_active_run,
+    repair_activity_payload_includes_live_log_for_active_run_turso
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataScrubAutoRepairCorruptionKind {
     ManifestMissing,

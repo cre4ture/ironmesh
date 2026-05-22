@@ -9,6 +9,7 @@ import {
   triggerDataScrub,
   triggerReplicationRepair,
   type DataScrubRunRecord,
+  type RepairLogEntry,
   type ManualRepairActionRunResponse,
   type RepairRunRecord,
   type ReplicationPlan
@@ -490,6 +491,56 @@ export function RepairPage() {
                         <Text size="xs" c="dimmed">
                           Run ID <Code>{activeRun.run_id}</Code>
                         </Text>
+                        {activeRun.live_log.length > 0 ? (
+                          <Card withBorder radius="sm" padding="sm">
+                            <Stack gap={6}>
+                              <Group justify="space-between" align="flex-start">
+                                <Text fw={600} size="sm">
+                                  Live progress log
+                                </Text>
+                                <Group gap="xs">
+                                  <Badge variant="light" color="teal">
+                                    {activeRun.live_log.length} event
+                                    {activeRun.live_log.length === 1 ? "" : "s"}
+                                  </Badge>
+                                  {activeRun.live_log_truncated ? (
+                                    <Badge variant="light" color="yellow">
+                                      latest slice
+                                    </Badge>
+                                  ) : null}
+                                </Group>
+                              </Group>
+                              <Text size="xs" c="dimmed">
+                                Latest event{" "}
+                                {formatUnixTs(
+                                  activeRun.last_log_at_unix ?? activeRun.started_at_unix
+                                )}
+                              </Text>
+                              <div
+                                role="log"
+                                aria-live="polite"
+                                style={{
+                                  maxHeight: 240,
+                                  overflowY: "auto",
+                                  overflowX: "auto",
+                                  paddingRight: 8
+                                }}
+                              >
+                                <Text ff="monospace" size="xs" style={{ whiteSpace: "pre-wrap" }}>
+                                  {activeRun.live_log
+                                    .slice()
+                                    .reverse()
+                                    .map(formatRepairLogLine)
+                                    .join("\n")}
+                                </Text>
+                              </div>
+                            </Stack>
+                          </Card>
+                        ) : (
+                          <Text size="xs" c="dimmed">
+                            Waiting for live progress entries from this run.
+                          </Text>
+                        )}
                       </Stack>
                     </Card>
                   ))}
@@ -1246,6 +1297,36 @@ function formatRepairStatus(status: string): string {
     default:
       return status;
   }
+}
+
+function formatRepairLogEvent(event: string): string {
+  return event.replaceAll("_", " ");
+}
+
+function formatRepairLogLine(entry: RepairLogEntry): string {
+  const qualifiers: string[] = [];
+  if (entry.key) {
+    qualifiers.push(`key=${entry.key}`);
+  }
+  if (entry.version_id) {
+    qualifiers.push(`version=${entry.version_id}`);
+  }
+  if (entry.subject && entry.subject !== entry.key) {
+    qualifiers.push(`subject=${entry.subject}`);
+  }
+  if (entry.source_node_id || entry.target_node_id) {
+    qualifiers.push(
+      `path=${entry.source_node_id ?? "unknown"}->${entry.target_node_id ?? "unknown"}`
+    );
+  }
+
+  return [
+    `${formatUnixTs(entry.captured_at_unix)} [${formatRepairLogEvent(entry.event)}]`,
+    entry.detail,
+    qualifiers.length > 0 ? `(${qualifiers.join(", ")})` : null
+  ]
+    .filter((part): part is string => part !== null)
+    .join(" ");
 }
 
 function repairActivityBadgeColor(state: string | undefined): string {

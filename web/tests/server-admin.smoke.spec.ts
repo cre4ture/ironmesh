@@ -71,6 +71,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("photos/cover.jpg", { exact: true })).toBeVisible();
   await expect(page.getByText("1 / 2 desired nodes currently present", { exact: true })).toBeVisible();
   await expect(page.getByText("under replicated", { exact: true })).toBeVisible();
+  await expect(page.getByText("Live progress log", { exact: true })).toBeVisible();
+  await expect(page.getByText("downloading replica chunk from source node")).toBeVisible();
 
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
@@ -1059,6 +1061,212 @@ async function installServerAdminMocks(
           status: "online"
         }
       ]);
+    }
+
+    if (pathname === apiV1("/auth/repair/activity") && method === "GET") {
+      return json(route, {
+        state: "running",
+        startup_status: "completed",
+        active_runs: [
+          {
+            run_id: "repair-run-live-001",
+            scope: "local",
+            trigger: "background_audit",
+            started_at_unix: 1_900_000_001,
+            last_log_at_unix: 1_900_000_009,
+            live_log_truncated: false,
+            live_log: [
+              {
+                captured_at_unix: 1_900_000_002,
+                report_node_id: "node-alpha",
+                event: "repair_run_started",
+                detail: "starting replication repair run",
+                context: {
+                  plan_item_count: 1,
+                  max_transfers: 32
+                }
+              },
+              {
+                captured_at_unix: 1_900_000_006,
+                report_node_id: "node-alpha",
+                event: "pull_chunk_progress",
+                detail: "downloading replica chunk from source node",
+                key: "photos/cover.jpg",
+                source_node_id: "node-beta",
+                target_node_id: "node-alpha",
+                context: {
+                  chunk_index: 1,
+                  chunk_count: 3,
+                  chunk_hash: "chunk-cover-001"
+                }
+              },
+              {
+                captured_at_unix: 1_900_000_009,
+                report_node_id: "node-alpha",
+                event: "target_manifest_push_started",
+                detail: "pushing replica manifest to target node",
+                key: "photos/cover.jpg",
+                source_node_id: "node-alpha",
+                target_node_id: "node-beta"
+              }
+            ]
+          }
+        ],
+        latest_run: {
+          run_id: "repair-run-finished-001",
+          reporting_node_id: "node-alpha",
+          scope: "cluster",
+          trigger: "manual_request",
+          status: "completed",
+          started_at_unix: 1_899_999_900,
+          finished_at_unix: 1_899_999_960,
+          duration_ms: 60_000,
+          plan_summary: {
+            generated_at_unix: 1_899_999_899,
+            under_replicated: 1,
+            over_replicated: 0,
+            cleanup_deferred_items: 0,
+            cleanup_deferred_extra_nodes: 0,
+            item_count: 1
+          },
+          summary: {
+            attempted_transfers: 1,
+            successful_transfers: 1,
+            failed_transfers: 0,
+            skipped_items: 0,
+            skipped_backoff: 0,
+            skipped_max_retries: 0,
+            skipped_detail_count: 0,
+            nodes_contacted: 2,
+            failed_nodes: 0,
+            last_error: null
+          }
+        }
+      });
+    }
+
+    if (pathname === apiV1("/auth/repair/history") && method === "GET") {
+      return json(route, {
+        retention_secs: 2_592_000,
+        runs: [
+          {
+            run_id: "repair-run-finished-001",
+            reporting_node_id: "node-alpha",
+            scope: "cluster",
+            trigger: "manual_request",
+            status: "completed",
+            started_at_unix: 1_899_999_900,
+            finished_at_unix: 1_899_999_960,
+            duration_ms: 60_000,
+            plan_summary: {
+              generated_at_unix: 1_899_999_899,
+              under_replicated: 1,
+              over_replicated: 0,
+              cleanup_deferred_items: 0,
+              cleanup_deferred_extra_nodes: 0,
+              item_count: 1
+            },
+            summary: {
+              attempted_transfers: 1,
+              successful_transfers: 1,
+              failed_transfers: 0,
+              skipped_items: 0,
+              skipped_backoff: 0,
+              skipped_max_retries: 0,
+              skipped_detail_count: 0,
+              nodes_contacted: 2,
+              failed_nodes: 0,
+              last_error: null
+            },
+            report: {
+              detailed_log: [
+                {
+                  captured_at_unix: 1_899_999_900,
+                  report_node_id: "node-alpha",
+                  event: "repair_run_started",
+                  detail: "starting replication repair run"
+                }
+              ]
+            }
+          }
+        ]
+      });
+    }
+
+    if (pathname === apiV1("/auth/repair/actions") && method === "GET") {
+      return json(route, {
+        actions: [
+          {
+            id: "legacy_rename_logical_paths",
+            label: "Rename legacy logical paths",
+            description: "Rewrite legacy logical paths to the current layout.",
+            dry_run_supported: true,
+            destructive: false
+          }
+        ]
+      });
+    }
+
+    if (pathname === apiV1("/auth/scrub/cluster") && method === "GET") {
+      return json(route, {
+        nodes: [
+          {
+            node_id: "node-alpha",
+            state: "idle",
+            enabled: true,
+            interval_secs: 604800,
+            retention_secs: 31104000,
+            active_runs: [],
+            latest_run: {
+              run_id: "scrub-run-001",
+              reporting_node_id: "node-alpha",
+              trigger: "scheduled",
+              status: "clean",
+              started_at_unix: 1_899_999_000,
+              finished_at_unix: 1_899_999_120,
+              duration_ms: 120_000,
+              summary: {
+                current_keys_scanned: 12,
+                version_indexes_scanned: 12,
+                version_records_scanned: 12,
+                manifests_scanned: 12,
+                chunks_scanned: 24,
+                bytes_scanned: 4096,
+                issue_count: 0,
+                sampled_issue_count: 0,
+                issue_sample_truncated: false,
+                issues: []
+              },
+              last_error: null
+            }
+          }
+        ],
+        skipped_nodes: [],
+        runs: [
+          {
+            run_id: "scrub-run-001",
+            reporting_node_id: "node-alpha",
+            trigger: "scheduled",
+            status: "clean",
+            started_at_unix: 1_899_999_000,
+            finished_at_unix: 1_899_999_120,
+            duration_ms: 120_000,
+            summary: {
+              current_keys_scanned: 12,
+              version_indexes_scanned: 12,
+              version_records_scanned: 12,
+              manifests_scanned: 12,
+              chunks_scanned: 24,
+              bytes_scanned: 4096,
+              issue_count: 0,
+              sampled_issue_count: 0,
+              issue_sample_truncated: false,
+              issues: []
+            },
+            last_error: null
+          }
+        ]
+      });
     }
 
     if (pathname === apiV1("/cluster/replication/plan") && method === "GET") {

@@ -132,6 +132,7 @@ const DATA_SCRUB_HISTORY_RETENTION_SECS: u64 = 12 * 30 * 24 * 60 * 60;
 const MAX_DATA_SCRUB_HISTORY_LIMIT: usize = 4_096;
 const REPAIR_RUN_HISTORY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_REPAIR_RUN_HISTORY_LIMIT: usize = 4_096;
+const ACTIVE_REPAIR_LIVE_LOG_LIMIT: usize = 1_024;
 const UPLOAD_SESSION_PERSIST_COALESCE_SECS: u64 = 5;
 const RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS: u64 = 50;
 const RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS: u64 = 250;
@@ -185,6 +186,11 @@ use storage::{
     StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
     media_cache_retry_due, promote_cached_media_metadata_to_incomplete,
 };
+
+tokio::task_local! {
+    static ACTIVE_REPAIR_LOG_HANDLE: RepairActiveRunLiveLogHandle;
+}
+
 #[derive(Clone)]
 struct ServerState {
     data_dir: PathBuf,
@@ -2098,17 +2104,83 @@ struct RepairHistoryResponse {
     runs: Vec<RepairRunRecord>,
 }
 
+#[derive(Debug, Default)]
+struct RepairActiveRunLiveState {
+    entries: VecDeque<replication::ReplicationRepairLogEntry>,
+    truncated: bool,
+    last_log_at_unix: Option<u64>,
+}
+
+impl RepairActiveRunLiveState {
+    fn push(&mut self, entry: replication::ReplicationRepairLogEntry) {
+        self.last_log_at_unix = Some(entry.captured_at_unix);
+        self.entries.push_back(entry);
+        while self.entries.len() > ACTIVE_REPAIR_LIVE_LOG_LIMIT {
+            self.entries.pop_front();
+            self.truncated = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RepairActiveRunLiveLogHandle {
+    state: Arc<StdMutex<RepairActiveRunLiveState>>,
+}
+
+impl RepairActiveRunLiveLogHandle {
+    fn push_entry(&self, entry: replication::ReplicationRepairLogEntry) {
+        let mut live_state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        live_state.push(entry);
+    }
+}
+
+#[derive(Debug)]
+struct RepairActiveRunRuntime {
+    run_id: String,
+    scope: replication::ReplicationRepairScope,
+    trigger: RepairRunTrigger,
+    started_at_unix: u64,
+    live_log: Arc<StdMutex<RepairActiveRunLiveState>>,
+}
+
+impl RepairActiveRunRuntime {
+    fn snapshot(&self) -> RepairActiveRun {
+        let live_state = match self.live_log.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        RepairActiveRun {
+            run_id: self.run_id.clone(),
+            scope: self.scope,
+            trigger: self.trigger,
+            started_at_unix: self.started_at_unix,
+            last_log_at_unix: live_state.last_log_at_unix,
+            live_log: live_state.entries.iter().cloned().collect(),
+            live_log_truncated: live_state.truncated,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RepairActiveRun {
     run_id: String,
     scope: replication::ReplicationRepairScope,
     trigger: RepairRunTrigger,
     started_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_log_at_unix: Option<u64>,
+    #[serde(default)]
+    live_log: Vec<replication::ReplicationRepairLogEntry>,
+    #[serde(default)]
+    live_log_truncated: bool,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct RepairActivityRuntime {
-    active_runs: Vec<RepairActiveRun>,
+    active_runs: Vec<RepairActiveRunRuntime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7669,6 +7741,27 @@ struct RepairRunTracker {
     trigger: RepairRunTrigger,
     started_at_unix: u64,
     started_at_instant: Instant,
+    live_log: Arc<StdMutex<RepairActiveRunLiveState>>,
+}
+
+fn append_active_repair_log_entry(entry: &replication::ReplicationRepairLogEntry) {
+    let _ = ACTIVE_REPAIR_LOG_HANDLE.try_with(|handle| {
+        handle.push_entry(entry.clone());
+    });
+}
+
+async fn with_active_repair_log_tracking<T>(
+    tracker: &RepairRunTracker,
+    future: impl Future<Output = T>,
+) -> T {
+    ACTIVE_REPAIR_LOG_HANDLE
+        .scope(
+            RepairActiveRunLiveLogHandle {
+                state: tracker.live_log.clone(),
+            },
+            future,
+        )
+        .await
 }
 
 async fn current_replication_plan(state: &ServerState) -> ReplicationPlan {
@@ -7692,14 +7785,16 @@ async fn begin_repair_run_tracking(
 ) -> RepairRunTracker {
     let run_id = Uuid::now_v7().to_string();
     let started_at_unix = unix_ts();
+    let live_log = Arc::new(StdMutex::new(RepairActiveRunLiveState::default()));
 
     {
         let mut activity = state.repair_activity.lock().await;
-        activity.active_runs.push(RepairActiveRun {
+        activity.active_runs.push(RepairActiveRunRuntime {
             run_id: run_id.clone(),
             scope,
             trigger,
             started_at_unix,
+            live_log: live_log.clone(),
         });
     }
 
@@ -7709,6 +7804,7 @@ async fn begin_repair_run_tracking(
         trigger,
         started_at_unix,
         started_at_instant: Instant::now(),
+        live_log,
     }
 }
 
@@ -7784,7 +7880,7 @@ async fn finish_repair_run_tracking(
 }
 
 fn current_repair_activity_state(
-    active_runs: &[RepairActiveRun],
+    active_runs: &[RepairActiveRunRuntime],
     startup_status: StartupRepairStatus,
 ) -> RepairActivityState {
     if !active_runs.is_empty() || startup_status == StartupRepairStatus::Running {
@@ -7794,6 +7890,24 @@ fn current_repair_activity_state(
     } else {
         RepairActivityState::Idle
     }
+}
+
+async fn local_repair_activity_payload(
+    state: &ServerState,
+) -> Result<RepairActivityStatusResponse> {
+    let latest_run = latest_repair_run_record(state).await?;
+    let startup_status = *state.startup_repair_status.lock().await;
+    let activity = state.repair_activity.lock().await;
+    Ok(RepairActivityStatusResponse {
+        state: current_repair_activity_state(&activity.active_runs, startup_status),
+        startup_status,
+        active_runs: activity
+            .active_runs
+            .iter()
+            .map(RepairActiveRunRuntime::snapshot)
+            .collect(),
+        latest_run,
+    })
 }
 
 async fn latest_repair_run_record(state: &ServerState) -> Result<Option<RepairRunRecord>> {
@@ -8096,11 +8210,14 @@ async fn execute_tracked_local_replication_repair(
     };
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let report = replication::execute_replication_repair_inner_with_context(
-        state,
-        batch_size_override,
-        Some(&tracker.run_id),
-    )
+    let report = with_active_repair_log_tracking(&tracker, async {
+        replication::execute_replication_repair_inner_with_context(
+            state,
+            batch_size_override,
+            Some(&tracker.run_id),
+        )
+        .await
+    })
     .await;
     finish_repair_run_tracking(
         state,
@@ -8129,12 +8246,15 @@ async fn execute_tracked_targeted_local_replication_repair(
     };
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let report = replication::execute_targeted_replication_repair_inner_with_context(
-        state,
-        subjects.clone(),
-        Some(subjects.len().max(1)),
-        Some(&tracker.run_id),
-    )
+    let report = with_active_repair_log_tracking(&tracker, async {
+        replication::execute_targeted_replication_repair_inner_with_context(
+            state,
+            subjects.clone(),
+            Some(subjects.len().max(1)),
+            Some(&tracker.run_id),
+        )
+        .await
+    })
     .await;
     finish_repair_run_tracking(
         state,
@@ -8155,14 +8275,16 @@ async fn execute_tracked_targeted_replication_repair(
 ) -> replication::ReplicationRepairReport {
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let (plan, report) =
+    let (plan, report) = with_active_repair_log_tracking(&tracker, async {
         replication::execute_planned_targeted_replication_repair_inner_with_context(
             state,
             subjects,
             None,
             Some(&tracker.run_id),
         )
-        .await;
+        .await
+    })
+    .await;
     finish_repair_run_tracking(
         state,
         tracker,
@@ -8188,11 +8310,14 @@ async fn execute_tracked_cluster_replication_repair(
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Cluster, trigger)
             .await;
-    let report = replication::execute_cluster_replication_repair_inner_with_context(
-        state,
-        batch_size_override,
-        Some(&tracker.run_id),
-    )
+    let report = with_active_repair_log_tracking(&tracker, async {
+        replication::execute_cluster_replication_repair_inner_with_context(
+            state,
+            batch_size_override,
+            Some(&tracker.run_id),
+        )
+        .await
+    })
     .await;
     finish_repair_run_tracking(
         state,
@@ -8247,11 +8372,14 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
             return;
         }
 
-        let report = replication::execute_replication_repair_inner_with_context(
-            &state,
-            None,
-            Some(&tracker.run_id),
-        )
+        let report = with_active_repair_log_tracking(&tracker, async {
+            replication::execute_replication_repair_inner_with_context(
+                &state,
+                None,
+                Some(&tracker.run_id),
+            )
+            .await
+        })
         .await;
         {
             let mut status = state.startup_repair_status.lock().await;
@@ -17710,24 +17838,13 @@ async fn repair_activity_status(
         return status.into_response();
     }
 
-    let latest_run = match latest_repair_run_record(&state).await {
-        Ok(latest_run) => latest_run,
+    match local_repair_activity_payload(&state).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(err) => {
-            tracing::error!(error = %err, "failed loading latest repair run record");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            tracing::error!(error = %err, "failed loading repair activity state");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
-    };
-
-    let startup_status = *state.startup_repair_status.lock().await;
-    let active_runs = state.repair_activity.lock().await.active_runs.clone();
-    let response = RepairActivityStatusResponse {
-        state: current_repair_activity_state(&active_runs, startup_status),
-        startup_status,
-        active_runs,
-        latest_run,
-    };
-
-    (StatusCode::OK, Json(response)).into_response()
+    }
 }
 
 async fn repair_history(

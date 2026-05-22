@@ -225,11 +225,27 @@ export type RepairRunRecord = {
   report?: Record<string, unknown> | null;
 };
 
+export type RepairLogEntry = {
+  captured_at_unix: number;
+  report_node_id: string;
+  event: string;
+  detail: string;
+  subject?: string | null;
+  key?: string | null;
+  version_id?: string | null;
+  source_node_id?: string | null;
+  target_node_id?: string | null;
+  context?: Record<string, unknown> | null;
+};
+
 export type RepairActiveRun = {
   run_id: string;
   scope: ReplicationRepairScope;
   trigger: RepairRunTrigger;
   started_at_unix: number;
+  last_log_at_unix?: number | null;
+  live_log: RepairLogEntry[];
+  live_log_truncated?: boolean;
 };
 
 export type RepairHistoryResponse = {
