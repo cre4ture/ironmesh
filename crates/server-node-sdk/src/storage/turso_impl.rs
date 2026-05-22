@@ -428,19 +428,21 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         content_fingerprint: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT metadata_json FROM media_cache WHERE content_fingerprint = ?1",
-                (content_fingerprint,),
-            )
-            .await?;
+        let payload = {
+            let mut rows = self
+                .connection
+                .query(
+                    "SELECT metadata_json FROM media_cache WHERE content_fingerprint = ?1",
+                    (content_fingerprint,),
+                )
+                .await?;
 
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+
+            row_blob(&row, 0, "media_cache.metadata_json")?
         };
-
-        let payload = row_blob(&row, 0, "media_cache.metadata_json")?;
         match self.decode_json::<CachedMediaMetadata>(payload, "media metadata") {
             Ok(metadata) => Ok(Some(metadata)),
             Err(err) => {
