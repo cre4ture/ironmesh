@@ -621,6 +621,23 @@ async fn media_cache_record_exists(
     }
 }
 
+async fn wait_for_media_cache_record_deletion(
+    backend: StorageTestBackend,
+    metadata_db_path: &Path,
+    content_fingerprint: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !media_cache_record_exists(backend, metadata_db_path, content_fingerprint).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("invalid media cache row should be deleted");
+}
+
 #[test]
 fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
     let mut index = empty_version_index("k");
@@ -3335,14 +3352,12 @@ async fn lookup_media_cache_deletes_invalid_metadata_records_impl(backend: Stora
         .unwrap()
         .unwrap();
     assert!(lookup.metadata.is_none());
-    assert!(
-        !media_cache_record_exists(
-            backend,
-            &store.metadata_db_path,
-            &metadata.content_fingerprint,
-        )
-        .await
-    );
+    wait_for_media_cache_record_deletion(
+        backend,
+        &store.metadata_db_path,
+        &metadata.content_fingerprint,
+    )
+    .await;
 
     let rebuilt = store
         .ensure_media_cache(&put.manifest_hash)
