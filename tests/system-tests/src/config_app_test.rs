@@ -404,4 +404,56 @@ mod tests {
         let _ = fs::remove_dir_all(&sync_root);
         result
     }
+
+    #[tokio::test]
+    async fn config_app_bundle_links_running_client_service_bind_addresses() -> Result<()> {
+        let config_bind = "127.0.0.1:19453";
+        let config_base = format!("http://{config_bind}");
+        let config_root = fresh_data_dir("config-app-client-bind-link-config");
+        let package_root = fresh_data_dir("config-app-client-bind-link-package");
+        let http = reqwest::Client::new();
+
+        let mut config_app = start_config_app(config_bind, &config_root, &package_root).await?;
+
+        let result = async {
+            let response = http
+                .get(format!("{config_base}/app.js"))
+                .send()
+                .await
+                .context("failed fetching config-app JS bundle")?;
+            let status = response.status();
+            let js = response
+                .text()
+                .await
+                .context("failed reading config-app JS bundle")?;
+            if !status.is_success() {
+                bail!("config-app JS bundle returned {status}: {js}");
+            }
+
+            assert!(
+                js.contains("kind === 'client' && label === 'Bind Address' && running"),
+                "app bundle should only link bind addresses for running client services"
+            );
+            assert!(
+                js.contains("class=\"instance-link\""),
+                "app bundle should render a dedicated bind-address link class"
+            );
+            assert!(
+                js.contains("target=\"_blank\" rel=\"noopener noreferrer\""),
+                "app bundle should open bind-address links in a separate browser tab"
+            );
+            assert!(
+                js.contains("http://${value}"),
+                "app bundle should turn client bind addresses into local http links"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut config_app).await;
+        let _ = fs::remove_dir_all(&config_root);
+        let _ = fs::remove_dir_all(&package_root);
+        result
+    }
 }

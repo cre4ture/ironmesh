@@ -3018,6 +3018,17 @@ dd {
   font-size: 14px;
 }
 
+.instance-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent-soft);
+  text-underline-offset: 0.18em;
+}
+
+.instance-link:hover {
+  color: var(--text);
+}
+
 .runtime-pill {
   width: fit-content;
   padding: 4px 9px;
@@ -3177,6 +3188,28 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function clientServiceHref(bind) {
+  const value = String(bind || '').trim();
+  if (!value) {
+    return '';
+  }
+  if (/^https?:\/\//i.test(value)) {
+    return value;
+  }
+  return `http://${value}`;
+}
+
+function renderInstanceDetailValue(kind, label, value, running) {
+  const displayValue = escapeHtml(value || '-');
+  if (kind === 'client' && label === 'Bind Address' && running) {
+    const href = clientServiceHref(value);
+    if (href) {
+      return `<a class="instance-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${displayValue}</a>`;
+    }
+  }
+  return displayValue;
 }
 
 function showStatus(value) {
@@ -3372,7 +3405,7 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
         </div>
       </div>
       <dl class="instance-meta">
-        ${details.map(([label, value]) => `<div><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value || '-')}</div>`).join('')}
+        ${details.map(([label, value]) => `<div><strong>${escapeHtml(label)}:</strong> ${renderInstanceDetailValue(kind, label, value, running)}</div>`).join('')}
       </dl>
     </article>
   `;
