@@ -177,6 +177,7 @@ fn main() {
     let generated_css = out_dir.join("server_admin_app.css");
     let generated_js = out_dir.join("server_admin_app.js");
     let generated_assets = out_dir.join("server_admin_assets.rs");
+    let staged_assets_dir = out_dir.join("server_admin_assets");
     let server_admin_dist_dir = match prebuilt_web_dir.as_deref() {
         Some(prebuilt_web_dir) => resolve_prebuilt_dist_dir(prebuilt_web_dir, "server-admin"),
         None => {
@@ -221,15 +222,38 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_css.display()));
     fs::write(&generated_js, script)
         .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_js.display()));
-    generate_embedded_assets_module(&server_admin_dist_dir, &generated_assets);
+    generate_embedded_assets_module(
+        &server_admin_dist_dir,
+        &staged_assets_dir,
+        &generated_assets,
+    );
 }
 
-fn generate_embedded_assets_module(dist_dir: &Path, generated_file: &Path) {
+fn generate_embedded_assets_module(
+    dist_dir: &Path,
+    staged_assets_dir: &Path,
+    generated_file: &Path,
+) {
     let assets_dir = dist_dir.join("assets");
     let mut assets = Vec::new();
 
+    if staged_assets_dir.exists() {
+        fs::remove_dir_all(staged_assets_dir).unwrap_or_else(|error| {
+            panic!(
+                "failed clearing staged asset dir {}: {error}",
+                staged_assets_dir.display()
+            )
+        });
+    }
+
     if assets_dir.is_dir() {
-        collect_embedded_assets(&assets_dir, &assets_dir, &mut assets);
+        fs::create_dir_all(staged_assets_dir).unwrap_or_else(|error| {
+            panic!(
+                "failed creating staged asset dir {}: {error}",
+                staged_assets_dir.display()
+            )
+        });
+        collect_embedded_assets(&assets_dir, &assets_dir, staged_assets_dir, &mut assets);
     }
 
     assets.sort_by(|left, right| left.0.cmp(&right.0));
@@ -251,14 +275,19 @@ fn generate_embedded_assets_module(dist_dir: &Path, generated_file: &Path) {
         .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_file.display()));
 }
 
-fn collect_embedded_assets(dir: &Path, root: &Path, assets: &mut Vec<(String, PathBuf)>) {
+fn collect_embedded_assets(
+    dir: &Path,
+    root: &Path,
+    staged_root: &Path,
+    assets: &mut Vec<(String, PathBuf)>,
+) {
     let entries = fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("failed reading asset dir {}: {error}", dir.display()));
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_embedded_assets(&path, root, assets);
+            collect_embedded_assets(&path, root, staged_root, assets);
             continue;
         }
 
@@ -267,7 +296,23 @@ fn collect_embedded_assets(dir: &Path, root: &Path, assets: &mut Vec<(String, Pa
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        assets.push((relative_path, path));
+        let staged_path = staged_root.join(&relative_path);
+        if let Some(parent) = staged_path.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|error| {
+                panic!(
+                    "failed creating staged asset parent {}: {error}",
+                    parent.display()
+                )
+            });
+        }
+        fs::copy(&path, &staged_path).unwrap_or_else(|error| {
+            panic!(
+                "failed copying embedded asset {} to {}: {error}",
+                path.display(),
+                staged_path.display()
+            )
+        });
+        assets.push((relative_path, staged_path));
     }
 }
 
