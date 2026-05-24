@@ -2193,6 +2193,8 @@ struct RepairActivityStatusResponse {
 }
 
 const LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID: &str = "legacy_rename_logical_paths";
+const CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID: &str =
+    "cleanup_delete_recreate_loop_metadata";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManualRepairActionDescriptor {
@@ -2236,6 +2238,26 @@ struct ManualRepairActionRunResponse {
     changed: bool,
     summary: String,
     report: serde_json::Value,
+}
+
+struct ManualRepairActionExecution {
+    changed: bool,
+    summary: String,
+    report: serde_json::Value,
+}
+
+fn serialize_manual_repair_report<T: Serialize>(action_id: &str, report: &T) -> serde_json::Value {
+    match serde_json::to_value(report) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(
+                error = %err,
+                action_id = %action_id,
+                "failed serializing manual repair action report"
+            );
+            json!({})
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -17706,13 +17728,28 @@ async fn trigger_data_scrub_peer(State(state): State<ServerState>) -> impl IntoR
 }
 
 fn manual_repair_action_descriptors() -> Vec<ManualRepairActionDescriptor> {
-    vec![ManualRepairActionDescriptor {
-        id: LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID.to_string(),
-        label: "Reconcile legacy rename metadata".to_string(),
-        description: "Correct historical version logical paths left behind by older rename handling when the stored manifest still names the original path.".to_string(),
-        dry_run_supported: true,
-        destructive: false,
-    }]
+    vec![
+        ManualRepairActionDescriptor {
+            id: LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID.to_string(),
+            label: "Reconcile legacy rename metadata".to_string(),
+            description: "Correct historical version logical paths left behind by older rename handling when the stored manifest still names the original path.".to_string(),
+            dry_run_supported: true,
+            destructive: false,
+        },
+        ManualRepairActionDescriptor {
+            id: CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID.to_string(),
+            label: "Clean duplicate delete/recreate loop metadata".to_string(),
+            description: "Collapse provably redundant delete-then-recreate loop lineages that were duplicated by older replica repair behavior, while preserving unique version history.".to_string(),
+            dry_run_supported: true,
+            destructive: true,
+        },
+    ]
+}
+
+fn manual_repair_action_descriptor(action_id: &str) -> Option<ManualRepairActionDescriptor> {
+    manual_repair_action_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.id == action_id)
 }
 
 async fn list_manual_repair_actions(
@@ -17741,16 +17778,21 @@ async fn run_manual_repair_action(
     Path(action_id): Path<String>,
     Json(request): Json<ManualRepairActionRunRequest>,
 ) -> impl IntoResponse {
+    let Some(descriptor) = manual_repair_action_descriptor(&action_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
     let action = "auth/repair/actions/run";
     if let Err(status) = authorize_admin_request(
         &state,
         &headers,
         action,
-        true,
+        request.dry_run,
         true,
         json!({
             "action_id": action_id.clone(),
             "dry_run": request.dry_run,
+            "destructive": descriptor.destructive,
         }),
     )
     .await
@@ -17758,59 +17800,97 @@ async fn run_manual_repair_action(
         return status.into_response();
     }
 
-    if action_id != LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
     let started_at_unix = unix_ts();
     let started = Instant::now();
-    let report = {
-        let mut store = lock_store(&state, "manual_repair.legacy_rename_logical_paths").await;
-        match store
-            .reconcile_legacy_rename_logical_paths(request.dry_run)
-            .await
-        {
-            Ok(report) => report,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    action_id = %action_id,
-                    dry_run = request.dry_run,
-                    "manual repair action failed"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let execution = match action_id.as_str() {
+        LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID => {
+            let report = {
+                let mut store =
+                    lock_store(&state, "manual_repair.legacy_rename_logical_paths").await;
+                match store
+                    .reconcile_legacy_rename_logical_paths(request.dry_run)
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            action_id = %action_id,
+                            dry_run = request.dry_run,
+                            "manual repair action failed"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            };
+
+            let changed = !request.dry_run && report.updated_records > 0;
+            let summary = if request.dry_run {
+                format!(
+                    "{} legacy rename record(s) are eligible for logical-path correction",
+                    report.eligible_records
+                )
+            } else {
+                format!(
+                    "{} legacy rename record(s) eligible; {} updated",
+                    report.eligible_records, report.updated_records
+                )
+            };
+            ManualRepairActionExecution {
+                changed,
+                summary,
+                report: serialize_manual_repair_report(&action_id, &report),
             }
         }
+        CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID => {
+            let report = {
+                let mut store = lock_store(
+                    &state,
+                    "manual_repair.cleanup_delete_recreate_loop_metadata",
+                )
+                .await;
+                match store
+                    .cleanup_duplicate_delete_recreate_loop_metadata(request.dry_run)
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            action_id = %action_id,
+                            dry_run = request.dry_run,
+                            "manual repair action failed"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            };
+
+            let changed = !request.dry_run && report.removed_indexes > 0;
+            let summary = if request.dry_run {
+                format!(
+                    "{} duplicate delete/recreate loop group(s) eligible; {} redundant lineage(s) removable",
+                    report.duplicate_groups, report.removable_indexes
+                )
+            } else {
+                format!(
+                    "{} duplicate delete/recreate loop group(s) eligible; {} redundant lineage(s) removed",
+                    report.duplicate_groups, report.removed_indexes
+                )
+            };
+            ManualRepairActionExecution {
+                changed,
+                summary,
+                report: serialize_manual_repair_report(&action_id, &report),
+            }
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let changed = !request.dry_run && report.updated_records > 0;
-    if changed {
+    if execution.changed {
         publish_namespace_change(&state);
         request_local_availability_refresh(&state);
     }
-
-    let summary = if request.dry_run {
-        format!(
-            "{} legacy rename record(s) are eligible for logical-path correction",
-            report.eligible_records
-        )
-    } else {
-        format!(
-            "{} legacy rename record(s) eligible; {} updated",
-            report.eligible_records, report.updated_records
-        )
-    };
-    let report_value = match serde_json::to_value(&report) {
-        Ok(value) => value,
-        Err(err) => {
-            warn!(
-                error = %err,
-                action_id = %action_id,
-                "failed serializing manual repair action report"
-            );
-            json!({})
-        }
-    };
 
     (
         StatusCode::OK,
@@ -17820,9 +17900,9 @@ async fn run_manual_repair_action(
             started_at_unix,
             finished_at_unix: unix_ts(),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            changed,
-            summary,
-            report: report_value,
+            changed: execution.changed,
+            summary: execution.summary,
+            report: execution.report,
         }),
     )
         .into_response()

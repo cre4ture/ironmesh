@@ -8770,6 +8770,10 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
             .iter()
             .any(|action| action.id == super::LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID)
     );
+    assert!(list_payload.actions.iter().any(|action| {
+        action.id == super::CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID
+            && action.destructive
+    }));
 
     let run_response = super::run_manual_repair_action(
         State(state.clone()),
@@ -8791,6 +8795,31 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
     );
     assert!(run_payload.dry_run);
     assert!(!run_payload.changed);
+
+    let destructive_run_response = super::run_manual_repair_action(
+        State(state.clone()),
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+            headers
+        },
+        Path(super::CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID.to_string()),
+        Json(super::ManualRepairActionRunRequest { dry_run: true }),
+    )
+    .await
+    .into_response();
+    assert_eq!(destructive_run_response.status(), StatusCode::OK);
+    let destructive_run_body = to_bytes(destructive_run_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let destructive_run_payload: super::ManualRepairActionRunResponse =
+        serde_json::from_slice(&destructive_run_body).unwrap();
+    assert_eq!(
+        destructive_run_payload.action_id,
+        super::CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID
+    );
+    assert!(destructive_run_payload.dry_run);
+    assert!(!destructive_run_payload.changed);
 
     cleanup_test_state(&state).await;
 }

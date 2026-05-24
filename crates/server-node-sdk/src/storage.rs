@@ -54,6 +54,7 @@ const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 120.0;
 const VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS: f64 = 60.0;
 const DATA_SCRUB_ISSUE_SAMPLE_LIMIT: usize = 128;
 const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
+const DELETE_RECREATE_LOOP_REPAIR_SAMPLE_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkRef {
@@ -164,6 +165,42 @@ pub struct LegacyRenameLogicalPathReconcileReport {
     pub updated_records: usize,
     pub sampled_updates: Vec<LegacyRenameLogicalPathReconcileUpdate>,
     pub update_sample_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteRecreateLoopCleanupGroup {
+    pub key: String,
+    pub kept_object_id: String,
+    pub removed_object_ids: Vec<String>,
+    pub preferred_head_version_id: Option<String>,
+    pub version_ids: Vec<String>,
+    pub manifest_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DeleteRecreateLoopCleanupReport {
+    pub dry_run: bool,
+    pub version_indexes_scanned: usize,
+    pub eligible_single_path_indexes: usize,
+    pub skipped_indexes_without_resolved_path: usize,
+    pub skipped_indexes_with_multiple_paths: usize,
+    pub skipped_indexes_without_delete_recreate_loop: usize,
+    pub duplicate_groups: usize,
+    pub duplicate_indexes: usize,
+    pub removable_indexes: usize,
+    pub removed_indexes: usize,
+    pub sampled_groups: Vec<DeleteRecreateLoopCleanupGroup>,
+    pub sampled_groups_truncated: bool,
+    pub archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchivedDeleteRecreateLoopIndexRecord {
+    key: String,
+    kept_object_id: String,
+    removed_object_id: String,
+    archived_at_unix: u64,
+    index: FileVersionIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3836,6 +3873,238 @@ impl PersistentStore {
         Ok(report)
     }
 
+    pub async fn cleanup_duplicate_delete_recreate_loop_metadata(
+        &mut self,
+        dry_run: bool,
+    ) -> Result<DeleteRecreateLoopCleanupReport> {
+        let mut report = DeleteRecreateLoopCleanupReport {
+            dry_run,
+            ..DeleteRecreateLoopCleanupReport::default()
+        };
+
+        let mut candidate_groups =
+            HashMap::<(String, String), Vec<DeleteRecreateLoopCleanupCandidate>>::new();
+        let mut indexes = self.load_all_version_indexes().await?;
+        indexes.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+
+        for index in indexes {
+            report.version_indexes_scanned = report.version_indexes_scanned.saturating_add(1);
+
+            match self
+                .build_delete_recreate_loop_cleanup_candidate(index)
+                .await?
+            {
+                DeleteRecreateLoopCleanupCandidateOutcome::Candidate(candidate) => {
+                    report.eligible_single_path_indexes =
+                        report.eligible_single_path_indexes.saturating_add(1);
+                    let signature_key = serde_json::to_string(&candidate.signature)?;
+                    candidate_groups
+                        .entry((candidate.key.clone(), signature_key))
+                        .or_default()
+                        .push(candidate);
+                }
+                DeleteRecreateLoopCleanupCandidateOutcome::UnresolvedPath => {
+                    report.skipped_indexes_without_resolved_path = report
+                        .skipped_indexes_without_resolved_path
+                        .saturating_add(1);
+                }
+                DeleteRecreateLoopCleanupCandidateOutcome::MultiplePaths => {
+                    report.skipped_indexes_with_multiple_paths =
+                        report.skipped_indexes_with_multiple_paths.saturating_add(1);
+                }
+                DeleteRecreateLoopCleanupCandidateOutcome::NoDeleteRecreateLoop => {
+                    report.skipped_indexes_without_delete_recreate_loop = report
+                        .skipped_indexes_without_delete_recreate_loop
+                        .saturating_add(1);
+                }
+            }
+        }
+
+        let mut duplicate_groups = candidate_groups
+            .into_iter()
+            .filter_map(|((key, _signature), mut candidates)| {
+                if candidates.len() <= 1 {
+                    return None;
+                }
+                candidates.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+                Some((key, candidates))
+            })
+            .collect::<Vec<_>>();
+        duplicate_groups.sort_by(
+            |(left_key, left_candidates), (right_key, right_candidates)| {
+                left_key.cmp(right_key).then_with(|| {
+                    left_candidates[0]
+                        .object_id
+                        .cmp(&right_candidates[0].object_id)
+                })
+            },
+        );
+
+        report.duplicate_groups = duplicate_groups.len();
+        report.duplicate_indexes = duplicate_groups
+            .iter()
+            .map(|(_, candidates)| candidates.len())
+            .sum();
+        report.removable_indexes = duplicate_groups
+            .iter()
+            .map(|(_, candidates)| candidates.len().saturating_sub(1))
+            .sum();
+
+        let mut archive_writer = None;
+        let archived_at_unix = unix_ts();
+        if !dry_run && report.removable_indexes > 0 {
+            let archive_dir = self
+                .root_dir
+                .join("state")
+                .join("delete_recreate_loop_archive");
+            fs::create_dir_all(&archive_dir).await?;
+            let archive_file = archive_dir.join(format!("archive-{}.jsonl", unix_ts_nanos()));
+            let writer = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&archive_file)
+                .await
+                .with_context(|| format!("failed to create {}", archive_file.display()))?;
+            report.archive_path = Some(archive_file.to_string_lossy().to_string());
+            archive_writer = Some(writer);
+        }
+
+        let mut current_state_changed = false;
+
+        for (key, candidates) in duplicate_groups {
+            let canonical_idx = select_delete_recreate_loop_cleanup_canonical(&candidates);
+            let canonical = &candidates[canonical_idx];
+            let removed = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, candidate)| {
+                    if idx == canonical_idx {
+                        None
+                    } else {
+                        Some(candidate)
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut version_ids = canonical
+                .signature
+                .versions
+                .iter()
+                .map(|record| record.version_id.clone())
+                .collect::<Vec<_>>();
+            version_ids.sort();
+
+            let mut manifest_hashes = canonical
+                .signature
+                .versions
+                .iter()
+                .map(|record| record.manifest_hash.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            manifest_hashes.sort();
+
+            if report.sampled_groups.len() < DELETE_RECREATE_LOOP_REPAIR_SAMPLE_LIMIT {
+                report.sampled_groups.push(DeleteRecreateLoopCleanupGroup {
+                    key: key.clone(),
+                    kept_object_id: canonical.object_id.clone(),
+                    removed_object_ids: removed
+                        .iter()
+                        .map(|candidate| candidate.object_id.clone())
+                        .collect(),
+                    preferred_head_version_id: canonical
+                        .signature
+                        .preferred_head_version_id
+                        .clone(),
+                    version_ids,
+                    manifest_hashes,
+                });
+            } else {
+                report.sampled_groups_truncated = true;
+            }
+
+            if dry_run {
+                continue;
+            }
+
+            for candidate in removed {
+                if let Some(writer) = archive_writer.as_mut() {
+                    let mut line = serde_json::to_vec(&ArchivedDeleteRecreateLoopIndexRecord {
+                        key: key.clone(),
+                        kept_object_id: canonical.object_id.clone(),
+                        removed_object_id: candidate.object_id.clone(),
+                        archived_at_unix,
+                        index: candidate.index.clone(),
+                    })?;
+                    line.push(b'\n');
+                    writer.write_all(&line).await?;
+                }
+
+                self.delete_version_index_by_object_id(&candidate.object_id)
+                    .await?;
+                report.removed_indexes = report.removed_indexes.saturating_add(1);
+
+                let stale_keys = self
+                    .current_state
+                    .object_ids
+                    .iter()
+                    .filter_map(|(current_key, current_object_id)| {
+                        if current_object_id == &candidate.object_id {
+                            Some(current_key.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if !stale_keys.is_empty() {
+                    current_state_changed = true;
+                }
+                for stale_key in stale_keys {
+                    self.current_state.objects.remove(&stale_key);
+                    self.current_state.object_ids.remove(&stale_key);
+                }
+            }
+
+            let before_manifest = self.current_state.objects.get(&key).cloned();
+            let before_object_id = self.current_state.object_ids.get(&key).cloned();
+            self.sync_current_state_for_key_from_index(&key, &canonical.index)?;
+            let stale_canonical_keys = self
+                .current_state
+                .object_ids
+                .iter()
+                .filter_map(|(current_key, current_object_id)| {
+                    if current_object_id == &canonical.object_id && current_key != &key {
+                        Some(current_key.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !stale_canonical_keys.is_empty() {
+                current_state_changed = true;
+            }
+            for stale_key in stale_canonical_keys {
+                self.current_state.objects.remove(&stale_key);
+                self.current_state.object_ids.remove(&stale_key);
+            }
+            if self.current_state.objects.get(&key).cloned() != before_manifest
+                || self.current_state.object_ids.get(&key).cloned() != before_object_id
+            {
+                current_state_changed = true;
+            }
+        }
+
+        if let Some(writer) = archive_writer.as_mut() {
+            writer.flush().await?;
+        }
+        if !dry_run && current_state_changed {
+            self.persist_current_state().await?;
+            self.create_snapshot().await?;
+        }
+
+        Ok(report)
+    }
+
     pub async fn has_manifest_for_key(&self, key: &str, manifest_hash: &str) -> Result<bool> {
         let Some(object_id) = self.object_id_for_key(key) else {
             return Ok(false);
@@ -6765,6 +7034,78 @@ impl PersistentStore {
         Ok(None)
     }
 
+    async fn build_delete_recreate_loop_cleanup_candidate(
+        &self,
+        index: FileVersionIndex,
+    ) -> Result<DeleteRecreateLoopCleanupCandidateOutcome> {
+        if index.versions.is_empty() {
+            return Ok(DeleteRecreateLoopCleanupCandidateOutcome::NoDeleteRecreateLoop);
+        }
+
+        let mut normalized_versions = Vec::with_capacity(index.versions.len());
+        let mut distinct_paths = BTreeSet::<String>::new();
+        let mut has_live_version = false;
+        let mut has_tombstone_version = false;
+
+        let mut version_ids = index.versions.keys().cloned().collect::<Vec<_>>();
+        version_ids.sort();
+
+        for version_id in version_ids {
+            let Some(record) = index.versions.get(&version_id) else {
+                continue;
+            };
+            let Some(resolved_path) = self.resolve_key_for_version_record(&index, record).await?
+            else {
+                return Ok(DeleteRecreateLoopCleanupCandidateOutcome::UnresolvedPath);
+            };
+            distinct_paths.insert(resolved_path.clone());
+            if distinct_paths.len() > 1 {
+                return Ok(DeleteRecreateLoopCleanupCandidateOutcome::MultiplePaths);
+            }
+
+            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                has_tombstone_version = true;
+            } else {
+                has_live_version = true;
+            }
+
+            normalized_versions.push(DeleteRecreateLoopNormalizedVersionRecord {
+                version_id: record.version_id.clone(),
+                manifest_hash: record.manifest_hash.clone(),
+                logical_path: resolved_path,
+                parent_version_ids: record.parent_version_ids.clone(),
+                state: record.state.clone(),
+                copied_from_object_id: record.copied_from_object_id.clone(),
+                copied_from_version_id: record.copied_from_version_id.clone(),
+                copied_from_path: record.copied_from_path.clone(),
+            });
+        }
+
+        if !has_live_version || !has_tombstone_version {
+            return Ok(DeleteRecreateLoopCleanupCandidateOutcome::NoDeleteRecreateLoop);
+        }
+
+        let Some(key) = distinct_paths.into_iter().next() else {
+            return Ok(DeleteRecreateLoopCleanupCandidateOutcome::UnresolvedPath);
+        };
+        let mut head_version_ids = index.head_version_ids.clone();
+        head_version_ids.sort();
+
+        Ok(DeleteRecreateLoopCleanupCandidateOutcome::Candidate(
+            DeleteRecreateLoopCleanupCandidate {
+                key: key.clone(),
+                object_id: index.object_id.clone(),
+                bound_current: self.current_state.object_ids.get(&key) == Some(&index.object_id),
+                signature: DeleteRecreateLoopNormalizedIndexSignature {
+                    preferred_head_version_id: index.preferred_head_version_id.clone(),
+                    head_version_ids,
+                    versions: normalized_versions,
+                },
+                index,
+            },
+        ))
+    }
+
     async fn choose_replication_bundle_object_id(
         &self,
         bundle: &ReplicationExportBundle,
@@ -7169,6 +7510,57 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
     }
+}
+
+enum DeleteRecreateLoopCleanupCandidateOutcome {
+    Candidate(DeleteRecreateLoopCleanupCandidate),
+    UnresolvedPath,
+    MultiplePaths,
+    NoDeleteRecreateLoop,
+}
+
+struct DeleteRecreateLoopCleanupCandidate {
+    key: String,
+    object_id: String,
+    bound_current: bool,
+    signature: DeleteRecreateLoopNormalizedIndexSignature,
+    index: FileVersionIndex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DeleteRecreateLoopNormalizedIndexSignature {
+    preferred_head_version_id: Option<String>,
+    head_version_ids: Vec<String>,
+    versions: Vec<DeleteRecreateLoopNormalizedVersionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DeleteRecreateLoopNormalizedVersionRecord {
+    version_id: String,
+    manifest_hash: String,
+    logical_path: String,
+    parent_version_ids: Vec<String>,
+    state: VersionConsistencyState,
+    copied_from_object_id: Option<String>,
+    copied_from_version_id: Option<String>,
+    copied_from_path: Option<String>,
+}
+
+fn select_delete_recreate_loop_cleanup_canonical(
+    candidates: &[DeleteRecreateLoopCleanupCandidate],
+) -> usize {
+    candidates
+        .iter()
+        .enumerate()
+        .max_by(|(left_idx, left), (right_idx, right)| {
+            left.bound_current
+                .cmp(&right.bound_current)
+                .then_with(|| left.index.versions.len().cmp(&right.index.versions.len()))
+                .then_with(|| right.object_id.cmp(&left.object_id))
+                .then_with(|| right_idx.cmp(left_idx))
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
 }
 
 fn replication_bundle_record_matches(

@@ -1202,6 +1202,13 @@ async function installServerAdminMocks(
             description: "Rewrite legacy logical paths to the current layout.",
             dry_run_supported: true,
             destructive: false
+          },
+          {
+            id: "cleanup_delete_recreate_loop_metadata",
+            label: "Clean duplicate delete/recreate loop metadata",
+            description: "Collapse provably redundant delete/recreate loop lineages.",
+            dry_run_supported: true,
+            destructive: true
           }
         ]
       });

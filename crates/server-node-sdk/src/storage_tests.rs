@@ -1880,6 +1880,235 @@ run_on_all_metadata_backends!(
     replayed_replica_tombstone_does_not_remove_repaired_key_turso
 );
 
+async fn cleanup_duplicate_delete_recreate_loop_metadata_removes_redundant_histories_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("cleanup-delete-recreate-loop").await;
+
+    let key = "docs/loop.txt";
+    let put = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"loop-payload"),
+            PutOptions {
+                explicit_version_id: Some("ver-loop-live".to_string()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let tombstone_version_id = store
+        .tombstone_object(
+            key,
+            PutOptions {
+                explicit_version_id: Some("tomb-loop-history".to_string()),
+                parent_version_ids: vec![put.version_id.clone()],
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let base_index = store
+        .load_all_version_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|index| {
+            index.versions.contains_key(&put.version_id)
+                && index.versions.contains_key(&tombstone_version_id)
+        })
+        .expect("expected base delete/recreate loop history");
+
+    for (offset_secs, object_id) in [(11u64, "obj-dup-loop-a"), (22u64, "obj-dup-loop-b")] {
+        let mut duplicate = base_index.clone();
+        duplicate.object_id = object_id.to_string();
+        for record in duplicate.versions.values_mut() {
+            record.object_id = object_id.to_string();
+            record.created_at_unix = record.created_at_unix.saturating_add(offset_secs);
+        }
+        store
+            .persist_version_index_by_object_id(object_id, &duplicate)
+            .await
+            .unwrap();
+    }
+
+    let duplicate_history_count = store
+        .load_all_version_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|index| {
+            index.versions.contains_key(&put.version_id)
+                && index.versions.contains_key(&tombstone_version_id)
+        })
+        .count();
+    assert_eq!(duplicate_history_count, 3);
+
+    let dry_run = store
+        .cleanup_duplicate_delete_recreate_loop_metadata(true)
+        .await
+        .unwrap();
+    assert_eq!(dry_run.duplicate_groups, 1);
+    assert_eq!(dry_run.removable_indexes, 2);
+    assert_eq!(dry_run.removed_indexes, 0);
+    assert_eq!(dry_run.sampled_groups.len(), 1);
+    assert_eq!(dry_run.sampled_groups[0].key, key);
+
+    let applied = store
+        .cleanup_duplicate_delete_recreate_loop_metadata(false)
+        .await
+        .unwrap();
+    assert_eq!(applied.duplicate_groups, 1);
+    assert_eq!(applied.removed_indexes, 2);
+    let archive_path = applied
+        .archive_path
+        .clone()
+        .expect("applied cleanup should archive removed loop indexes");
+    assert!(fs::try_exists(Path::new(&archive_path)).await.unwrap());
+
+    let remaining_histories = store
+        .load_all_version_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|index| {
+            index.versions.contains_key(&put.version_id)
+                && index.versions.contains_key(&tombstone_version_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(remaining_histories.len(), 1);
+    assert!(
+        !store.current_state.object_ids.contains_key(key),
+        "tombstoned loop cleanup must not resurrect the deleted key"
+    );
+    assert!(!store.current_state.objects.contains_key(key));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_duplicate_delete_recreate_loop_metadata_removes_redundant_histories_impl,
+    cleanup_duplicate_delete_recreate_loop_metadata_removes_redundant_histories,
+    cleanup_duplicate_delete_recreate_loop_metadata_removes_redundant_histories_turso
+);
+
+async fn cleanup_duplicate_delete_recreate_loop_metadata_preserves_legitimate_recreate_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("cleanup-delete-recreate-safe-skip")
+        .await;
+
+    let key = "docs/recreate.txt";
+    let payload = Bytes::from_static(b"same-payload");
+    let first_put = store
+        .put_object_versioned(
+            key,
+            payload.clone(),
+            PutOptions {
+                explicit_version_id: Some("ver-legit-first".to_string()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let first_object_id = store
+        .list_versions(key)
+        .await
+        .unwrap()
+        .expect("first put should be current")
+        .object_id;
+    store
+        .tombstone_object(
+            key,
+            PutOptions {
+                explicit_version_id: Some("tomb-legit-first".to_string()),
+                parent_version_ids: vec![first_put.version_id.clone()],
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let recreate_put = store
+        .put_object_versioned(
+            key,
+            payload,
+            PutOptions {
+                explicit_version_id: Some("ver-legit-second".to_string()),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let recreated_versions = store
+        .list_versions(key)
+        .await
+        .unwrap()
+        .expect("recreated key should be current");
+    assert_ne!(recreated_versions.object_id, first_object_id);
+
+    let history_count_before = store
+        .load_all_version_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|index| {
+            index
+                .versions
+                .values()
+                .any(|record| record.logical_path.as_deref() == Some(key))
+        })
+        .count();
+    assert_eq!(history_count_before, 2);
+
+    let dry_run = store
+        .cleanup_duplicate_delete_recreate_loop_metadata(true)
+        .await
+        .unwrap();
+    assert_eq!(dry_run.duplicate_groups, 0);
+    assert_eq!(dry_run.removable_indexes, 0);
+
+    let applied = store
+        .cleanup_duplicate_delete_recreate_loop_metadata(false)
+        .await
+        .unwrap();
+    assert_eq!(applied.removed_indexes, 0);
+
+    let history_count_after = store
+        .load_all_version_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|index| {
+            index
+                .versions
+                .values()
+                .any(|record| record.logical_path.as_deref() == Some(key))
+        })
+        .count();
+    assert_eq!(history_count_after, 2);
+
+    let current_versions = store
+        .list_versions(key)
+        .await
+        .unwrap()
+        .expect("legitimate recreate should remain current after cleanup");
+    assert_eq!(
+        current_versions.preferred_head_version_id,
+        Some(recreate_put.version_id)
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_duplicate_delete_recreate_loop_metadata_preserves_legitimate_recreate_impl,
+    cleanup_duplicate_delete_recreate_loop_metadata_preserves_legitimate_recreate,
+    cleanup_duplicate_delete_recreate_loop_metadata_preserves_legitimate_recreate_turso
+);
+
 async fn import_replication_bundle_replaces_conflicting_same_version_history_impl(
     backend: StorageTestBackend,
 ) {
