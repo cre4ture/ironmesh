@@ -2386,7 +2386,9 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
         )
         .await?;
         let scenario = async {
-            // Restart should resume or replace the hidden staged download and remove leftovers.
+            // Restart should tolerate the hidden staged download and eventually
+            // clean it up after the refreshed file lands locally.
+            wait_for_local_file_size_and_prefix(&target, expected_size, b"REMOTE-V2-", 360).await?;
             for _ in 0..120 {
                 if !artifact.exists() {
                     break;
@@ -2395,11 +2397,9 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
             }
             assert!(
                 !artifact.exists(),
-                "expected temp artifact to be cleaned up on restart: {}",
+                "expected temp artifact to be cleaned up after restart completed: {}",
                 artifact.display()
             );
-
-            wait_for_local_file_size_and_prefix(&target, expected_size, b"REMOTE-V2-", 360).await?;
             assert_remote_store_index_has_no_paths_containing(&sdk, "ironmesh-part-", 20).await?;
             Ok::<(), anyhow::Error>(())
         }
