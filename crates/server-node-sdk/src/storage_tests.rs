@@ -4324,6 +4324,103 @@ run_on_all_metadata_backends!(
     storage_stats_collect_and_persist_latest_snapshot_metrics_turso
 );
 
+async fn metadata_db_logical_distribution_reports_table_content_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("metadata-db-logical-distribution").await;
+    let payload = Bytes::from_static(b"metadata-db-distribution-payload");
+
+    store
+        .put_object_versioned("docs/readme.txt", payload.clone(), PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .append_admin_audit_event(&AdminAuditEvent {
+            event_id: "audit-1".to_string(),
+            action: "metadata-db-distribution-check".to_string(),
+            actor: Some("tester".to_string()),
+            source_node: Some("node-alpha".to_string()),
+            authorized: true,
+            dry_run: false,
+            approved: true,
+            outcome: "success".to_string(),
+            details_json: "{\"source\":\"storage-tests\"}".to_string(),
+            created_at_unix: 1_700_000_000,
+        })
+        .await
+        .unwrap();
+
+    let sample = store.collect_storage_stats_sample().await.unwrap();
+    store.persist_storage_stats_sample(&sample).await.unwrap();
+
+    let distribution = store.load_metadata_db_logical_distribution().await.unwrap();
+    assert_eq!(
+        distribution.backend,
+        match backend {
+            StorageTestBackend::Sqlite => MetadataBackendKind::Sqlite,
+            #[cfg(feature = "turso-metadata")]
+            StorageTestBackend::Turso => MetadataBackendKind::Turso,
+        }
+    );
+    assert!(distribution.generated_at_unix > 0);
+    assert!(distribution.total_row_count > 0);
+    assert!(distribution.total_tracked_value_bytes > 0);
+
+    let current_objects = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "current_objects")
+        .expect("missing current_objects breakdown");
+    assert!(current_objects.row_count > 0);
+    assert!(current_objects.tracked_value_bytes > 0);
+    assert!(current_objects.tracked_columns.iter().any(|column| column == "key"));
+
+    let version_indexes = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "version_indexes")
+        .expect("missing version_indexes breakdown");
+    assert!(version_indexes.row_count > 0);
+    assert!(version_indexes.tracked_value_bytes > 0);
+
+    let snapshots = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "snapshots")
+        .expect("missing snapshots breakdown");
+    assert!(snapshots.row_count > 0);
+    assert!(snapshots.tracked_value_bytes > 0);
+
+    let storage_stats_history = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "storage_stats_history")
+        .expect("missing storage_stats_history breakdown");
+    assert_eq!(storage_stats_history.row_count, 1);
+    assert!(storage_stats_history.tracked_value_bytes > 0);
+
+    let admin_audit_events = distribution
+        .tables
+        .iter()
+        .find(|table| table.table == "admin_audit_events")
+        .expect("missing admin_audit_events breakdown");
+    assert_eq!(admin_audit_events.row_count, 1);
+    assert!(admin_audit_events.tracked_value_bytes > 0);
+
+    assert!(distribution
+        .tables
+        .iter()
+        .any(|table| table.average_tracked_value_bytes.is_some()));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_db_logical_distribution_reports_table_content_impl,
+    metadata_db_logical_distribution_reports_table_content,
+    metadata_db_logical_distribution_reports_table_content_turso
+);
+
 async fn chunk_store_bytes_state_tracks_ingest_and_cleanup_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("chunk-store-state").await;
     let payload = Bytes::from_static(b"orphaned-chunk-payload");

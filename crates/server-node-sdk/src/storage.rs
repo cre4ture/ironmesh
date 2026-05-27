@@ -1041,17 +1041,153 @@ struct FfprobeFormat {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum MetadataBackendKind {
     Sqlite,
     #[cfg(feature = "turso-metadata")]
     Turso,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataDbTableLogicalBreakdown {
+    pub table: String,
+    pub row_count: u64,
+    pub tracked_value_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_tracked_value_bytes: Option<u64>,
+    #[serde(default)]
+    pub tracked_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataDbLogicalDistribution {
+    pub backend: MetadataBackendKind,
+    pub generated_at_unix: u64,
+    pub total_row_count: u64,
+    pub total_tracked_value_bytes: u64,
+    #[serde(default)]
+    pub tables: Vec<MetadataDbTableLogicalBreakdown>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MetadataDbLogicalTableSpec {
+    pub(super) table: &'static str,
+    pub(super) tracked_columns: &'static [&'static str],
+}
+
+const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
+    MetadataDbLogicalTableSpec {
+        table: "metadata_meta",
+        tracked_columns: &["key", "value"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "current_objects",
+        tracked_columns: &["key", "manifest_hash", "object_id"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "version_indexes",
+        tracked_columns: &["object_id", "index_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "snapshots",
+        tracked_columns: &["snapshot_id", "snapshot_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "storage_stats_current",
+        tracked_columns: &["sample_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "storage_stats_state",
+        tracked_columns: &["state_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "storage_stats_history",
+        tracked_columns: &["sample_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "repair_attempts",
+        tracked_columns: &["subject"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "repair_run_history",
+        tracked_columns: &["run_id", "record_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "data_scrub_run_history",
+        tracked_columns: &["run_id", "record_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "cluster_replicas",
+        tracked_columns: &["subject", "node_id"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "client_credential_state",
+        tracked_columns: &["state_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "admin_audit_events",
+        tracked_columns: &["event_id", "event_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "data_change_events",
+        tracked_columns: &[
+            "event_id",
+            "action",
+            "path",
+            "from_path",
+            "to_path",
+            "actor_kind",
+            "actor_id",
+            "actor_label",
+            "actor_credential_fingerprint",
+            "event_json",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "media_cache",
+        tracked_columns: &["content_fingerprint", "metadata_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "cached_chunks",
+        tracked_columns: &["hash", "record_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "locally_owned_manifests",
+        tracked_columns: &["manifest_hash"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "reconcile_markers",
+        tracked_columns: &["source_node_id", "key", "source_version_id", "local_version_id"],
+    },
+];
+
+pub(super) fn metadata_db_logical_table_specs() -> &'static [MetadataDbLogicalTableSpec] {
+    METADATA_DB_LOGICAL_TABLE_SPECS
+}
+
+pub(super) fn metadata_db_logical_summary_query(spec: MetadataDbLogicalTableSpec) -> String {
+    let tracked_value_expression = if spec.tracked_columns.is_empty() {
+        "0".to_string()
+    } else {
+        spec.tracked_columns
+            .iter()
+            .map(|column| format!("COALESCE(LENGTH(CAST(\"{column}\" AS BLOB)), 0)"))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    };
+
+    format!(
+        "SELECT COUNT(*) AS row_count, COALESCE(SUM({tracked_value_expression}), 0) AS tracked_value_bytes FROM \"{}\"",
+        spec.table
+    )
+}
+
 pub struct PersistentStore {
     root_dir: PathBuf,
     chunks_dir: PathBuf,
     manifests_dir: PathBuf,
+    metadata_backend_kind: MetadataBackendKind,
     metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
     media_cache_build_permits: Arc<Semaphore>,
@@ -1255,6 +1391,9 @@ trait MetadataStore: Send + Sync {
         limit: Option<usize>,
         collected_since_unix: Option<u64>,
     ) -> Result<Vec<StorageStatsSample>>;
+    async fn load_metadata_db_logical_breakdown(
+        &self,
+    ) -> Result<Vec<MetadataDbTableLogicalBreakdown>>;
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()>;
     async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()>;
     async fn has_version_index(&self, object_id: &str) -> Result<bool>;
@@ -2875,6 +3014,7 @@ impl PersistentStore {
             root_dir,
             chunks_dir,
             manifests_dir,
+            metadata_backend_kind: backend,
             metadata_db_path,
             media_thumbnails_dir,
             media_cache_build_permits,
@@ -6010,6 +6150,33 @@ impl PersistentStore {
         self.metadata_store
             .list_storage_stats_history(limit, collected_since_unix)
             .await
+    }
+
+    pub async fn load_metadata_db_logical_distribution(
+        &self,
+    ) -> Result<MetadataDbLogicalDistribution> {
+        let mut tables = self
+            .metadata_store
+            .load_metadata_db_logical_breakdown()
+            .await?;
+        tables.sort_by(|left, right| {
+            right
+                .tracked_value_bytes
+                .cmp(&left.tracked_value_bytes)
+                .then_with(|| right.row_count.cmp(&left.row_count))
+                .then_with(|| left.table.cmp(&right.table))
+        });
+
+        Ok(MetadataDbLogicalDistribution {
+            backend: self.metadata_backend_kind,
+            generated_at_unix: unix_ts(),
+            total_row_count: tables.iter().map(|table| table.row_count).sum(),
+            total_tracked_value_bytes: tables
+                .iter()
+                .map(|table| table.tracked_value_bytes)
+                .sum(),
+            tables,
+        })
     }
 
     #[cfg(test)]

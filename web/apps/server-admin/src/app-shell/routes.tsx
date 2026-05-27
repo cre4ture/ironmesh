@@ -1,4 +1,4 @@
-import { IconActivity, IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconActivity, IconArrowsTransferUp, IconCertificate, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { RepairPage } from "../pages/RepairPage";
 import { SetupPage } from "../pages/SetupPage";
@@ -12,6 +12,7 @@ import { DependenciesPage } from "../pages/DependenciesPage";
 import { LogsPage } from "../pages/LogsPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { ExplorerPage } from "../pages/ExplorerPage";
+import { MetadataPage } from "../pages/MetadataPage";
 
 export const serverAdminRoutes = [
   {
@@ -27,6 +28,13 @@ export const serverAdminRoutes = [
     description: "Monitor live repair activity, inspect retained repair and scrub runs, and trigger clustered maintenance passes without crowding the dashboard.",
     icon: IconActivity,
     element: <RepairPage />
+  },
+  {
+    id: "metadata",
+    label: "Metadata",
+    description: "Inspect how node-local metadata storage is split across the SQLite state DB, manifest files, and generated media cache over time.",
+    icon: IconDatabase,
+    element: <MetadataPage />
   },
   {
     id: "setup",

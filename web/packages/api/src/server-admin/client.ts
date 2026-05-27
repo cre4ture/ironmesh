@@ -28,6 +28,7 @@ import type {
   ManagedRendezvousFailoverPackage,
   ManualRepairActionListResponse,
   ManualRepairActionRunResponse,
+  MetadataDbLogicalDistribution,
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
@@ -635,6 +636,15 @@ export async function getStorageStatsHistory(options?: {
     credentials: "same-origin",
     cache: "no-store"
   });
+}
+
+export async function getMetadataDbLogicalDistribution(
+  adminTokenOverride?: string
+): Promise<MetadataDbLogicalDistribution> {
+  return fetchAdminJson<MetadataDbLogicalDistribution>(
+    apiV1("/auth/storage/stats/metadata-db/logical"),
+    { adminTokenOverride }
+  );
 }
 
 export async function getSetupStatus(): Promise<SetupStatus> {

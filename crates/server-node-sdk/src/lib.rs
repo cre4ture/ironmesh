@@ -179,12 +179,12 @@ use storage::{
     ClientCredentialRecord, ClientCredentialState, DataChangeAction, DataChangeActorKind,
     DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
     DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
-    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
+    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
+    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
+    ReplicationExportBundle, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
     promote_cached_media_metadata_to_incomplete,
 };
 
@@ -4973,6 +4973,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/data-changes", get(list_data_change_events))
+        .route(
+            "/auth/storage/stats/metadata-db/logical",
+            get(metadata_db_logical_distribution),
+        )
         .route("/auth/versions/{key}", get(list_versions_admin))
         .route(
             "/auth/versions/{key}/restore/{version_id}",
@@ -17290,6 +17294,66 @@ async fn storage_stats_history(
     let samples = downsample_storage_stats_samples(samples, max_points);
 
     (StatusCode::OK, Json(samples)).into_response()
+}
+
+async fn metadata_db_logical_distribution(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/storage/stats/metadata-db/logical";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let distribution = {
+        let store = read_store(&state, "storage_stats.load_metadata_db_logical_distribution").await;
+        match store.load_metadata_db_logical_distribution().await {
+            Ok(distribution) => distribution,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed loading metadata db logical distribution"
+                );
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": err.to_string() }),
+                )
+                .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "backend": distribution.backend,
+            "tables": distribution.tables.len(),
+            "total_row_count": distribution.total_row_count,
+            "total_tracked_value_bytes": distribution.total_tracked_value_bytes,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json::<MetadataDbLogicalDistribution>(distribution)).into_response()
 }
 
 fn resolved_data_scrub_history_limit(

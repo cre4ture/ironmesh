@@ -24,6 +24,28 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByRole("button", { name: "All", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "0 B", exact: true })).toHaveCount(0);
 
+  await page
+    .getByLabel("Primary navigation")
+    .locator("a, button")
+    .filter({ hasText: "Metadata" })
+    .first()
+    .click();
+  await expect(page.getByRole("heading", { name: "Metadata" })).toBeVisible();
+  await expect(page.getByText("Metadata Space History", { exact: true })).toBeVisible();
+  await expect(page.getByText("Metadata DB Logical Distribution", { exact: true })).toBeVisible();
+  await expect(page.getByText("Current Breakdown Details", { exact: true })).toBeVisible();
+  await expect(page.getByText("Latest Snapshot Context", { exact: true })).toBeVisible();
+  await expect(
+    page
+      .locator('svg[aria-label="Metadata space history chart"] text')
+      .filter({ hasText: "Collected at (UTC)" })
+  ).toBeVisible();
+  await expect(
+    page
+      .locator('svg[aria-label="Metadata space history chart"] text')
+      .filter({ hasText: "Metadata used (bytes)" })
+  ).toBeVisible();
+
   await page.getByText("Provisioning", { exact: true }).click();
   await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
   await expect(page.locator("pre").filter({ hasText: '"cluster_id"' })).toBeVisible();

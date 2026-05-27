@@ -11,9 +11,10 @@ use tracing::warn;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
-    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, MetadataStore,
-    ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState,
+    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    MetadataDbTableLogicalBreakdown, MetadataStore, ReconcileMarker, RepairAttemptRecord,
+    RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
@@ -928,6 +929,13 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(samples)
     }
 
+    async fn load_metadata_db_logical_breakdown(
+        &self,
+    ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
+        let db = self.metadata_conn()?;
+        load_metadata_db_logical_breakdown_from_db(&db)
+    }
+
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
         let payload = serde_json::to_vec_pretty(sample)?;
         self.in_metadata_tx(|db| {
@@ -1237,6 +1245,43 @@ fn load_current_state_from_db(db: &Connection) -> Result<CurrentState> {
         state.object_ids.insert(key, object_id);
     }
     Ok(state)
+}
+
+fn load_metadata_db_logical_breakdown_from_db(
+    db: &Connection,
+) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
+    let mut tables = Vec::with_capacity(metadata_db_logical_table_specs().len());
+    for spec in metadata_db_logical_table_specs() {
+        let query = metadata_db_logical_summary_query(*spec);
+        let (row_count, tracked_value_bytes) = db.query_row(&query, [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let row_count = u64::try_from(row_count)
+            .with_context(|| format!("negative row count reported for {}", spec.table))?;
+        let tracked_value_bytes = u64::try_from(tracked_value_bytes).with_context(|| {
+            format!(
+                "negative tracked value bytes reported for {}",
+                spec.table
+            )
+        })?;
+        tables.push(MetadataDbTableLogicalBreakdown {
+            table: spec.table.to_string(),
+            row_count,
+            tracked_value_bytes,
+            average_tracked_value_bytes: if row_count > 0 {
+                Some(tracked_value_bytes / row_count)
+            } else {
+                None
+            },
+            tracked_columns: spec
+                .tracked_columns
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect(),
+        });
+    }
+
+    Ok(tables)
 }
 
 fn u64_to_i64(value: u64) -> Result<i64> {

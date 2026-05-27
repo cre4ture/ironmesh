@@ -461,6 +461,24 @@ export type StorageStatsCurrentResponse = {
   last_error?: string | null;
 };
 
+export type MetadataDbBackendKind = "sqlite" | "turso";
+
+export type MetadataDbTableLogicalBreakdown = {
+  table: string;
+  row_count: number;
+  tracked_value_bytes: number;
+  average_tracked_value_bytes?: number | null;
+  tracked_columns: string[];
+};
+
+export type MetadataDbLogicalDistribution = {
+  backend: MetadataDbBackendKind;
+  generated_at_unix: number;
+  total_row_count: number;
+  total_tracked_value_bytes: number;
+  tables: MetadataDbTableLogicalBreakdown[];
+};
+
 export type AdminMediaCacheClearResponse = {
   deleted_metadata_records: number;
   deleted_thumbnail_files: number;

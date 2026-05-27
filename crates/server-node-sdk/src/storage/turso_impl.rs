@@ -8,9 +8,10 @@ use tracing::warn;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
-    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, MetadataStore,
-    ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState,
+    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    MetadataDbTableLogicalBreakdown, MetadataStore, ReconcileMarker, RepairAttemptRecord,
+    RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -999,6 +1000,48 @@ impl MetadataStore for TursoMetadataStore {
             );
         }
         Ok(samples)
+    }
+
+    async fn load_metadata_db_logical_breakdown(
+        &self,
+    ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
+        let mut tables = Vec::with_capacity(metadata_db_logical_table_specs().len());
+        for spec in metadata_db_logical_table_specs() {
+            let mut rows = self
+                .connection
+                .query(&metadata_db_logical_summary_query(*spec), ())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to load metadata db logical distribution for {} from {}",
+                        spec.table,
+                        self.metadata_path.display()
+                    )
+                })?;
+            let Some(row) = rows.next().await? else {
+                bail!("missing metadata db logical distribution row for {}", spec.table);
+            };
+            let row_count = row_u64(&row, 0, "metadata_db_distribution.row_count")?;
+            let tracked_value_bytes =
+                row_u64(&row, 1, "metadata_db_distribution.tracked_value_bytes")?;
+            tables.push(MetadataDbTableLogicalBreakdown {
+                table: spec.table.to_string(),
+                row_count,
+                tracked_value_bytes,
+                average_tracked_value_bytes: if row_count > 0 {
+                    Some(tracked_value_bytes / row_count)
+                } else {
+                    None
+                },
+                tracked_columns: spec
+                    .tracked_columns
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect(),
+            });
+        }
+
+        Ok(tables)
     }
 
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {

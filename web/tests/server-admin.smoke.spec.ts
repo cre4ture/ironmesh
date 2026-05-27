@@ -66,6 +66,33 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
       .getByRole("code")
   ).toBeVisible();
 
+  await page
+    .getByLabel("Primary navigation")
+    .locator("a, button")
+    .filter({ hasText: "Metadata" })
+    .first()
+    .click();
+  await expect(page.getByRole("heading", { name: "Metadata" })).toBeVisible();
+  await expect(page.getByText("Metadata Space History", { exact: true })).toBeVisible();
+  await expect(page.getByText("Metadata DB Logical Distribution", { exact: true })).toBeVisible();
+  await expect(page.getByText("Current Breakdown Details", { exact: true })).toBeVisible();
+  await expect(page.getByText("Latest Snapshot Context", { exact: true })).toBeVisible();
+  await expect(
+    page
+      .locator('svg[aria-label="Metadata space history chart"] text')
+      .filter({ hasText: "Collected at (UTC)" })
+  ).toBeVisible();
+  await expect(
+    page
+      .locator('svg[aria-label="Metadata space history chart"] text')
+      .filter({ hasText: "Metadata used (bytes)" })
+  ).toBeVisible();
+  await expect(page.getByText("SQLite metadata DB", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Manifest store", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Media cache", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("version_indexes", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Tracked Value Bytes", { exact: true })).toBeVisible();
+
   await page.getByText("Repair", { exact: true }).click();
   await expect(page.getByRole("columnheader", { name: "Replication progress" })).toBeVisible();
   await expect(page.getByText("photos/cover.jpg", { exact: true })).toBeVisible();
@@ -1395,6 +1422,70 @@ async function installServerAdminMocks(
           latest_snapshot_unique_chunk_bytes: 1_020_000_000
         }
       ]);
+    }
+
+    if (pathname === apiV1("/auth/storage/stats/metadata-db/logical") && method === "GET") {
+      return json(route, {
+        backend: "sqlite",
+        generated_at_unix: 1_900_000_121,
+        total_row_count: 203,
+        total_tracked_value_bytes: 3_447_552,
+        tables: [
+          {
+            table: "version_indexes",
+            row_count: 42,
+            tracked_value_bytes: 1_640_448,
+            average_tracked_value_bytes: 39_058,
+            tracked_columns: ["object_id", "index_json"]
+          },
+          {
+            table: "snapshots",
+            row_count: 9,
+            tracked_value_bytes: 962_560,
+            average_tracked_value_bytes: 106_951,
+            tracked_columns: ["snapshot_id", "snapshot_json"]
+          },
+          {
+            table: "data_change_events",
+            row_count: 88,
+            tracked_value_bytes: 442_368,
+            average_tracked_value_bytes: 5_027,
+            tracked_columns: [
+              "event_id",
+              "action",
+              "path",
+              "from_path",
+              "to_path",
+              "actor_kind",
+              "actor_id",
+              "actor_label",
+              "actor_credential_fingerprint",
+              "event_json"
+            ]
+          },
+          {
+            table: "current_objects",
+            row_count: 42,
+            tracked_value_bytes: 155_648,
+            average_tracked_value_bytes: 3_706,
+            tracked_columns: ["key", "manifest_hash", "object_id"]
+          },
+          {
+            table: "admin_audit_events",
+            row_count: 12,
+            tracked_value_bytes: 139_264,
+            average_tracked_value_bytes: 11_605,
+            tracked_columns: ["event_id", "event_json"]
+          },
+          {
+            table: "storage_stats_history",
+            row_count: 10,
+            tracked_value_bytes: 107_264,
+            average_tracked_value_bytes: 10_726,
+            tracked_columns: ["sample_json"]
+          }
+        ]
+      });
     }
 
     if (pathname === "/setup/status" && method === "GET" && options?.setupMode) {
