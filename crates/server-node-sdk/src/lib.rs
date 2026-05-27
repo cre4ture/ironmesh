@@ -8989,9 +8989,8 @@ struct VersionGraphResponse {
 type StoreIndexSnapshotScan = (
     Vec<String>,
     HashMap<String, String>,
-    HashMap<String, u64>,
     HashMap<String, String>,
-    HashMap<String, u64>,
+    Option<u64>,
 );
 
 #[derive(Debug, Deserialize)]
@@ -10451,6 +10450,7 @@ async fn list_store_index_response(
     thumbnail_route: &str,
 ) -> Response {
     let request_id = Uuid::new_v4();
+    let request_started_at = Instant::now();
     let prefix = query.prefix.unwrap_or_default();
     let depth = query.depth.unwrap_or(1).max(1);
     let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
@@ -10460,114 +10460,98 @@ async fn list_store_index_response(
         let store = read_store(state, "store_index.clone_worker").await;
         (store.store_index_inspector(), store.waited_ms())
     };
-    let (
-        keys,
-        key_hashes,
-        key_sizes,
-        key_content_fingerprints,
-        key_modified_times,
-    ): StoreIndexSnapshotScan = if let Some(snapshot_id) =
-        query.snapshot.as_deref()
-    {
-        match store_index_inspector
-            .snapshot_object_state(snapshot_id)
-            .await
-        {
-            Ok(Some(snapshot_state)) => {
-                let (object_hashes, object_ids) = filter_store_index_object_maps_for_prefix(
-                    snapshot_state.objects,
-                    snapshot_state.object_ids,
-                    &prefix,
-                );
-                let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
-                keys.sort();
-                let (sizes, content_fingerprints) = match store_index_inspector
-                    .object_sizes_and_content_fingerprints_by_key(&object_hashes)
-                    .await
-                {
-                    Ok(values) => values,
-                    Err(err) => {
-                        tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to compute snapshot key metadata");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                let modified_times = match store_index_inspector
-                    .object_modified_at_by_key(
-                        &object_hashes,
-                        &object_ids,
+    let (keys, key_hashes, object_ids, snapshot_created_at_limit): StoreIndexSnapshotScan =
+        if let Some(snapshot_id) = query.snapshot.as_deref() {
+            match store_index_inspector
+                .snapshot_object_state(snapshot_id)
+                .await
+            {
+                Ok(Some(snapshot_state)) => {
+                    let (object_hashes, object_ids) = filter_store_index_object_maps_for_prefix(
+                        snapshot_state.objects,
+                        snapshot_state.object_ids,
+                        &prefix,
+                    );
+                    let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
+                    keys.sort();
+                    (
+                        keys,
+                        object_hashes,
+                        object_ids,
                         Some(snapshot_state.created_at_unix),
                     )
-                    .await
-                {
-                    Ok(modified_times) => modified_times,
-                    Err(err) => {
-                        tracing::error!(
-                            snapshot_id = %snapshot_id,
-                            error = %err,
-                            "failed to compute snapshot key modified times"
-                        );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                (keys, object_hashes, sizes, content_fingerprints, modified_times)
+                }
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(err) => {
+                    tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to list snapshot key index");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             }
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(err) => {
-                tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to list snapshot key index");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        }
-    } else {
-        let (object_hashes, object_ids) = filter_store_index_object_maps_for_prefix(
-            store_index_inspector.current_object_hashes(),
-            store_index_inspector.current_object_ids(),
-            &prefix,
-        );
-        let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
-        keys.sort();
-        let (sizes, content_fingerprints) = match store_index_inspector
-            .object_sizes_and_content_fingerprints_by_key(&object_hashes)
-            .await
-        {
-            Ok(values) => values,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to compute current key metadata");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+        } else {
+            let (object_hashes, object_ids) = filter_store_index_object_maps_for_prefix(
+                store_index_inspector.current_object_hashes(),
+                store_index_inspector.current_object_ids(),
+                &prefix,
+            );
+            let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
+            keys.sort();
+            (keys, object_hashes, object_ids, None)
         };
-        let modified_times = match store_index_inspector
-            .object_modified_at_by_key(&object_hashes, &object_ids, None)
-            .await
-        {
-            Ok(modified_times) => modified_times,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to compute current key modified times");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        (keys, object_hashes, sizes, content_fingerprints, modified_times)
-    };
     let snapshot_scan_ms = snapshot_scan_started_at.elapsed().as_millis();
-    if snapshot_scan_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
-        || snapshot_scan_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
-    {
-        warn!(
-            request_id = %request_id,
-            prefix = %prefix,
-            snapshot = snapshot_label,
-            depth,
-            key_count = keys.len(),
-            lock_waited_ms = snapshot_scan_waited_ms,
-            phase_ms = snapshot_scan_ms,
-            "slow store index snapshot scan"
-        );
-    }
 
-    let mut entries = build_store_index_entries_with_hashes(
-        &keys,
-        &prefix,
-        depth,
-        Some(&key_hashes),
+    let entry_plan_started_at = Instant::now();
+    let entry_plan = plan_store_index_entries(&keys, &prefix, depth);
+    let visible_object_hashes =
+        filter_store_index_values_for_paths(&key_hashes, &entry_plan.file_entries);
+    let visible_object_ids =
+        filter_store_index_values_for_paths(&object_ids, &entry_plan.file_entries);
+    let entry_plan_ms = entry_plan_started_at.elapsed().as_millis();
+
+    let content_summary_lookup_started_at = Instant::now();
+    let (key_sizes, key_content_fingerprints) = match store_index_inspector
+        .object_sizes_and_content_fingerprints_by_key(&visible_object_hashes)
+        .await
+    {
+        Ok(values) => values,
+        Err(err) => {
+            if query.snapshot.is_some() {
+                tracing::error!(snapshot = snapshot_label, error = %err, "failed to compute snapshot key metadata");
+            } else {
+                tracing::error!(error = %err, "failed to compute current key metadata");
+            }
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
+    let modified_time_lookup_started_at = Instant::now();
+    let key_modified_times = match store_index_inspector
+        .object_modified_at_by_key(
+            &visible_object_hashes,
+            &visible_object_ids,
+            snapshot_created_at_limit,
+        )
+        .await
+    {
+        Ok(modified_times) => modified_times,
+        Err(err) => {
+            if query.snapshot.is_some() {
+                tracing::error!(
+                    snapshot = snapshot_label,
+                    error = %err,
+                    "failed to compute snapshot key modified times"
+                );
+            } else {
+                tracing::error!(error = %err, "failed to compute current key modified times");
+            }
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
+    let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
+
+    let mut entries = build_store_index_entries_from_plan(
+        &entry_plan,
+        Some(&visible_object_hashes),
         Some(&key_sizes),
         Some(&key_content_fingerprints),
         Some(&key_modified_times),
@@ -10590,14 +10574,19 @@ async fn list_store_index_response(
             continue;
         }
 
-        let Some(manifest_hash) = entry.content_hash.as_deref() else {
+        let media_lookup = if let Some(content_fingerprint) = entry.content_fingerprint.as_deref() {
+            store_index_inspector
+                .lookup_media_cache_by_content_fingerprint(content_fingerprint)
+                .await
+        } else if let Some(manifest_hash) = entry.content_hash.as_deref() {
+            store_index_inspector
+                .lookup_media_cache(manifest_hash)
+                .await
+        } else {
             continue;
         };
 
-        match store_index_inspector
-            .lookup_media_cache(manifest_hash)
-            .await
-        {
+        match media_lookup {
             Ok(Some(lookup)) => {
                 match lookup.metadata.as_ref().map(|metadata| &metadata.status) {
                     Some(MediaCacheStatus::Ready) => media_ready_count += 1,
@@ -10622,7 +10611,8 @@ async fn list_store_index_response(
                 media_error_count += 1;
                 warn!(
                     key = %entry.path,
-                    manifest_hash = %manifest_hash,
+                    manifest_hash = ?entry.content_hash.as_deref(),
+                    content_fingerprint = ?entry.content_fingerprint.as_deref(),
                     error = %err,
                     "failed to read cached media metadata for store index"
                 );
@@ -10630,42 +10620,26 @@ async fn list_store_index_response(
         }
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
-    if media_entry_count > 0
-        && (media_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
-            || media_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS)
-    {
-        warn!(
-            request_id = %request_id,
-            prefix = %prefix,
-            snapshot = snapshot_label,
-            depth,
-            entry_count = entries.len(),
-            media_entry_count,
-            lock_waited_ms = media_lookup_waited_ms,
-            phase_ms = media_lookup_ms,
-            ready_count = media_ready_count,
-            pending_count = media_pending_count,
-            incomplete_count = media_incomplete_count,
-            unsupported_count = media_unsupported_count,
-            failed_count = media_failed_count,
-            missing_count = media_missing_count,
-            error_count = media_error_count,
-            "slow store index media lookup"
-        );
-    }
 
+    let collapse_started_at = Instant::now();
     if matches!(query.view, Some(StoreIndexView::Tree)) {
         entries = collapse_store_index_entries_for_tree_view(entries);
     }
+    let tree_collapse_ms = collapse_started_at.elapsed().as_millis();
 
+    let filter_started_at = Instant::now();
     if let Some(media_filter) = query.media_filter {
         entries.retain(|entry| matches_store_index_media_filter(entry, media_filter));
     }
+    let filter_ms = filter_started_at.elapsed().as_millis();
 
+    let sort_started_at = Instant::now();
     if let Some(sort) = query.sort {
         sort_store_index_entries(&mut entries, sort);
     }
+    let sort_ms = sort_started_at.elapsed().as_millis();
 
+    let pagination_started_at = Instant::now();
     let total_entry_count = entries.len();
     let media_summary = summarize_store_index_entries(&entries);
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
@@ -10677,13 +10651,65 @@ async fn list_store_index_response(
         Some(value) => entries.into_iter().skip(offset).take(value).collect(),
         None => entries.into_iter().skip(offset).collect(),
     };
+    let pagination_ms = pagination_started_at.elapsed().as_millis();
+    let returned_entry_count = entries.len();
+    let total_ms = request_started_at.elapsed().as_millis();
+
+    if snapshot_scan_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
+        || snapshot_scan_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || entry_plan_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || content_summary_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || modified_time_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || metadata_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || media_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
+        || media_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || tree_collapse_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || filter_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || sort_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || pagination_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || total_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+    {
+        warn!(
+            request_id = %request_id,
+            prefix = %prefix,
+            snapshot = snapshot_label,
+            depth,
+            matching_key_count = keys.len(),
+            visible_file_count = entry_plan.file_entries.len(),
+            prefix_entry_count = entry_plan.prefix_entries.len(),
+            entry_count_before_pagination = total_entry_count,
+            returned_entry_count,
+            media_entry_count,
+            snapshot_scan_lock_waited_ms = snapshot_scan_waited_ms,
+            snapshot_scan_ms,
+            entry_plan_ms,
+            content_summary_lookup_ms,
+            modified_time_lookup_ms,
+            metadata_lookup_ms,
+            media_lookup_lock_waited_ms = media_lookup_waited_ms,
+            media_lookup_ms,
+            tree_collapse_ms,
+            filter_ms,
+            sort_ms,
+            pagination_ms,
+            total_ms,
+            ready_count = media_ready_count,
+            pending_count = media_pending_count,
+            incomplete_count = media_incomplete_count,
+            unsupported_count = media_unsupported_count,
+            failed_count = media_failed_count,
+            missing_count = media_missing_count,
+            error_count = media_error_count,
+            "slow store index response"
+        );
+    }
 
     let mut response = (
         StatusCode::OK,
         Json(StoreIndexResponse {
             prefix,
             depth,
-            entry_count: entries.len(),
+            entry_count: returned_entry_count,
             total_entry_count,
             offset,
             limit,
@@ -10698,6 +10724,27 @@ async fn list_store_index_response(
         response
             .headers_mut()
             .insert("x-ironmesh-change-sequence", header_value);
+    }
+    if let Ok(header_value) = HeaderValue::from_str(&request_id.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-store-index-request-id", header_value);
+    }
+    let server_timing = format!(
+        "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
+    );
+    if let Ok(header_value) = HeaderValue::from_str(&server_timing) {
+        response.headers_mut().insert("server-timing", header_value);
+    }
+    if let Ok(header_value) = HeaderValue::from_str(&keys.len().to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-store-index-matching-keys", header_value);
+    }
+    if let Ok(header_value) = HeaderValue::from_str(&entry_plan.file_entries.len().to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-store-index-visible-files", header_value);
     }
     response
 }
@@ -11055,6 +11102,60 @@ fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec
     build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None)
 }
 
+#[derive(Debug, Clone)]
+struct StoreIndexEntryPlan {
+    file_entries: Vec<String>,
+    prefix_entries: Vec<String>,
+}
+
+fn plan_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> StoreIndexEntryPlan {
+    let normalized_prefix = prefix.trim().trim_matches('/');
+    let mut file_entries = BTreeSet::new();
+    let mut prefix_entries = BTreeSet::new();
+
+    for key in keys {
+        let Some(remainder) = store_index_remainder_for_prefix(key, normalized_prefix) else {
+            continue;
+        };
+
+        let segments: Vec<&str> = remainder
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+
+        if segments.is_empty() || segments.len() <= depth {
+            file_entries.insert(key.clone());
+            continue;
+        }
+
+        let partial = segments[..depth].join("/");
+        let combined = if normalized_prefix.is_empty() {
+            partial
+        } else {
+            format!("{normalized_prefix}/{partial}")
+        };
+        prefix_entries.insert(format!("{}/", combined.trim_end_matches('/')));
+    }
+
+    StoreIndexEntryPlan {
+        file_entries: file_entries.into_iter().collect(),
+        prefix_entries: prefix_entries.into_iter().collect(),
+    }
+}
+
+fn filter_store_index_values_for_paths<T: Clone>(
+    values: &HashMap<String, T>,
+    paths: &[String],
+) -> HashMap<String, T> {
+    let mut filtered = HashMap::with_capacity(paths.len());
+    for path in paths {
+        if let Some(value) = values.get(path) {
+            filtered.insert(path.clone(), value.clone());
+        }
+    }
+    filtered
+}
+
 fn filter_store_index_object_maps_for_prefix(
     object_hashes: HashMap<String, String>,
     object_ids: HashMap<String, String>,
@@ -11085,38 +11186,27 @@ fn build_store_index_entries_with_hashes(
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
 ) -> Vec<StoreIndexEntry> {
-    let normalized_prefix = prefix.trim().trim_matches('/');
-    let mut file_entries = BTreeSet::new();
-    let mut prefix_entries = BTreeSet::new();
+    let plan = plan_store_index_entries(keys, prefix, depth);
+    build_store_index_entries_from_plan(
+        &plan,
+        hashes_by_key,
+        sizes_by_key,
+        content_fingerprints_by_key,
+        modified_times_by_key,
+    )
+}
 
-    for key in keys {
-        let Some(remainder) = store_index_remainder_for_prefix(key, normalized_prefix) else {
-            continue;
-        };
-
-        let segments: Vec<&str> = remainder
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect();
-
-        if segments.is_empty() || segments.len() <= depth {
-            file_entries.insert(key.clone());
-            continue;
-        }
-
-        let partial = segments[..depth].join("/");
-        let combined = if normalized_prefix.is_empty() {
-            partial
-        } else {
-            format!("{normalized_prefix}/{partial}")
-        };
-        prefix_entries.insert(format!("{}/", combined.trim_end_matches('/')));
-    }
-
-    let mut entries = Vec::with_capacity(file_entries.len() + prefix_entries.len());
-    for path in prefix_entries {
+fn build_store_index_entries_from_plan(
+    plan: &StoreIndexEntryPlan,
+    hashes_by_key: Option<&HashMap<String, String>>,
+    sizes_by_key: Option<&HashMap<String, u64>>,
+    content_fingerprints_by_key: Option<&HashMap<String, String>>,
+    modified_times_by_key: Option<&HashMap<String, u64>>,
+) -> Vec<StoreIndexEntry> {
+    let mut entries = Vec::with_capacity(plan.file_entries.len() + plan.prefix_entries.len());
+    for path in &plan.prefix_entries {
         entries.push(StoreIndexEntry {
-            path,
+            path: path.clone(),
             entry_type: "prefix".to_string(),
             version: None,
             content_hash: None,
@@ -11126,17 +11216,21 @@ fn build_store_index_entries_with_hashes(
             media: None,
         });
     }
-    for path in file_entries {
-        let content_hash = hashes_by_key.and_then(|values| values.get(&path)).cloned();
-        let size_bytes = sizes_by_key.and_then(|values| values.get(&path)).copied();
+    for path in &plan.file_entries {
+        let content_hash = hashes_by_key
+            .and_then(|values| values.get(path.as_str()))
+            .cloned();
+        let size_bytes = sizes_by_key
+            .and_then(|values| values.get(path.as_str()))
+            .copied();
         let content_fingerprint = content_fingerprints_by_key
-            .and_then(|values| values.get(&path))
+            .and_then(|values| values.get(path.as_str()))
             .cloned();
         let modified_at_unix = modified_times_by_key
-            .and_then(|values| values.get(&path))
+            .and_then(|values| values.get(path.as_str()))
             .copied();
         entries.push(StoreIndexEntry {
-            path,
+            path: path.clone(),
             entry_type: "key".to_string(),
             version: None,
             content_hash,
@@ -17308,7 +17402,11 @@ async fn metadata_db_logical_distribution(
     };
 
     let distribution = {
-        let store = read_store(&state, "storage_stats.load_metadata_db_logical_distribution").await;
+        let store = read_store(
+            &state,
+            "storage_stats.load_metadata_db_logical_distribution",
+        )
+        .await;
         match store.load_metadata_db_logical_distribution().await {
             Ok(distribution) => distribution,
             Err(err) => {
@@ -17353,7 +17451,11 @@ async fn metadata_db_logical_distribution(
     )
     .await;
 
-    (StatusCode::OK, Json::<MetadataDbLogicalDistribution>(distribution)).into_response()
+    (
+        StatusCode::OK,
+        Json::<MetadataDbLogicalDistribution>(distribution),
+    )
+        .into_response()
 }
 
 fn resolved_data_scrub_history_limit(

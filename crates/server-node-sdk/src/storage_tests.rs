@@ -4324,9 +4324,7 @@ run_on_all_metadata_backends!(
     storage_stats_collect_and_persist_latest_snapshot_metrics_turso
 );
 
-async fn metadata_db_logical_distribution_reports_table_content_impl(
-    backend: StorageTestBackend,
-) {
+async fn metadata_db_logical_distribution_reports_table_content_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("metadata-db-logical-distribution").await;
     let payload = Bytes::from_static(b"metadata-db-distribution-payload");
 
@@ -4373,7 +4371,12 @@ async fn metadata_db_logical_distribution_reports_table_content_impl(
         .expect("missing current_objects breakdown");
     assert!(current_objects.row_count > 0);
     assert!(current_objects.tracked_value_bytes > 0);
-    assert!(current_objects.tracked_columns.iter().any(|column| column == "key"));
+    assert!(
+        current_objects
+            .tracked_columns
+            .iter()
+            .any(|column| column == "key")
+    );
 
     let version_indexes = distribution
         .tables
@@ -4407,10 +4410,12 @@ async fn metadata_db_logical_distribution_reports_table_content_impl(
     assert_eq!(admin_audit_events.row_count, 1);
     assert!(admin_audit_events.tracked_value_bytes > 0);
 
-    assert!(distribution
-        .tables
-        .iter()
-        .any(|table| table.average_tracked_value_bytes.is_some()));
+    assert!(
+        distribution
+            .tables
+            .iter()
+            .any(|table| table.average_tracked_value_bytes.is_some())
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }
@@ -4800,6 +4805,67 @@ run_on_all_metadata_backends!(
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl,
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records,
     importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_turso
+);
+
+async fn store_index_uses_persisted_manifest_summary_when_manifest_file_is_missing_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("store-index-manifest-summary").await;
+
+    let payload = Bytes::from_static(b"summary-backed-manifest-payload");
+    let expected_size_bytes = payload.len() as u64;
+    let put = store
+        .put_object_versioned("docs/summary.txt", payload, PutOptions::default())
+        .await
+        .unwrap();
+
+    let manifest = store
+        .load_manifest_by_hash(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("manifest should exist after put");
+    let expected_content_fingerprint = content_fingerprint_from_manifest(&manifest);
+
+    let persisted_summaries = store
+        .metadata_store
+        .load_manifest_summaries(std::slice::from_ref(&put.manifest_hash))
+        .await
+        .unwrap();
+    let persisted_summary = persisted_summaries
+        .get(&put.manifest_hash)
+        .expect("manifest summary should persist during put");
+    assert_eq!(persisted_summary.total_size_bytes, expected_size_bytes);
+    assert_eq!(
+        persisted_summary.content_fingerprint,
+        expected_content_fingerprint
+    );
+
+    fs::remove_file(store.manifest_path_for_test(&put.manifest_hash))
+        .await
+        .unwrap();
+
+    let object_hashes = [("docs/summary.txt".to_string(), put.manifest_hash.clone())]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let (sizes, content_fingerprints) = store
+        .store_index_inspector()
+        .object_sizes_and_content_fingerprints_by_key(&object_hashes)
+        .await
+        .unwrap();
+
+    assert_eq!(sizes.get("docs/summary.txt"), Some(&expected_size_bytes));
+    assert_eq!(
+        content_fingerprints.get("docs/summary.txt"),
+        Some(&expected_content_fingerprint)
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    store_index_uses_persisted_manifest_summary_when_manifest_file_is_missing_impl,
+    store_index_uses_persisted_manifest_summary_when_manifest_file_is_missing,
+    store_index_uses_persisted_manifest_summary_when_manifest_file_is_missing_turso
 );
 
 async fn storage_stats_history_prune_drops_older_samples_impl(backend: StorageTestBackend) {

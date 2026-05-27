@@ -5,10 +5,11 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use common::NodeId;
 use tracing::warn;
+use turso::params_from_iter;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
-    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, ManifestSummary,
     MetadataDbTableLogicalBreakdown, MetadataStore, ReconcileMarker, RepairAttemptRecord,
     RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
@@ -676,6 +677,75 @@ impl MetadataStore for TursoMetadataStore {
         Ok(Some(index))
     }
 
+    async fn load_manifest_summaries(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<HashMap<String, ManifestSummary>> {
+        const TURSO_SUMMARY_QUERY_BATCH_SIZE: usize = 500;
+
+        let mut summaries = HashMap::with_capacity(manifest_hashes.len());
+        for chunk in manifest_hashes.chunks(TURSO_SUMMARY_QUERY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT manifest_hash, total_size_bytes, content_fingerprint
+                         FROM manifest_summaries
+                         WHERE manifest_hash IN ({placeholders})"
+                    ),
+                    params_from_iter(chunk.iter().cloned()),
+                )
+                .await?;
+
+            while let Some(row) = rows.next().await? {
+                let manifest_hash = row_string(&row, 0, "manifest_summaries.manifest_hash")?;
+                let total_size_bytes = row_u64(&row, 1, "manifest_summaries.total_size_bytes")?;
+                let content_fingerprint =
+                    row_string(&row, 2, "manifest_summaries.content_fingerprint")?;
+                summaries.insert(
+                    manifest_hash,
+                    ManifestSummary {
+                        total_size_bytes,
+                        content_fingerprint,
+                    },
+                );
+            }
+        }
+
+        Ok(summaries)
+    }
+
+    async fn persist_manifest_summary(
+        &self,
+        manifest_hash: &str,
+        summary: &ManifestSummary,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO manifest_summaries (manifest_hash, total_size_bytes, content_fingerprint)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(manifest_hash) DO UPDATE
+                 SET total_size_bytes = excluded.total_size_bytes,
+                     content_fingerprint = excluded.content_fingerprint",
+                (
+                    manifest_hash,
+                    i64::try_from(summary.total_size_bytes)
+                        .context("manifest summary size overflow")?,
+                    summary.content_fingerprint.as_str(),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn persist_version_index_by_object_id(
         &self,
         object_id: &str,
@@ -1019,7 +1089,10 @@ impl MetadataStore for TursoMetadataStore {
                     )
                 })?;
             let Some(row) = rows.next().await? else {
-                bail!("missing metadata db logical distribution row for {}", spec.table);
+                bail!(
+                    "missing metadata db logical distribution row for {}",
+                    spec.table
+                );
             };
             let row_count = row_u64(&row, 0, "metadata_db_distribution.row_count")?;
             let tracked_value_bytes =
@@ -1267,6 +1340,12 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS cached_chunks (
                 hash TEXT PRIMARY KEY,
                 record_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS manifest_summaries (
+                manifest_hash TEXT PRIMARY KEY,
+                total_size_bytes INTEGER NOT NULL,
+                content_fingerprint TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS locally_owned_manifests (

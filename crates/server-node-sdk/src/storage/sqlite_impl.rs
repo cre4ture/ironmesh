@@ -11,7 +11,7 @@ use tracing::warn;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
-    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, ManifestSummary,
     MetadataDbTableLogicalBreakdown, MetadataStore, ReconcileMarker, RepairAttemptRecord,
     RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
@@ -652,6 +652,74 @@ impl MetadataStore for SqliteMetadataStore {
         }
     }
 
+    async fn load_manifest_summaries(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, ManifestSummary>> {
+        const SQLITE_SUMMARY_QUERY_BATCH_SIZE: usize = 500;
+
+        let db = self.metadata_conn()?;
+        let mut summaries = std::collections::HashMap::with_capacity(manifest_hashes.len());
+        for chunk in manifest_hashes.chunks(SQLITE_SUMMARY_QUERY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT manifest_hash, total_size_bytes, content_fingerprint
+                 FROM manifest_summaries
+                 WHERE manifest_hash IN ({placeholders})"
+            );
+            let mut stmt = db.prepare(&query)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (manifest_hash, total_size_bytes, content_fingerprint) = row?;
+                summaries.insert(
+                    manifest_hash,
+                    ManifestSummary {
+                        total_size_bytes: u64::try_from(total_size_bytes)
+                            .context("negative manifest summary size in sqlite")?,
+                        content_fingerprint,
+                    },
+                );
+            }
+        }
+
+        Ok(summaries)
+    }
+
+    async fn persist_manifest_summary(
+        &self,
+        manifest_hash: &str,
+        summary: &ManifestSummary,
+    ) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute(
+            "INSERT INTO manifest_summaries (manifest_hash, total_size_bytes, content_fingerprint)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(manifest_hash) DO UPDATE
+             SET total_size_bytes = excluded.total_size_bytes,
+                 content_fingerprint = excluded.content_fingerprint",
+            params![
+                manifest_hash,
+                u64_to_i64(summary.total_size_bytes)?,
+                summary.content_fingerprint.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
     async fn persist_version_index_by_object_id(
         &self,
         object_id: &str,
@@ -1149,6 +1217,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             record_json BLOB NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS manifest_summaries (
+            manifest_hash TEXT PRIMARY KEY,
+            total_size_bytes INTEGER NOT NULL,
+            content_fingerprint TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS locally_owned_manifests (
             manifest_hash TEXT PRIMARY KEY,
             owned_at_unix INTEGER NOT NULL
@@ -1258,12 +1332,8 @@ fn load_metadata_db_logical_breakdown_from_db(
         })?;
         let row_count = u64::try_from(row_count)
             .with_context(|| format!("negative row count reported for {}", spec.table))?;
-        let tracked_value_bytes = u64::try_from(tracked_value_bytes).with_context(|| {
-            format!(
-                "negative tracked value bytes reported for {}",
-                spec.table
-            )
-        })?;
+        let tracked_value_bytes = u64::try_from(tracked_value_bytes)
+            .with_context(|| format!("negative tracked value bytes reported for {}", spec.table))?;
         tables.push(MetadataDbTableLogicalBreakdown {
             table: spec.table.to_string(),
             row_count,

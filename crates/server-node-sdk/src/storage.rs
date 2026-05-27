@@ -69,6 +69,21 @@ struct ObjectManifest {
     chunks: Vec<ChunkRef>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestSummary {
+    total_size_bytes: u64,
+    content_fingerprint: String,
+}
+
+impl ManifestSummary {
+    fn from_manifest(manifest: &ObjectManifest) -> Self {
+        Self {
+            total_size_bytes: manifest.total_size_bytes as u64,
+            content_fingerprint: content_fingerprint_from_manifest(manifest),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotManifest {
     id: String,
@@ -1153,12 +1168,21 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["hash", "record_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "manifest_summaries",
+        tracked_columns: &["manifest_hash", "content_fingerprint"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "locally_owned_manifests",
         tracked_columns: &["manifest_hash"],
     },
     MetadataDbLogicalTableSpec {
         table: "reconcile_markers",
-        tracked_columns: &["source_node_id", "key", "source_version_id", "local_version_id"],
+        tracked_columns: &[
+            "source_node_id",
+            "key",
+            "source_version_id",
+            "local_version_id",
+        ],
     },
 ];
 
@@ -1361,6 +1385,15 @@ trait MetadataStore: Send + Sync {
         &self,
         object_id: &str,
     ) -> Result<Option<FileVersionIndex>>;
+    async fn load_manifest_summaries(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<HashMap<String, ManifestSummary>>;
+    async fn persist_manifest_summary(
+        &self,
+        manifest_hash: &str,
+        summary: &ManifestSummary,
+    ) -> Result<()>;
     async fn persist_version_index_by_object_id(
         &self,
         object_id: &str,
@@ -2671,12 +2704,54 @@ impl StoreIndexInspector {
     ) -> Result<(HashMap<String, u64>, HashMap<String, String>)> {
         let mut sizes = HashMap::with_capacity(object_hashes.len());
         let mut content_fingerprints = HashMap::with_capacity(object_hashes.len());
+        let requested_manifest_hashes = object_hashes
+            .values()
+            .filter(|manifest_hash| manifest_hash.as_str() != TOMBSTONE_MANIFEST_HASH)
+            .cloned()
+            .collect::<Vec<_>>();
+        let persisted_summaries = match self
+            .metadata_store
+            .load_manifest_summaries(&requested_manifest_hashes)
+            .await
+        {
+            Ok(summaries) => summaries,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    manifest_count = requested_manifest_hashes.len(),
+                    "failed loading manifest summaries for store index"
+                );
+                HashMap::new()
+            }
+        };
+
         for (key, manifest_hash) in object_hashes {
+            if let Some(summary) = persisted_summaries.get(manifest_hash) {
+                sizes.insert(key.clone(), summary.total_size_bytes);
+                content_fingerprints.insert(key.clone(), summary.content_fingerprint.clone());
+                continue;
+            }
+            if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
             match self.load_manifest_by_hash(manifest_hash).await {
                 Ok(Some(manifest)) => {
-                    sizes.insert(key.clone(), manifest.total_size_bytes as u64);
-                    content_fingerprints
-                        .insert(key.clone(), content_fingerprint_from_manifest(&manifest));
+                    let summary = ManifestSummary::from_manifest(&manifest);
+                    sizes.insert(key.clone(), summary.total_size_bytes);
+                    content_fingerprints.insert(key.clone(), summary.content_fingerprint.clone());
+                    if let Err(err) = self
+                        .metadata_store
+                        .persist_manifest_summary(manifest_hash, &summary)
+                        .await
+                    {
+                        warn!(
+                            key = %key,
+                            manifest_hash = %manifest_hash,
+                            error = %err,
+                            "failed to backfill manifest summary for store index"
+                        );
+                    }
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -2765,6 +2840,32 @@ impl StoreIndexInspector {
 
         Ok(Some(MediaCacheLookup {
             content_fingerprint,
+            metadata,
+        }))
+    }
+
+    pub(crate) async fn lookup_media_cache_by_content_fingerprint(
+        &self,
+        content_fingerprint: &str,
+    ) -> Result<Option<MediaCacheLookup>> {
+        let lookup_started_at = Instant::now();
+        let metadata = current_media_cache_metadata(
+            self.metadata_store
+                .load_cached_media_metadata(content_fingerprint)
+                .await?,
+        );
+        let total_ms = lookup_started_at.elapsed().as_millis();
+        if total_ms >= SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS {
+            warn!(
+                content_fingerprint = %content_fingerprint,
+                total_ms,
+                metadata_present = metadata.is_some(),
+                "slow media cache lookup by content fingerprint"
+            );
+        }
+
+        Ok(Some(MediaCacheLookup {
+            content_fingerprint: content_fingerprint.to_string(),
             metadata,
         }))
     }
@@ -4542,6 +4643,8 @@ impl PersistentStore {
             .await?;
 
         if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
+            self.persist_manifest_summary(manifest_hash, &manifest)
+                .await?;
             for chunk in manifest.chunks {
                 self.metadata_store
                     .delete_cached_chunk_record(&chunk.hash)
@@ -4550,6 +4653,20 @@ impl PersistentStore {
         }
 
         Ok(())
+    }
+
+    async fn persist_manifest_summary(
+        &self,
+        manifest_hash: &str,
+        manifest: &ObjectManifest,
+    ) -> Result<()> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(());
+        }
+
+        self.metadata_store
+            .persist_manifest_summary(manifest_hash, &ManifestSummary::from_manifest(manifest))
+            .await
     }
 
     pub(crate) async fn note_cached_chunk_fetch(
@@ -4798,7 +4915,7 @@ impl PersistentStore {
                 );
             }
 
-            let _: ObjectManifest = serde_json::from_slice(&manifest.manifest_bytes)
+            let parsed_manifest: ObjectManifest = serde_json::from_slice(&manifest.manifest_bytes)
                 .context("invalid metadata manifest payload")?;
 
             let manifest_path = self
@@ -4808,6 +4925,8 @@ impl PersistentStore {
                 write_atomic(&manifest_path, &manifest.manifest_bytes).await?;
                 changed = true;
             }
+            self.persist_manifest_summary(&manifest.manifest_hash, &parsed_manifest)
+                .await?;
         }
 
         let mut current_state_changed = false;
@@ -6171,10 +6290,7 @@ impl PersistentStore {
             backend: self.metadata_backend_kind,
             generated_at_unix: unix_ts(),
             total_row_count: tables.iter().map(|table| table.row_count).sum(),
-            total_tracked_value_bytes: tables
-                .iter()
-                .map(|table| table.tracked_value_bytes)
-                .sum(),
+            total_tracked_value_bytes: tables.iter().map(|table| table.tracked_value_bytes).sum(),
             tables,
         })
     }

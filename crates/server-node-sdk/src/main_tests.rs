@@ -5240,6 +5240,20 @@ fn store_index_prefix_respects_path_boundaries() {
 }
 
 #[test]
+fn store_index_entry_plan_limits_visible_files_to_requested_depth() {
+    let keys = vec![
+        "docs/readme.md".to_string(),
+        "docs/guide/intro.md".to_string(),
+        "docs/api/v1.json".to_string(),
+    ];
+
+    let plan = super::plan_store_index_entries(&keys, "docs", 1);
+
+    assert_eq!(plan.file_entries, vec!["docs/readme.md"]);
+    assert_eq!(plan.prefix_entries, vec!["docs/api/", "docs/guide/"]);
+}
+
+#[test]
 fn store_index_object_map_filter_respects_prefix_boundaries() {
     let (hashes, object_ids) = super::filter_store_index_object_maps_for_prefix(
         HashMap::from([
@@ -6175,6 +6189,72 @@ run_on_main_metadata_backends!(
     list_store_index_skips_invalid_manifest_metadata_turso
 );
 
+async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "docs/readme.txt",
+                bytes::Bytes::from_static(b"hello"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("docs".to_string()),
+                depth: Some(1),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let headers = response.headers();
+    assert!(
+        headers
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("total;dur=")),
+        "store index response should expose server timing details"
+    );
+    assert!(
+        headers.get("x-ironmesh-store-index-request-id").is_some(),
+        "store index response should expose a request id for log correlation"
+    );
+    assert_eq!(
+        headers
+            .get("x-ironmesh-store-index-matching-keys")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(
+        headers
+            .get("x-ironmesh-store-index-visible-files")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_sets_timing_headers_impl,
+    list_store_index_sets_timing_headers,
+    list_store_index_sets_timing_headers_turso
+);
+
 #[test]
 fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
     let mut entries = vec![
@@ -6322,6 +6402,13 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
             .unwrap();
         assert!(!replica_subjects.contains(&"photos/cat.png".to_string()));
         assert!(!replica_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
+    }
+
+    {
+        let locked = lock_store(&target, "tests.target.store").await;
+        fs::remove_file(locked.manifest_path_for_test(&put.manifest_hash))
+            .await
+            .unwrap();
     }
 
     let response = axum::response::IntoResponse::into_response(
