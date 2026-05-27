@@ -665,8 +665,7 @@ impl MetadataStore for SqliteMetadataStore {
                 continue;
             }
 
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
@@ -1338,11 +1337,7 @@ fn load_metadata_db_logical_breakdown_from_db(
             table: spec.table.to_string(),
             row_count,
             tracked_value_bytes,
-            average_tracked_value_bytes: if row_count > 0 {
-                Some(tracked_value_bytes / row_count)
-            } else {
-                None
-            },
+            average_tracked_value_bytes: tracked_value_bytes.checked_div(row_count),
             tracked_columns: spec
                 .tracked_columns
                 .iter()

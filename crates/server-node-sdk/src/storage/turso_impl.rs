@@ -1101,11 +1101,7 @@ impl MetadataStore for TursoMetadataStore {
                 table: spec.table.to_string(),
                 row_count,
                 tracked_value_bytes,
-                average_tracked_value_bytes: if row_count > 0 {
-                    Some(tracked_value_bytes / row_count)
-                } else {
-                    None
-                },
+                average_tracked_value_bytes: tracked_value_bytes.checked_div(row_count),
                 tracked_columns: spec
                     .tracked_columns
                     .iter()
@@ -1250,6 +1246,11 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     connection
         .execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS metadata_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS current_objects (
                 key TEXT PRIMARY KEY,
                 manifest_hash TEXT NOT NULL,

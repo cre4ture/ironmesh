@@ -11177,6 +11177,7 @@ fn filter_store_index_object_maps_for_prefix(
     (object_hashes, object_ids)
 }
 
+#[cfg(test)]
 fn build_store_index_entries_with_hashes(
     keys: &[String],
     prefix: &str,

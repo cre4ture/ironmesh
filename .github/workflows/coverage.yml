@@ -35,9 +35,6 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
