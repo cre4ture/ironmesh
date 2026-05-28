@@ -1,3 +1,16 @@
+ironmesh (1.0.18-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add a Metadata Footprint admin page with logical metadata table
+    breakdowns and interactive footprint charts.
+  * Speed up metadata and file lookup paths and reuse the shared zoomable
+    time-series chart across dashboard and metadata views.
+  * Fix Turso metadata schema and clippy regressions affecting CI
+    coverage, and stabilize the Rust coverage workflow around a
+    sustainable core package set.
+  * Roll the workspace release to 1.0.18.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 28 May 2026 06:57:38 +0200
+
 ironmesh (1.0.17-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Preserve replication repair lineage across nodes and stop replayed
