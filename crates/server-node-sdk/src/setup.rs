@@ -341,6 +341,7 @@ fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<StartupMode
 pub(crate) async fn run_setup_mode(
     config: SetupBootstrapConfig,
     log_buffer: Arc<LogBuffer>,
+    runtime_log_control: RuntimeLogControl,
 ) -> Result<()> {
     let initial_state =
         ensure_managed_setup_state(&config.state_path).context("failed preparing setup state")?;
@@ -391,7 +392,7 @@ pub(crate) async fn run_setup_mode(
     outcome.context("bootstrap setup server exited during transition")?;
 
     let completion = completion.expect("checked is_some above");
-    run_inner(completion.config, Some(log_buffer)).await
+    run_inner(completion.config, Some(log_buffer), runtime_log_control).await
 }
 
 async fn setup_health(State(state): State<SetupServerState>) -> impl IntoResponse {

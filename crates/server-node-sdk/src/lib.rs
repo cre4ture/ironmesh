@@ -62,8 +62,11 @@ use tower::Service;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
 use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::Registry;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
     BootstrapClaimBroker, BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial,
@@ -198,6 +201,8 @@ tokio::task_local! {
     static ACTIVE_REPAIR_LOG_HANDLE: RepairActiveRunLiveLogHandle;
 }
 
+type RuntimeLogReloadHandle = reload::Handle<EnvFilter, Registry>;
+
 #[derive(Clone)]
 struct ServerState {
     data_dir: PathBuf,
@@ -214,6 +219,7 @@ struct ServerState {
     peer_heartbeat_config: PeerHeartbeatConfig,
     repair_config: RepairConfig,
     log_buffer: Arc<LogBuffer>,
+    runtime_log_control: RuntimeLogControl,
 }
 
 #[derive(Clone)]
@@ -1885,6 +1891,251 @@ where
         };
 
         self.buffer.push(line);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeLogDirective {
+    target: String,
+    level: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeLogConfigView {
+    filter_expression: String,
+    default_level: Option<String>,
+    directives: Vec<RuntimeLogDirective>,
+    runtime_reconfigurable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpdateRuntimeLogConfigRequest {
+    #[serde(default)]
+    filter_expression: Option<String>,
+    #[serde(default)]
+    default_level: Option<String>,
+    #[serde(default)]
+    directives: Vec<RuntimeLogDirective>,
+}
+
+#[derive(Clone)]
+struct RuntimeLogControl {
+    filter_expression: Arc<StdMutex<String>>,
+    reload_handle: Option<Arc<StdMutex<RuntimeLogReloadHandle>>>,
+}
+
+impl RuntimeLogControl {
+    fn with_reload_handle(
+        filter_expression: impl Into<String>,
+        reload_handle: RuntimeLogReloadHandle,
+    ) -> Self {
+        Self {
+            filter_expression: Arc::new(StdMutex::new(filter_expression.into())),
+            reload_handle: Some(Arc::new(StdMutex::new(reload_handle))),
+        }
+    }
+
+    fn disabled(filter_expression: impl Into<String>) -> Self {
+        Self {
+            filter_expression: Arc::new(StdMutex::new(filter_expression.into())),
+            reload_handle: None,
+        }
+    }
+
+    fn runtime_reconfigurable(&self) -> bool {
+        self.reload_handle.is_some()
+    }
+
+    fn current_filter_expression(&self) -> String {
+        match self.filter_expression.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn view(&self) -> RuntimeLogConfigView {
+        let filter_expression = self.current_filter_expression();
+        let (default_level, directives) =
+            parse_simple_runtime_log_config(&filter_expression).unwrap_or((None, Vec::new()));
+        RuntimeLogConfigView {
+            filter_expression,
+            default_level,
+            directives,
+            runtime_reconfigurable: self.runtime_reconfigurable(),
+        }
+    }
+
+    fn apply_filter_expression(&self, filter_expression: &str) -> Result<()> {
+        let filter = EnvFilter::try_new(filter_expression.to_string())
+            .with_context(|| format!("invalid log filter expression: {filter_expression}"))?;
+
+        if let Some(handle) = &self.reload_handle {
+            let guard = match handle.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .reload(filter)
+                .context("failed applying runtime log filter")?;
+        } else {
+            bail!("runtime log reconfiguration is not available in this process");
+        }
+
+        match self.filter_expression.lock() {
+            Ok(mut guard) => *guard = filter_expression.to_string(),
+            Err(poisoned) => *poisoned.into_inner() = filter_expression.to_string(),
+        }
+        Ok(())
+    }
+}
+
+fn normalize_runtime_log_level(level: &str) -> Result<String> {
+    let normalized = level.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" | "off" => Ok(normalized),
+        _ => bail!(
+            "unsupported log level {level}; expected one of trace, debug, info, warn, error, off"
+        ),
+    }
+}
+
+fn build_runtime_log_filter_expression(
+    default_level: &str,
+    directives: &[RuntimeLogDirective],
+) -> Result<String> {
+    let normalized_default = normalize_runtime_log_level(default_level)?;
+    let mut segments = vec![normalized_default];
+    for directive in directives {
+        let target = directive.target.trim();
+        if target.is_empty() {
+            bail!("log directives must include a non-empty target");
+        }
+        let level = normalize_runtime_log_level(&directive.level)?;
+        segments.push(format!("{target}={level}"));
+    }
+    Ok(segments.join(","))
+}
+
+fn runtime_log_filter_expression_from_request(
+    request: &UpdateRuntimeLogConfigRequest,
+) -> Result<String> {
+    let explicit_filter = request
+        .filter_expression
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if explicit_filter.is_some()
+        && (request.default_level.is_some() || !request.directives.is_empty())
+    {
+        bail!("provide either filter_expression or default_level/directives, not both");
+    }
+
+    if let Some(filter_expression) = explicit_filter {
+        EnvFilter::try_new(filter_expression.to_string())
+            .with_context(|| format!("invalid log filter expression: {filter_expression}"))?;
+        return Ok(filter_expression.to_string());
+    }
+
+    build_runtime_log_filter_expression(
+        request.default_level.as_deref().unwrap_or("info"),
+        &request.directives,
+    )
+}
+
+fn parse_simple_runtime_log_config(
+    filter_expression: &str,
+) -> Option<(Option<String>, Vec<RuntimeLogDirective>)> {
+    let mut default_level = None;
+    let mut directives = Vec::new();
+
+    for raw_segment in filter_expression.split(',') {
+        let segment = raw_segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        if segment.contains('[') || segment.contains(']') || segment.contains('/') {
+            return None;
+        }
+
+        if let Some((target, level)) = segment.rsplit_once('=') {
+            let target = target.trim();
+            let level = normalize_runtime_log_level(level).ok()?;
+            if target.is_empty() {
+                return None;
+            }
+            directives.push(RuntimeLogDirective {
+                target: target.to_string(),
+                level,
+            });
+        } else {
+            let level = normalize_runtime_log_level(segment).ok()?;
+            if default_level.is_some() {
+                return None;
+            }
+            default_level = Some(level);
+        }
+    }
+
+    Some((default_level, directives))
+}
+
+#[cfg(test)]
+mod runtime_log_control_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_log_filter_expression_builds_from_default_and_directives() {
+        let expression = build_runtime_log_filter_expression(
+            "info",
+            &[
+                RuntimeLogDirective {
+                    target: "server_node_sdk".to_string(),
+                    level: "debug".to_string(),
+                },
+                RuntimeLogDirective {
+                    target: "server_node_sdk::replication".to_string(),
+                    level: "trace".to_string(),
+                },
+            ],
+        )
+        .expect("filter expression should build");
+
+        assert_eq!(
+            expression,
+            "info,server_node_sdk=debug,server_node_sdk::replication=trace"
+        );
+    }
+
+    #[test]
+    fn simple_runtime_log_config_round_trips() {
+        let filter_expression = "warn,server_node_sdk=debug,server_node_sdk::replication=off";
+        let (default_level, directives) =
+            parse_simple_runtime_log_config(filter_expression).expect("config should parse");
+
+        assert_eq!(default_level.as_deref(), Some("warn"));
+        assert_eq!(directives.len(), 2);
+        assert_eq!(directives[0].target, "server_node_sdk");
+        assert_eq!(directives[0].level, "debug");
+        assert_eq!(directives[1].target, "server_node_sdk::replication");
+        assert_eq!(directives[1].level, "off");
+    }
+
+    #[test]
+    fn request_rejects_mixed_expression_and_directives() {
+        let request = UpdateRuntimeLogConfigRequest {
+            filter_expression: Some("info".to_string()),
+            default_level: Some("debug".to_string()),
+            directives: Vec::new(),
+        };
+
+        let err =
+            runtime_log_filter_expression_from_request(&request).expect_err("request should fail");
+        assert!(
+            err.to_string()
+                .contains("either filter_expression or default_level/directives")
+        );
     }
 }
 
@@ -4189,23 +4440,57 @@ fn wait_for_local_node_ready(
     bail!("local node did not become healthy at {health_url}")
 }
 
+fn runtime_log_filter_from_env(default_directive: &str) -> (EnvFilter, String) {
+    match std::env::var(EnvFilter::DEFAULT_ENV) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                (
+                    EnvFilter::new(default_directive),
+                    default_directive.to_string(),
+                )
+            } else {
+                match EnvFilter::try_new(trimmed.to_string()) {
+                    Ok(filter) => (filter, trimmed.to_string()),
+                    Err(_) => (
+                        EnvFilter::new(default_directive),
+                        default_directive.to_string(),
+                    ),
+                }
+            }
+        }
+        Err(_) => (
+            EnvFilter::new(default_directive),
+            default_directive.to_string(),
+        ),
+    }
+}
+
 pub async fn run_from_env() -> Result<()> {
     let log_buffer = Arc::new(LogBuffer::new(500));
+    let (env_filter, filter_expression) = runtime_log_filter_from_env("info");
+    let (reload_layer, reload_handle) = reload::Layer::new(env_filter);
+    let runtime_log_control =
+        RuntimeLogControl::with_reload_handle(filter_expression, reload_handle);
     tracing_subscriber::registry()
-        .with(common::logging::env_filter_from_default_env("info"))
+        .with(reload_layer)
         .with(common::logging::compact_fmt_layer())
         .with(LogCaptureLayer::new(log_buffer.clone()))
         .init();
 
     ensure_rustls_crypto_provider_installed();
     match setup::load_startup_mode_from_env()? {
-        setup::StartupMode::Runtime(config) => run_inner(config, Some(log_buffer)).await,
-        setup::StartupMode::Setup(config) => setup::run_setup_mode(config, log_buffer).await,
+        setup::StartupMode::Runtime(config) => {
+            run_inner(config, Some(log_buffer), runtime_log_control).await
+        }
+        setup::StartupMode::Setup(config) => {
+            setup::run_setup_mode(config, log_buffer, runtime_log_control).await
+        }
     }
 }
 
 pub async fn run(config: ServerNodeConfig) -> Result<()> {
-    run_inner(config, None).await
+    run_inner(config, None, RuntimeLogControl::disabled("info")).await
 }
 
 async fn wait_for_shutdown_trigger(mut shutdown_rx: watch::Receiver<bool>) {
@@ -4407,7 +4692,11 @@ async fn shutdown_signal() {
     }
 }
 
-async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
+async fn run_inner(
+    config: ServerNodeConfig,
+    log_buffer: Option<Arc<LogBuffer>>,
+    runtime_log_control: RuntimeLogControl,
+) -> Result<()> {
     ensure_rustls_crypto_provider_installed();
     config.validate_public_listener_security()?;
 
@@ -4873,6 +5162,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         peer_heartbeat_config,
         repair_config,
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
+        runtime_log_control,
     };
 
     let internal_peer_url = config
@@ -5096,6 +5386,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/media/cache/clear", post(clear_media_cache_admin))
         .route("/auth/store/{key}", get(get_object_admin))
         .route("/auth/client-connections", get(list_client_connections))
+        .route(
+            "/auth/logging/config",
+            get(get_runtime_log_config).put(update_runtime_log_config),
+        )
         .route(
             "/auth/rendezvous-config",
             get(get_rendezvous_config).put(update_rendezvous_config),
@@ -17052,6 +17346,113 @@ async fn list_client_connections(
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn get_runtime_log_config(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/logging/config/get";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let view = state.runtime_log_control.view();
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "filter_expression": view.filter_expression,
+            "runtime_reconfigurable": view.runtime_reconfigurable,
+            "directive_count": view.directives.len(),
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(view)).into_response()
+}
+
+async fn update_runtime_log_config(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateRuntimeLogConfigRequest>,
+) -> impl IntoResponse {
+    let filter_expression = match runtime_log_filter_expression_from_request(&request) {
+        Ok(filter_expression) => filter_expression,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let action = "auth/logging/config/update";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        true,
+        json!({ "filter_expression": filter_expression }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    if let Err(err) = state
+        .runtime_log_control
+        .apply_filter_expression(&filter_expression)
+    {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            false,
+            true,
+            "error",
+            json!({
+                "filter_expression": filter_expression,
+                "error": err.to_string(),
+            }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let view = state.runtime_log_control.view();
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        false,
+        true,
+        "success",
+        json!({
+            "filter_expression": view.filter_expression,
+            "runtime_reconfigurable": view.runtime_reconfigurable,
+            "directive_count": view.directives.len(),
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(view)).into_response()
 }
 
 async fn list_data_change_events(

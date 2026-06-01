@@ -382,6 +382,10 @@ impl ChildGuard {
         }
     }
 
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(Child::id)
+    }
+
     #[cfg(windows)]
     pub fn with_cleanup_command(
         mut self,

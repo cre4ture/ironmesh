@@ -14,6 +14,9 @@ mod framework_win;
 mod cfapi_monitor_test;
 
 #[cfg(windows)]
+mod windows_cfapi_cluster_workload_support;
+
+#[cfg(windows)]
 mod windows_cfapi_cluster_workload_test;
 
 #[cfg(target_os = "linux")]

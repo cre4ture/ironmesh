@@ -7876,6 +7876,7 @@ async fn build_test_state(
             busy_wait_millis: 100,
         },
         log_buffer: Arc::new(super::LogBuffer::new(64)),
+        runtime_log_control: super::RuntimeLogControl::disabled("info"),
     };
 
     if seed_gap {
