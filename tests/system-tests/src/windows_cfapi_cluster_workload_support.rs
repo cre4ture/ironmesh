@@ -866,6 +866,19 @@ async fn pause_for_investigation(
         }
         if live.continue_signal_path.exists() {
             let _ = fs::remove_file(&live.continue_signal_path);
+            update_manifest(
+                &RuntimeMode::Live(live.clone()),
+                config,
+                cluster_id,
+                phase,
+                "running",
+                Some(&format!("{detail} (resumed)")),
+                paths,
+                node_a,
+                node_b,
+                node_c,
+                adapter,
+            )?;
             eprintln!("[live] continuing from phase={phase}");
             return Ok(PauseOutcome::Continue);
         }
