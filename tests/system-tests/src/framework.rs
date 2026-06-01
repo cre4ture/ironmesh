@@ -1410,6 +1410,8 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
         .join("target")
         .join("debug")
         .join(executable_name);
+    #[cfg(windows)]
+    let path = path.with_extension("exe");
 
     if !path.exists() {
         bail!(

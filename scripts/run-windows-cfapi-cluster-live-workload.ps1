@@ -57,6 +57,13 @@ function Resolve-DriverExecutable {
         (Join-Path $RepoRoot "tests\system-tests\target\debug")
     )
 
+    foreach ($searchRoot in $searchRoots) {
+        $directCandidate = Join-Path $searchRoot "windows_cfapi_cluster_workload_driver.exe"
+        if (Test-Path -LiteralPath $directCandidate) {
+            return Get-Item -LiteralPath $directCandidate
+        }
+    }
+
     $matches = foreach ($searchRoot in $searchRoots) {
         if (-not (Test-Path -LiteralPath $searchRoot)) {
             continue
