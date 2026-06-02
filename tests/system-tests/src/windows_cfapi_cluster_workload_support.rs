@@ -24,10 +24,10 @@ const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_SAMPLE_VERIFY_COUNT: usize = 24;
 const DEFAULT_SUBDIR_COUNT: usize = 80;
 const DEFAULT_MAX_DIR_DEPTH: usize = 4;
-const STORE_INDEX_PAGE_SIZE: usize = 256;
+const DEFAULT_UPLOAD_TIMEOUT_SECS: u64 = 150 * 60;
+const DEFAULT_REPLICATION_TIMEOUT_SECS: u64 = 60 * 60;
+const STORE_INDEX_PROGRESS_LIMIT: usize = 1;
 const IO_BUFFER_BYTES: usize = 256 * 1024;
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-const REPLICATION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone)]
 struct WorkloadConfig {
@@ -37,6 +37,8 @@ struct WorkloadConfig {
     sample_verify_count: usize,
     subdir_count: usize,
     max_dir_depth: usize,
+    upload_timeout: Duration,
+    replication_timeout: Duration,
 }
 
 impl WorkloadConfig {
@@ -57,6 +59,14 @@ impl WorkloadConfig {
             "IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH",
             DEFAULT_MAX_DIR_DEPTH,
         )?;
+        let upload_timeout = Duration::from_secs(read_env_u64(
+            "IRONMESH_WINDOWS_CFAPI_UPLOAD_TIMEOUT_SECS",
+            DEFAULT_UPLOAD_TIMEOUT_SECS,
+        )?);
+        let replication_timeout = Duration::from_secs(read_env_u64(
+            "IRONMESH_WINDOWS_CFAPI_REPLICATION_TIMEOUT_SECS",
+            DEFAULT_REPLICATION_TIMEOUT_SECS,
+        )?);
 
         if min_bytes == 0 {
             bail!("IRONMESH_WINDOWS_CFAPI_LOAD_MIN_BYTES must be greater than zero");
@@ -86,6 +96,8 @@ impl WorkloadConfig {
             sample_verify_count: sample_verify_count.max(1),
             subdir_count,
             max_dir_depth,
+            upload_timeout,
+            replication_timeout,
         })
     }
 
@@ -476,13 +488,15 @@ async fn execute_workload(
     adapter: &mut Option<AdapterFixture>,
 ) -> Result<WorkloadOutcome> {
     eprintln!(
-        "[cluster] starting workload: files={} min_bytes={} max_bytes={} average_bytes={} subdirs={} max_depth={}",
+        "[cluster] starting workload: files={} min_bytes={} max_bytes={} average_bytes={} subdirs={} max_depth={} upload_timeout_secs={} replication_timeout_secs={}",
         config.file_count,
         config.min_bytes,
         config.max_bytes,
         config.average_bytes(),
         config.subdir_count,
-        config.max_dir_depth
+        config.max_dir_depth,
+        config.upload_timeout.as_secs(),
+        config.replication_timeout.as_secs()
     );
 
     update_manifest(
@@ -585,13 +599,19 @@ async fn execute_workload(
         "[cluster-a] waiting for {} uploaded files to appear on the ingress node",
         expected_paths.len()
     );
-    wait_for_store_file_paths(&node_a.sdk, &expected_paths, node_a.label, UPLOAD_TIMEOUT).await?;
+    wait_for_store_file_paths(
+        &node_a.sdk,
+        &expected_paths,
+        node_a.label,
+        config.upload_timeout,
+    )
+    .await?;
     wait_for_local_subjects(
         &node_a.internal_http,
         &node_a.internal_base_url,
         &expected_paths,
         node_a.label,
-        UPLOAD_TIMEOUT,
+        config.upload_timeout,
     )
     .await?;
     eprintln!("[cluster-a] upload convergence complete");
@@ -640,19 +660,24 @@ async fn execute_workload(
     drive_replication_to_completion(
         &node_a.internal_http,
         &node_a.internal_base_url,
-        REPLICATION_TIMEOUT,
+        config.replication_timeout,
     )
     .await?;
 
     for node in [&*node_a, &*node_b, &*node_c] {
-        wait_for_store_file_paths(&node.sdk, &expected_paths, node.label, REPLICATION_TIMEOUT)
-            .await?;
+        wait_for_store_file_paths(
+            &node.sdk,
+            &expected_paths,
+            node.label,
+            config.replication_timeout,
+        )
+        .await?;
         wait_for_local_subjects(
             &node.internal_http,
             &node.internal_base_url,
             &expected_paths,
             node.label,
-            REPLICATION_TIMEOUT,
+            config.replication_timeout,
         )
         .await?;
         eprintln!(
@@ -774,6 +799,8 @@ fn update_manifest(
             "sample_verify_count": config.sample_verify_count,
             "subdir_count": config.subdir_count,
             "max_dir_depth": config.max_dir_depth,
+            "upload_timeout_secs": config.upload_timeout.as_secs(),
+            "replication_timeout_secs": config.replication_timeout.as_secs(),
         },
         "holds": {
             "after_copy": live.hold_after_copy,
@@ -932,6 +959,16 @@ fn read_env_usize(name: &str, default: usize) -> Result<usize> {
         Ok(value) => value
             .parse::<usize>()
             .with_context(|| format!("failed parsing {name}={value} as usize")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(err).with_context(|| format!("failed reading {name}")),
+    }
+}
+
+fn read_env_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("failed parsing {name}={value} as u64")),
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(err) => Err(err).with_context(|| format!("failed reading {name}")),
     }
@@ -1118,37 +1155,62 @@ async fn register_full_mesh(http: &Client, nodes: &[&ClusterNodeFixture]) -> Res
 }
 
 async fn fetch_all_store_file_paths(sdk: &IronMeshClient) -> Result<BTreeSet<String>> {
-    let mut paths = BTreeSet::new();
-    let mut offset = 0usize;
+    let response = sdk
+        .store_index_with_options(
+            None,
+            8,
+            None,
+            StoreIndexRequestOptions {
+                synthesize_missing_folder_markers: false,
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await?;
 
-    loop {
-        let response = sdk
-            .store_index_with_options(
-                None,
-                8,
-                None,
-                StoreIndexRequestOptions {
-                    offset: Some(offset),
-                    limit: Some(STORE_INDEX_PAGE_SIZE),
-                    ..StoreIndexRequestOptions::default()
-                },
-            )
-            .await?;
+    Ok(response
+        .entries
+        .into_iter()
+        .filter(|entry| !entry.path.ends_with('/'))
+        .map(|entry| entry.path)
+        .collect())
+}
 
-        let batch_len = response.entries.len();
-        for entry in response.entries {
-            if !entry.path.ends_with('/') {
-                paths.insert(entry.path);
+async fn fetch_store_entry_count(sdk: &IronMeshClient) -> Result<usize> {
+    let response = sdk
+        .store_index_with_options(
+            None,
+            8,
+            None,
+            StoreIndexRequestOptions {
+                limit: Some(STORE_INDEX_PROGRESS_LIMIT),
+                synthesize_missing_folder_markers: false,
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await?;
+
+    Ok(response.total_entry_count)
+}
+
+fn expected_store_entry_count(expected_paths: &BTreeSet<String>) -> usize {
+    let mut directory_paths = BTreeSet::new();
+
+    for path in expected_paths {
+        let mut prefix = String::new();
+        let mut parts = path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
             }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            directory_paths.insert(format!("{prefix}/"));
         }
-
-        if batch_len == 0 || !response.has_more {
-            break;
-        }
-        offset += batch_len;
     }
 
-    Ok(paths)
+    expected_paths.len() + directory_paths.len()
 }
 
 async fn wait_for_store_file_paths(
@@ -1159,24 +1221,47 @@ async fn wait_for_store_file_paths(
 ) -> Result<()> {
     let started = Instant::now();
     let mut last_log = Instant::now();
+    let expected_entry_count = expected_store_entry_count(expected_paths);
     loop {
-        match fetch_all_store_file_paths(sdk).await {
-            Ok(actual_paths) if actual_paths == *expected_paths => return Ok(()),
-            Ok(actual_paths) => {
+        match fetch_store_entry_count(sdk).await {
+            Ok(actual_count) if actual_count >= expected_entry_count => {
+                match fetch_all_store_file_paths(sdk).await {
+                    Ok(actual_paths) if actual_paths == *expected_paths => return Ok(()),
+                    Ok(actual_paths) => {
+                        if last_log.elapsed() >= Duration::from_secs(10) {
+                            let missing = expected_paths
+                                .difference(&actual_paths)
+                                .take(5)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let extra = actual_paths
+                                .difference(expected_paths)
+                                .take(5)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            eprintln!(
+                                "[{label}] store index progress: have_files={} expected_files={} have_entries={} expected_entries={} missing_sample={missing:?} extra_sample={extra:?}",
+                                actual_paths.len(),
+                                expected_paths.len(),
+                                actual_count,
+                                expected_entry_count
+                            );
+                            last_log = Instant::now();
+                        }
+                    }
+                    Err(err) if last_log.elapsed() >= Duration::from_secs(10) => {
+                        eprintln!("[{label}] store index retry after full scan error: {err:#}");
+                        last_log = Instant::now();
+                    }
+                    Err(_) => {}
+                }
+            }
+            Ok(actual_count) => {
                 if last_log.elapsed() >= Duration::from_secs(10) {
-                    let missing = expected_paths
-                        .difference(&actual_paths)
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let extra = actual_paths
-                        .difference(expected_paths)
-                        .take(5)
-                        .cloned()
-                        .collect::<Vec<_>>();
                     eprintln!(
-                        "[{label}] store index progress: have={} expected={} missing_sample={missing:?} extra_sample={extra:?}",
-                        actual_paths.len(),
+                        "[{label}] store index progress: have_entries={} expected_entries={} expected_files={}",
+                        actual_count,
+                        expected_entry_count,
                         expected_paths.len()
                     );
                     last_log = Instant::now();

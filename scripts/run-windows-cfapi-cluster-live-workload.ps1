@@ -5,6 +5,9 @@ param(
     [int]$VerifySampleCount = 24,
     [int]$SubdirCount = 80,
     [int]$MaxDirDepth = 4,
+    [int]$CloseUploadConcurrency = 8,
+    [int]$UploadTimeoutMinutes = 150,
+    [int]$ReplicationTimeoutMinutes = 60,
     [bool]$HoldOnFailure = $true,
     [switch]$HoldAfterCopy,
     [switch]$HoldAfterUpload,
@@ -32,6 +35,15 @@ if ($MaxDirDepth -le 0) {
 }
 if ($SubdirCount -gt $FileCount) {
     throw "SubdirCount must be less than or equal to FileCount."
+}
+if ($CloseUploadConcurrency -le 0) {
+    throw "CloseUploadConcurrency must be greater than zero."
+}
+if ($UploadTimeoutMinutes -le 0) {
+    throw "UploadTimeoutMinutes must be greater than zero."
+}
+if ($ReplicationTimeoutMinutes -le 0) {
+    throw "ReplicationTimeoutMinutes must be greater than zero."
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -120,6 +132,9 @@ $inner = @(
     "set `"IRONMESH_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT=$VerifySampleCount`"",
     "set `"IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT=$SubdirCount`"",
     "set `"IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH=$MaxDirDepth`"",
+    "set `"IRONMESH_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY=$CloseUploadConcurrency`"",
+    "set `"IRONMESH_WINDOWS_CFAPI_UPLOAD_TIMEOUT_SECS=$($UploadTimeoutMinutes * 60)`"",
+    "set `"IRONMESH_WINDOWS_CFAPI_REPLICATION_TIMEOUT_SECS=$($ReplicationTimeoutMinutes * 60)`"",
     "set `"IRONMESH_WINDOWS_CFAPI_LIVE_MANIFEST_PATH=$manifestPath`"",
     "set `"IRONMESH_WINDOWS_CFAPI_LIVE_CONTINUE_SIGNAL_PATH=$continueSignalPath`"",
     "set `"IRONMESH_WINDOWS_CFAPI_LIVE_CLEANUP_SIGNAL_PATH=$cleanupSignalPath`"",

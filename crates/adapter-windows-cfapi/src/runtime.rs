@@ -17,7 +17,8 @@ use crate::cfapi_safe_wrap::{
     unregister_sync_root as cf_unregister_sync_root,
 };
 use crate::close_upload::{
-    UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
+    UploadConcurrencyGate, UploadDebounceState, UploadWorkerContext,
+    close_upload_max_concurrency_from_env, schedule_debounced_close_upload,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
@@ -1719,11 +1720,17 @@ pub fn connect_sync_root(
     uploader: std::sync::Arc<dyn Uploader>,
 ) -> Result<SyncRootConnection> {
     let root_path = utf16_path(&registration.root_path);
+    let close_upload_max_concurrency = close_upload_max_concurrency_from_env()?;
+    tracing::info!(
+        "close-completion: max concurrent uploads set to {}",
+        close_upload_max_concurrency
+    );
     let upload_worker = Arc::new(UploadWorkerContext {
         sync_root: registration.root_path.clone(),
         provider_instance_id,
         runtime: runtime.clone(),
         uploader: uploader.clone(),
+        upload_gate: Arc::new(UploadConcurrencyGate::new(close_upload_max_concurrency)),
     });
     let upload_debounce = Arc::new(UploadDebounceState::default());
     let mut callback_context = Box::new(CallbackContext {
@@ -2794,6 +2801,7 @@ mod tests {
                 provider_instance_id: uuid::Uuid::new_v4(),
                 runtime,
                 uploader,
+                upload_gate: Arc::new(UploadConcurrencyGate::new(1)),
             }),
             upload_debounce: upload_debounce.clone(),
         };

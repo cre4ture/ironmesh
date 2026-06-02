@@ -5,6 +5,7 @@ param(
     [int]$VerifySampleCount = 24,
     [int]$SubdirCount = 80,
     [int]$MaxDirDepth = 4,
+    [int]$CloseUploadConcurrency = 8,
     [switch]$SkipBuild
 )
 
@@ -28,6 +29,9 @@ if ($MaxDirDepth -le 0) {
 if ($SubdirCount -gt $FileCount) {
     throw "SubdirCount must be less than or equal to FileCount."
 }
+if ($CloseUploadConcurrency -le 0) {
+    throw "CloseUploadConcurrency must be greater than zero."
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
@@ -37,6 +41,7 @@ $env:IRONMESH_WINDOWS_CFAPI_LOAD_MAX_BYTES = [string]($MaxSizeMiB * 1MB)
 $env:IRONMESH_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT = [string]$VerifySampleCount
 $env:IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT = [string]$SubdirCount
 $env:IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH = [string]$MaxDirDepth
+$env:IRONMESH_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY = [string]$CloseUploadConcurrency
 
 Write-Host "Running Windows CFAPI cluster workload"
 Write-Host "  files          : $FileCount"
@@ -45,6 +50,7 @@ Write-Host "  average MiB    : $([math]::Round(($MinSizeMiB + $MaxSizeMiB) / 2, 
 Write-Host "  sample checks  : $VerifySampleCount"
 Write-Host "  subdirs        : $SubdirCount"
 Write-Host "  max dir depth  : $MaxDirDepth"
+Write-Host "  upload slots   : $CloseUploadConcurrency"
 
 Push-Location $repoRoot
 try {

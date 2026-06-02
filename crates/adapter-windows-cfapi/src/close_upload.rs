@@ -6,20 +6,107 @@ use crate::placeholder_metadata::record_in_sync_content_baseline;
 use crate::runtime::{
     CfapiRuntime, UploadReceipt, Uploader, reconcile_ancestor_directory_sync_states,
 };
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 const CLOSE_UPLOAD_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const CLOSE_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(1000);
+const CLOSE_UPLOAD_PERMIT_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
 pub(crate) struct UploadWorkerContext {
     pub(crate) sync_root: PathBuf,
     pub(crate) provider_instance_id: uuid::Uuid,
     pub(crate) runtime: Arc<CfapiRuntime>,
     pub(crate) uploader: Arc<dyn Uploader>,
+    pub(crate) upload_gate: Arc<UploadConcurrencyGate>,
+}
+
+pub(crate) fn close_upload_max_concurrency_from_env() -> Result<usize> {
+    const ENV_NAME: &str = "IRONMESH_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY";
+
+    match std::env::var(ENV_NAME) {
+        Ok(value) => {
+            let parsed = value
+                .parse::<usize>()
+                .with_context(|| format!("failed parsing {ENV_NAME}={value} as usize"))?;
+            if parsed == 0 {
+                bail!("{ENV_NAME} must be greater than zero");
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default_close_upload_max_concurrency()),
+        Err(err) => Err(err).with_context(|| format!("failed reading {ENV_NAME}")),
+    }
+}
+
+pub(crate) fn default_close_upload_max_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().clamp(4, 8))
+        .unwrap_or(8)
+}
+
+pub(crate) struct UploadConcurrencyGate {
+    max_active: usize,
+    active: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl UploadConcurrencyGate {
+    pub(crate) fn new(max_active: usize) -> Self {
+        Self {
+            max_active,
+            active: Mutex::new(0),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, relative_path: &str) -> UploadConcurrencyPermit {
+        let started = Instant::now();
+        let mut active = self.active.lock().expect("upload gate lock poisoned");
+        while *active >= self.max_active {
+            active = self
+                .ready
+                .wait(active)
+                .expect("upload gate lock poisoned while waiting");
+        }
+        *active += 1;
+        let active_now = *active;
+        drop(active);
+
+        let waited = started.elapsed();
+        if waited >= CLOSE_UPLOAD_PERMIT_WAIT_LOG_THRESHOLD {
+            tracing::info!(
+                "close-completion: acquired upload permit for {} after {:?} (active={} max_active={})",
+                relative_path,
+                waited,
+                active_now,
+                self.max_active
+            );
+        }
+
+        UploadConcurrencyPermit {
+            gate: Arc::clone(self),
+        }
+    }
+}
+
+struct UploadConcurrencyPermit {
+    gate: Arc<UploadConcurrencyGate>,
+}
+
+impl Drop for UploadConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .gate
+            .active
+            .lock()
+            .expect("upload gate lock poisoned on release");
+        *active = active.saturating_sub(1);
+        self.gate.ready.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -201,6 +288,7 @@ fn spawn_debounced_close_upload(
             }
         }
 
+        let _upload_permit = worker.upload_gate.acquire(&relative_path);
         let outcome = process_debounced_close_upload(worker.as_ref(), &relative_path);
 
         debounce
@@ -569,6 +657,7 @@ mod tests {
             provider_instance_id: uuid::Uuid::nil(),
             runtime: Arc::new(CfapiRuntime::default()),
             uploader,
+            upload_gate: Arc::new(UploadConcurrencyGate::new(1)),
         }
     }
 
