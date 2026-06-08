@@ -2767,6 +2767,168 @@ fn local_entry_state_from_metadata(metadata: &fs::Metadata) -> LocalEntryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Result, bail};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum BackendOperation {
+        EnsureDirectory(String),
+        DownloadFile { local_path: String, remote_key: String },
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingBackend {
+        local_entries: LocalTreeState,
+        operations: Vec<BackendOperation>,
+        fail_download_for: Option<String>,
+    }
+
+    impl RecordingBackend {
+        fn with_download_failure(path: &str) -> Self {
+            Self {
+                fail_download_for: Some(path.to_string()),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl FolderAgentLocalBackend for RecordingBackend {
+        fn storage_mode_label(&self, _options: &FolderAgentRuntimeOptions) -> &'static str {
+            "test"
+        }
+
+        fn watch_mode_label(&self, _options: &FolderAgentRuntimeOptions) -> &'static str {
+            "test"
+        }
+
+        fn state_identity_root(&self, _options: &FolderAgentRuntimeOptions) -> Result<PathBuf> {
+            Ok(PathBuf::from("/tmp"))
+        }
+
+        fn prepare(&mut self, _options: &FolderAgentRuntimeOptions) -> Result<()> {
+            Ok(())
+        }
+
+        fn scan_local_tree_with_progress(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            _on_progress: &mut dyn FnMut(&LocalTreeScanProgress),
+        ) -> Result<LocalTreeState> {
+            Ok(self.local_entries.clone())
+        }
+
+        fn local_entry_state(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            relative_path: &str,
+        ) -> Result<Option<LocalEntryState>> {
+            Ok(self.local_entries.get(relative_path).cloned())
+        }
+
+        fn file_content_fingerprint(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            relative_path: &str,
+        ) -> Result<String> {
+            Ok(format!("fingerprint-{relative_path}"))
+        }
+
+        fn ensure_local_directory(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            relative_path: &str,
+        ) -> Result<()> {
+            self.operations
+                .push(BackendOperation::EnsureDirectory(relative_path.to_string()));
+            self.local_entries.insert(
+                relative_path.to_string(),
+                LocalEntryState {
+                    kind: LocalEntryKind::Directory,
+                    size_bytes: 0,
+                    modified_unix_ms: 0,
+                },
+            );
+            Ok(())
+        }
+
+        fn upload_local_file(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            _client: &IronMeshClient,
+            _scope: &PathScope,
+            _relative_path: &str,
+            _size_bytes: u64,
+        ) -> Result<String> {
+            panic!("upload_local_file should not be called in this test");
+        }
+
+        fn download_remote_file(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            _client: &IronMeshClient,
+            local_relative_path: &str,
+            remote_key: &str,
+        ) -> Result<()> {
+            self.operations.push(BackendOperation::DownloadFile {
+                local_path: local_relative_path.to_string(),
+                remote_key: remote_key.to_string(),
+            });
+            if self.fail_download_for.as_deref() == Some(local_relative_path) {
+                bail!("simulated download failure");
+            }
+            self.local_entries.insert(
+                local_relative_path.to_string(),
+                LocalEntryState {
+                    kind: LocalEntryKind::File,
+                    size_bytes: 7,
+                    modified_unix_ms: 0,
+                },
+            );
+            Ok(())
+        }
+
+        fn remove_local_path(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            _relative_path: &str,
+        ) -> Result<()> {
+            panic!("remove_local_path should not be called in this test");
+        }
+
+        fn start_local_change_monitor(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn local_change_hint_pending(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    fn test_runtime_options() -> FolderAgentRuntimeOptions {
+        FolderAgentRuntimeOptions {
+            root_dir: PathBuf::from("/tmp"),
+            state_root_dir: None,
+            local_tree_uri: None,
+            server_base_url: None,
+            client_bootstrap_json: None,
+            server_ca_pem: None,
+            client_identity_json: None,
+            prefix: None,
+            depth: 0,
+            remote_refresh_interval_ms: 1000,
+            local_scan_interval_ms: 1000,
+            no_watch_local: true,
+            run_once: true,
+            ui_bind: None,
+        }
+    }
 
     #[test]
     fn seed_downloaded_remote_files_into_local_state_preserves_recent_downloads() {
@@ -2823,5 +2985,68 @@ mod tests {
         );
 
         assert!(!local_state.contains_key("docs/readme.txt"));
+    }
+
+    #[test]
+    fn apply_remote_snapshot_ensures_directories_before_failing_file_downloads() {
+        let mut backend = RecordingBackend::with_download_failure("a-file.txt");
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                sync_core::NamespaceEntry::file("a-file.txt", "v1", "h1"),
+                sync_core::NamespaceEntry::directory("z-dir"),
+            ],
+        };
+        let changed_paths = vec!["a-file.txt".to_string(), "z-dir".to_string()];
+        let scope = PathScope::new(None);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+
+        let error = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect_err("file download should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to download remote file a-file.txt"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            backend.operations,
+            vec![
+                BackendOperation::EnsureDirectory("z-dir".to_string()),
+                BackendOperation::DownloadFile {
+                    local_path: "a-file.txt".to_string(),
+                    remote_key: "a-file.txt".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            backend.local_entries.get("z-dir"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 0,
+            })
+        );
+        assert!(suppressed_uploads.is_empty());
+        assert!(remote_index.directories.is_empty());
+        assert!(remote_index.files.is_empty());
     }
 }
