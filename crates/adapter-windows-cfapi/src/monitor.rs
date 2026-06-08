@@ -695,32 +695,54 @@ impl SyncRootMonitor {
             tracing::info!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
             let remote_path = directory_marker_path(&rel_path);
-            let _ = self
-                .uploader
-                .upload_reader(&remote_path, &mut cursor, b"<DIR>".len() as u64);
+            if let Err(err) =
+                self.uploader
+                    .upload_reader(&remote_path, &mut cursor, b"<DIR>".len() as u64)
+            {
+                tracing::info!(
+                    "{}: failed to upload directory marker {}: {}",
+                    self.name,
+                    rel_path,
+                    err
+                );
+                self.mark_entry_for_retry(current, &rel_path, previous_entry);
+            }
         } else {
             let metadata = match std::fs::metadata(path) {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            // Check if file is already a CFAPI placeholder using Windows file attributes
-            let is_placeholder = path_is_placeholder(path);
-            if is_placeholder {
-                tracing::info!(
-                    "{}: skipping placeholder creation for CFAPI placeholder file {}",
-                    self.name,
-                    rel_path
-                );
-            } else if path.exists() {
-                // File is materialized, convert to placeholder using a file HANDLE
-                try_convert_materialized_file(path, &rel_path, &metadata);
+            if path.exists() {
+                let was_placeholder = path_is_placeholder(path);
+                if was_placeholder {
+                    tracing::info!(
+                        "{}: uploading placeholder-backed file {} after local change detection",
+                        self.name,
+                        rel_path
+                    );
+                }
+                let mut file = match std::fs::File::open(path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        tracing::info!(
+                            "{}: failed to reopen file {} for upload: {}",
+                            self.name,
+                            rel_path,
+                            err
+                        );
+                        self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                        return;
+                    }
+                };
                 // upload content to server
-                match self.uploader.upload_reader(
-                    &rel_path,
-                    &mut std::fs::File::open(path).unwrap(),
-                    metadata.len(),
-                ) {
+                match self
+                    .uploader
+                    .upload_reader(&rel_path, &mut file, metadata.len())
+                {
                     Ok(receipt) => {
+                        if !was_placeholder {
+                            try_convert_materialized_file(path, &rel_path, &metadata);
+                        }
                         if let Some(in_sync_content_fingerprint) =
                             receipt.in_sync_content_fingerprint.as_deref()
                             && let Err(err) = record_in_sync_content_baseline(
@@ -741,6 +763,7 @@ impl SyncRootMonitor {
                     }
                     Err(e) => {
                         tracing::info!("{}: failed to upload file {}: {}", self.name, rel_path, e);
+                        self.mark_entry_for_retry(current, &rel_path, previous_entry);
                     }
                 }
             } else {
@@ -755,10 +778,24 @@ impl SyncRootMonitor {
                         rel_path,
                         e
                     );
+                    self.mark_entry_for_retry(current, &rel_path, previous_entry);
                 } else {
                     tracing::info!("{}: created placeholder for {}", self.name, rel_path);
                 }
             }
+        }
+    }
+
+    fn mark_entry_for_retry(
+        &self,
+        current: &mut HashMap<String, SeenEntry>,
+        rel_path: &str,
+        previous_entry: Option<&SeenEntry>,
+    ) {
+        if let Some(previous_entry) = previous_entry {
+            current.insert(rel_path.to_string(), previous_entry.clone());
+        } else {
+            current.remove(rel_path);
         }
     }
 
@@ -1375,6 +1412,12 @@ mod tests {
         deletes: Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct FailOnceUploader {
+        attempts: Mutex<HashMap<String, usize>>,
+        uploads: Mutex<Vec<String>>,
+    }
+
     impl Uploader for MockUploader {
         fn upload_reader(
             &self,
@@ -1397,6 +1440,35 @@ mod tests {
                 .expect("deletes lock poisoned")
                 .push(path.to_string());
             Ok(())
+        }
+    }
+
+    impl Uploader for FailOnceUploader {
+        fn upload_reader(
+            &self,
+            path: &str,
+            reader: &mut dyn Read,
+            _length: u64,
+        ) -> anyhow::Result<UploadReceipt> {
+            let mut sink = Vec::new();
+            let _ = reader.read_to_end(&mut sink)?;
+
+            let attempt = {
+                let mut attempts = self.attempts.lock().expect("attempts lock poisoned");
+                let entry = attempts.entry(path.to_string()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+
+            if attempt == 1 {
+                anyhow::bail!("injected upload failure for {path}");
+            }
+
+            self.uploads
+                .lock()
+                .expect("uploads lock poisoned")
+                .push(path.to_string());
+            Ok(UploadReceipt::default())
         }
     }
 
@@ -1494,6 +1566,52 @@ mod tests {
                 .iter()
                 .all(|path| path != "docs/" && path != "docs/readme.txt"),
             "startup walk should not re-upload remote-seeded entries"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn failed_upload_is_retried_on_next_walk_for_local_file() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-retry-local-file-{unique}"));
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+        let uploader = Arc::new(FailOnceUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+
+        std::fs::write(sync_root.join("retry.txt"), b"retry me")
+            .expect("failed to create local retry file");
+
+        monitor.walk();
+        monitor.walk();
+
+        let attempts = uploader
+            .attempts
+            .lock()
+            .expect("attempts lock poisoned")
+            .get("retry.txt")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            attempts, 2,
+            "local file should be retried after an upload failure"
+        );
+        assert_eq!(
+            uploader
+                .uploads
+                .lock()
+                .expect("uploads lock poisoned")
+                .as_slice(),
+            ["retry.txt"],
+            "second walk should complete the upload"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);

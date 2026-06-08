@@ -157,6 +157,14 @@ impl AdapterFixture {
         self.adapter.id()
     }
 
+    fn stdout_log(&self) -> PathBuf {
+        self.local_appdata_dir.join("os-integration.stdout.log")
+    }
+
+    fn stderr_log(&self) -> PathBuf {
+        self.local_appdata_dir.join("os-integration.stderr.log")
+    }
+
     async fn stop_and_cleanup(&mut self) {
         stop_server(&mut self.adapter).await;
         let _ = fs::remove_dir_all(&self.local_appdata_dir);
@@ -812,6 +820,8 @@ fn update_manifest(
             json!({
                 "pid": adapter.pid(),
                 "local_appdata_dir": adapter.local_appdata_dir.display().to_string(),
+                "stdout_log": adapter.stdout_log().display().to_string(),
+                "stderr_log": adapter.stderr_log().display().to_string(),
             })
         }),
         "nodes": [
@@ -1222,9 +1232,13 @@ async fn wait_for_store_file_paths(
     let started = Instant::now();
     let mut last_log = Instant::now();
     let expected_entry_count = expected_store_entry_count(expected_paths);
+    let minimum_entries_for_full_scan = expected_paths.len();
     loop {
         match fetch_store_entry_count(sdk).await {
-            Ok(actual_count) if actual_count >= expected_entry_count => {
+            // The store index can legitimately omit some intermediate directory markers even when
+            // the full file set has converged, so gate the expensive full scan on file-count
+            // reachability instead of the synthesized directory total.
+            Ok(actual_count) if actual_count >= minimum_entries_for_full_scan => {
                 match fetch_all_store_file_paths(sdk).await {
                     Ok(actual_paths) if actual_paths == *expected_paths => return Ok(()),
                     Ok(actual_paths) => {

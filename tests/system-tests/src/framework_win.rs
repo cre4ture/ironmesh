@@ -212,11 +212,41 @@ async fn start_cfapi_adapter_with_resolved_inputs(
     }
     if let Some(local_appdata_dir) = local_appdata_dir {
         command.env("LOCALAPPDATA", local_appdata_dir);
+        command.env(
+            "IRONMESH_CFAPI_CLOSE_UPLOAD_TRACE_FILE",
+            local_appdata_dir.join("close-upload.debug.log"),
+        );
     }
 
+    let (stdout_stdio, stderr_stdio) = if let Some(local_appdata_dir) = local_appdata_dir {
+        std::fs::create_dir_all(local_appdata_dir).with_context(|| {
+            format!(
+                "failed creating os-integration log directory {}",
+                local_appdata_dir.display()
+            )
+        })?;
+        let stdout_log = local_appdata_dir.join("os-integration.stdout.log");
+        let stderr_log = local_appdata_dir.join("os-integration.stderr.log");
+        let stdout_file = std::fs::File::create(&stdout_log).with_context(|| {
+            format!(
+                "failed creating os-integration stdout log {}",
+                stdout_log.display()
+            )
+        })?;
+        let stderr_file = std::fs::File::create(&stderr_log).with_context(|| {
+            format!(
+                "failed creating os-integration stderr log {}",
+                stderr_log.display()
+            )
+        })?;
+        (Stdio::from(stdout_file), Stdio::from(stderr_file))
+    } else {
+        (Stdio::inherit(), Stdio::inherit())
+    };
+
     let child = match command
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(stdout_stdio)
+        .stderr(stderr_stdio)
         .spawn()
     {
         Ok(child) => child,

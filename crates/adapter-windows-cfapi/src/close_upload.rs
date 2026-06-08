@@ -8,6 +8,8 @@ use crate::runtime::{
 };
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
+use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -15,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 const CLOSE_UPLOAD_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const CLOSE_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(1000);
 const CLOSE_UPLOAD_PERMIT_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+const CLOSE_UPLOAD_TRACE_FILE_ENV: &str = "IRONMESH_CFAPI_CLOSE_UPLOAD_TRACE_FILE";
 
 pub(crate) struct UploadWorkerContext {
     pub(crate) sync_root: PathBuf,
@@ -232,6 +235,13 @@ pub(crate) fn schedule_debounced_close_upload(
         generation,
         snapshot.to_log_string()
     );
+    close_upload_trace_event(format!(
+        "scheduled path={} generation={} delay_ms={} {}",
+        relative_path,
+        generation,
+        CLOSE_UPLOAD_QUIET_PERIOD.as_millis(),
+        snapshot.to_log_string()
+    ));
 
     spawn_debounced_close_upload(
         worker,
@@ -267,6 +277,12 @@ fn spawn_debounced_close_upload(
                 generation,
                 snapshot.to_log_string()
             );
+            close_upload_trace_event(format!(
+                "stale-worker-skip path={} generation={} {}",
+                relative_path,
+                generation,
+                snapshot.to_log_string()
+            ));
             return;
         }
 
@@ -284,12 +300,49 @@ fn spawn_debounced_close_upload(
                     generation,
                     snapshot.to_log_string()
                 );
+                close_upload_trace_event(format!(
+                    "already-in-flight path={} generation={} {}",
+                    relative_path,
+                    generation,
+                    snapshot.to_log_string()
+                ));
                 return;
             }
         }
 
         let _upload_permit = worker.upload_gate.acquire(&relative_path);
-        let outcome = process_debounced_close_upload(worker.as_ref(), &relative_path);
+        tracing::info!(
+            "close-completion: starting upload worker for {} generation {} after {:?}",
+            relative_path,
+            generation,
+            delay
+        );
+        close_upload_trace_event(format!(
+            "worker-start path={} generation={} delay_ms={}",
+            relative_path,
+            generation,
+            delay.as_millis()
+        ));
+        let outcome = match panic::catch_unwind(AssertUnwindSafe(|| {
+            process_debounced_close_upload(worker.as_ref(), &relative_path)
+        })) {
+            Ok(outcome) => outcome,
+            Err(payload) => {
+                tracing::error!(
+                    "close-completion: upload worker panicked for {} generation {}: {}",
+                    relative_path,
+                    generation,
+                    panic_payload_message(payload.as_ref())
+                );
+                close_upload_trace_event(format!(
+                    "worker-panic path={} generation={} panic={}",
+                    relative_path,
+                    generation,
+                    panic_payload_message(payload.as_ref())
+                ));
+                UploadAttemptOutcome::Retry
+            }
+        };
 
         debounce
             .uploads_in_flight
@@ -304,36 +357,125 @@ fn spawn_debounced_close_upload(
                 .expect("pending upload generations lock poisoned");
             pending.get(&relative_path).copied()
         };
+        let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
+        tracing::info!(
+            "close-completion: worker finished for {} generation {} outcome={:?} latest_generation={:?} ({})",
+            relative_path,
+            generation,
+            outcome,
+            latest_generation,
+            snapshot.to_log_string()
+        );
+        close_upload_trace_event(format!(
+            "worker-finish path={} generation={} outcome={:?} latest_generation={:?} {}",
+            relative_path,
+            generation,
+            outcome,
+            latest_generation,
+            snapshot.to_log_string()
+        ));
 
-        match (outcome, latest_generation) {
-            (_, Some(latest)) if latest != generation => {}
-            (UploadAttemptOutcome::Retry, Some(latest)) => {
-                let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
+        if let Some(latest) = latest_generation {
+            if latest != generation {
+                let follow_up_delay = match outcome {
+                    UploadAttemptOutcome::Retry => CLOSE_UPLOAD_RETRY_DELAY,
+                    UploadAttemptOutcome::Settled => CLOSE_UPLOAD_QUIET_PERIOD,
+                };
                 tracing::info!(
-                    "close-completion: retrying upload for {} generation {} after {:?} ({})",
-                    relative_path,
+                    "close-completion: newer generation {} is pending for {}; scheduling follow-up after {:?} ({})",
                     latest,
-                    CLOSE_UPLOAD_RETRY_DELAY,
+                    relative_path,
+                    follow_up_delay,
                     snapshot.to_log_string()
                 );
+                close_upload_trace_event(format!(
+                    "worker-follow-up path={} generation={} latest_generation={} delay_ms={} {}",
+                    relative_path,
+                    generation,
+                    latest,
+                    follow_up_delay.as_millis(),
+                    snapshot.to_log_string()
+                ));
                 spawn_debounced_close_upload(
                     worker,
                     debounce,
                     relative_path,
                     latest,
-                    CLOSE_UPLOAD_RETRY_DELAY,
+                    follow_up_delay,
                 );
+                return;
             }
-            (UploadAttemptOutcome::Settled, Some(latest)) if latest == generation => {
-                debounce
-                    .pending_generations
-                    .lock()
-                    .expect("pending upload generations lock poisoned")
-                    .remove(&relative_path);
+
+            match outcome {
+                UploadAttemptOutcome::Retry => {
+                    tracing::info!(
+                        "close-completion: retrying upload for {} generation {} after {:?} ({})",
+                        relative_path,
+                        latest,
+                        CLOSE_UPLOAD_RETRY_DELAY,
+                        snapshot.to_log_string()
+                    );
+                    close_upload_trace_event(format!(
+                        "worker-retry path={} generation={} delay_ms={} {}",
+                        relative_path,
+                        latest,
+                        CLOSE_UPLOAD_RETRY_DELAY.as_millis(),
+                        snapshot.to_log_string()
+                    ));
+                    spawn_debounced_close_upload(
+                        worker,
+                        debounce,
+                        relative_path,
+                        latest,
+                        CLOSE_UPLOAD_RETRY_DELAY,
+                    );
+                }
+                UploadAttemptOutcome::Settled => {
+                    close_upload_trace_event(format!(
+                        "worker-settled path={} generation={}",
+                        relative_path, latest
+                    ));
+                    debounce
+                        .pending_generations
+                        .lock()
+                        .expect("pending upload generations lock poisoned")
+                        .remove(&relative_path);
+                }
             }
-            _ => {}
         }
     });
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn close_upload_trace_event(message: String) {
+    let Some(path) = std::env::var_os(CLOSE_UPLOAD_TRACE_FILE_ENV).map(PathBuf::from) else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let timestamp = match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => format!("{}.{}", elapsed.as_secs(), elapsed.subsec_millis()),
+        Err(_) => "time-error".to_string(),
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{} {}", timestamp, message);
+    }
 }
 
 fn process_debounced_close_upload(
@@ -363,6 +505,10 @@ fn process_debounced_close_upload(
                 full_path.display(),
                 err
             );
+            close_upload_trace_event(format!(
+                "metadata-error path={} error={}",
+                relative_path, err
+            ));
             return UploadAttemptOutcome::Retry;
         }
     };
@@ -391,6 +537,7 @@ fn process_debounced_close_upload(
                 full_path.display(),
                 err
             );
+            close_upload_trace_event(format!("open-error path={} error={}", relative_path, err));
             return UploadAttemptOutcome::Retry;
         }
     };
@@ -398,11 +545,14 @@ fn process_debounced_close_upload(
     match cf_get_placeholder_standard_info(&file) {
         Ok(placeholder_info) if placeholder_info.ModifiedDataSize == 0 => {
             tracing::info!(
-                "close-completion: skipping upload for {} because ModifiedDataSize is zero state={}",
+                "close-completion: {} was already scheduled for upload but ModifiedDataSize is zero; continuing upload to preserve retry semantics state={}",
                 relative_path,
                 describe_path_state(&full_path)
             );
-            return UploadAttemptOutcome::Settled;
+            close_upload_trace_event(format!(
+                "modified-data-zero-continue path={}",
+                relative_path
+            ));
         }
         Ok(_) => {}
         Err(err) => {
@@ -422,6 +572,10 @@ fn process_debounced_close_upload(
                 relative_path,
                 err
             );
+            close_upload_trace_event(format!(
+                "snapshot-before-error path={} error={}",
+                relative_path, err
+            ));
             return UploadAttemptOutcome::Retry;
         }
     };
@@ -434,6 +588,10 @@ fn process_debounced_close_upload(
                 relative_path,
                 err
             );
+            close_upload_trace_event(format!(
+                "prepare-error path={} error={:#}",
+                relative_path, err
+            ));
             return UploadAttemptOutcome::Retry;
         }
     };
@@ -456,6 +614,10 @@ fn process_debounced_close_upload(
                     snapshot_before.len,
                     err
                 );
+                close_upload_trace_event(format!(
+                    "upload-error path={} bytes={} error={:#}",
+                    relative_path, snapshot_before.len, err
+                ));
                 return UploadAttemptOutcome::Retry;
             }
         };
@@ -475,6 +637,10 @@ fn process_debounced_close_upload(
                 relative_path,
                 err
             );
+            close_upload_trace_event(format!(
+                "snapshot-after-error path={} error={}",
+                relative_path, err
+            ));
             return UploadAttemptOutcome::Retry;
         }
     };
@@ -487,6 +653,10 @@ fn process_debounced_close_upload(
             snapshot_after,
             describe_path_state(&full_path)
         );
+        close_upload_trace_event(format!(
+            "snapshot-changed path={} snapshot_before={:?} snapshot_after={:?}",
+            relative_path, snapshot_before, snapshot_after
+        ));
         return UploadAttemptOutcome::Retry;
     }
     tracing::info!(
@@ -511,6 +681,10 @@ fn process_debounced_close_upload(
                     relative_path,
                     err
                 );
+                close_upload_trace_event(format!(
+                    "mark-in-sync-error path={} error={:#}",
+                    relative_path, err
+                ));
                 return UploadAttemptOutcome::Retry;
             }
         }
@@ -520,6 +694,10 @@ fn process_debounced_close_upload(
                 relative_path,
                 err
             );
+            close_upload_trace_event(format!(
+                "reopen-for-sync-error path={} error={}",
+                relative_path, err
+            ));
             return UploadAttemptOutcome::Retry;
         }
     }
@@ -545,6 +723,10 @@ fn process_debounced_close_upload(
         snapshot_before.len,
         describe_path_state(&full_path)
     );
+    close_upload_trace_event(format!(
+        "upload-success path={} bytes={}",
+        relative_path, snapshot_before.len
+    ));
     UploadAttemptOutcome::Settled
 }
 
