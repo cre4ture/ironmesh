@@ -166,6 +166,29 @@ struct WorkloadConfig {
     replication_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderAgentStartMode {
+    BeforeCopy,
+    AfterCopy,
+}
+
+impl FolderAgentStartMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "before_copy" | "before-copy" | "before" => Ok(Self::BeforeCopy),
+                "after_copy" | "after-copy" | "after" => Ok(Self::AfterCopy),
+                other => bail!(
+                    "failed parsing IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE={other}; expected before_copy or after_copy"
+                ),
+            },
+            Err(std::env::VarError::NotPresent) => Ok(Self::BeforeCopy),
+            Err(err) => Err(err)
+                .with_context(|| "failed reading IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE"),
+        }
+    }
+}
+
 impl WorkloadConfig {
     fn from_env(kind: LocalRuntimeKind) -> Result<Self> {
         let env = kind.workload_env();
@@ -515,6 +538,11 @@ pub async fn run_live_driver_from_env_for(kind: LocalRuntimeKind) -> Result<()> 
 
 async fn run_workload(kind: LocalRuntimeKind, mode: RuntimeMode) -> Result<()> {
     let config = WorkloadConfig::from_env(kind)?;
+    let folder_agent_start_mode = if kind == LocalRuntimeKind::FolderAgent {
+        Some(FolderAgentStartMode::from_env()?)
+    } else {
+        None
+    };
     let cluster_id = Uuid::new_v4().to_string();
     let http = Client::new();
     let paths = match &mode {
@@ -567,6 +595,7 @@ async fn run_workload(kind: LocalRuntimeKind, mode: RuntimeMode) -> Result<()> {
         &mut node_b,
         &mut node_c,
         &mut runtime,
+        folder_agent_start_mode,
     )
     .await;
 
@@ -682,6 +711,7 @@ async fn execute_workload(
     node_b: &mut ClusterNodeFixture,
     node_c: &mut ClusterNodeFixture,
     runtime: &mut Option<LocalRuntimeFixture>,
+    folder_agent_start_mode: Option<FolderAgentStartMode>,
 ) -> Result<WorkloadOutcome> {
     eprintln!(
         "[cluster] starting workload: files={} min_bytes={} max_bytes={} average_bytes={} subdirs={} max_depth={} upload_timeout_secs={} replication_timeout_secs={}",
@@ -724,9 +754,15 @@ async fn execute_workload(
         cluster_id,
         "cluster_ready",
         "running",
-        Some(match kind {
-            LocalRuntimeKind::Cfapi => "cluster online; starting CFAPI adapter",
-            LocalRuntimeKind::FolderAgent => {
+        Some(match (kind, folder_agent_start_mode) {
+            (LocalRuntimeKind::Cfapi, _) => "cluster online; starting CFAPI adapter",
+            (LocalRuntimeKind::FolderAgent, Some(FolderAgentStartMode::AfterCopy)) => {
+                "cluster online; workload will be copied before starting Folder Agent"
+            }
+            (LocalRuntimeKind::FolderAgent, Some(FolderAgentStartMode::BeforeCopy)) => {
+                "cluster online; starting Folder Agent before workload copy"
+            }
+            (LocalRuntimeKind::FolderAgent, None) => {
                 "cluster online; workload will be copied before starting Folder Agent"
             }
         }),
@@ -737,7 +773,9 @@ async fn execute_workload(
         runtime.as_ref(),
     )?;
 
-    if kind == LocalRuntimeKind::Cfapi {
+    if kind == LocalRuntimeKind::Cfapi
+        || matches!(folder_agent_start_mode, Some(FolderAgentStartMode::BeforeCopy))
+    {
         *runtime = Some(start_local_runtime(kind, paths, node_a).await?);
     }
 

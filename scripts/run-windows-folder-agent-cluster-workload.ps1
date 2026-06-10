@@ -5,6 +5,8 @@ param(
     [int]$VerifySampleCount = 24,
     [int]$SubdirCount = 80,
     [int]$MaxDirDepth = 4,
+    [ValidateSet("before_copy", "after_copy")]
+    [string]$StartMode = "before_copy",
     [int]$UploadTimeoutMinutes = 150,
     [int]$ReplicationTimeoutMinutes = 60,
     [switch]$SkipBuild
@@ -45,6 +47,7 @@ $env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES = [string]($MaxSizeMiB * 1MB)
 $env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT = [string]$VerifySampleCount
 $env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT = [string]$SubdirCount
 $env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH = [string]$MaxDirDepth
+$env:IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE = $StartMode
 $env:IRONMESH_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS = [string]($UploadTimeoutMinutes * 60)
 $env:IRONMESH_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS = [string]($ReplicationTimeoutMinutes * 60)
 
@@ -55,6 +58,7 @@ Write-Host "  average MiB    : $([math]::Round(($MinSizeMiB + $MaxSizeMiB) / 2, 
 Write-Host "  sample checks  : $VerifySampleCount"
 Write-Host "  subdirs        : $SubdirCount"
 Write-Host "  max dir depth  : $MaxDirDepth"
+Write-Host "  start mode     : $StartMode"
 Write-Host "  upload timeout : $UploadTimeoutMinutes min"
 Write-Host "  repl timeout   : $ReplicationTimeoutMinutes min"
 

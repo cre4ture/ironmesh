@@ -76,7 +76,7 @@ function Resolve-DriverExecutable {
         }
     }
 
-    $matches = foreach ($searchRoot in $searchRoots) {
+    $matches = @(foreach ($searchRoot in $searchRoots) {
         if (-not (Test-Path -LiteralPath $searchRoot)) {
             continue
         }
@@ -87,7 +87,7 @@ function Resolve-DriverExecutable {
             -File `
             -Recurse `
             -ErrorAction SilentlyContinue
-    } | Where-Object {
+    }) | Where-Object {
         $_.FullName -notmatch '\\deps\\'
     }
 

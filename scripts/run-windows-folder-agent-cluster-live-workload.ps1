@@ -5,6 +5,8 @@ param(
     [int]$VerifySampleCount = 24,
     [int]$SubdirCount = 80,
     [int]$MaxDirDepth = 4,
+    [ValidateSet("before_copy", "after_copy")]
+    [string]$StartMode = "before_copy",
     [int]$UploadTimeoutMinutes = 150,
     [int]$ReplicationTimeoutMinutes = 60,
     [bool]$HoldOnFailure = $true,
@@ -72,7 +74,7 @@ function Resolve-DriverExecutable {
         }
     }
 
-    $matches = foreach ($searchRoot in $searchRoots) {
+    $matches = @(foreach ($searchRoot in $searchRoots) {
         if (-not (Test-Path -LiteralPath $searchRoot)) {
             continue
         }
@@ -83,7 +85,7 @@ function Resolve-DriverExecutable {
             -File `
             -Recurse `
             -ErrorAction SilentlyContinue
-    } | Where-Object {
+    }) | Where-Object {
         $_.FullName -notmatch '\\deps\\'
     }
 
@@ -130,6 +132,7 @@ $inner = @(
     "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT=$VerifySampleCount`"",
     "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT=$SubdirCount`"",
     "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH=$MaxDirDepth`"",
+    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE=$StartMode`"",
     "set `"IRONMESH_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS=$($UploadTimeoutMinutes * 60)`"",
     "set `"IRONMESH_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS=$($ReplicationTimeoutMinutes * 60)`"",
     "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_MANIFEST_PATH=$manifestPath`"",
