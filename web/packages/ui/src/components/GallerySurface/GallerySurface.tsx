@@ -3229,7 +3229,8 @@ function buildGalleryLightboxItem(
     mimeType: entry.media?.mime_type ?? null,
     width: entry.media?.width ?? null,
     height: entry.media?.height ?? null,
-    takenAtUnix: entry.media?.taken_at_unix ?? null
+    takenAtUnix: entry.media?.taken_at_unix ?? null,
+    gps: entry.media?.gps ?? null
   };
 }
 
@@ -3265,7 +3266,8 @@ function buildGalleryVersionLightboxItem(
     width: previewEntry.media?.width ?? null,
     height: previewEntry.media?.height ?? null,
     takenAtUnix:
-      previewEntry.media?.taken_at_unix ?? version.modified_at_unix ?? version.created_at_unix ?? null
+      previewEntry.media?.taken_at_unix ?? version.modified_at_unix ?? version.created_at_unix ?? null,
+    gps: previewEntry.media?.gps ?? null
   };
 }
 

@@ -12,6 +12,7 @@ import {
 import {
   IconChevronLeft,
   IconChevronRight,
+  IconMapPin,
   IconPhoto,
   IconPlayerPlay,
   IconVideo
@@ -56,6 +57,7 @@ export type MediaLightboxItem = {
   width?: number | null;
   height?: number | null;
   takenAtUnix?: number | null;
+  gps?: { latitude: number; longitude: number } | null;
 };
 
 type MediaLightboxModalProps = {
@@ -265,6 +267,15 @@ export function MediaLightboxModal({
                   {selectedItem.width && selectedItem.height ? (
                     <Badge variant="light">
                       {selectedItem.width} x {selectedItem.height}
+                    </Badge>
+                  ) : null}
+                  {selectedItem.gps ? (
+                    <Badge
+                      variant="light"
+                      color="green"
+                      leftSection={<IconMapPin size={12} />}
+                    >
+                      {selectedItem.gps.latitude.toFixed(5)}, {selectedItem.gps.longitude.toFixed(5)}
                     </Badge>
                   ) : null}
                 </Group>
