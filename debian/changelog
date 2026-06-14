@@ -1,3 +1,19 @@
+ironmesh (1.0.19-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add Windows folder-agent cluster workload harness with live CFAPI driver,
+    nested workload staging, and start-before-copy default; fix disk-full
+    recovery, workload convergence handling, binary resolution, and live
+    manifest updates on resume.
+  * Stabilize rendezvous connection establishment and latency probing.
+  * Add GPS data support and display in the media lightbox item.
+  * Refactor PersistentStore, server-node-sdk, and DataScrubber; add
+    RecordingBackend for folder-agent test coverage; avoid reuploading clean
+    CFAPI placeholders.
+  * Fix CI regressions on main and add Windows CI access skill.
+  * Roll the workspace release to 1.0.19.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 14 Jun 2026 23:31:28 +0200
+
 ironmesh (1.0.18-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add a Metadata Footprint admin page with logical metadata table
