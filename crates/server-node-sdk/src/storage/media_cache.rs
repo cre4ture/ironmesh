@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::media_tools::{
-    FfprobeOutput, MediaToolPaths, FFMPEG_TIMEOUT_SECS, FFPROBE_TIMEOUT_SECS,
+    FFMPEG_TIMEOUT_SECS, FFPROBE_TIMEOUT_SECS, FfprobeOutput, MediaToolPaths,
     VIDEO_THUMBNAIL_SEEK_FRACTION, VIDEO_THUMBNAIL_SEEK_MAX_SECS, VIDEO_THUMBNAIL_SEEK_MIN_SECS,
     VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS,
 };

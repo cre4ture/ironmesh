@@ -1966,7 +1966,7 @@ impl RuntimeLogControl {
     }
 
     fn apply_filter_expression(&self, filter_expression: &str) -> Result<()> {
-        let filter = EnvFilter::try_new(filter_expression.to_string())
+        let filter = EnvFilter::try_new(filter_expression)
             .with_context(|| format!("invalid log filter expression: {filter_expression}"))?;
 
         if let Some(handle) = &self.reload_handle {
@@ -2032,7 +2032,7 @@ fn runtime_log_filter_expression_from_request(
     }
 
     if let Some(filter_expression) = explicit_filter {
-        EnvFilter::try_new(filter_expression.to_string())
+        EnvFilter::try_new(filter_expression)
             .with_context(|| format!("invalid log filter expression: {filter_expression}"))?;
         return Ok(filter_expression.to_string());
     }
@@ -4450,7 +4450,7 @@ fn runtime_log_filter_from_env(default_directive: &str) -> (EnvFilter, String) {
                     default_directive.to_string(),
                 )
             } else {
-                match EnvFilter::try_new(trimmed.to_string()) {
+                match EnvFilter::try_new(trimmed) {
                     Ok(filter) => (filter, trimmed.to_string()),
                     Err(_) => (
                         EnvFilter::new(default_directive),

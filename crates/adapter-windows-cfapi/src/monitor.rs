@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::windows::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
@@ -13,7 +14,9 @@ use crate::cfapi::{
 };
 use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
-use crate::helpers::{decode_path_from_file_identity, path_to_relative};
+use crate::helpers::{
+    decode_path_from_file_identity, error_chain_has_win32_hresult, path_to_relative,
+};
 use crate::hydration_control::is_active_hydration_marked;
 use crate::placeholder_metadata::{
     promote_remote_to_in_sync_content_baseline, record_in_sync_content_baseline,
@@ -23,11 +26,15 @@ use crate::placeholder_metadata::{
 use crate::runtime::UploadReceipt;
 use crate::runtime::Uploader;
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
     CF_PLACEHOLDER_STATE_NO_STATES, CF_PLACEHOLDER_STATE_PARTIAL,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_UNPINNED};
+
+const DEHYDRATE_SHARING_VIOLATION_MAX_RETRIES: usize = 8;
+const DEHYDRATE_SHARING_VIOLATION_RETRY_DELAY_MS: u64 = 250;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LocalFileIdentity {
@@ -319,7 +326,6 @@ impl SyncRootMonitor {
     }
 
     pub fn run(&mut self) {
-        use std::time::Duration;
         loop {
             self.walk();
             std::thread::sleep(Duration::from_secs(5));
@@ -878,25 +884,47 @@ impl SyncRootMonitor {
                 placeholder_state.to_log_string()
             );
 
-            let result = cf_dehydrate_placeholder_with_oplock(&full_path, &rel_path);
-
-            match result {
-                Ok(()) => {
-                    tracing::info!(
-                        "{}: dehydrated placeholder {} state_after={}",
-                        monitor_name,
-                        rel_path,
-                        describe_path_state(&full_path)
-                    );
-                }
-                Err(err) => {
-                    tracing::info!(
-                        "{}: failed to dehydrate placeholder {}: {:#} state_after={}",
-                        monitor_name,
-                        rel_path,
-                        err,
-                        describe_path_state(&full_path)
-                    );
+            let mut attempt = 0usize;
+            loop {
+                match cf_dehydrate_placeholder_with_oplock(&full_path, &rel_path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "{}: dehydrated placeholder {} state_after={}",
+                            monitor_name,
+                            rel_path,
+                            describe_path_state(&full_path)
+                        );
+                        break;
+                    }
+                    Err(err)
+                        if error_chain_has_win32_hresult(&err, ERROR_SHARING_VIOLATION)
+                            && attempt < DEHYDRATE_SHARING_VIOLATION_MAX_RETRIES =>
+                    {
+                        attempt += 1;
+                        tracing::info!(
+                            "{}: dehydrate placeholder {} hit sharing violation; retrying attempt={}/{} after {} ms error={:#} state_now={}",
+                            monitor_name,
+                            rel_path,
+                            attempt,
+                            DEHYDRATE_SHARING_VIOLATION_MAX_RETRIES,
+                            DEHYDRATE_SHARING_VIOLATION_RETRY_DELAY_MS,
+                            err,
+                            describe_path_state(&full_path)
+                        );
+                        std::thread::sleep(Duration::from_millis(
+                            DEHYDRATE_SHARING_VIOLATION_RETRY_DELAY_MS,
+                        ));
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            "{}: failed to dehydrate placeholder {}: {:#} state_after={}",
+                            monitor_name,
+                            rel_path,
+                            err,
+                            describe_path_state(&full_path)
+                        );
+                        break;
+                    }
                 }
             }
 

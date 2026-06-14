@@ -2,15 +2,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::{
+    ChunkRef, CurrentState, MetadataStore, TOMBSTONE_MANIFEST_HASH, chunk_path_for_hash, hash_hex,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 #[cfg(test)]
 use tokio::sync::Semaphore;
-use super::{
-    ChunkRef, CurrentState, MetadataStore, TOMBSTONE_MANIFEST_HASH,
-    chunk_path_for_hash, hash_hex,
-};
 
 const DATA_SCRUB_ISSUE_SAMPLE_LIMIT: usize = 128;
 

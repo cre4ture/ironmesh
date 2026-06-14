@@ -1728,7 +1728,7 @@ mod tests {
                     .post(format!("{web_base}/api/latency-test"))
                     .json(&serde_json::json!({
                         "sample_count": 2,
-                        "warmup_count": 0,
+                        "warmup_count": 1,
                         "response_bytes": 64,
                         "pause_between_samples_ms": 0,
                         "server_delay_ms": 0,

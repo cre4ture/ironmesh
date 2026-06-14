@@ -2774,7 +2774,10 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum BackendOperation {
         EnsureDirectory(String),
-        DownloadFile { local_path: String, remote_key: String },
+        DownloadFile {
+            local_path: String,
+            remote_key: String,
+        },
     }
 
     #[derive(Debug, Default)]

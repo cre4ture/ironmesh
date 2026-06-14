@@ -1,18 +1,55 @@
 use anyhow::Result;
 use normpath::PathExt;
+use std::fmt;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+#[derive(Debug)]
+struct HResultError {
+    operation: String,
+    hr: i32,
+}
+
+impl fmt::Display for HResultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} failed with HRESULT 0x{:08X}",
+            self.operation, self.hr as u32
+        )
+    }
+}
+
+impl std::error::Error for HResultError {}
 
 pub(crate) fn hresult_nonneg(hr: i32, operation: &str) -> Result<()> {
     if hr >= 0 {
         Ok(())
     } else {
-        Err(anyhow::anyhow!(
-            "{operation} failed with HRESULT 0x{:08X}",
-            hr as u32
-        ))
+        Err(HResultError {
+            operation: operation.to_string(),
+            hr,
+        }
+        .into())
     }
+}
+
+pub(crate) fn hresult_from_win32(error: u32) -> u32 {
+    if error == 0 {
+        0
+    } else {
+        (error & 0x0000_FFFF) | 0x8007_0000
+    }
+}
+
+pub(crate) fn error_chain_has_win32_hresult(error: &anyhow::Error, win32_error: u32) -> bool {
+    let target_hresult = hresult_from_win32(win32_error);
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<HResultError>()
+            .is_some_and(|hresult_error| hresult_error.hr as u32 == target_hresult)
+    })
 }
 
 pub fn normalize_path(path: &str) -> String {
@@ -284,10 +321,13 @@ fn strip_to_after_root_name_case_insensitive<'a>(
 mod tests {
     use super::{
         PlaceholderFileIdentity, decode_path_from_file_identity, decode_placeholder_file_identity,
-        encode_placeholder_file_identity, path_to_relative,
+        encode_placeholder_file_identity, error_chain_has_win32_hresult, hresult_from_win32,
+        hresult_nonneg, path_to_relative,
     };
+    use anyhow::Context;
     use std::path::Path;
     use uuid::Uuid;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
     #[test]
     fn path_to_relative_strips_full_root_prefix_with_drive() {
@@ -411,5 +451,20 @@ mod tests {
             decoded_current.in_sync_content_fingerprint.as_deref(),
             Some("cfp-current")
         );
+    }
+
+    #[test]
+    fn wrapped_hresult_errors_still_match_their_win32_source() {
+        let error = hresult_nonneg(
+            hresult_from_win32(ERROR_SHARING_VIOLATION) as i32,
+            "CfOpenFileWithOplock",
+        )
+        .context("while dehydrating placeholder")
+        .expect_err("sharing violation should surface as an error");
+
+        assert!(error_chain_has_win32_hresult(
+            &error,
+            ERROR_SHARING_VIOLATION
+        ));
     }
 }

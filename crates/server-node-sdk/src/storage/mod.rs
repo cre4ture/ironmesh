@@ -16,35 +16,35 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub(super) mod data_scrub;
+pub(super) mod media_cache;
+pub(super) mod media_tools;
 mod sqlite_impl;
 #[cfg(feature = "turso-metadata")]
 mod turso_impl;
-pub(super) mod media_tools;
-pub(super) mod media_cache;
-pub(super) mod data_scrub;
 
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
 use self::turso_impl::TursoMetadataStore;
 use super::{DataScrubRunRecord, RepairRunRecord};
 
+pub use data_scrub::DataScrubReport;
 pub use media_cache::{
     CachedMediaMetadata, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates,
     media_cache_retry_due, promote_cached_media_metadata_to_incomplete,
 };
 pub use media_tools::{HostDependencyReport, HostDependencyStatus};
-pub use data_scrub::DataScrubReport;
 
-pub(crate) use media_cache::{MediaCacheWorker, current_media_cache_metadata};
 pub(crate) use data_scrub::DataScrubber;
-use media_tools::MediaToolPaths;
+#[cfg(test)]
+pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
 #[cfg(test)]
 use media_cache::{
     MEDIA_CACHE_INCOMPLETE_RETRY_SECS, MEDIA_CACHE_SCHEMA_VERSION, exif_gps_coordinate,
     parse_exif_taken_at, persist_media_cache_record_with_payload, preferred_video_seek_time,
 };
-#[cfg(test)]
-pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
+pub(crate) use media_cache::{MediaCacheWorker, current_media_cache_metadata};
+use media_tools::MediaToolPaths;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
@@ -303,7 +303,6 @@ pub struct StorageStatsState {
     pub chunk_store_bytes: u64,
     pub last_reconciled_unix: u64,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CachedChunkRecord {
@@ -711,8 +710,6 @@ pub struct PutResult {
     pub dedup_reused_chunks: usize,
     pub created_new_version: bool,
 }
-
-
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1127,7 +1124,6 @@ impl ChunkIngestor {
     }
 }
 
-
 impl StorageStatsCollector {
     fn new(
         root_dir: PathBuf,
@@ -1311,7 +1307,6 @@ impl StorageStatsCollector {
             .await
     }
 }
-
 
 impl StoreIndexInspector {
     fn new(
