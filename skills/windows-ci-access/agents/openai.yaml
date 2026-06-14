@@ -1,0 +1,4 @@
+interface:
+  display_name: "Windows CI Access"
+  short_description: "Use the local Windows host for CI repros"
+  default_prompt: "Use $windows-ci-access to reproduce and debug a Windows-specific CI failure from Linux."
