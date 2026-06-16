@@ -1,10 +1,16 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::ClusterId;
 use reqwest::{Certificate, Client, Url};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use x509_parser::parse_x509_certificate;
 
 use crate::bootstrap::RelayMode;
 use crate::bootstrap_claim::{
@@ -204,6 +210,12 @@ impl RendezvousControlClient {
             .snapshot(&self.config.rendezvous_urls)
     }
 
+    pub fn client_identity_expiry_diagnostic(&self) -> Option<String> {
+        self.client_identity_pem.as_deref().and_then(|client_identity_pem| {
+            rendezvous_client_identity_expiry_diagnostic_at(client_identity_pem, unix_timestamp())
+        })
+    }
+
     pub async fn probe_endpoints(&self) -> Result<RendezvousRuntimeState> {
         self.probe_endpoints_with_path("/control/presence").await
     }
@@ -220,9 +232,9 @@ impl RendezvousControlClient {
                     Ok(_) => Ok(()),
                     Err(err) => Err(format!("rendezvous endpoint {url} returned error: {err}")),
                 },
-                Err(err) => Err(format!(
+                Err(err) => Err(self.decorate_transport_error(format!(
                     "failed contacting rendezvous endpoint {url}: {err}"
-                )),
+                ))),
             };
             self.record_endpoint_result(base_url, result, false);
         }
@@ -311,8 +323,9 @@ impl RendezvousControlClient {
                     return Ok(client);
                 }
                 Err(err) => {
-                    let message =
-                        format!("failed establishing relay tunnel source at {base_url}: {err}");
+                    let message = self.decorate_transport_error(format!(
+                        "failed establishing relay tunnel source at {base_url}: {err}"
+                    ));
                     self.record_endpoint_result(base_url, Err(message.clone()), true);
                     last_error = Some(anyhow!(message));
                 }
@@ -350,8 +363,9 @@ impl RendezvousControlClient {
                     return Ok(client);
                 }
                 Err(err) => {
-                    let message =
-                        format!("failed accepting relay tunnel target at {base_url}: {err}");
+                    let message = self.decorate_transport_error(format!(
+                        "failed accepting relay tunnel target at {base_url}: {err}"
+                    ));
                     self.record_endpoint_result(base_url, Err(message.clone()), true);
                     last_error = Some(anyhow!(message));
                 }
@@ -413,7 +427,9 @@ impl RendezvousControlClient {
                     }
                 },
                 Err(err) => {
-                    let message = format!("failed contacting rendezvous endpoint {url}: {err}");
+                    let message = self.decorate_transport_error(format!(
+                        "failed contacting rendezvous endpoint {url}: {err}"
+                    ));
                     self.record_endpoint_result(base_url, Err(message.clone()), true);
                     last_error = Some(anyhow!(message));
                 }
@@ -452,7 +468,9 @@ impl RendezvousControlClient {
                     }
                 },
                 Err(err) => {
-                    let message = format!("failed contacting rendezvous endpoint {url}: {err}");
+                    let message = self.decorate_transport_error(format!(
+                        "failed contacting rendezvous endpoint {url}: {err}"
+                    ));
                     self.record_endpoint_result(base_url, Err(message.clone()), true);
                     last_error = Some(anyhow!(message));
                 }
@@ -472,6 +490,14 @@ impl RendezvousControlClient {
             .lock()
             .expect("rendezvous runtime state lock poisoned")
             .record_result(base_url, result, mark_active);
+    }
+
+    fn decorate_transport_error(&self, message: String) -> String {
+        decorate_rendezvous_transport_error(
+            message,
+            self.client_identity_pem.as_deref(),
+            unix_timestamp(),
+        )
     }
 }
 
@@ -612,12 +638,82 @@ fn validate_optional_url(field_name: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn decorate_rendezvous_transport_error(
+    message: String,
+    client_identity_pem: Option<&[u8]>,
+    now_unix: u64,
+) -> String {
+    let Some(client_identity_pem) = client_identity_pem else {
+        return message;
+    };
+    let Some(diagnostic) =
+        rendezvous_client_identity_expiry_diagnostic_at(client_identity_pem, now_unix)
+    else {
+        return message;
+    };
+    format!("{message}; {diagnostic}")
+}
+
+fn rendezvous_client_identity_expiry_diagnostic_at(
+    client_identity_pem: &[u8],
+    now_unix: u64,
+) -> Option<String> {
+    let not_after_unix = rendezvous_client_identity_not_after_unix(client_identity_pem).ok()?;
+    if not_after_unix > now_unix {
+        return None;
+    }
+    Some(format!(
+        "local rendezvous client identity is expired at {}",
+        format_diagnostic_timestamp(not_after_unix)
+    ))
+}
+
+fn rendezvous_client_identity_not_after_unix(client_identity_pem: &[u8]) -> Result<u64> {
+    let mut cert_reader = Cursor::new(client_identity_pem);
+    let certificate = CertificateDer::pem_reader_iter(&mut cert_reader)
+        .next()
+        .transpose()
+        .context("failed parsing rendezvous client certificate chain")?
+        .ok_or_else(|| anyhow!("rendezvous client identity PEM is missing a certificate chain"))?;
+
+    let (_, certificate) = parse_x509_certificate(certificate.as_ref())
+        .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
+    let not_after_unix = certificate.validity().not_after.timestamp();
+    if not_after_unix < 0 {
+        bail!("rendezvous client certificate not_after is before the unix epoch");
+    }
+    Ok(not_after_unix as u64)
+}
+
+fn format_diagnostic_timestamp(unix: u64) -> String {
+    OffsetDateTime::from_unix_timestamp(unix as i64)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
+        .map(|value| format!("{value} (unix {unix})"))
+        .unwrap_or_else(|| format!("unix {unix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::{Json, Router, routing::get};
     use uuid::Uuid;
+
+    const TEST_RENDEZVOUS_CLIENT_CERT_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIB3DCCAYKgAwIBAgITK3r0r5jwkdN+susWXewPKMOgPDAKBggqhkjOPQQDAjBA\n",
+        "MT4wPAYDVQQDDDVpcm9ubWVzaC1jbHVzdGVyLTAxOWQwMmViLWFiMzktNzIyMC05\n",
+        "MTFhLWMwZWFmY2IzODI0OTAeFw0yNjAzMjExMzA5MzRaFw0yNjA0MjAxMzA5MzRa\n",
+        "MD8xPTA7BgNVBAMMNGlyb25tZXNoLWRldmljZS0wMTlkMTA4My1lYTIzLTdiZjEt\n",
+        "YjVjYi0xZDVmY2ViNTBlOGEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASeG/Cl\n",
+        "E3s04e07hBjVXH8/IMPXIiGewwOLPXEcJM4pU0ELoDcfpgZ0evvEiOKFC+R19CI3\n",
+        "/dbbU02U0VnXMMXxo1wwWjBDBgNVHREEPDA6hjh1cm46aXJvbm1lc2g6ZGV2aWNl\n",
+        "OjAxOWQxMDgzLWVhMjMtN2JmMS1iNWNiLTFkNWZjZWI1MGU4YTATBgNVHSUEDDAK\n",
+        "BggrBgEFBQcDAjAKBggqhkjOPQQDAgNIADBFAiBPOa5XZSZLs8CqhQO9PscDS2Il\n",
+        "jkjn2HXRB0g2pB2aeAIhALe+yYYMAqULo8WmhjcudAgQm/1vYSjowEWtUcMCY2J3\n",
+        "-----END CERTIFICATE-----\n"
+    );
 
     #[tokio::test]
     async fn runtime_state_tracks_failed_and_active_rendezvous_endpoints() {
@@ -759,6 +855,44 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn expired_rendezvous_identity_diagnostic_is_detected_at_boundary() {
+        let not_after_unix =
+            rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
+                .expect("test certificate should parse");
+
+        assert!(rendezvous_client_identity_expiry_diagnostic_at(
+            TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+            not_after_unix.saturating_sub(1)
+        )
+        .is_none());
+
+        let diagnostic = rendezvous_client_identity_expiry_diagnostic_at(
+            TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+            not_after_unix,
+        )
+        .expect("diagnostic should be emitted once the certificate expires");
+        assert!(diagnostic.contains("local rendezvous client identity is expired at"));
+        assert!(diagnostic.contains("unix"));
+    }
+
+    #[test]
+    fn transport_error_decoration_appends_expired_identity_diagnostic() {
+        let not_after_unix =
+            rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
+                .expect("test certificate should parse");
+
+        let message = decorate_rendezvous_transport_error(
+            "failed contacting rendezvous endpoint https://relay.example/health: synthetic failure"
+                .to_string(),
+            Some(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes()),
+            not_after_unix.saturating_add(1),
+        );
+
+        assert!(message.contains("failed contacting rendezvous endpoint"));
+        assert!(message.contains("local rendezvous client identity is expired at"));
     }
 
     #[test]

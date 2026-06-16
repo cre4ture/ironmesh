@@ -401,7 +401,7 @@ fn order_clients_by_startup_probe(
         match probe {
             Ok(score) => success.push((score, index, client)),
             Err(error) => {
-                probe_errors.push(error.to_string());
+                probe_errors.push(format!("{error:#}"));
                 failed.push((index, client));
             }
         }
@@ -431,6 +431,12 @@ fn order_clients_by_startup_probe(
 }
 
 async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+    if let Some(rendezvous) = client.rendezvous_client()
+        && let Some(diagnostic) = rendezvous.client_identity_expiry_diagnostic()
+    {
+        bail!(diagnostic);
+    }
+
     let result = tokio::time::timeout(
         STARTUP_PROBE_TIMEOUT,
         client.run_latency_probe(LatencyProbeConfig {

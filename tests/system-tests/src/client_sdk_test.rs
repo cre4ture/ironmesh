@@ -1,6 +1,26 @@
 #[cfg(test)]
 mod tests {
     const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
+    const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX: i64 = 1_776_690_574;
+    const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIB3DCCAYKgAwIBAgITK3r0r5jwkdN+susWXewPKMOgPDAKBggqhkjOPQQDAjBA\n",
+        "MT4wPAYDVQQDDDVpcm9ubWVzaC1jbHVzdGVyLTAxOWQwMmViLWFiMzktNzIyMC05\n",
+        "MTFhLWMwZWFmY2IzODI0OTAeFw0yNjAzMjExMzA5MzRaFw0yNjA0MjAxMzA5MzRa\n",
+        "MD8xPTA7BgNVBAMMNGlyb25tZXNoLWRldmljZS0wMTlkMTA4My1lYTIzLTdiZjEt\n",
+        "YjVjYi0xZDVmY2ViNTBlOGEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASeG/Cl\n",
+        "E3s04e07hBjVXH8/IMPXIiGewwOLPXEcJM4pU0ELoDcfpgZ0evvEiOKFC+R19CI3\n",
+        "/dbbU02U0VnXMMXxo1wwWjBDBgNVHREEPDA6hjh1cm46aXJvbm1lc2g6ZGV2aWNl\n",
+        "OjAxOWQxMDgzLWVhMjMtN2JmMS1iNWNiLTFkNWZjZWI1MGU4YTATBgNVHSUEDDAK\n",
+        "BggrBgEFBQcDAjAKBggqhkjOPQQDAgNIADBFAiBPOa5XZSZLs8CqhQO9PscDS2Il\n",
+        "jkjn2HXRB0g2pB2aeAIhALe+yYYMAqULo8WmhjcudAgQm/1vYSjowEWtUcMCY2J3\n",
+        "-----END CERTIFICATE-----\n",
+        "-----BEGIN PRIVATE KEY-----\n",
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgaxQmF3EgQxM8/nYg\n",
+        "C4fi+hVjqma6xwFK4pwamjmotA+hRANCAASeG/ClE3s04e07hBjVXH8/IMPXIiGe\n",
+        "wwOLPXEcJM4pU0ELoDcfpgZ0evvEiOKFC+R19CI3/dbbU02U0VnXMMXx\n",
+        "-----END PRIVATE KEY-----\n"
+    );
 
     use std::fs;
     use std::io::Cursor;
@@ -13,6 +33,7 @@ mod tests {
         IronMeshClient, LatencyProbeConfig, UploadMode, enroll_connection_input_blocking,
     };
     use serde_json::json;
+    use time::OffsetDateTime;
     use uuid::Uuid;
 
     use crate::framework::{
@@ -1136,6 +1157,110 @@ mod tests {
         let _ = fs::remove_dir_all(&client_dir);
         let _ = fs::remove_dir_all(&server_data_dir);
         let _ = fs::remove_dir_all(&working_dir);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn relay_only_startup_probe_reports_expired_rendezvous_client_identity() -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19250";
+        let bind = "127.0.0.1:19251";
+        let cluster_id = "11111111-1111-7111-8111-111111111150";
+        let node_id = "00000000-0000-0000-0000-000000000950";
+        let client_dir = fresh_data_dir("expired-rendezvous-identity-client");
+        let server_data_dir = fresh_data_dir("expired-rendezvous-identity-server");
+        fs::create_dir_all(&client_dir)?;
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_url = format!("http://{bind}");
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut server =
+            start_open_server_with_env(bind, &server_data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        assert!(
+            OffsetDateTime::now_utc().unix_timestamp()
+                > KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX,
+            "expired rendezvous identity fixture is no longer expired for the current test clock"
+        );
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_url,
+                TEST_ADMIN_TOKEN,
+                &client_dir,
+                "expired-rendezvous.bootstrap.json",
+                Some("expired-rendezvous"),
+                Some(3600),
+            )
+            .await?;
+
+            let mut relay_only_bootstrap = enrolled.bootstrap.clone();
+            relay_only_bootstrap.relay_mode = transport_sdk::RelayMode::Required;
+            let mut extra_relay_target = relay_only_bootstrap
+                .direct_endpoints
+                .iter()
+                .find(|endpoint| endpoint.usage == Some(BootstrapEndpointUse::PublicApi))
+                .cloned()
+                .context("expected bootstrap public endpoint for relay startup probe test")?;
+            extra_relay_target.node_id = Some(Uuid::new_v4());
+            relay_only_bootstrap.direct_endpoints.push(extra_relay_target);
+            for endpoint in &mut relay_only_bootstrap.direct_endpoints {
+                if endpoint.usage == Some(BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+
+            let mut expired_identity = enrolled.identity.clone();
+            expired_identity.rendezvous_client_identity_pem =
+                Some(KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM.to_string());
+
+            let error = {
+                let bootstrap = relay_only_bootstrap;
+                let identity = expired_identity;
+                tokio::task::spawn_blocking(move || match bootstrap.build_client_with_identity(&identity) {
+                    Ok(_) => panic!(
+                        "relay-only client with expired rendezvous identity should fail startup probing"
+                    ),
+                    Err(error) => error,
+                })
+                .await
+                .context("expired relay client construction task panicked")?
+            };
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("startup connection quality probe failed for all client transport targets"),
+                "expected startup probe failure, got {message}"
+            );
+            assert!(
+                message.contains("local rendezvous client identity is expired at"),
+                "expected expired rendezvous identity diagnostic, got {message}"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        stop_server(&mut rendezvous).await;
+        let _ = fs::remove_dir_all(&client_dir);
+        let _ = fs::remove_dir_all(&server_data_dir);
 
         result
     }

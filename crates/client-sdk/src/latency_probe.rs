@@ -249,7 +249,7 @@ impl IronMeshClient {
                         response_bytes: 0,
                         throughput_bytes_per_sec: None,
                         node_id: None,
-                        error: Some(error.to_string()),
+                        error: Some(format!("{error:#}")),
                     },
                     Err(_) => LatencyProbeSample {
                         index: request_index.saturating_sub(config.warmup_count),

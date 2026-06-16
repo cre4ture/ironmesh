@@ -3373,10 +3373,12 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.24.0",
  "uuid",
+ "x509-parser 0.16.0",
  "yamux",
 ]
 
