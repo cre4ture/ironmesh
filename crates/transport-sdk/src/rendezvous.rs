@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::ClusterId;
 use reqwest::{Certificate, Client, Url};
-use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -211,9 +211,14 @@ impl RendezvousControlClient {
     }
 
     pub fn client_identity_expiry_diagnostic(&self) -> Option<String> {
-        self.client_identity_pem.as_deref().and_then(|client_identity_pem| {
-            rendezvous_client_identity_expiry_diagnostic_at(client_identity_pem, unix_timestamp())
-        })
+        self.client_identity_pem
+            .as_deref()
+            .and_then(|client_identity_pem| {
+                rendezvous_client_identity_expiry_diagnostic_at(
+                    client_identity_pem,
+                    unix_timestamp(),
+                )
+            })
     }
 
     pub fn client_identity_needs_renewal(&self) -> bool {
@@ -885,11 +890,13 @@ mod tests {
             rendezvous_client_identity_not_after_unix(TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes())
                 .expect("test certificate should parse");
 
-        assert!(rendezvous_client_identity_expiry_diagnostic_at(
-            TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
-            not_after_unix.saturating_sub(1)
-        )
-        .is_none());
+        assert!(
+            rendezvous_client_identity_expiry_diagnostic_at(
+                TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+                not_after_unix.saturating_sub(1)
+            )
+            .is_none()
+        );
 
         let diagnostic = rendezvous_client_identity_expiry_diagnostic_at(
             TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),

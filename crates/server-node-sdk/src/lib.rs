@@ -17073,12 +17073,10 @@ async fn renew_device_rendezvous_identity(
 }
 
 fn parse_credential_pem_expires_at(credential_pem: &str) -> Option<u64> {
-    credential_pem
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("expires_at_unix=")
-                .and_then(|v| v.trim().parse::<u64>().ok())
-        })
+    credential_pem.lines().find_map(|line| {
+        line.strip_prefix("expires_at_unix=")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
 }
 
 async fn export_client_credentials(

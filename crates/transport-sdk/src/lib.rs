@@ -48,10 +48,10 @@ pub use relay_tunnel::{
     RelayTunnelSession, relay_tunnel_ws_url,
 };
 pub use rendezvous::{
-    PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
-    RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RendezvousClientConfig, RendezvousControlClient,
-    RendezvousEndpointConnectionState, RendezvousEndpointStatus, RendezvousRuntimeState,
-    TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,
+    PresenceEntry, PresenceListResponse, PresenceRegistration,
+    RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
+    RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
+    RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,
     rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at,
 };
 pub use rendezvous_runtime::{

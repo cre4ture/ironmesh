@@ -211,8 +211,8 @@ fn response_error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, routing::post};
     use crate::IronMeshClient;
+    use axum::{Json, Router, routing::post};
     use uuid::Uuid;
 
     fn sample_response() -> DeviceEnrollmentResponse {
@@ -378,10 +378,7 @@ mod tests {
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener should have addr");
-        let app = Router::new().route(
-            "/api/v1/auth/device/renew-rendezvous-identity",
-            handler,
-        );
+        let app = Router::new().route("/api/v1/auth/device/renew-rendezvous-identity", handler);
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -394,9 +391,7 @@ mod tests {
         let pem_owned = pem.to_string();
         let (url, server) = spawn_renewal_mock(post(move || {
             let pem = pem_owned.clone();
-            async move {
-                Json(serde_json::json!({ "rendezvous_client_identity_pem": pem }))
-            }
+            async move { Json(serde_json::json!({ "rendezvous_client_identity_pem": pem })) }
         }))
         .await;
 
