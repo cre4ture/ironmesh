@@ -375,13 +375,12 @@ impl ConnectionBootstrap {
             // If the cert is already past its expiry the relay connection itself fails mTLS, so
             // we must reach the cluster via a direct target.  If the cert is merely approaching
             // expiry the relay is still usable, so we can renew through any available target.
-            let already_expired =
-                identity
-                    .rendezvous_client_identity_pem
-                    .as_deref()
-                    .is_some_and(|pem| {
-                        transport_sdk::rendezvous_client_identity_is_expired_at(pem.as_bytes(), now)
-                    });
+            let already_expired = identity
+                .rendezvous_client_identity_pem
+                .as_deref()
+                .is_some_and(|pem| {
+                    transport_sdk::rendezvous_client_identity_is_expired_at(pem.as_bytes(), now)
+                });
 
             let renewal_targets: Vec<_> = if already_expired {
                 planned_targets
@@ -697,9 +696,8 @@ fn try_renew_rendezvous_identity(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: &ClientIdentityMaterial,
 ) -> Result<String> {
-    let renewal_client =
-        build_http_client_with_identity_from_planned_targets(targets, identity)
-            .context("failed to build client for rendezvous identity renewal")?;
+    let renewal_client = build_http_client_with_identity_from_planned_targets(targets, identity)
+        .context("failed to build client for rendezvous identity renewal")?;
     let worker = std::thread::Builder::new()
         .name("ironmesh-rendezvous-renewal".to_string())
         .spawn(move || -> Result<String> {
@@ -1027,8 +1025,7 @@ mod tests {
     }
 
     fn identity_for_bootstrap(cluster_id: ClusterId) -> ClientIdentityMaterial {
-        ClientIdentityMaterial::generate(cluster_id, None, None)
-            .expect("identity should generate")
+        ClientIdentityMaterial::generate(cluster_id, None, None).expect("identity should generate")
     }
 
     async fn spawn_health_server(delay_ms: u64) -> (String, tokio::task::JoinHandle<()>) {
