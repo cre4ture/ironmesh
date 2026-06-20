@@ -1,3 +1,14 @@
+ironmesh (1.0.21-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add config-app managed identity auto-renewal for rendezvous client
+    certificates, including startup reconciliation and dependent service
+    restarts.
+  * Add Windows and Ubuntu system-level coverage for managed auto-renew
+    startup flows, and fix the follow-up config-app clippy regression.
+  * Roll the workspace release to 1.0.21.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 20 Jun 2026 21:26:47 +0200
+
 ironmesh (1.0.20-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add automatic renewal of rendezvous client identity cert before expiry,
