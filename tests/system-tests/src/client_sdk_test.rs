@@ -32,9 +32,11 @@ mod tests {
         BootstrapEndpointUse, ClientNode, ConnectionBootstrap, ContentAddressedClientCache,
         IronMeshClient, LatencyProbeConfig, UploadMode, enroll_connection_input_blocking,
     };
-    use transport_sdk::{rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at};
     use serde_json::json;
     use time::OffsetDateTime;
+    use transport_sdk::{
+        rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at,
+    };
     use uuid::Uuid;
 
     use crate::framework::{
@@ -1389,8 +1391,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_client_with_identity_renewing_renews_expired_rendezvous_cert_via_direct(
-    ) -> Result<()> {
+    async fn build_client_with_identity_renewing_renews_expired_rendezvous_cert_via_direct()
+    -> Result<()> {
         let bind = "127.0.0.1:19252";
         let cluster_id = "11111111-1111-7111-8111-111111111152";
         let node_id = "00000000-0000-0000-0000-000000000952";

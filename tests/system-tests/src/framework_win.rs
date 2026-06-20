@@ -244,11 +244,7 @@ async fn start_cfapi_adapter_with_resolved_inputs(
         (Stdio::inherit(), Stdio::inherit())
     };
 
-    let child = match command
-        .stdout(stdout_stdio)
-        .stderr(stderr_stdio)
-        .spawn()
-    {
+    let child = match command.stdout(stdout_stdio).stderr(stderr_stdio).spawn() {
         Ok(child) => child,
         Err(error) => {
             unregister_cfapi_sync_root(&os_integration_bin, root_path)

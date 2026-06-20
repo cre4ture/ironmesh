@@ -183,8 +183,9 @@ impl FolderAgentStartMode {
                 ),
             },
             Err(std::env::VarError::NotPresent) => Ok(Self::BeforeCopy),
-            Err(err) => Err(err)
-                .with_context(|| "failed reading IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE"),
+            Err(err) => {
+                Err(err).with_context(|| "failed reading IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE")
+            }
         }
     }
 }
@@ -199,8 +200,10 @@ impl WorkloadConfig {
             read_env_usize(env.sample_verify_count, DEFAULT_SAMPLE_VERIFY_COUNT)?;
         let subdir_count = read_env_usize(env.subdir_count, DEFAULT_SUBDIR_COUNT)?;
         let max_dir_depth = read_env_usize(env.max_dir_depth, DEFAULT_MAX_DIR_DEPTH)?;
-        let upload_timeout =
-            Duration::from_secs(read_env_u64(env.upload_timeout_secs, DEFAULT_UPLOAD_TIMEOUT_SECS)?);
+        let upload_timeout = Duration::from_secs(read_env_u64(
+            env.upload_timeout_secs,
+            DEFAULT_UPLOAD_TIMEOUT_SECS,
+        )?);
         let replication_timeout = Duration::from_secs(read_env_u64(
             env.replication_timeout_secs,
             DEFAULT_REPLICATION_TIMEOUT_SECS,
@@ -422,14 +425,12 @@ impl InvestigationControl {
                 )
             })?;
         let continue_signal_path = PathBuf::from(
-            std::env::var(env.continue_signal_path).unwrap_or_else(|_| {
-                run_root.join("continue.signal").display().to_string()
-            }),
+            std::env::var(env.continue_signal_path)
+                .unwrap_or_else(|_| run_root.join("continue.signal").display().to_string()),
         );
         let cleanup_signal_path = PathBuf::from(
-            std::env::var(env.cleanup_signal_path).unwrap_or_else(|_| {
-                run_root.join("cleanup.signal").display().to_string()
-            }),
+            std::env::var(env.cleanup_signal_path)
+                .unwrap_or_else(|_| run_root.join("cleanup.signal").display().to_string()),
         );
 
         Ok(Self {
@@ -533,7 +534,11 @@ pub async fn run_managed_test_workload_for(kind: LocalRuntimeKind) -> Result<()>
 }
 
 pub async fn run_live_driver_from_env_for(kind: LocalRuntimeKind) -> Result<()> {
-    run_workload(kind, RuntimeMode::Live(InvestigationControl::from_env(kind)?)).await
+    run_workload(
+        kind,
+        RuntimeMode::Live(InvestigationControl::from_env(kind)?),
+    )
+    .await
 }
 
 async fn run_workload(kind: LocalRuntimeKind, mode: RuntimeMode) -> Result<()> {
@@ -677,7 +682,14 @@ async fn run_workload(kind: LocalRuntimeKind, mode: RuntimeMode) -> Result<()> {
         }
     };
 
-    cleanup_runtime(&paths, &mut node_a, &mut node_b, &mut node_c, runtime.as_mut()).await;
+    cleanup_runtime(
+        &paths,
+        &mut node_a,
+        &mut node_b,
+        &mut node_c,
+        runtime.as_mut(),
+    )
+    .await;
 
     if final_result.is_ok() {
         let _ = update_manifest(
@@ -774,7 +786,10 @@ async fn execute_workload(
     )?;
 
     if kind == LocalRuntimeKind::Cfapi
-        || matches!(folder_agent_start_mode, Some(FolderAgentStartMode::BeforeCopy))
+        || matches!(
+            folder_agent_start_mode,
+            Some(FolderAgentStartMode::BeforeCopy)
+        )
     {
         *runtime = Some(start_local_runtime(kind, paths, node_a).await?);
     }
@@ -1080,7 +1095,8 @@ fn update_manifest(
 
     fs::write(
         &live.manifest_path,
-        serde_json::to_vec_pretty(&manifest).context("failed serializing investigation manifest")?,
+        serde_json::to_vec_pretty(&manifest)
+            .context("failed serializing investigation manifest")?,
     )
     .with_context(|| format!("failed writing {}", live.manifest_path.display()))?;
 
@@ -1405,21 +1421,19 @@ async fn start_local_runtime(
                 adapter,
             })
         }
-        LocalRuntimeKind::FolderAgent => {
-            start_folder_agent_with_bootstrap_and_state_root(
-                &paths.sync_root,
-                &node_a.bootstrap_file,
-                &default_client_identity_path(&node_a.bootstrap_file),
-                &paths.runtime_state_dir,
-                DEFAULT_RUNTIME_REFRESH_INTERVAL_MS,
-                DEFAULT_RUNTIME_REFRESH_INTERVAL_MS,
-            )
-            .await
-            .map(|agent| LocalRuntimeFixture::FolderAgent {
-                state_root_dir: paths.runtime_state_dir.clone(),
-                agent,
-            })
-        }
+        LocalRuntimeKind::FolderAgent => start_folder_agent_with_bootstrap_and_state_root(
+            &paths.sync_root,
+            &node_a.bootstrap_file,
+            &default_client_identity_path(&node_a.bootstrap_file),
+            &paths.runtime_state_dir,
+            DEFAULT_RUNTIME_REFRESH_INTERVAL_MS,
+            DEFAULT_RUNTIME_REFRESH_INTERVAL_MS,
+        )
+        .await
+        .map(|agent| LocalRuntimeFixture::FolderAgent {
+            state_root_dir: paths.runtime_state_dir.clone(),
+            agent,
+        }),
     }
 }
 
@@ -1886,8 +1900,12 @@ fn stage_workload(config: &WorkloadConfig, source_dir: &Path) -> Result<Vec<File
                 staged_path.display()
             )
         })?;
-        fs::create_dir_all(staged_parent)
-            .with_context(|| format!("failed to create staged directory {}", staged_parent.display()))?;
+        fs::create_dir_all(staged_parent).with_context(|| {
+            format!(
+                "failed to create staged directory {}",
+                staged_parent.display()
+            )
+        })?;
         let size_bytes = file_size_for_index(config, index);
         let seed = file_seed_for_index(index);
         let content_hash = write_random_file(&staged_path, size_bytes, seed)?;
@@ -1927,8 +1945,9 @@ fn copy_staged_workload_into_sync_root(
         let staged_path = source_dir.join(&spec.relative_path);
         let target_path = sync_root.join(&spec.relative_path);
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create sync-root directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create sync-root directory {}", parent.display())
+            })?;
         }
 
         let copied = fs::copy(&staged_path, &target_path).with_context(|| {

@@ -1588,6 +1588,7 @@ version = "1.0.20"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
  "client-sdk",
  "desktop-client-config",
