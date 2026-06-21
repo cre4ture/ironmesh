@@ -1,8 +1,7 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
-
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+import { request as httpsRequest } from "node:https";
 
 const repoRoot = resolve(process.cwd(), "..");
 const dataDir = resolve(process.cwd(), "test-results", "server-node-runtime-data");
@@ -14,6 +13,8 @@ const binaryPath = resolve(
 );
 const publicOrigin = "https://127.0.0.1:18181";
 const runtimeAdminPassword = "playwright-runtime-password";
+const bootstrapTlsCertPath = resolve(dataDir, "managed", "bootstrap-ui", "bootstrap-cert.pem");
+const runtimePublicCaPath = resolve(dataDir, "managed", "runtime", "public", "public-ca.pem");
 let fatalBootstrapError = false;
 
 rmSync(dataDir, { recursive: true, force: true });
@@ -57,15 +58,67 @@ function delay(timeoutMs) {
   });
 }
 
-async function waitForOk(url, timeoutMs) {
+async function waitForFile(path, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      return;
+    }
+    await delay(250);
+  }
+
+  throw new Error(`timed out waiting for ${path}`);
+}
+
+async function requestText(url, { method = "GET", body, caPath } = {}) {
+  const payload = body ? JSON.stringify(body) : null;
+  const ca = caPath ? readFileSync(caPath, "utf8") : undefined;
+
+  return await new Promise((resolve, reject) => {
+    const request = httpsRequest(
+      new URL(url),
+      {
+        method,
+        ca,
+        headers: payload
+          ? {
+              "content-type": "application/json",
+              "content-length": String(Buffer.byteLength(payload))
+            }
+          : undefined
+      },
+      (response) => {
+        const chunks = [];
+
+        response.on("data", (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        response.on("end", () => {
+          resolve({
+            ok: (response.statusCode ?? 500) >= 200 && (response.statusCode ?? 500) < 300,
+            status: response.statusCode ?? 500,
+            text: Buffer.concat(chunks).toString("utf8")
+          });
+        });
+      }
+    );
+
+    request.on("error", reject);
+    if (payload) {
+      request.write(payload);
+    }
+    request.end();
+  });
+}
+
+async function waitForOk(url, timeoutMs, caPath) {
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
 
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url, {
-        cache: "no-store"
-      });
+      const response = await requestText(url, { caPath });
       if (response.ok) {
         return response;
       }
@@ -81,26 +134,26 @@ async function waitForOk(url, timeoutMs) {
 }
 
 async function bootstrapRuntime() {
-  await waitForOk(`${publicOrigin}/setup/status`, 60_000);
+  await waitForFile(bootstrapTlsCertPath, 60_000);
+  await waitForOk(`${publicOrigin}/setup/status`, 60_000, bootstrapTlsCertPath);
 
-  const response = await fetch(`${publicOrigin}/setup/start-cluster`, {
+  const response = await requestText(`${publicOrigin}/setup/start-cluster`, {
     method: "POST",
-    cache: "no-store",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
+    caPath: bootstrapTlsCertPath,
+    body: {
       admin_password: runtimeAdminPassword,
       public_origin: publicOrigin
-    })
+    }
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`failed to start runtime cluster setup: HTTP ${response.status}: ${errorText}`);
+    throw new Error(
+      `failed to start runtime cluster setup: HTTP ${response.status}: ${response.text}`
+    );
   }
 
-  await waitForOk(`${publicOrigin}/api/v1/auth/admin/session`, 60_000);
+  await waitForFile(runtimePublicCaPath, 60_000);
+  await waitForOk(`${publicOrigin}/api/v1/auth/admin/session`, 60_000, runtimePublicCaPath);
 }
 
 void bootstrapRuntime().catch((error) => {
