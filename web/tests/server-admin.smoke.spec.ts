@@ -130,6 +130,10 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Revoke credential" }).click();
   await expect(page.getByText("manual smoke revocation")).toBeVisible();
 
+  await page.getByText("Connections", { exact: true }).click();
+  await expect(page.getByRole("columnheader", { name: "Transport" })).toBeVisible();
+  await expect(page.getByText("via relay-alpha.local:9443", { exact: true })).toBeVisible();
+
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Fingerprint: internal-cert-fingerprint", { exact: true })).toBeVisible();
 
@@ -266,7 +270,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
       apiV1("/health"),
       apiV1("/storage/stats/current"),
       apiV1("/auth/bootstrap-claims/issue"),
-      apiV1("/auth/rendezvous-config")
+      apiV1("/auth/rendezvous-config"),
+      apiV1("/auth/client-connections")
     ])
   );
   expect(
@@ -817,6 +822,62 @@ async function installServerAdminMocks(
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
+    }
+
+    if (pathname === apiV1("/auth/client-connections") && method === "GET") {
+      return json(route, {
+        summary: {
+          total: 3,
+          http_requests: 1,
+          direct_transport: 1,
+          relay_transport: 1
+        },
+        entries: [
+          {
+            connection_id: "relay-relay-session-1",
+            device_id: "device-relay-1",
+            label: "Relay Client",
+            credential_fingerprint: "cred-relay-1",
+            connection_name: "client/relay",
+            transport: "relay_transport",
+            connected_at_unix: 1_900_000_220,
+            last_activity_at_unix: 1_900_000_225,
+            method: null,
+            path: null,
+            session_id: "relay-session-1",
+            rendezvous_url: "https://relay-alpha.local:9443/rendezvous"
+          },
+          {
+            connection_id: "direct-direct-session-1",
+            device_id: "device-direct-1",
+            label: "Direct Client",
+            credential_fingerprint: "cred-direct-1",
+            connection_name: "client/direct",
+            transport: "direct_transport",
+            connected_at_unix: 1_900_000_210,
+            last_activity_at_unix: 1_900_000_215,
+            method: null,
+            path: null,
+            session_id: "direct-session-1",
+            rendezvous_url: null
+          },
+          {
+            connection_id: "http-http-request-1",
+            device_id: "device-http-1",
+            label: "HTTP Client",
+            credential_fingerprint: "cred-http-1",
+            connection_name: "client/http",
+            transport: "http_request",
+            connected_at_unix: 1_900_000_200,
+            last_activity_at_unix: 1_900_000_205,
+            method: "GET",
+            path: "/api/v1/store/index",
+            session_id: null,
+            rendezvous_url: null
+          }
+        ],
+        next_cursor: null
+      });
     }
 
     if (pathname.startsWith(apiV1("/auth/versions/")) && method === "GET") {

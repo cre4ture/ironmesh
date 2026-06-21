@@ -221,9 +221,7 @@ export function ClientConnectionsPage() {
                     <TimestampCell unixTs={entry.last_activity_at_unix} nowMs={nowMs} />
                   </Table.Td>
                   <Table.Td>
-                    <Badge color={transportBadgeColor(entry.transport)} variant="light">
-                      {transportLabel(entry.transport)}
-                    </Badge>
+                    <TransportCell entry={entry} />
                   </Table.Td>
                   <Table.Td>
                     <Text size="sm" fw={600}>
@@ -286,6 +284,23 @@ function TimestampCell({
   );
 }
 
+function TransportCell({ entry }: { entry: ClientConnectionEntry }) {
+  const detail = describeTransportDetail(entry);
+
+  return (
+    <Stack gap={2}>
+      <Badge color={transportBadgeColor(entry.transport)} variant="light">
+        {transportLabel(entry.transport)}
+      </Badge>
+      {detail ? (
+        <Text size="xs" c="dimmed" ff="monospace">
+          {detail}
+        </Text>
+      ) : null}
+    </Stack>
+  );
+}
+
 function transportLabel(transport: ClientConnectionTransport): string {
   switch (transport) {
     case "http_request":
@@ -306,6 +321,16 @@ function transportBadgeColor(transport: ClientConnectionTransport): string {
     case "relay_transport":
       return "grape";
   }
+}
+
+function describeTransportDetail(entry: ClientConnectionEntry): string | null {
+  if (entry.transport !== "relay_transport") {
+    return null;
+  }
+  if (!entry.rendezvous_url) {
+    return "via unknown relay";
+  }
+  return `via ${summarizeUrl(entry.rendezvous_url)}`;
 }
 
 function describeDevice(entry: ClientConnectionEntry): string {
@@ -338,4 +363,13 @@ function describeSecondaryActivity(entry: ClientConnectionEntry): string | null 
     return `session ${entry.session_id}`;
   }
   return null;
+}
+
+function summarizeUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    return parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+  } catch {
+    return value;
+  }
 }

@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use common::DeviceId;
+use common::{ClusterId, DeviceId};
 use serde::Serialize;
 use tracing::warn;
 use transport_sdk::peer::PeerIdentity;
@@ -343,20 +343,29 @@ async fn serve_relay_tunnel_websocket(
     authenticated_peer: MaybeAuthenticatedPeer,
     mut socket: WebSocket,
 ) {
-    if let Err(err) = run_relay_tunnel_websocket(&state, &authenticated_peer, &mut socket).await {
-        if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(&err.to_string()) {
-            tracing::debug!(
-                error = %err,
-                "relay tunnel websocket closed after idle target wait"
-            );
-        } else {
-            warn!(error = %err, "relay tunnel websocket failed");
+    let initial = match read_relay_tunnel_initial_message(&mut socket).await {
+        Ok(initial) => initial,
+        Err(err) => {
+            let error = err.to_string();
+            log_relay_tunnel_websocket_error(&error, None);
+            let _ = send_relay_tunnel_control(
+                &mut socket,
+                &RelayTunnelControlMessage::Error { message: error },
+            )
+            .await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
         }
+    };
+    let log_context = RelayTunnelLogContext::from_initial(&initial);
+    if let Err(err) =
+        run_relay_tunnel_websocket(&state, &authenticated_peer, &mut socket, initial).await
+    {
+        let error = err.to_string();
+        log_relay_tunnel_websocket_error(&error, log_context.as_ref());
         let _ = send_relay_tunnel_control(
             &mut socket,
-            &RelayTunnelControlMessage::Error {
-                message: err.to_string(),
-            },
+            &RelayTunnelControlMessage::Error { message: error },
         )
         .await;
     }
@@ -367,8 +376,8 @@ async fn run_relay_tunnel_websocket(
     state: &RendezvousAppState,
     authenticated_peer: &MaybeAuthenticatedPeer,
     socket: &mut WebSocket,
+    initial: RelayTunnelControlMessage,
 ) -> anyhow::Result<()> {
-    let initial = read_relay_tunnel_initial_message(socket).await?;
     let mut endpoint = establish_relay_tunnel_endpoint(state, authenticated_peer, initial).await?;
     send_relay_tunnel_control(
         socket,
@@ -469,6 +478,116 @@ async fn run_relay_tunnel_websocket(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayTunnelLogContext {
+    Source {
+        cluster_id: ClusterId,
+        session_id: String,
+        source_peer: PeerIdentity,
+        target_peer: PeerIdentity,
+        session_kind: RelayTunnelSessionKind,
+    },
+    Target {
+        cluster_id: ClusterId,
+        target_peer: PeerIdentity,
+        session_kind: RelayTunnelSessionKind,
+    },
+}
+
+impl RelayTunnelLogContext {
+    fn from_initial(control: &RelayTunnelControlMessage) -> Option<Self> {
+        match control {
+            RelayTunnelControlMessage::ConnectSource { ticket } => Some(Self::Source {
+                cluster_id: ticket.cluster_id,
+                session_id: ticket.session_id.clone(),
+                source_peer: ticket.source.clone(),
+                target_peer: ticket.target.clone(),
+                session_kind: ticket.session_kind,
+            }),
+            RelayTunnelControlMessage::AcceptTarget { request } => Some(Self::Target {
+                cluster_id: request.cluster_id,
+                target_peer: request.target.clone(),
+                session_kind: request.session_kind,
+            }),
+            RelayTunnelControlMessage::Paired { .. }
+            | RelayTunnelControlMessage::CloseWrite
+            | RelayTunnelControlMessage::Error { .. } => None,
+        }
+    }
+}
+
+fn log_relay_tunnel_websocket_error(error: &str, context: Option<&RelayTunnelLogContext>) {
+    let is_expected_idle = transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(error);
+    match context {
+        Some(RelayTunnelLogContext::Source {
+            cluster_id,
+            session_id,
+            source_peer,
+            target_peer,
+            session_kind,
+        }) => {
+            if is_expected_idle {
+                tracing::debug!(
+                    error,
+                    websocket_role = "source",
+                    cluster_id = %cluster_id,
+                    session_id,
+                    source_peer = %source_peer,
+                    target_peer = %target_peer,
+                    session_kind = ?session_kind,
+                    "relay tunnel websocket closed after idle target wait"
+                );
+            } else {
+                warn!(
+                    error,
+                    websocket_role = "source",
+                    cluster_id = %cluster_id,
+                    session_id,
+                    source_peer = %source_peer,
+                    target_peer = %target_peer,
+                    session_kind = ?session_kind,
+                    "relay tunnel websocket failed"
+                );
+            }
+        }
+        Some(RelayTunnelLogContext::Target {
+            cluster_id,
+            target_peer,
+            session_kind,
+        }) => {
+            if is_expected_idle {
+                tracing::debug!(
+                    error,
+                    websocket_role = "target",
+                    cluster_id = %cluster_id,
+                    target_peer = %target_peer,
+                    session_kind = ?session_kind,
+                    "relay tunnel websocket closed after idle target wait"
+                );
+            } else {
+                warn!(
+                    error,
+                    websocket_role = "target",
+                    cluster_id = %cluster_id,
+                    target_peer = %target_peer,
+                    session_kind = ?session_kind,
+                    "relay tunnel websocket failed"
+                );
+            }
+        }
+        None => {
+            if is_expected_idle {
+                tracing::debug!(
+                    error,
+                    "relay tunnel websocket closed after idle target wait"
+                );
+            } else {
+                warn!(error, "relay tunnel websocket failed");
+            }
+        }
+    }
+}
+
 async fn read_relay_tunnel_initial_message(
     socket: &mut WebSocket,
 ) -> anyhow::Result<RelayTunnelControlMessage> {
@@ -543,4 +662,62 @@ async fn send_relay_tunnel_control(
         .send(Message::Text(payload.into()))
         .await
         .context("failed sending relay tunnel control message")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_tunnel_log_context_captures_source_ticket_metadata() {
+        let cluster_id = ClusterId::now_v7();
+        let source_peer = PeerIdentity::Device(DeviceId::now_v7());
+        let target_peer = PeerIdentity::Node(common::NodeId::now_v7());
+        let initial = RelayTunnelControlMessage::ConnectSource {
+            ticket: RelayTicket {
+                cluster_id,
+                session_id: "relay-session-123".to_string(),
+                source: source_peer.clone(),
+                target: target_peer.clone(),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                relay_urls: vec!["https://relay.example".to_string()],
+                issued_at_unix: 1,
+                expires_at_unix: 2,
+            },
+        };
+
+        assert_eq!(
+            RelayTunnelLogContext::from_initial(&initial),
+            Some(RelayTunnelLogContext::Source {
+                cluster_id,
+                session_id: "relay-session-123".to_string(),
+                source_peer,
+                target_peer,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            })
+        );
+    }
+
+    #[test]
+    fn relay_tunnel_log_context_captures_target_wait_metadata() {
+        let cluster_id = ClusterId::now_v7();
+        let target_peer = PeerIdentity::Node(common::NodeId::now_v7());
+        let initial = RelayTunnelControlMessage::AcceptTarget {
+            request: transport_sdk::RelayTunnelAcceptRequest {
+                cluster_id,
+                target: target_peer.clone(),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(15_000),
+            },
+        };
+
+        assert_eq!(
+            RelayTunnelLogContext::from_initial(&initial),
+            Some(RelayTunnelLogContext::Target {
+                cluster_id,
+                target_peer,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            })
+        );
+    }
 }
