@@ -372,8 +372,7 @@ export function BootstrapBundlesPage() {
               </Group>
               <Text c="dimmed">
                 Issue a compact QR claim for a new client, then keep the full bootstrap bundle available
-                as a file fallback. This uses the current admin session or the advanced token override
-                from the header drawer.
+                as a file fallback. This uses the current admin session from the header drawer.
               </Text>
               <TextInput
                 label="Device label"

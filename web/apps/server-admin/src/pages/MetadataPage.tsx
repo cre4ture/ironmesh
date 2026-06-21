@@ -429,8 +429,8 @@ export function MetadataPage() {
 
           {!canInspectDbDistribution ? (
             <Text size="sm" c="dimmed">
-              Sign in or provide an admin token override to inspect the per-table distribution
-              inside the metadata database.
+              Sign in with the local admin password to inspect the per-table distribution inside
+              the metadata database.
             </Text>
           ) : dbDistributionError ? (
             <Alert color="red" title="Failed to load metadata DB logical distribution">

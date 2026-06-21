@@ -52,7 +52,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
   await expect(page.getByText("Snapshot logical size:")).toBeVisible();
-  await expect(page.getByText("Sign in or provide an admin token override to inspect the live rendezvous registration details here.")).toBeVisible();
+  await expect(page.getByText(/live rendezvous registration details here\./i)).toBeVisible();
 
   await page.getByRole("button", { name: "Admin Access" }).click();
   await page.getByLabel("Admin password").fill("hunter2-harder");

@@ -117,7 +117,7 @@ export function DataChangesPage() {
     return (
       <Stack gap="lg">
         <Alert color="yellow" title="Admin access required">
-          Sign in or provide an admin token override to inspect node-local data changes and client
+          Sign in with the local admin password to inspect node-local data changes and client
           identity attribution.
         </Alert>
       </Stack>

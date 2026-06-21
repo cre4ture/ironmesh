@@ -117,7 +117,7 @@ export function ClientConnectionsPage() {
     return (
       <Stack gap="lg">
         <Alert color="yellow" title="Admin access required">
-          Sign in or provide an admin token override to inspect the node’s currently active client
+          Sign in with the local admin password to inspect the node’s currently active client
           requests and transport sessions.
         </Alert>
       </Stack>

@@ -477,7 +477,7 @@ export function DashboardPage() {
               </Text>
               {!canInspectRendezvous ? (
                 <Text size="sm" c="dimmed">
-                  Sign in or provide an admin token override to inspect the live rendezvous registration details here.
+                  Sign in with the local admin password to inspect the live rendezvous registration details here.
                 </Text>
               ) : null}
               <Text size="sm" c="dimmed">
@@ -724,7 +724,7 @@ export function DashboardPage() {
                 ) : null}
                 {!canRunAdminMaintenance ? (
                   <Text size="sm" c="dimmed">
-                    Sign in or provide an admin token override to run destructive maintenance actions from this page.
+                    Sign in with the local admin password to run destructive maintenance actions from this page.
                   </Text>
                 ) : (
                   <Text size="sm" c="dimmed">

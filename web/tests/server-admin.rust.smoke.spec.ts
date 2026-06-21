@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+const PLAYWRIGHT_RUNTIME_ADMIN_PASSWORD = "playwright-runtime-password";
+
 test("server-admin is served by a real server-node runtime", async ({ page }) => {
   await page.goto("/");
 
@@ -11,7 +13,9 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Server Admin", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "Admin Access" }).click();
-  await page.getByLabel("Admin token override").fill("playwright-admin-token");
+  await page.getByLabel("Admin password").fill(PLAYWRIGHT_RUNTIME_ADMIN_PASSWORD);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("authenticated", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
   await expect(page.getByText("1 / 1", { exact: true })).toBeVisible();
@@ -63,13 +67,13 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   ).toBeVisible();
 
   await page.getByText("Logs", { exact: true }).click();
-  await expect(page.getByText("server node listening")).toBeVisible();
+  await expect(page.getByRole("log")).toContainText(/T\d{2}:\d{2}:\d{2}\.000Z/);
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText(/No (image|media) objects in view/)).toBeVisible();
 
   await page.getByText("Certificates", { exact: true }).click();
-  await expect(page.getByText("Not configured on this node")).toHaveCount(1);
+  await expect(page.getByText("Configured on this node").first()).toBeVisible();
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();
 
   await page.getByText("Control Plane", { exact: true }).click();

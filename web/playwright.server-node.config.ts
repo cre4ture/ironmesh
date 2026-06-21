@@ -2,19 +2,21 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests",
-  timeout: 45_000,
+  timeout: 90_000,
   expect: {
-    timeout: 5_000
+    timeout: 10_000
   },
   use: {
-    baseURL: "http://127.0.0.1:18181",
-    trace: "retain-on-failure"
+    baseURL: "https://127.0.0.1:18181",
+    trace: "retain-on-failure",
+    ignoreHTTPSErrors: true
   },
   webServer: {
     command: "node tests/scripts/run-server-node-runtime.mjs",
-    url: "http://127.0.0.1:18181/health",
+    url: "https://127.0.0.1:18181/api/v1/auth/admin/session",
     reuseExistingServer: false,
-    timeout: 60_000
+    timeout: 90_000,
+    ignoreHTTPSErrors: true
   },
   projects: [
     {

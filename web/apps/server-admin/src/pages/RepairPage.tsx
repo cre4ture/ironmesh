@@ -260,7 +260,7 @@ export function RepairPage() {
 
       {!canInspectRepair ? (
         <Alert color="blue" title="Admin access required">
-          Sign in or provide an admin token override to inspect repair activity, clustered scrub
+          Sign in with the local admin password to inspect repair activity, clustered scrub
           history, and retained maintenance runs.
         </Alert>
       ) : null}

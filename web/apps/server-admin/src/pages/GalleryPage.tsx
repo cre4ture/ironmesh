@@ -13,9 +13,6 @@ import {
   type GalleryMediaRequests
 } from "@ironmesh/ui";
 import { useCallback } from "react";
-import { useAdminAccess } from "../lib/admin-access";
-
-const ADMIN_TOKEN_HEADER = "x-ironmesh-admin-token";
 const ADMIN_GALLERY_BASEMAP_MANIFEST_KEY =
   "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json";
 const ADMIN_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY =
@@ -58,28 +55,17 @@ const ADMIN_GALLERY_BASEMAPS: GalleryBasemapConfig[] = [
 ];
 
 export function GalleryPage() {
-  const { adminTokenOverride } = useAdminAccess();
-  const previewHeaders = adminTokenOverride.trim()
-    ? { [ADMIN_TOKEN_HEADER]: adminTokenOverride.trim() }
-    : undefined;
-
-  const loadSnapshots = useCallback(
-    () => listAdminSnapshots(adminTokenOverride),
-    [adminTokenOverride]
-  );
+  const loadSnapshots = useCallback(() => listAdminSnapshots(), []);
   const loadEntries = useCallback(
     (
       prefix: string,
       depth: number,
       snapshotId: string | null,
       options?: GalleryLoadEntriesOptions
-    ) => listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride, options),
-    [adminTokenOverride]
+    ) => listAdminStoreEntries(prefix, depth, snapshotId, undefined, options),
+    []
   );
-  const loadVersions = useCallback(
-    (key: string) => getAdminVersionGraph(key, adminTokenOverride),
-    [adminTokenOverride]
-  );
+  const loadVersions = useCallback((key: string) => getAdminVersionGraph(key), []);
   const getMediaRequests = useCallback(
     (
       entry: GalleryEntry,
@@ -87,34 +73,32 @@ export function GalleryPage() {
       versionId?: string | null
     ): GalleryMediaRequests => {
       const original = {
-        url: adminBinaryObjectUrl(entry.path, snapshotId, versionId),
-        headers: previewHeaders
+        url: adminBinaryObjectUrl(entry.path, snapshotId, versionId)
       };
 
       return {
         thumbnail: entry.media?.thumbnail?.url
           ? {
-              url: entry.media.thumbnail.url,
-              headers: previewHeaders
+              url: entry.media.thumbnail.url
             }
           : null,
         original
       };
     },
-    [previewHeaders]
+    []
   );
   const retryMediaEntry = useCallback(
     (entry: GalleryEntry, snapshotId: string | null) =>
-      retryAdminMediaCacheEntry(entry.path, adminTokenOverride, {
+      retryAdminMediaCacheEntry(entry.path, undefined, {
         snapshot: snapshotId,
         version: typeof entry.version === "string" ? entry.version : null
       }),
-    [adminTokenOverride]
+    []
   );
 
   return (
     <GallerySurface
-      intro="Browse the node-side store index through admin-authenticated snapshot, index, and media routes. The gallery stays shared with the client surface, while this wrapper carries the admin session or advanced token override when previews need authenticated fetches."
+      intro="Browse the node-side store index through admin-authenticated snapshot, index, and media routes. The gallery stays shared with the client surface and uses the current admin session for protected previews."
       previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
       allowedMediaKinds={["image", "video"]}
       basemaps={ADMIN_GALLERY_BASEMAPS}
@@ -123,7 +107,7 @@ export function GalleryPage() {
       getMediaRequests={getMediaRequests}
       loadVersions={loadVersions}
       restoreVersion={(key, versionId, targetPath) =>
-        restoreAdminStoreVersion(key, versionId, targetPath, adminTokenOverride)
+        restoreAdminStoreVersion(key, versionId, targetPath)
       }
       retryMediaEntry={retryMediaEntry}
     />

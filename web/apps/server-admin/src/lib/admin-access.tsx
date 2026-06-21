@@ -5,8 +5,8 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
-  useState,
   type ReactNode
 } from "react";
 
@@ -27,14 +27,10 @@ type AdminAccessContextValue = {
 
 const AdminAccessContext = createContext<AdminAccessContextValue | null>(null);
 
-function adminSessionQueryOptions(adminTokenOverride: string) {
-  const normalizedAdminTokenOverride = adminTokenOverride.trim();
+function adminSessionQueryOptions() {
   return {
-    queryKey: ["admin-session", normalizedAdminTokenOverride] as const,
-    queryFn: () =>
-      getAdminSessionStatus(
-        normalizedAdminTokenOverride.length > 0 ? normalizedAdminTokenOverride : undefined
-      )
+    queryKey: ["admin-session"] as const,
+    queryFn: () => getAdminSessionStatus()
   };
 }
 
@@ -53,22 +49,15 @@ async function delay(timeoutMs: number): Promise<void> {
 
 export function AdminAccessProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
-  const [adminTokenOverride, setAdminTokenOverrideState] = useState(() => {
-    if (typeof window === "undefined") {
-      return "";
-    }
+  const adminTokenOverride = "";
+  const sessionQueryOptions = useMemo(() => adminSessionQueryOptions(), []);
 
-    return window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ?? "";
-  });
-  const sessionQueryOptions = useMemo(
-    () => adminSessionQueryOptions(adminTokenOverride),
-    [adminTokenOverride]
-  );
+  const setAdminTokenOverride = useCallback((_value: string) => {
+  }, []);
 
-  const setAdminTokenOverride = useCallback((value: string) => {
-    setAdminTokenOverrideState(value);
+  useEffect(() => {
     if (typeof window !== "undefined") {
-      window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, value);
+      window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
     }
   }, []);
 
@@ -115,9 +104,7 @@ export function AdminAccessProvider({ children }: { children: ReactNode }) {
 
   const logoutMutation = useMutation({
     mutationFn: async () => {
-      await logoutAdmin(
-        adminTokenOverride.trim().length > 0 ? adminTokenOverride.trim() : undefined
-      );
+      await logoutAdmin();
       await queryClient.invalidateQueries({
         queryKey: sessionQueryOptions.queryKey,
         exact: true
