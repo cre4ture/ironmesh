@@ -11,7 +11,10 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand};
-use client_sdk::{ClientIdentityMaterial, ConnectionBootstrap, enroll_connection_input_blocking};
+use client_sdk::{
+    ClientIdentityMaterial, ConnectionBootstrap, enroll_connection_input_blocking,
+    rendezvous_client_identity_not_after_unix,
+};
 #[cfg(windows)]
 use desktop_client_config::default_desktop_status_file_path;
 use desktop_client_config::{
@@ -252,6 +255,8 @@ impl UpsertClientIdentityRequest {
             device_label: existing.and_then(|identity| identity.device_label.clone()),
             issued_at_unix: existing.and_then(|identity| identity.issued_at_unix),
             expires_at_unix: existing.and_then(|identity| identity.expires_at_unix),
+            rendezvous_client_identity_expires_at_unix: existing
+                .and_then(|identity| identity.rendezvous_client_identity_expires_at_unix),
             last_enrolled_at_unix_ms: existing
                 .and_then(|identity| identity.last_enrolled_at_unix_ms),
         };
@@ -1716,7 +1721,8 @@ fn spawn_background_child_reaper(mut child: Child, process_label: String) {
 }
 
 fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
-    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
+    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
+    refresh_store_client_identity_metadata(&mut store);
     let last_launch_report = load_last_launch_report(&state.launch_report_path)?;
     let service_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
     Ok(ConfigResponse {
@@ -1735,6 +1741,12 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
         service_statuses,
         last_launch_report,
     })
+}
+
+fn refresh_store_client_identity_metadata(store: &mut ManagedInstanceStore) {
+    for identity in &mut store.client_identities {
+        refresh_client_identity_metadata(identity);
+    }
 }
 
 fn normalize_service_kind(kind: &str) -> Result<&'static str, ApiError> {
@@ -2279,6 +2291,8 @@ fn enroll_client_identity_blocking(
 }
 
 fn refresh_client_identity_metadata(identity: &mut ClientIdentityConfig) {
+    identity.rendezvous_client_identity_expires_at_unix = None;
+
     let Ok(raw) = std::fs::read_to_string(&identity.client_identity_file) else {
         return;
     };
@@ -2292,6 +2306,9 @@ fn refresh_client_identity_metadata(identity: &mut ClientIdentityConfig) {
     identity.issued_at_unix = json_u64_field(&value, "issued_at_unix").or(identity.issued_at_unix);
     identity.expires_at_unix =
         json_u64_field(&value, "expires_at_unix").or(identity.expires_at_unix);
+    identity.rendezvous_client_identity_expires_at_unix =
+        json_string_field(&value, "rendezvous_client_identity_pem")
+            .and_then(|pem| rendezvous_client_identity_not_after_unix(pem.as_bytes()).ok());
 }
 
 fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, ApiError> {
@@ -3836,6 +3853,18 @@ function formatFullVersion(version, revision) {
   return version || revision || 'unknown';
 }
 
+function formatUnixTimestamp(unix) {
+  const value = Number(unix);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '';
+  }
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return `unix ${value}`;
+  }
+  return date.toLocaleString();
+}
+
 function renderIdentityOptions(selectId, selectedId) {
   const target = document.getElementById(selectId);
   const options = ['<option value="">Manual or no managed identity</option>'];
@@ -3890,6 +3919,7 @@ function renderClientIdentityCard(identity) {
   const details = [
     ['Bootstrap File', identity.bootstrap_file],
     ['Cluster ID', identity.cluster_id || ''],
+    ['Rendezvous Cert Expires', formatUnixTimestamp(identity.rendezvous_client_identity_expires_at_unix)],
   ];
   return `
     <article class="instance-card">
@@ -4476,8 +4506,105 @@ mod tests {
             device_label: None,
             issued_at_unix: None,
             expires_at_unix: None,
+            rendezvous_client_identity_expires_at_unix: None,
             last_enrolled_at_unix_ms: None,
         }
+    }
+
+    const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX: u64 = 1_776_690_574;
+    const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIB3DCCAYKgAwIBAgITK3r0r5jwkdN+susWXewPKMOgPDAKBggqhkjOPQQDAjBA\n",
+        "MT4wPAYDVQQDDDVpcm9ubWVzaC1jbHVzdGVyLTAxOWQwMmViLWFiMzktNzIyMC05\n",
+        "MTFhLWMwZWFmY2IzODI0OTAeFw0yNjAzMjExMzA5MzRaFw0yNjA0MjAxMzA5MzRa\n",
+        "MD8xPTA7BgNVBAMMNGlyb25tZXNoLWRldmljZS0wMTlkMTA4My1lYTIzLTdiZjEt\n",
+        "YjVjYi0xZDVmY2ViNTBlOGEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASeG/Cl\n",
+        "E3s04e07hBjVXH8/IMPXIiGewwOLPXEcJM4pU0ELoDcfpgZ0evvEiOKFC+R19CI3\n",
+        "/dbbU02U0VnXMMXxo1wwWjBDBgNVHREEPDA6hjh1cm46aXJvbm1lc2g6ZGV2aWNl\n",
+        "OjAxOWQxMDgzLWVhMjMtN2JmMS1iNWNiLTFkNWZjZWI1MGU4YTATBgNVHSUEDDAK\n",
+        "BggrBgEFBQcDAjAKBggqhkjOPQQDAgNIADBFAiBPOa5XZSZLs8CqhQO9PscDS2Il\n",
+        "jkjn2HXRB0g2pB2aeAIhALe+yYYMAqULo8WmhjcudAgQm/1vYSjowEWtUcMCY2J3\n",
+        "-----END CERTIFICATE-----\n",
+        "-----BEGIN PRIVATE KEY-----\n",
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgaxQmF3EgQxM8/nYg\n",
+        "C4fi+hVjqma6xwFK4pwamjmotA+hRANCAASeG/ClE3s04e07hBjVXH8/IMPXIiGe\n",
+        "wwOLPXEcJM4pU0ELoDcfpgZ0evvEiOKFC+R19CI3/dbbU02U0VnXMMXx\n",
+        "-----END PRIVATE KEY-----\n"
+    );
+
+    #[test]
+    fn refresh_client_identity_metadata_reads_rendezvous_cert_expiry() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ironmesh-config-app-rendezvous-expiry-{}-{}",
+            std::process::id(),
+            unix_ts_ms()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let identity_path = temp_dir.join("identity.json");
+        std::fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cluster_id": "11111111-1111-7111-8111-111111111111",
+                "device_id": "22222222-2222-7222-8222-222222222222",
+                "label": "Managed Device",
+                "issued_at_unix": 10,
+                "expires_at_unix": 20,
+                "rendezvous_client_identity_pem": KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM,
+            }))
+            .expect("identity json should serialize"),
+        )
+        .expect("identity file should be written");
+
+        let mut identity = sample_identity(
+            "identity-a",
+            identity_path
+                .to_str()
+                .expect("identity path should be utf-8"),
+        );
+        refresh_client_identity_metadata(&mut identity);
+
+        assert_eq!(
+            identity.rendezvous_client_identity_expires_at_unix,
+            Some(KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX)
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn refresh_client_identity_metadata_clears_rendezvous_cert_expiry_without_pem() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ironmesh-config-app-rendezvous-expiry-clear-{}-{}",
+            std::process::id(),
+            unix_ts_ms()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let identity_path = temp_dir.join("identity.json");
+        std::fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cluster_id": "11111111-1111-7111-8111-111111111111",
+                "device_id": "22222222-2222-7222-8222-222222222222",
+                "label": "Managed Device",
+                "issued_at_unix": 10,
+                "expires_at_unix": 20,
+            }))
+            .expect("identity json should serialize"),
+        )
+        .expect("identity file should be written");
+
+        let mut identity = sample_identity(
+            "identity-a",
+            identity_path
+                .to_str()
+                .expect("identity path should be utf-8"),
+        );
+        identity.rendezvous_client_identity_expires_at_unix = Some(99);
+        refresh_client_identity_metadata(&mut identity);
+
+        assert_eq!(identity.rendezvous_client_identity_expires_at_unix, None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     fn sample_client_cli_instance(

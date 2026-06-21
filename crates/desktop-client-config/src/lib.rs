@@ -270,6 +270,8 @@ pub struct ClientIdentityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendezvous_client_identity_expires_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_enrolled_at_unix_ms: Option<u64>,
 }
 

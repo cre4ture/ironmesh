@@ -53,6 +53,7 @@ pub use rendezvous::{
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,
     rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at,
+    rendezvous_client_identity_not_after_unix,
 };
 pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayTunnelBroker,

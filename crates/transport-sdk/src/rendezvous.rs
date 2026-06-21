@@ -695,7 +695,7 @@ fn rendezvous_client_identity_expiry_diagnostic_at(
     ))
 }
 
-fn rendezvous_client_identity_not_after_unix(client_identity_pem: &[u8]) -> Result<u64> {
+pub fn rendezvous_client_identity_not_after_unix(client_identity_pem: &[u8]) -> Result<u64> {
     let mut cert_reader = Cursor::new(client_identity_pem);
     let certificate = CertificateDer::pem_reader_iter(&mut cert_reader)
         .next()

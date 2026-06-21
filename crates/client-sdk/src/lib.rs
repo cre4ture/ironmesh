@@ -52,4 +52,5 @@ pub use transport_sdk::{
     ClientBootstrapClaimRedeemResponse, ClientIdentityMaterial, RelayMode, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RendezvousRuntimeState, build_signed_request_headers,
+    rendezvous_client_identity_not_after_unix,
 };
