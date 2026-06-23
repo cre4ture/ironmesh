@@ -5,6 +5,7 @@ import type {
   ClientRendezvousView,
   ClientUiPingResponse,
   JsonObject,
+  LogsResponse,
   SnapshotSummary,
   StoreGetResponse,
   StoreListRequestOptions,
@@ -52,6 +53,14 @@ export async function getClientHealth(): Promise<JsonObject> {
 
 export async function getClientClusterStatus(): Promise<JsonObject> {
   return fetchJson<JsonObject>(apiV1("/cluster/status"));
+}
+
+export async function getClientRecentLogs(limit = 200): Promise<LogsResponse> {
+  const resolvedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(1000, Math.trunc(limit))) : 200;
+  return fetchJson<LogsResponse>(`/logs?limit=${resolvedLimit}`, {
+    credentials: "same-origin",
+    cache: "no-store"
+  });
 }
 
 export async function getClientRendezvous(): Promise<ClientRendezvousView> {

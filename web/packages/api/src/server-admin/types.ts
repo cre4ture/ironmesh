@@ -1,4 +1,5 @@
 import type { VersionGraphResponse } from "../client-ui/types";
+import type { LogsResponse, ServerLogEntry } from "../shared/logs";
 import type {
   StoreIndexEntry,
   StoreIndexMediaSummary,
@@ -401,15 +402,6 @@ export type DataScrubTriggerResponse = {
   node_results: DataScrubTriggerNodeResult[];
 };
 
-export type ServerLogEntry = {
-  captured_at_unix: number;
-  line: string;
-};
-
-export type LogsResponse = {
-  entries: ServerLogEntry[];
-};
-
 export type HostDependencyStatus = "ready" | "missing" | "builtin";
 
 export type HostDependencyCheck = {
@@ -428,6 +420,8 @@ export type HostDependencyReport = {
   generated_at_unix: number;
   checks: HostDependencyCheck[];
 };
+
+export type { LogsResponse, ServerLogEntry };
 
 export type ServerHealthResponse = {
   node_id?: string;
