@@ -46,6 +46,8 @@ use tower::{Service, ServiceExt};
 use uuid::Uuid;
 use x509_parser::prelude::FromDer;
 
+const TEST_ADMIN_TOKEN: &str = "system-test-admin";
+
 #[derive(Clone, Copy)]
 enum MainTestBackend {
     Sqlite,
