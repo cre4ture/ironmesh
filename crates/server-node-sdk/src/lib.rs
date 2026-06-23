@@ -191,12 +191,11 @@ use storage::{
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions,
-    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
-    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
-    media_cache_retry_due, metadata_db_logical_table_count,
-    promote_cached_media_metadata_to_incomplete,
+    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
+    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
+    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
+    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
 };
 
 tokio::task_local! {
@@ -18142,8 +18141,8 @@ fn spawn_metadata_db_logical_distribution_refresh(state: ServerState) {
             store.metadata_db_distribution_loader()
         };
         let progress_runtime = state.storage.metadata_db_distribution_runtime.clone();
-        let progress_callback: MetadataDbLogicalProgressCallback = Arc::new(
-            move |progress: MetadataDbLogicalProgress| {
+        let progress_callback: MetadataDbLogicalProgressCallback =
+            Arc::new(move |progress: MetadataDbLogicalProgress| {
                 if let Ok(mut runtime) = progress_runtime.lock() {
                     runtime.progress = Some(MetadataDbLogicalDistributionProgressView {
                         completed_tables: progress.completed_tables,
@@ -18151,8 +18150,7 @@ fn spawn_metadata_db_logical_distribution_refresh(state: ServerState) {
                         current_table: progress.current_table,
                     });
                 }
-            },
-        );
+            });
         let result = distribution_loader
             .load_with_progress(Some(progress_callback))
             .await;
@@ -18204,8 +18202,8 @@ async fn metadata_db_logical_distribution_status(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let action = "auth/storage/stats/metadata-db/logical/status";
-    if let Err(status) = authorize_admin_request(&state, &headers, action, true, true, json!({}))
-        .await
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, action, true, true, json!({})).await
     {
         return status.into_response();
     }
@@ -18263,7 +18261,11 @@ async fn start_metadata_db_logical_distribution(
         true,
         true,
         true,
-        if started { "started" } else { "already_running" },
+        if started {
+            "started"
+        } else {
+            "already_running"
+        },
         json!({
             "started": started,
             "backend": status.backend,

@@ -1885,6 +1885,15 @@ impl PersistentStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn load_metadata_db_logical_distribution(
+        &self,
+    ) -> Result<MetadataDbLogicalDistribution> {
+        self.metadata_db_distribution_loader()
+            .load_with_progress(None)
+            .await
+    }
+
     pub(crate) fn data_scrubber(&self) -> DataScrubber {
         let scrubber = DataScrubber::new(
             self.current_state.clone(),
