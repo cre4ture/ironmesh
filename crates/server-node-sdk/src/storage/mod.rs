@@ -741,6 +741,16 @@ pub struct MetadataDbLogicalDistribution {
     pub tables: Vec<MetadataDbTableLogicalBreakdown>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataDbLogicalProgress {
+    pub total_tables: usize,
+    pub completed_tables: usize,
+    pub current_table: Option<String>,
+}
+
+pub(crate) type MetadataDbLogicalProgressCallback =
+    Arc<dyn Fn(MetadataDbLogicalProgress) + Send + Sync>;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MetadataDbLogicalTableSpec {
     pub(super) table: &'static str,
@@ -846,6 +856,10 @@ pub(super) fn metadata_db_logical_table_specs() -> &'static [MetadataDbLogicalTa
     METADATA_DB_LOGICAL_TABLE_SPECS
 }
 
+pub(crate) fn metadata_db_logical_table_count() -> usize {
+    METADATA_DB_LOGICAL_TABLE_SPECS.len()
+}
+
 pub(super) fn metadata_db_logical_summary_query(spec: MetadataDbLogicalTableSpec) -> String {
     let tracked_value_expression = if spec.tracked_columns.is_empty() {
         "0".to_string()
@@ -896,6 +910,12 @@ pub(crate) struct StorageStatsCollector {
     media_thumbnails_dir: PathBuf,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MetadataDbDistributionLoader {
+    metadata_backend_kind: MetadataBackendKind,
+    metadata_store: Arc<dyn MetadataStore>,
 }
 
 #[derive(Clone)]
@@ -1022,6 +1042,7 @@ trait MetadataStore: Send + Sync {
     ) -> Result<Vec<StorageStatsSample>>;
     async fn load_metadata_db_logical_breakdown(
         &self,
+        progress: Option<MetadataDbLogicalProgressCallback>,
     ) -> Result<Vec<MetadataDbTableLogicalBreakdown>>;
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()>;
     async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()>;
@@ -1855,6 +1876,13 @@ impl PersistentStore {
             self.metadata_store.clone(),
             self.storage_stats_lock.clone(),
         )
+    }
+
+    pub(crate) fn metadata_db_distribution_loader(&self) -> MetadataDbDistributionLoader {
+        MetadataDbDistributionLoader {
+            metadata_backend_kind: self.metadata_backend_kind,
+            metadata_store: self.metadata_store.clone(),
+        }
     }
 
     pub(crate) fn data_scrubber(&self) -> DataScrubber {
@@ -4944,30 +4972,6 @@ impl PersistentStore {
             .await
     }
 
-    pub async fn load_metadata_db_logical_distribution(
-        &self,
-    ) -> Result<MetadataDbLogicalDistribution> {
-        let mut tables = self
-            .metadata_store
-            .load_metadata_db_logical_breakdown()
-            .await?;
-        tables.sort_by(|left, right| {
-            right
-                .tracked_value_bytes
-                .cmp(&left.tracked_value_bytes)
-                .then_with(|| right.row_count.cmp(&left.row_count))
-                .then_with(|| left.table.cmp(&right.table))
-        });
-
-        Ok(MetadataDbLogicalDistribution {
-            backend: self.metadata_backend_kind,
-            generated_at_unix: unix_ts(),
-            total_row_count: tables.iter().map(|table| table.row_count).sum(),
-            total_tracked_value_bytes: tables.iter().map(|table| table.tracked_value_bytes).sum(),
-            tables,
-        })
-    }
-
     #[cfg(test)]
     pub async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
         self.storage_stats_collector()
@@ -6472,6 +6476,33 @@ impl PersistentStore {
             bail!("archive file not found: {}", path.display());
         }
         Ok(path)
+    }
+}
+
+impl MetadataDbDistributionLoader {
+    pub(crate) async fn load_with_progress(
+        &self,
+        progress: Option<MetadataDbLogicalProgressCallback>,
+    ) -> Result<MetadataDbLogicalDistribution> {
+        let mut tables = self
+            .metadata_store
+            .load_metadata_db_logical_breakdown(progress)
+            .await?;
+        tables.sort_by(|left, right| {
+            right
+                .tracked_value_bytes
+                .cmp(&left.tracked_value_bytes)
+                .then_with(|| right.row_count.cmp(&left.row_count))
+                .then_with(|| left.table.cmp(&right.table))
+        });
+
+        Ok(MetadataDbLogicalDistribution {
+            backend: self.metadata_backend_kind,
+            generated_at_unix: unix_ts(),
+            total_row_count: tables.iter().map(|table| table.row_count).sum(),
+            total_tracked_value_bytes: tables.iter().map(|table| table.tracked_value_bytes).sum(),
+            tables,
+        })
     }
 }
 

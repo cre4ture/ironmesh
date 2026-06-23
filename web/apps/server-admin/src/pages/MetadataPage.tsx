@@ -1,9 +1,11 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  getMetadataDbLogicalDistribution,
+  getMetadataDbLogicalDistributionStatus,
   getStorageStatsCurrent,
   getStorageStatsHistory,
+  startMetadataDbLogicalDistribution,
   type MetadataDbLogicalDistribution,
+  type MetadataDbLogicalDistributionStatusResponse,
   type StorageStatsSample
 } from "@ironmesh/api";
 import {
@@ -132,11 +134,38 @@ export function MetadataPage() {
     queryKey: ["metadata-page", "storage-stats-history", historyRange],
     queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(historyRange))
   });
-  const dbDistributionQuery = useQuery({
-    queryKey: ["metadata-page", "metadata-db-logical-distribution", normalizedAdminTokenOverride],
+  const dbDistributionStatusQuery = useQuery({
+    queryKey: [
+      "metadata-page",
+      "metadata-db-logical-distribution-status",
+      normalizedAdminTokenOverride
+    ],
     queryFn: () =>
-      getMetadataDbLogicalDistribution(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectDbDistribution
+      getMetadataDbLogicalDistributionStatus(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectDbDistribution,
+    refetchInterval: (query) =>
+      query.state.data?.state === "running" ? 1_000 : false
+  });
+  const startDbDistributionMutation = useMutation({
+    mutationFn: () => startMetadataDbLogicalDistribution(normalizedAdminTokenOverride || undefined),
+    onSuccess: async (result) => {
+      queryClient.setQueryData(
+        [
+          "metadata-page",
+          "metadata-db-logical-distribution-status",
+          normalizedAdminTokenOverride
+        ],
+        result.status
+      );
+      await queryClient.refetchQueries({
+        queryKey: [
+          "metadata-page",
+          "metadata-db-logical-distribution-status",
+          normalizedAdminTokenOverride
+        ],
+        exact: true
+      });
+    }
   });
 
   const refresh = useCallback(async () => {
@@ -144,7 +173,11 @@ export function MetadataPage() {
       ["metadata-page", "storage-stats-current"],
       ["metadata-page", "storage-stats-history", historyRange],
       ...(canInspectDbDistribution
-        ? [["metadata-page", "metadata-db-logical-distribution", normalizedAdminTokenOverride]]
+        ? [[
+            "metadata-page",
+            "metadata-db-logical-distribution-status",
+            normalizedAdminTokenOverride
+          ]]
         : [])
     ];
 
@@ -208,7 +241,12 @@ export function MetadataPage() {
     metadataTotalBytes,
     managedLocalBytes
   );
-  const dbDistribution = canInspectDbDistribution ? dbDistributionQuery.data ?? null : null;
+  const dbDistributionStatus = canInspectDbDistribution
+    ? dbDistributionStatusQuery.data ?? null
+    : null;
+  const dbDistribution = dbDistributionStatus?.distribution ?? null;
+  const dbDistributionProgress = dbDistributionStatus?.progress ?? null;
+  const dbDistributionRunning = dbDistributionStatus?.state === "running";
   const dbDistributionRows = useMemo(
     () => buildMetadataDbTableDisplayRows(dbDistribution),
     [dbDistribution]
@@ -230,10 +268,13 @@ export function MetadataPage() {
   const loading =
     currentQuery.isFetching ||
     historyQuery.isFetching ||
-    (canInspectDbDistribution && dbDistributionQuery.isFetching);
+    startDbDistributionMutation.isPending;
   const error = firstErrorMessage([currentQuery.error, historyQuery.error]);
   const dbDistributionError = canInspectDbDistribution
-    ? firstErrorMessage([dbDistributionQuery.error])
+    ? firstErrorMessage([
+        startDbDistributionMutation.error,
+        dbDistributionStatusQuery.error
+      ])
     : null;
 
   return (
@@ -414,17 +455,43 @@ export function MetadataPage() {
                 it excludes WAL growth, free pages, B-tree overhead, index pages, and most integer
                 storage.
               </Text>
+              <Text size="sm" c="dimmed" maw={800}>
+                This scan now runs only when requested because it can be expensive on large
+                metadata databases. Once completed, the latest result stays cached in memory until
+                the next explicit refresh or a server restart.
+              </Text>
             </Stack>
-            {dbDistribution ? (
-              <Stack gap="xs" align="flex-end">
-                <Badge variant="light">
-                  backend {dbDistribution.backend}
-                </Badge>
-                <Badge variant="light">
-                  generated {formatUnixTs(dbDistribution.generated_at_unix)}
-                </Badge>
-              </Stack>
-            ) : null}
+            <Stack gap="xs" align="flex-end">
+              {canInspectDbDistribution ? (
+                <Button
+                  variant="light"
+                  onClick={() => void startDbDistributionMutation.mutateAsync()}
+                  loading={startDbDistributionMutation.isPending}
+                  disabled={dbDistributionRunning}
+                >
+                  {dbDistributionRunning
+                    ? "Analysis running"
+                    : dbDistribution
+                      ? "Refresh analysis"
+                      : "Analyze metadata DB"}
+                </Button>
+              ) : null}
+              {dbDistributionStatus ? (
+                <Group gap="xs">
+                  <Badge variant="light" color={dbDistributionRunning ? "blue" : "gray"}>
+                    {dbDistributionRunning ? "running" : "idle"}
+                  </Badge>
+                  <Badge variant="light">
+                    backend {dbDistributionStatus.backend}
+                  </Badge>
+                  {dbDistribution ? (
+                    <Badge variant="light">
+                      generated {formatUnixTs(dbDistribution.generated_at_unix)}
+                    </Badge>
+                  ) : null}
+                </Group>
+              ) : null}
+            </Stack>
           </Group>
 
           {!canInspectDbDistribution ? (
@@ -436,7 +503,62 @@ export function MetadataPage() {
             <Alert color="red" title="Failed to load metadata DB logical distribution">
               {dbDistributionError}
             </Alert>
-          ) : dbDistribution ? (
+          ) : null}
+
+          {canInspectDbDistribution &&
+          dbDistributionRunning &&
+          dbDistributionProgress &&
+          dbDistributionProgress.total_tables > 0 ? (
+            <Alert color="blue" variant="light" title="Logical distribution analysis in progress">
+              <Stack gap="xs">
+                <Text size="sm">
+                  Scanned {formatCount(dbDistributionProgress.completed_tables)} of{" "}
+                  {formatCount(dbDistributionProgress.total_tables)} tracked tables
+                  {dbDistributionProgress.current_table
+                    ? `. Currently reading ${dbDistributionProgress.current_table}.`
+                    : "."}
+                </Text>
+                <Progress
+                  value={metadataDbDistributionProgressPercent(dbDistributionProgress)}
+                  size="md"
+                  radius="xl"
+                  animated
+                />
+                {dbDistributionStatus?.started_at_unix ? (
+                  <Text size="xs" c="dimmed">
+                    Started {formatUnixTs(dbDistributionStatus.started_at_unix)}.
+                  </Text>
+                ) : null}
+              </Stack>
+            </Alert>
+          ) : null}
+
+          {canInspectDbDistribution &&
+          !dbDistributionRunning &&
+          dbDistributionStatus?.last_error ? (
+            <Alert color="yellow" variant="light" title="Latest logical distribution run failed">
+              {dbDistributionStatus.last_error}
+            </Alert>
+          ) : null}
+
+          {canInspectDbDistribution && dbDistributionStatusQuery.isLoading && !dbDistributionStatus ? (
+            <Text size="sm" c="dimmed">
+              Loading metadata DB logical-distribution status…
+            </Text>
+          ) : null}
+
+          {canInspectDbDistribution &&
+          !dbDistribution &&
+          !dbDistributionRunning &&
+          !dbDistributionError &&
+          !dbDistributionStatusQuery.isLoading ? (
+            <Text size="sm" c="dimmed">
+              No logical-distribution snapshot has been generated yet. Use{" "}
+              <Code>Analyze metadata DB</Code> to run the scan on demand.
+            </Text>
+          ) : null}
+
+          {canInspectDbDistribution && dbDistribution ? (
             <>
               <Grid>
                 <Grid.Col span={{ base: 12, md: 6, xl: 3 }}>
@@ -533,11 +655,7 @@ export function MetadataPage() {
                 </Table>
               </ScrollArea>
             </>
-          ) : (
-            <Text size="sm" c="dimmed">
-              Loading metadata DB logical distribution…
-            </Text>
-          )}
+          ) : null}
         </Stack>
       </Card>
 
@@ -929,6 +1047,19 @@ function buildMetadataDbTableDisplayRows(
         : null,
     trackedColumns: table.tracked_columns
   }));
+}
+
+function metadataDbDistributionProgressPercent(
+  progress: MetadataDbLogicalDistributionStatusResponse["progress"]
+): number {
+  if (!progress || progress.total_tables <= 0) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    Math.min(100, Math.round((progress.completed_tables / progress.total_tables) * 100))
+  );
 }
 
 function describeMetadataDbTable(table: string): string {

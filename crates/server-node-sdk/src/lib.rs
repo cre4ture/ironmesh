@@ -189,11 +189,13 @@ use storage::{
     DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
     DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
-    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
-    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
-    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
-    ReplicationExportBundle, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
-    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
+    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
+    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions,
+    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
+    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
+    media_cache_retry_due, metadata_db_logical_table_count,
     promote_cached_media_metadata_to_incomplete,
 };
 
@@ -230,6 +232,7 @@ struct ServerStorageRuntime {
     upload_sessions_persist_notify: Arc<Notify>,
     storage_stats_history_retention_secs: u64,
     storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
+    metadata_db_distribution_runtime: Arc<StdMutex<MetadataDbLogicalDistributionRuntime>>,
     namespace_change_sequence: Arc<AtomicU64>,
     namespace_change_tx: watch::Sender<u64>,
     map_perf_logging_enabled: bool,
@@ -2726,6 +2729,61 @@ struct StorageStatsRuntime {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MetadataDbLogicalDistributionActivityState {
+    Idle,
+    Running,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MetadataDbLogicalDistributionProgressView {
+    completed_tables: usize,
+    total_tables: usize,
+    current_table: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataDbLogicalDistributionRuntime {
+    backend: MetadataBackendKind,
+    running: bool,
+    started_at_unix: Option<u64>,
+    finished_at_unix: Option<u64>,
+    last_error: Option<String>,
+    progress: Option<MetadataDbLogicalDistributionProgressView>,
+    distribution: Option<MetadataDbLogicalDistribution>,
+}
+
+impl MetadataDbLogicalDistributionRuntime {
+    fn new(backend: MetadataBackendKind) -> Self {
+        Self {
+            backend,
+            running: false,
+            started_at_unix: None,
+            finished_at_unix: None,
+            last_error: None,
+            progress: None,
+            distribution: None,
+        }
+    }
+
+    fn status_response(&self) -> MetadataDbLogicalDistributionStatusResponse {
+        MetadataDbLogicalDistributionStatusResponse {
+            state: if self.running {
+                MetadataDbLogicalDistributionActivityState::Running
+            } else {
+                MetadataDbLogicalDistributionActivityState::Idle
+            },
+            backend: self.backend,
+            started_at_unix: self.started_at_unix,
+            finished_at_unix: self.finished_at_unix,
+            last_error: self.last_error.clone(),
+            progress: self.progress.clone(),
+            distribution: self.distribution.clone(),
+        }
+    }
+}
+
 impl MetadataCommitMode {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
@@ -5086,6 +5144,9 @@ async fn run_inner(
             upload_sessions_persist_notify: Arc::new(Notify::new()),
             storage_stats_history_retention_secs,
             storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
+            metadata_db_distribution_runtime: Arc::new(StdMutex::new(
+                MetadataDbLogicalDistributionRuntime::new(config.metadata_backend()),
+            )),
             namespace_change_sequence: Arc::new(AtomicU64::new(0)),
             namespace_change_tx: watch::channel(0).0,
             map_perf_logging_enabled,
@@ -5375,7 +5436,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/data-changes", get(list_data_change_events))
         .route(
             "/auth/storage/stats/metadata-db/logical",
-            get(metadata_db_logical_distribution),
+            get(metadata_db_logical_distribution_status)
+                .post(start_metadata_db_logical_distribution),
         )
         .route("/auth/versions/{key}", get(list_versions_admin))
         .route(
@@ -13256,6 +13318,23 @@ struct StorageStatsCurrentResponse {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct MetadataDbLogicalDistributionStatusResponse {
+    state: MetadataDbLogicalDistributionActivityState,
+    backend: MetadataBackendKind,
+    started_at_unix: Option<u64>,
+    finished_at_unix: Option<u64>,
+    last_error: Option<String>,
+    progress: Option<MetadataDbLogicalDistributionProgressView>,
+    distribution: Option<MetadataDbLogicalDistribution>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetadataDbLogicalDistributionTriggerResponse {
+    started: bool,
+    status: MetadataDbLogicalDistributionStatusResponse,
+}
+
 #[derive(Debug, Deserialize)]
 struct TombstoneRestoreQuery {
     object_id: String,
@@ -18040,48 +18119,141 @@ async fn storage_stats_history(
     (StatusCode::OK, Json(samples)).into_response()
 }
 
-async fn metadata_db_logical_distribution(
+fn metadata_db_logical_distribution_status_response(
+    state: &ServerState,
+) -> std::result::Result<MetadataDbLogicalDistributionStatusResponse, StatusCode> {
+    state
+        .storage
+        .metadata_db_distribution_runtime
+        .lock()
+        .map(|runtime| runtime.status_response())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn spawn_metadata_db_logical_distribution_refresh(state: ServerState) {
+    tokio::spawn(async move {
+        let started_at = Instant::now();
+        let distribution_loader = {
+            let store = read_store(
+                &state,
+                "storage_stats.load_metadata_db_logical_distribution",
+            )
+            .await;
+            store.metadata_db_distribution_loader()
+        };
+        let progress_runtime = state.storage.metadata_db_distribution_runtime.clone();
+        let progress_callback: MetadataDbLogicalProgressCallback = Arc::new(
+            move |progress: MetadataDbLogicalProgress| {
+                if let Ok(mut runtime) = progress_runtime.lock() {
+                    runtime.progress = Some(MetadataDbLogicalDistributionProgressView {
+                        completed_tables: progress.completed_tables,
+                        total_tables: progress.total_tables,
+                        current_table: progress.current_table,
+                    });
+                }
+            },
+        );
+        let result = distribution_loader
+            .load_with_progress(Some(progress_callback))
+            .await;
+        let finished_at_unix = unix_ts();
+        let duration_ms = started_at.elapsed().as_millis();
+
+        match result {
+            Ok(distribution) => {
+                tracing::info!(
+                    backend = ?distribution.backend,
+                    tables = distribution.tables.len(),
+                    total_row_count = distribution.total_row_count,
+                    total_tracked_value_bytes = distribution.total_tracked_value_bytes,
+                    duration_ms,
+                    "completed metadata db logical distribution analysis"
+                );
+                if let Ok(mut runtime) = state.storage.metadata_db_distribution_runtime.lock() {
+                    runtime.running = false;
+                    runtime.finished_at_unix = Some(finished_at_unix);
+                    runtime.last_error = None;
+                    runtime.progress = None;
+                    runtime.distribution = Some(distribution);
+                } else {
+                    tracing::error!(
+                        duration_ms,
+                        "failed to persist metadata db logical distribution result because the runtime lock is poisoned"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    duration_ms,
+                    "failed loading metadata db logical distribution in background"
+                );
+                if let Ok(mut runtime) = state.storage.metadata_db_distribution_runtime.lock() {
+                    runtime.running = false;
+                    runtime.finished_at_unix = Some(finished_at_unix);
+                    runtime.last_error = Some(err.to_string());
+                    runtime.progress = None;
+                }
+            }
+        }
+    });
+}
+
+async fn metadata_db_logical_distribution_status(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let action = "auth/storage/stats/metadata-db/logical";
+    let action = "auth/storage/stats/metadata-db/logical/status";
+    if let Err(status) = authorize_admin_request(&state, &headers, action, true, true, json!({}))
+        .await
+    {
+        return status.into_response();
+    }
+
+    match metadata_db_logical_distribution_status_response(&state) {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn start_metadata_db_logical_distribution(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/storage/stats/metadata-db/logical/run";
     let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
     {
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
 
-    let distribution = {
-        let store = read_store(
-            &state,
-            "storage_stats.load_metadata_db_logical_distribution",
-        )
-        .await;
-        match store.load_metadata_db_logical_distribution().await {
-            Ok(distribution) => distribution,
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    "failed loading metadata db logical distribution"
-                );
-                append_admin_audit(
-                    &state,
-                    action,
-                    &authz,
-                    true,
-                    true,
-                    true,
-                    "error",
-                    json!({ "error": err.to_string() }),
-                )
-                .await;
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": err.to_string() })),
-                )
-                    .into_response();
+    let started = match state.storage.metadata_db_distribution_runtime.lock() {
+        Ok(mut runtime) => {
+            if runtime.running {
+                false
+            } else {
+                runtime.running = true;
+                runtime.started_at_unix = Some(unix_ts());
+                runtime.finished_at_unix = None;
+                runtime.last_error = None;
+                runtime.progress = Some(MetadataDbLogicalDistributionProgressView {
+                    completed_tables: 0,
+                    total_tables: metadata_db_logical_table_count(),
+                    current_table: None,
+                });
+                true
             }
         }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    if started {
+        spawn_metadata_db_logical_distribution_refresh(state.clone());
+    }
+
+    let status = match metadata_db_logical_distribution_status_response(&state) {
+        Ok(status) => status,
+        Err(status) => return status.into_response(),
     };
 
     append_admin_audit(
@@ -18091,19 +18263,19 @@ async fn metadata_db_logical_distribution(
         true,
         true,
         true,
-        "success",
+        if started { "started" } else { "already_running" },
         json!({
-            "backend": distribution.backend,
-            "tables": distribution.tables.len(),
-            "total_row_count": distribution.total_row_count,
-            "total_tracked_value_bytes": distribution.total_tracked_value_bytes,
+            "started": started,
+            "backend": status.backend,
+            "state": status.state,
+            "has_cached_distribution": status.distribution.is_some(),
         }),
     )
     .await;
 
     (
-        StatusCode::OK,
-        Json::<MetadataDbLogicalDistribution>(distribution),
+        StatusCode::ACCEPTED,
+        Json(MetadataDbLogicalDistributionTriggerResponse { started, status }),
     )
         .into_response()
 }

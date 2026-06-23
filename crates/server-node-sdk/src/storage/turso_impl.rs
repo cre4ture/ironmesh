@@ -10,6 +10,7 @@ use turso::params_from_iter;
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
     DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, ManifestSummary,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, ReconcileMarker, RepairAttemptRecord,
     RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
@@ -1074,9 +1075,18 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn load_metadata_db_logical_breakdown(
         &self,
+        progress: Option<MetadataDbLogicalProgressCallback>,
     ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
-        let mut tables = Vec::with_capacity(metadata_db_logical_table_specs().len());
-        for spec in metadata_db_logical_table_specs() {
+        let specs = metadata_db_logical_table_specs();
+        let mut tables = Vec::with_capacity(specs.len());
+        for (index, spec) in specs.iter().enumerate() {
+            if let Some(progress) = progress.as_ref() {
+                progress(MetadataDbLogicalProgress {
+                    total_tables: specs.len(),
+                    completed_tables: index,
+                    current_table: Some(spec.table.to_string()),
+                });
+            }
             let mut rows = self
                 .connection
                 .query(&metadata_db_logical_summary_query(*spec), ())
@@ -1107,6 +1117,14 @@ impl MetadataStore for TursoMetadataStore {
                     .iter()
                     .map(|column| (*column).to_string())
                     .collect(),
+            });
+        }
+
+        if let Some(progress) = progress.as_ref() {
+            progress(MetadataDbLogicalProgress {
+                total_tables: specs.len(),
+                completed_tables: specs.len(),
+                current_table: None,
             });
         }
 

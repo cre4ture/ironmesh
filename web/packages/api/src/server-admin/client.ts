@@ -28,7 +28,8 @@ import type {
   ManagedRendezvousFailoverPackage,
   ManualRepairActionListResponse,
   ManualRepairActionRunResponse,
-  MetadataDbLogicalDistribution,
+  MetadataDbLogicalDistributionStatusResponse,
+  MetadataDbLogicalDistributionTriggerResponse,
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
@@ -638,12 +639,24 @@ export async function getStorageStatsHistory(options?: {
   });
 }
 
-export async function getMetadataDbLogicalDistribution(
+export async function getMetadataDbLogicalDistributionStatus(
   adminTokenOverride?: string
-): Promise<MetadataDbLogicalDistribution> {
-  return fetchAdminJson<MetadataDbLogicalDistribution>(
+): Promise<MetadataDbLogicalDistributionStatusResponse> {
+  return fetchAdminJson<MetadataDbLogicalDistributionStatusResponse>(
     apiV1("/auth/storage/stats/metadata-db/logical"),
     { adminTokenOverride }
+  );
+}
+
+export async function startMetadataDbLogicalDistribution(
+  adminTokenOverride?: string
+): Promise<MetadataDbLogicalDistributionTriggerResponse> {
+  return fetchAdminJson<MetadataDbLogicalDistributionTriggerResponse>(
+    apiV1("/auth/storage/stats/metadata-db/logical"),
+    {
+      method: "POST",
+      adminTokenOverride
+    }
   );
 }
 

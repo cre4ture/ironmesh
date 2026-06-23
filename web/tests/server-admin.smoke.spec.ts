@@ -96,8 +96,11 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("SQLite metadata DB", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Manifest store", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Media cache", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Analyze metadata DB" })).toBeVisible();
+  await page.getByRole("button", { name: "Analyze metadata DB" }).click();
   await expect(page.getByText("version_indexes", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Tracked Value Bytes", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Refresh analysis" })).toBeVisible();
 
   await page.getByText("Repair", { exact: true }).click();
   await expect(page.getByRole("columnheader", { name: "Replication progress" })).toBeVisible();
@@ -766,6 +769,68 @@ async function installServerAdminMocks(
   const requestedPaths = new Set<string>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
+  const metadataDbLogicalDistribution = {
+    backend: "sqlite",
+    generated_at_unix: 1_900_000_121,
+    total_row_count: 203,
+    total_tracked_value_bytes: 3_447_552,
+    tables: [
+      {
+        table: "version_indexes",
+        row_count: 42,
+        tracked_value_bytes: 1_640_448,
+        average_tracked_value_bytes: 39_058,
+        tracked_columns: ["object_id", "index_json"]
+      },
+      {
+        table: "snapshots",
+        row_count: 9,
+        tracked_value_bytes: 962_560,
+        average_tracked_value_bytes: 106_951,
+        tracked_columns: ["snapshot_id", "snapshot_json"]
+      },
+      {
+        table: "data_change_events",
+        row_count: 88,
+        tracked_value_bytes: 442_368,
+        average_tracked_value_bytes: 5_027,
+        tracked_columns: [
+          "event_id",
+          "action",
+          "path",
+          "from_path",
+          "to_path",
+          "actor_kind",
+          "actor_id",
+          "actor_label",
+          "actor_credential_fingerprint",
+          "event_json"
+        ]
+      },
+      {
+        table: "current_objects",
+        row_count: 42,
+        tracked_value_bytes: 155_648,
+        average_tracked_value_bytes: 3_706,
+        tracked_columns: ["key", "manifest_hash", "object_id"]
+      },
+      {
+        table: "admin_audit_events",
+        row_count: 12,
+        tracked_value_bytes: 139_264,
+        average_tracked_value_bytes: 11_605,
+        tracked_columns: ["event_id", "event_json"]
+      },
+      {
+        table: "storage_stats_history",
+        row_count: 10,
+        tracked_value_bytes: 107_264,
+        average_tracked_value_bytes: 10_726,
+        tracked_columns: ["sample_json"]
+      }
+    ]
+  };
+  let metadataDbLogicalDistributionPhase: "idle" | "running" | "ready" = "idle";
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -1492,66 +1557,54 @@ async function installServerAdminMocks(
     }
 
     if (pathname === apiV1("/auth/storage/stats/metadata-db/logical") && method === "GET") {
+      if (metadataDbLogicalDistributionPhase === "running") {
+        metadataDbLogicalDistributionPhase = "ready";
+        return json(route, {
+          state: "running",
+          backend: "sqlite",
+          started_at_unix: 1_900_000_118,
+          finished_at_unix: null,
+          last_error: null,
+          progress: {
+            completed_tables: 12,
+            total_tables: 20,
+            current_table: "data_change_events"
+          },
+          distribution: null
+        });
+      }
+
       return json(route, {
+        state: "idle",
         backend: "sqlite",
-        generated_at_unix: 1_900_000_121,
-        total_row_count: 203,
-        total_tracked_value_bytes: 3_447_552,
-        tables: [
-          {
-            table: "version_indexes",
-            row_count: 42,
-            tracked_value_bytes: 1_640_448,
-            average_tracked_value_bytes: 39_058,
-            tracked_columns: ["object_id", "index_json"]
+        started_at_unix: metadataDbLogicalDistributionPhase === "ready" ? 1_900_000_118 : null,
+        finished_at_unix: metadataDbLogicalDistributionPhase === "ready" ? 1_900_000_121 : null,
+        last_error: null,
+        progress: null,
+        distribution:
+          metadataDbLogicalDistributionPhase === "ready"
+            ? metadataDbLogicalDistribution
+            : null
+      });
+    }
+
+    if (pathname === apiV1("/auth/storage/stats/metadata-db/logical") && method === "POST") {
+      metadataDbLogicalDistributionPhase = "running";
+      return json(route, {
+        started: true,
+        status: {
+          state: "running",
+          backend: "sqlite",
+          started_at_unix: 1_900_000_118,
+          finished_at_unix: null,
+          last_error: null,
+          progress: {
+            completed_tables: 0,
+            total_tables: 20,
+            current_table: null
           },
-          {
-            table: "snapshots",
-            row_count: 9,
-            tracked_value_bytes: 962_560,
-            average_tracked_value_bytes: 106_951,
-            tracked_columns: ["snapshot_id", "snapshot_json"]
-          },
-          {
-            table: "data_change_events",
-            row_count: 88,
-            tracked_value_bytes: 442_368,
-            average_tracked_value_bytes: 5_027,
-            tracked_columns: [
-              "event_id",
-              "action",
-              "path",
-              "from_path",
-              "to_path",
-              "actor_kind",
-              "actor_id",
-              "actor_label",
-              "actor_credential_fingerprint",
-              "event_json"
-            ]
-          },
-          {
-            table: "current_objects",
-            row_count: 42,
-            tracked_value_bytes: 155_648,
-            average_tracked_value_bytes: 3_706,
-            tracked_columns: ["key", "manifest_hash", "object_id"]
-          },
-          {
-            table: "admin_audit_events",
-            row_count: 12,
-            tracked_value_bytes: 139_264,
-            average_tracked_value_bytes: 11_605,
-            tracked_columns: ["event_id", "event_json"]
-          },
-          {
-            table: "storage_stats_history",
-            row_count: 10,
-            tracked_value_bytes: 107_264,
-            average_tracked_value_bytes: 10_726,
-            tracked_columns: ["sample_json"]
-          }
-        ]
+          distribution: null
+        }
       });
     }
 

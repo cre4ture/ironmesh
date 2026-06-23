@@ -473,6 +473,29 @@ export type MetadataDbLogicalDistribution = {
   tables: MetadataDbTableLogicalBreakdown[];
 };
 
+export type MetadataDbLogicalDistributionActivityState = "idle" | "running";
+
+export type MetadataDbLogicalDistributionProgress = {
+  completed_tables: number;
+  total_tables: number;
+  current_table?: string | null;
+};
+
+export type MetadataDbLogicalDistributionStatusResponse = {
+  state: MetadataDbLogicalDistributionActivityState;
+  backend: MetadataDbBackendKind;
+  started_at_unix?: number | null;
+  finished_at_unix?: number | null;
+  last_error?: string | null;
+  progress?: MetadataDbLogicalDistributionProgress | null;
+  distribution?: MetadataDbLogicalDistribution | null;
+};
+
+export type MetadataDbLogicalDistributionTriggerResponse = {
+  started: boolean;
+  status: MetadataDbLogicalDistributionStatusResponse;
+};
+
 export type AdminMediaCacheClearResponse = {
   deleted_metadata_records: number;
   deleted_thumbnail_files: number;

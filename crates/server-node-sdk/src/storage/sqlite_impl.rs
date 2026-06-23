@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use tracing::warn;
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
     DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, ManifestSummary,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, ReconcileMarker, RepairAttemptRecord,
     RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
@@ -20,6 +21,7 @@ use super::{
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
 
 pub(super) struct SqliteMetadataStore {
+    metadata_db_path: PathBuf,
     metadata: Mutex<Connection>,
 }
 
@@ -38,6 +40,7 @@ impl SqliteMetadataStore {
         init_metadata_db(&metadata)
             .with_context(|| format!("failed to initialize {}", metadata_db_path.display()))?;
         Ok(Self {
+            metadata_db_path: metadata_db_path.to_path_buf(),
             metadata: Mutex::new(metadata),
         })
     }
@@ -998,9 +1001,26 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn load_metadata_db_logical_breakdown(
         &self,
+        progress: Option<MetadataDbLogicalProgressCallback>,
     ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
-        let db = self.metadata_conn()?;
-        load_metadata_db_logical_breakdown_from_db(&db)
+        let metadata_db_path = self.metadata_db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
+            let db = Connection::open(&metadata_db_path).with_context(|| {
+                format!(
+                    "failed to open logical distribution sqlite connection for {}",
+                    metadata_db_path.display()
+                )
+            })?;
+            db.busy_timeout(Duration::from_secs(5)).with_context(|| {
+                format!(
+                    "failed to configure logical distribution sqlite busy timeout for {}",
+                    metadata_db_path.display()
+                )
+            })?;
+            load_metadata_db_logical_breakdown_from_db(&db, progress)
+        })
+        .await
+        .context("logical distribution sqlite worker join failure")?
     }
 
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
@@ -1322,9 +1342,18 @@ fn load_current_state_from_db(db: &Connection) -> Result<CurrentState> {
 
 fn load_metadata_db_logical_breakdown_from_db(
     db: &Connection,
+    progress: Option<MetadataDbLogicalProgressCallback>,
 ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
-    let mut tables = Vec::with_capacity(metadata_db_logical_table_specs().len());
-    for spec in metadata_db_logical_table_specs() {
+    let specs = metadata_db_logical_table_specs();
+    let mut tables = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
+        if let Some(progress) = progress.as_ref() {
+            progress(MetadataDbLogicalProgress {
+                total_tables: specs.len(),
+                completed_tables: index,
+                current_table: Some(spec.table.to_string()),
+            });
+        }
         let query = metadata_db_logical_summary_query(*spec);
         let (row_count, tracked_value_bytes) = db.query_row(&query, [], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
@@ -1343,6 +1372,14 @@ fn load_metadata_db_logical_breakdown_from_db(
                 .iter()
                 .map(|column| (*column).to_string())
                 .collect(),
+        });
+    }
+
+    if let Some(progress) = progress.as_ref() {
+        progress(MetadataDbLogicalProgress {
+            total_tables: specs.len(),
+            completed_tables: specs.len(),
+            current_table: None,
         });
     }
 
