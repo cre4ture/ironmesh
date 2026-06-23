@@ -1,3 +1,13 @@
+ironmesh (1.0.23-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Load metadata DB logical distribution on demand in server-admin and add
+    progress feedback for the analysis.
+  * Keep metadata distribution analysis aligned with the admin/runtime test
+    paths used by release validation.
+  * Roll the workspace release to 1.0.23.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 23 Jun 2026 23:09:47 +0200
+
 ironmesh (1.0.22-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Logs page and shared UI components for viewing recent client-side
