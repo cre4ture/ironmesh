@@ -28,5 +28,6 @@ Keep this file limited to stable repo-specific facts. Discover common commands f
 ## Commit and tag rules
 
 - Keep the release commit narrow.
-- Inspect recent release commits and tags before choosing the exact commit message and tag format.
+- Inspect recent release commits and tags before choosing the exact commit message.
+- Ensure the release tag is an annotated one by providing a tag message.
 - Push the tag only after verifying it points at the intended release commit.
