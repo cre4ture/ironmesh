@@ -17,3 +17,4 @@ web/test-results
 ironmesh-client-*.json
 map/
 windows/thumbnail-provider/out/
+.claude
