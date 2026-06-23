@@ -1,3 +1,16 @@
+ironmesh (1.0.22-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add Logs page and shared UI components for viewing recent client-side
+    backend logs.
+  * Handle rendezvous client identity expiration and refresh, remove the
+    server-admin token override UI, and improve relay tunnel logging and
+    transport display.
+  * Trust runtime test certificates explicitly for the server-node web smoke
+    flows.
+  * Roll the workspace release to 1.0.22.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 23 Jun 2026 17:51:06 +0200
+
 ironmesh (1.0.21-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add config-app managed identity auto-renewal for rendezvous client
