@@ -13,13 +13,15 @@ Read [references/ironmesh-release-facts.md](references/ironmesh-release-facts.md
 
 ## Workflow
 
-1. Inspect the current branch and current commit on GitHub Actions.
-2. Fix failing CI first and push those fixes before cutting the release commit.
-3. Continue only after the release base commit is green remotely.
-4. Choose the target version.
-5. Update the release files.
-6. Commit, tag, and push using the repo's current release convention.
-7. Verify the pushed release commit on GitHub Actions.
+1. Make sure the current branch is up to date with the remote.
+2. Check clippy and rust fmt locally before pushing any commits.
+3. Inspect the current branch and current commit on GitHub Actions.
+4. Fix failing CI first and push those fixes before cutting the release commit.
+5. Continue only after the release base commit is green remotely.
+6. Choose the target version.
+7. Update the release files.
+8. Commit, tag, and push using the repo's current release convention.
+9. Verify the pushed release commit on GitHub Actions.
 
 ## Make CI Green
 
