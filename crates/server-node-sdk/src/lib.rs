@@ -19218,15 +19218,8 @@ async fn placement_for_key(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(status) = authorize_admin_request(
-        &state,
-        &headers,
-        "placement_lookup",
-        false,
-        true,
-        json!({}),
-    )
-    .await
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, "placement_lookup", false, true, json!({})).await
     {
         return status.into_response();
     }

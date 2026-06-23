@@ -4402,7 +4402,7 @@ mod tests {
 
             for _ in 0..120 {
                 http.post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                    .header("x-ironmesh-admin-token", admin_token)
                     .send()
                     .await?
                     .error_for_status()?;

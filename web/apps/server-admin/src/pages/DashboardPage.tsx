@@ -115,12 +115,14 @@ export function DashboardPage() {
     queryFn: () => getServerHealth()
   });
   const storageStatsQuery = useQuery({
-    queryKey: ["dashboard", "storage-stats-current"],
-    queryFn: () => getStorageStatsCurrent()
+    queryKey: ["dashboard", "storage-stats-current", normalizedAdminTokenOverride],
+    queryFn: () => getStorageStatsCurrent(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster
   });
   const storageHistoryQuery = useQuery({
-    queryKey: ["dashboard", "storage-stats-history", storageHistoryRange],
-    queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(storageHistoryRange))
+    queryKey: ["dashboard", "storage-stats-history", storageHistoryRange, normalizedAdminTokenOverride],
+    queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(storageHistoryRange), normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster
   });
   const clusterSummaryQuery = useQuery({
     queryKey: ["dashboard", "cluster-summary", normalizedAdminTokenOverride],

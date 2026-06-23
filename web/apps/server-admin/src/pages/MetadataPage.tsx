@@ -127,12 +127,14 @@ export function MetadataPage() {
     !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
 
   const currentQuery = useQuery({
-    queryKey: ["metadata-page", "storage-stats-current"],
-    queryFn: () => getStorageStatsCurrent()
+    queryKey: ["metadata-page", "storage-stats-current", normalizedAdminTokenOverride],
+    queryFn: () => getStorageStatsCurrent(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectDbDistribution
   });
   const historyQuery = useQuery({
-    queryKey: ["metadata-page", "storage-stats-history", historyRange],
-    queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(historyRange))
+    queryKey: ["metadata-page", "storage-stats-history", historyRange, normalizedAdminTokenOverride],
+    queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(historyRange), normalizedAdminTokenOverride || undefined),
+    enabled: canInspectDbDistribution
   });
   const dbDistributionStatusQuery = useQuery({
     queryKey: [

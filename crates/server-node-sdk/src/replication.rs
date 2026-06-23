@@ -152,6 +152,7 @@ pub(crate) async fn execute_replication_repair_public(
         false,
     )
     .await
+    .into_response()
 }
 
 pub(crate) async fn execute_replication_repair_peer(
