@@ -21,6 +21,7 @@ import {
 } from "@mantine/core";
 import {
   IconFiles,
+  IconFileText,
   IconActivity,
   IconFolder,
   IconPlugConnected,
@@ -71,8 +72,17 @@ import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
+import { LogsPage } from "../pages/LogsPage";
 
-type PageId = "overview" | "rendezvous" | "latency" | "store" | "explorer" | "gallery" | "cluster";
+type PageId =
+  | "overview"
+  | "rendezvous"
+  | "latency"
+  | "store"
+  | "explorer"
+  | "gallery"
+  | "cluster"
+  | "logs";
 type BinaryUploadQueueStatus =
   | "queued"
   | "starting"
@@ -173,6 +183,12 @@ const pages = [
     label: "Cluster",
     icon: IconServer,
     description: "Inspect cluster status, nodes, and replication planning."
+  },
+  {
+    id: "logs" as const,
+    label: "Logs",
+    icon: IconFileText,
+    description: "Inspect recent runtime logs from the connected server node with the same live-tail view as admin."
   }
 ];
 
@@ -276,6 +292,8 @@ export function ClientShell() {
           onRefreshOverview={refreshOverview}
         />
       ) : null}
+
+      {activePageId === "logs" ? <LogsPage /> : null}
     </NavigationShell>
   );
 }

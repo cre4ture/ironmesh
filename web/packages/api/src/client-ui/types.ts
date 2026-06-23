@@ -1,3 +1,4 @@
+import type { LogsResponse, ServerLogEntry } from "../shared/logs";
 import type {
   StoreIndexEntry,
   StoreIndexMediaSummary,
@@ -178,6 +179,8 @@ export type StoreEntry = StoreIndexEntry;
 export type StoreListResponse = StoreIndexResponse;
 
 export type {
+  LogsResponse,
+  ServerLogEntry,
   StoreIndexMediaSummary,
   StoreListMediaFilter,
   StoreListRequestOptions,
