@@ -607,18 +607,22 @@ export async function getServerHealth(): Promise<ServerHealthResponse> {
   });
 }
 
-export async function getStorageStatsCurrent(): Promise<StorageStatsCurrentResponse> {
-  return fetchJson<StorageStatsCurrentResponse>(apiV1("/storage/stats/current"), {
-    credentials: "same-origin",
-    cache: "no-store"
+export async function getStorageStatsCurrent(
+  adminTokenOverride?: string
+): Promise<StorageStatsCurrentResponse> {
+  return fetchAdminJson<StorageStatsCurrentResponse>(apiV1("/storage/stats/current"), {
+    adminTokenOverride
   });
 }
 
-export async function getStorageStatsHistory(options?: {
-  limit?: number;
-  sinceUnix?: number;
-  maxPoints?: number;
-}): Promise<StorageStatsSample[]> {
+export async function getStorageStatsHistory(
+  options?: {
+    limit?: number;
+    sinceUnix?: number;
+    maxPoints?: number;
+  },
+  adminTokenOverride?: string
+): Promise<StorageStatsSample[]> {
   const query = new URLSearchParams();
   if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
     query.set("limit", String(Math.max(1, Math.trunc(options.limit))));
@@ -633,10 +637,10 @@ export async function getStorageStatsHistory(options?: {
     query.set("limit", "120");
   }
 
-  return fetchJson<StorageStatsSample[]>(`${apiV1("/storage/stats/history")}?${query.toString()}`, {
-    credentials: "same-origin",
-    cache: "no-store"
-  });
+  return fetchAdminJson<StorageStatsSample[]>(
+    `${apiV1("/storage/stats/history")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
 }
 
 export async function getMetadataDbLogicalDistributionStatus(
