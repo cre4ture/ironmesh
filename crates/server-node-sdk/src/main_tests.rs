@@ -311,7 +311,7 @@ fn test_cluster_config_without_internal_tls(
         startup_repair_delay_secs: 5,
         peer_heartbeat_enabled: false,
         peer_heartbeat_interval_secs: 15,
-        admin_token: None,
+        admin_token: Some(TEST_ADMIN_TOKEN.to_string()),
         admin_password_hash: None,
         require_client_auth: false,
     }
@@ -424,6 +424,7 @@ async fn register_node_with_server(
             base_url.trim_end_matches('/'),
             node_id
         ))
+        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
         .json(&serde_json::json!({
             "reachability": {
                 "public_api_url": public_api_url,
@@ -458,6 +459,7 @@ async fn register_node_with_server_client(
             base_url.trim_end_matches('/'),
             node_id
         ))
+        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
         .json(&serde_json::json!({
             "reachability": {
                 "public_api_url": public_api_url,
