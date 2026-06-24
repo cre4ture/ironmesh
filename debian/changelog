@@ -1,3 +1,13 @@
+ironmesh (1.0.25-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Persist manual repair action status across server-admin navigation and
+    surface progress for background repair runs.
+  * Move manual repair actions off the main execution path so they avoid
+    blocking unrelated system work.
+  * Roll the workspace release to 1.0.25.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 25 Jun 2026 01:52:11 +0200
+
 ironmesh (1.0.24-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Batch live snapshot creation by non-overlapping path changes, with a
