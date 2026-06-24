@@ -2770,6 +2770,195 @@ run_on_all_metadata_backends!(
     compact_snapshot_history_limits_batch_window_turso
 );
 
+async fn live_snapshot_batch_reuses_snapshot_for_distinct_paths_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("live-snapshot-batch-distinct").await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"a1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .put_object_versioned(
+            "docs/b.txt",
+            Bytes::from_static(b"b1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.snapshot_id, second.snapshot_id);
+    assert_eq!(
+        snapshot_ids_chronological(&store).await,
+        vec![first.snapshot_id.clone()]
+    );
+    assert_eq!(
+        store.active_snapshot_batch_id_for_test(),
+        Some(first.snapshot_id.clone())
+    );
+
+    let snapshot = store
+        .load_snapshot_manifest(&first.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.objects.len(), 2);
+    assert!(snapshot.objects.contains_key("docs/a.txt"));
+    assert!(snapshot.objects.contains_key("docs/b.txt"));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    live_snapshot_batch_reuses_snapshot_for_distinct_paths_impl,
+    live_snapshot_batch_reuses_snapshot_for_distinct_paths,
+    live_snapshot_batch_reuses_snapshot_for_distinct_paths_turso
+);
+
+async fn live_snapshot_batch_flushes_on_overlap_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("live-snapshot-batch-overlap").await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"v2"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+    assert_eq!(
+        snapshot_ids_chronological(&store).await,
+        vec![first.snapshot_id.clone(), second.snapshot_id.clone()]
+    );
+
+    let payload = store
+        .get_object(
+            "docs/readme.txt",
+            Some(&first.snapshot_id),
+            None,
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap();
+    assert_eq!(payload.as_ref(), b"v1");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    live_snapshot_batch_flushes_on_overlap_impl,
+    live_snapshot_batch_flushes_on_overlap,
+    live_snapshot_batch_flushes_on_overlap_turso
+);
+
+async fn live_snapshot_batch_honors_max_window_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("live-snapshot-batch-window").await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"a1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_snapshot_batch_started_at_unix_for_test(
+            unix_ts().saturating_sub(SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS + 1),
+        )
+        .await
+        .unwrap();
+
+    let second = store
+        .put_object_versioned(
+            "docs/b.txt",
+            Bytes::from_static(b"b1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+    assert_eq!(
+        snapshot_ids_chronological(&store).await,
+        vec![first.snapshot_id.clone(), second.snapshot_id.clone()]
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    live_snapshot_batch_honors_max_window_impl,
+    live_snapshot_batch_honors_max_window,
+    live_snapshot_batch_honors_max_window_turso
+);
+
+async fn live_snapshot_batch_state_survives_restart_impl(backend: StorageTestBackend) {
+    let root = test_store_dir(&format!("live-snapshot-batch-restart-{}", backend.suffix()));
+    let mut store = backend.open_store(root.clone()).await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"a1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .put_object_versioned(
+            "docs/b.txt",
+            Bytes::from_static(b"b1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.snapshot_id, second.snapshot_id);
+
+    drop(store);
+
+    let mut reopened = backend.open_store(root.clone()).await;
+    assert_eq!(
+        reopened.active_snapshot_batch_id_for_test(),
+        Some(first.snapshot_id.clone())
+    );
+
+    let third = reopened
+        .put_object_versioned(
+            "docs/c.txt",
+            Bytes::from_static(b"c1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(third.snapshot_id, first.snapshot_id);
+    assert_eq!(
+        snapshot_ids_chronological(&reopened).await,
+        vec![first.snapshot_id.clone()]
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    live_snapshot_batch_state_survives_restart_impl,
+    live_snapshot_batch_state_survives_restart,
+    live_snapshot_batch_state_survives_restart_turso
+);
+
 async fn rename_replication_subjects_include_source_path_deletion_event_impl(
     backend: StorageTestBackend,
 ) {

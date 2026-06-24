@@ -8,11 +8,12 @@ use tracing::warn;
 use turso::params_from_iter;
 
 use super::{
-    AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
-    DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, ManifestSummary,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo,
-    SnapshotManifest, StorageStatsSample, StorageStatsState, metadata_db_logical_summary_query,
+    ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
+    ClientCredentialState, CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord,
+    FileVersionIndex, ManifestSummary, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
+    StorageStatsSample, StorageStatsState, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs,
 };
 
@@ -427,6 +428,51 @@ impl MetadataStore for TursoMetadataStore {
         Ok(Some(snapshot))
     }
 
+    async fn load_snapshot_batch_state(&self) -> Result<Option<ActiveSnapshotBatch>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT state_json
+                 FROM snapshot_batch_state
+                 WHERE singleton = 1",
+                (),
+            )
+            .await?;
+
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+
+        let payload = row_blob(&row, 0, "snapshot_batch_state.state_json")?;
+        let state = self.decode_json::<ActiveSnapshotBatch>(payload, "snapshot batch state")?;
+        Ok(Some(state))
+    }
+
+    async fn persist_snapshot_batch_state(
+        &self,
+        state: Option<&ActiveSnapshotBatch>,
+    ) -> Result<()> {
+        match state {
+            Some(state) => {
+                let payload = serde_json::to_vec_pretty(state)?;
+                self.connection
+                    .execute(
+                        "INSERT INTO snapshot_batch_state (singleton, state_json)
+                         VALUES (1, ?1)
+                         ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
+                        (payload,),
+                    )
+                    .await?;
+            }
+            None => {
+                self.connection
+                    .execute("DELETE FROM snapshot_batch_state WHERE singleton = 1", ())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn load_cached_media_metadata(
         &self,
         content_fingerprint: &str,
@@ -819,7 +865,10 @@ impl MetadataStore for TursoMetadataStore {
             .execute(
                 "INSERT INTO snapshots (snapshot_id, created_at_unix, object_count, snapshot_json)
                  VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(snapshot_id) DO NOTHING",
+                 ON CONFLICT(snapshot_id) DO UPDATE SET
+                     created_at_unix = excluded.created_at_unix,
+                     object_count = excluded.object_count,
+                     snapshot_json = excluded.snapshot_json",
                 (
                     manifest.id.as_str(),
                     i64::try_from(manifest.created_at_unix)
@@ -1322,6 +1371,11 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 created_at_unix INTEGER NOT NULL,
                 object_count INTEGER NOT NULL,
                 snapshot_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshot_batch_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                state_json BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS storage_stats_current (
