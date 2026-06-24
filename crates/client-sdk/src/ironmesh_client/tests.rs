@@ -511,6 +511,7 @@ async fn spawn_upload_session_http_server(
 struct RelayTestState {
     public_url: String,
     captured_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
+    health_hits: Arc<AtomicUsize>,
     issued_ticket_count: Arc<AtomicUsize>,
     paired_session_count: Arc<AtomicUsize>,
     object_write_failures_remaining: Arc<AtomicUsize>,
@@ -716,6 +717,9 @@ async fn serve_test_multiplex_socket(state: RelayTestState, socket: WebSocket, s
         let request = read_buffered_transport_request(&mut stream)
             .await
             .expect("multiplexed relay test request should decode");
+        if request.path == "/api/v1/health" {
+            state.health_hits.fetch_add(1, Ordering::SeqCst);
+        }
         *state.captured_request.lock().await = Some(RelayTestCapturedRequest {
             kind: Some(request.kind),
             method: request.method.clone(),
@@ -854,6 +858,7 @@ async fn spawn_relay_test_server_at(
     let state = RelayTestState {
         public_url: format!("http://{addr}"),
         captured_request: Arc::new(Mutex::new(None)),
+        health_hits: Arc::new(AtomicUsize::new(0)),
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
         paired_session_count: Arc::new(AtomicUsize::new(0)),
         object_write_failures_remaining: Arc::new(AtomicUsize::new(
@@ -888,6 +893,7 @@ async fn spawn_direct_transport_test_server(
     let state = RelayTestState {
         public_url: format!("http://{addr}"),
         captured_request: Arc::new(Mutex::new(None)),
+        health_hits: Arc::new(AtomicUsize::new(0)),
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
         paired_session_count: Arc::new(AtomicUsize::new(0)),
         object_write_failures_remaining: Arc::new(AtomicUsize::new(0)),
@@ -2031,19 +2037,16 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
     // Allow up to 10s: the probe fires immediately on success, but if it fails
     // transiently the min-interval (5000ms) gates the retry, leaving only a
     // narrow window before the test would time out at 5s.
-    let background_capture = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(captured) = primary_state.captured_request.lock().await.clone()
-                && captured.path_and_query == "/api/v1/health"
-            {
-                break captured;
+            if primary_state.health_hits.load(Ordering::SeqCst) >= 1 {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .expect("background probe should hit the recovered relay route");
-    assert_eq!(background_capture.path_and_query, "/api/v1/health");
 
     let third = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -2061,6 +2064,7 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
     .expect("client should eventually prefer the recovered relay route");
     assert_eq!(third["route"], "primary");
     assert_eq!(client.relay_target_node_id(), Some(primary_target_node_id));
+    assert!(primary_state.health_hits.load(Ordering::SeqCst) >= 1);
     assert!(primary_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
     assert!(primary_state.paired_session_count.load(Ordering::SeqCst) >= 1);
     assert_eq!(fallback_state.issued_ticket_count.load(Ordering::SeqCst), 1);
