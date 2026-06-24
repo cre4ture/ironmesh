@@ -1,3 +1,13 @@
+ironmesh (1.0.24-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Batch live snapshot creation by non-overlapping path changes, with a
+    two-hour maximum batch window.
+  * Stabilize the relay background probe coverage test and skip unsupported
+    Turso metadata VACUUM during snapshot cleanup.
+  * Roll the workspace release to 1.0.24.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 24 Jun 2026 21:49:12 +0200
+
 ironmesh (1.0.23-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Load metadata DB logical distribution on demand in server-admin and add
