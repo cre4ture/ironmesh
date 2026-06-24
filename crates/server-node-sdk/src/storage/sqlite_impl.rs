@@ -875,10 +875,10 @@ impl MetadataStore for SqliteMetadataStore {
         })
     }
 
-    async fn vacuum_metadata_store(&self) -> Result<()> {
+    async fn vacuum_metadata_store(&self) -> Result<bool> {
         let db = self.metadata_conn()?;
         db.execute_batch("VACUUM")?;
-        Ok(())
+        Ok(true)
     }
 
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {

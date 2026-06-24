@@ -736,8 +736,7 @@ impl MetadataStore for TursoMetadataStore {
                 continue;
             }
 
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut rows = self
@@ -911,8 +910,7 @@ impl MetadataStore for TursoMetadataStore {
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             for chunk in snapshot_ids.chunks(TURSO_SNAPSHOT_DELETE_BATCH_SIZE) {
-                let placeholders = std::iter::repeat("?")
-                    .take(chunk.len())
+                let placeholders = std::iter::repeat_n("?", chunk.len())
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.connection
@@ -933,9 +931,24 @@ impl MetadataStore for TursoMetadataStore {
         result
     }
 
-    async fn vacuum_metadata_store(&self) -> Result<()> {
-        self.connection.execute("VACUUM", ()).await?;
-        Ok(())
+    async fn vacuum_metadata_store(&self) -> Result<bool> {
+        match self.connection.execute("VACUUM", ()).await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("VACUUM is an experimental feature")
+                    || message.contains("--experimental-vacuum")
+                {
+                    warn!(
+                        metadata_db = %self.metadata_path.display(),
+                        "skipping metadata VACUUM because this Turso build does not support it"
+                    );
+                    Ok(false)
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
     }
 
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {

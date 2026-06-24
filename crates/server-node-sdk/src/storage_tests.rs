@@ -466,6 +466,14 @@ impl StorageTestBackend {
                 .unwrap(),
         }
     }
+
+    fn supports_metadata_vacuum(self) -> bool {
+        match self {
+            Self::Sqlite => true,
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => false,
+        }
+    }
 }
 
 macro_rules! run_on_all_metadata_backends {
@@ -2685,7 +2693,10 @@ async fn compact_snapshot_history_keeps_overlap_boundaries_impl(backend: Storage
 
     let applied = store.compact_snapshot_history(false).await.unwrap();
     assert_eq!(applied.removed_snapshots, 2);
-    assert!(applied.vacuumed_metadata_db);
+    assert_eq!(
+        applied.vacuumed_metadata_db,
+        backend.supports_metadata_vacuum()
+    );
     assert_eq!(
         snapshot_ids_chronological(&store).await,
         vec![
@@ -2755,7 +2766,10 @@ async fn compact_snapshot_history_limits_batch_window_impl(backend: StorageTestB
 
     let applied = store.compact_snapshot_history(false).await.unwrap();
     assert_eq!(applied.removed_snapshots, 1);
-    assert!(applied.vacuumed_metadata_db);
+    assert_eq!(
+        applied.vacuumed_metadata_db,
+        backend.supports_metadata_vacuum()
+    );
     assert_eq!(
         snapshot_ids_chronological(&store).await,
         vec!["snap-window-002".to_string(), "snap-window-003".to_string(),]

@@ -1073,7 +1073,7 @@ trait MetadataStore: Send + Sync {
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()>;
-    async fn vacuum_metadata_store(&self) -> Result<()>;
+    async fn vacuum_metadata_store(&self) -> Result<bool>;
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>>;
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()>;
     async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>>;
@@ -3277,9 +3277,8 @@ impl PersistentStore {
                 .map(|snapshot| snapshot.snapshot_id.clone())
                 .collect::<Vec<_>>();
             self.delete_snapshots_by_id(&removable_ids).await?;
-            self.vacuum_metadata_store().await?;
+            report.vacuumed_metadata_db = self.vacuum_metadata_store().await?;
             report.removed_snapshots = removable_ids.len();
-            report.vacuumed_metadata_db = true;
         }
 
         Ok(report)
@@ -6957,7 +6956,7 @@ impl PersistentStore {
             .await
     }
 
-    async fn vacuum_metadata_store(&self) -> Result<()> {
+    async fn vacuum_metadata_store(&self) -> Result<bool> {
         self.metadata_store.vacuum_metadata_store().await
     }
 
