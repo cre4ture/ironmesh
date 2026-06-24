@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getDataScrubClusterStatus,
+  getManualRepairActionActivityStatus,
+  getManualRepairActionHistory,
   getManualRepairActions,
   getRepairActivityStatus,
   getRepairHistory,
@@ -9,8 +11,8 @@ import {
   triggerDataScrub,
   triggerReplicationRepair,
   type DataScrubRunRecord,
+  type ManualRepairActionRunRecord,
   type RepairLogEntry,
-  type ManualRepairActionRunResponse,
   type RepairRunRecord,
   type ReplicationPlan
 } from "@ironmesh/api";
@@ -47,8 +49,6 @@ export function RepairPage() {
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
   const [selectedRun, setSelectedRun] = useState<RepairRunRecord | null>(null);
   const [selectedScrubRun, setSelectedScrubRun] = useState<DataScrubRunRecord | null>(null);
-  const [manualActionResult, setManualActionResult] =
-    useState<ManualRepairActionRunResponse | null>(null);
   const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const hasExplicitAdminAccess =
     Boolean(normalizedAdminTokenOverride) || Boolean(sessionStatus?.authenticated);
@@ -72,6 +72,24 @@ export function RepairPage() {
     queryFn: () => getManualRepairActions(normalizedAdminTokenOverride || undefined),
     enabled: canInspectRepair
   });
+  const manualRepairActivityQuery = useQuery({
+    queryKey: ["repair-page", "manual-action-activity", normalizedAdminTokenOverride],
+    queryFn: () => getManualRepairActionActivityStatus(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectRepair,
+    refetchInterval: 3_000
+  });
+  const manualRepairActivity = canInspectRepair ? manualRepairActivityQuery.data ?? null : null;
+  const activeManualRepairRun = manualRepairActivity?.active_runs[0] ?? null;
+  const hasActiveManualRepairRun = activeManualRepairRun !== null;
+  const manualRepairHistoryQuery = useQuery({
+    queryKey: ["repair-page", "manual-action-history", normalizedAdminTokenOverride],
+    queryFn: () =>
+      getManualRepairActionHistory({ limit: 40 }, normalizedAdminTokenOverride || undefined),
+    enabled:
+      canInspectRepair &&
+      manualRepairActivityQuery.status === "success" &&
+      !hasActiveManualRepairRun
+  });
   const replicationPlanQuery = useQuery({
     queryKey: ["repair-page", "replication-plan", normalizedAdminTokenOverride],
     queryFn: () => getReplicationPlan(normalizedAdminTokenOverride || undefined),
@@ -85,14 +103,25 @@ export function RepairPage() {
     refetchInterval: 5_000
   });
 
+  const repairActivity = canInspectRepair ? repairActivityQuery.data ?? null : null;
+  const repairHistory = canInspectRepair ? repairHistoryQuery.data ?? null : null;
+  const manualRepairActions = canInspectRepair ? manualRepairActionsQuery.data?.actions ?? [] : [];
+  const manualRepairHistory = canInspectRepair ? manualRepairHistoryQuery.data ?? null : null;
+  const replicationPlan = canInspectRepair ? replicationPlanQuery.data ?? null : null;
+  const scrubCluster = canInspectRepair ? scrubClusterQuery.data ?? null : null;
+
   const refresh = useCallback(async () => {
-    const queryKeys: ReadonlyArray<readonly unknown[]> = [
+    const queryKeys: Array<readonly unknown[]> = [
       ["repair-page", "activity", normalizedAdminTokenOverride],
       ["repair-page", "history", normalizedAdminTokenOverride],
       ["repair-page", "manual-actions", normalizedAdminTokenOverride],
+      ["repair-page", "manual-action-activity", normalizedAdminTokenOverride],
       ["repair-page", "replication-plan", normalizedAdminTokenOverride],
       ["repair-page", "scrub-cluster", normalizedAdminTokenOverride]
     ];
+    if (!hasActiveManualRepairRun) {
+      queryKeys.push(["repair-page", "manual-action-history", normalizedAdminTokenOverride]);
+    }
 
     await Promise.all(
       queryKeys.map((queryKey) =>
@@ -102,7 +131,7 @@ export function RepairPage() {
         })
       )
     );
-  }, [normalizedAdminTokenOverride, queryClient]);
+  }, [hasActiveManualRepairRun, normalizedAdminTokenOverride, queryClient]);
 
   const repairMutation = useMutation({
     mutationFn: () => triggerReplicationRepair(normalizedAdminTokenOverride || undefined),
@@ -119,21 +148,22 @@ export function RepairPage() {
   const manualRepairActionMutation = useMutation({
     mutationFn: ({ actionId, dryRun }: { actionId: string; dryRun: boolean }) =>
       runManualRepairAction(actionId, { dryRun }, normalizedAdminTokenOverride || undefined),
-    onSuccess: async (result) => {
-      setManualActionResult(result);
-      await refresh();
+    onSuccess: async () => {
+      await queryClient.refetchQueries({
+        queryKey: ["repair-page", "manual-action-activity", normalizedAdminTokenOverride],
+        exact: true
+      });
     }
   });
 
-  const repairActivity = canInspectRepair ? repairActivityQuery.data ?? null : null;
-  const repairHistory = canInspectRepair ? repairHistoryQuery.data ?? null : null;
-  const manualRepairActions = canInspectRepair ? manualRepairActionsQuery.data?.actions ?? [] : [];
-  const replicationPlan = canInspectRepair ? replicationPlanQuery.data ?? null : null;
-  const scrubCluster = canInspectRepair ? scrubClusterQuery.data ?? null : null;
   const scrubAutoRepairRuns =
     repairHistory?.runs.filter((run) => run.trigger === "data_scrub_auto_repair") ?? [];
   const latestRun = repairActivity?.latest_run ?? null;
   const activeRuns = repairActivity?.active_runs ?? [];
+  const latestManualRepairRunsByActionId = indexLatestManualRepairRuns(
+    manualRepairHistory?.runs ?? []
+  );
+  const latestManualRepairRun = manualRepairHistory?.runs[0] ?? null;
   const scrubRuns = scrubCluster?.runs ?? [];
   const scrubNodes = scrubCluster?.nodes ?? [];
   const selectedScrubRelatedRepairRuns = selectedScrubRun
@@ -142,6 +172,9 @@ export function RepairPage() {
   const latestScrubRun = mostRecentScrubRun(scrubRuns);
   const retentionLabel = repairHistory
     ? formatRetentionWindow(repairHistory.retention_secs)
+    : "not loaded";
+  const manualRepairRetentionLabel = manualRepairHistory
+    ? formatRetentionWindow(manualRepairHistory.retention_secs)
     : "not loaded";
   const scrubRetentionLabel = scrubNodes[0]
     ? formatRetentionWindow(scrubNodes[0].retention_secs)
@@ -193,6 +226,8 @@ export function RepairPage() {
     repairActivityQuery.isFetching ||
     repairHistoryQuery.isFetching ||
     manualRepairActionsQuery.isFetching ||
+    manualRepairActivityQuery.isFetching ||
+    manualRepairHistoryQuery.isFetching ||
     replicationPlanQuery.isFetching ||
     scrubClusterQuery.isFetching;
   const error = firstErrorMessage([
@@ -202,6 +237,8 @@ export function RepairPage() {
     repairActivityQuery.error,
     repairHistoryQuery.error,
     manualRepairActionsQuery.error,
+    manualRepairActivityQuery.error,
+    manualRepairHistoryQuery.error,
     replicationPlanQuery.error,
     scrubClusterQuery.error
   ]);
@@ -278,6 +315,10 @@ export function RepairPage() {
                     ? "loading"
                     : "not loaded"}
               </Badge>
+              <Badge variant="light" color={hasActiveManualRepairRun ? "orange" : "gray"}>
+                {hasActiveManualRepairRun ? "1 running" : "idle"}
+              </Badge>
+              <Badge variant="light">retention {manualRepairRetentionLabel}</Badge>
               <TablePageControls
                 pagination={pagedManualRepairActions}
                 onPrevious={() => setManualRepairActionsPageIndex((current) => current - 1)}
@@ -286,21 +327,24 @@ export function RepairPage() {
             </Stack>
           </Group>
           {manualRepairActions.length > 0 ? (
-            <Table.ScrollContainer minWidth={760}>
+            <Table.ScrollContainer minWidth={920}>
               <Table striped highlightOnHover withTableBorder>
                 <Table.Thead>
                   <Table.Tr>
                     <Table.Th>Action</Table.Th>
                     <Table.Th>Description</Table.Th>
                     <Table.Th>Mode</Table.Th>
+                    <Table.Th>Status</Table.Th>
                     <Table.Th />
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
                   {pagedManualRepairActions.pageItems.map((action) => {
-                    const actionPending =
+                    const latestActionRun = latestManualRepairRunsByActionId.get(action.id) ?? null;
+                    const actionStarting =
                       manualRepairActionMutation.isPending &&
                       manualRepairActionMutation.variables?.actionId === action.id;
+                    const actionRunning = activeManualRepairRun?.action_id === action.id;
                     return (
                       <Table.Tr key={action.id}>
                         <Table.Td>
@@ -328,13 +372,52 @@ export function RepairPage() {
                             </Badge>
                           </Group>
                         </Table.Td>
+                        <Table.Td miw={220}>
+                          {actionRunning ? (
+                            <Stack gap={4}>
+                              <Badge color="orange" variant="light">
+                                {activeManualRepairRun?.dry_run ? "dry run running" : "running"}
+                              </Badge>
+                              <Text size="xs" c="dimmed">
+                                Started {formatUnixTs(activeManualRepairRun.started_at_unix)}
+                              </Text>
+                            </Stack>
+                          ) : latestActionRun ? (
+                            <Stack gap={4}>
+                              <Badge
+                                color={manualRepairRunStatusColor(latestActionRun)}
+                                variant="light"
+                              >
+                                {formatManualRepairRunStatus(latestActionRun)}
+                              </Badge>
+                              <Text size="xs" c="dimmed">
+                                Finished {formatUnixTs(latestActionRun.finished_at_unix)}
+                              </Text>
+                              <Text size="xs" c="dimmed">
+                                {latestActionRun.summary}
+                              </Text>
+                            </Stack>
+                          ) : (
+                            <Text size="sm" c="dimmed">
+                              No recent run
+                            </Text>
+                          )}
+                        </Table.Td>
                         <Table.Td>
                           <Group gap="xs" justify="flex-end" wrap="nowrap">
                             <Button
                               size="xs"
                               variant="default"
-                              disabled={!canInspectRepair || !action.dry_run_supported}
-                              loading={actionPending && manualRepairActionMutation.variables?.dryRun}
+                              disabled={
+                                !canInspectRepair ||
+                                !action.dry_run_supported ||
+                                hasActiveManualRepairRun
+                              }
+                              loading={
+                                actionStarting
+                                  ? manualRepairActionMutation.variables?.dryRun
+                                  : actionRunning && activeManualRepairRun?.dry_run
+                              }
                               leftSection={<IconSearch size={14} />}
                               onClick={() =>
                                 void manualRepairActionMutation.mutateAsync({
@@ -349,9 +432,11 @@ export function RepairPage() {
                               size="xs"
                               color={action.destructive ? "red" : "teal"}
                               variant="light"
-                              disabled={!canInspectRepair}
+                              disabled={!canInspectRepair || hasActiveManualRepairRun}
                               loading={
-                                actionPending && !manualRepairActionMutation.variables?.dryRun
+                                actionStarting
+                                  ? !manualRepairActionMutation.variables?.dryRun
+                                  : actionRunning && !activeManualRepairRun?.dry_run
                               }
                               leftSection={<IconPlayerPlay size={14} />}
                               onClick={() =>
@@ -376,19 +461,43 @@ export function RepairPage() {
               {loading ? "Loading manual repair actions..." : "No manual repair actions are available."}
             </Text>
           )}
-          {manualActionResult ? (
+          {activeManualRepairRun ? (
             <Alert
-              color={manualActionResult.changed ? "teal" : "blue"}
+              color="orange"
               variant="light"
-              title={manualActionResult.dry_run ? "Manual repair dry run finished" : "Manual repair action finished"}
+              title={
+                activeManualRepairRun.dry_run
+                  ? "Manual repair dry run is running"
+                  : "Manual repair action is running"
+              }
             >
               <Stack gap="sm">
-                <Text size="sm">{manualActionResult.summary}</Text>
-                <Text size="xs" c="dimmed">
-                  Action <Code>{manualActionResult.action_id}</Code> finished after{" "}
-                  {formatDurationShort(manualActionResult.duration_ms)}.
+                <Text size="sm">
+                  Action <Code>{activeManualRepairRun.action_id}</Code> started{" "}
+                  {formatUnixTs(activeManualRepairRun.started_at_unix)} and will keep reporting
+                  here even if you switch away from the page.
                 </Text>
-                <JsonBlock value={manualActionResult} />
+              </Stack>
+            </Alert>
+          ) : null}
+          {latestManualRepairRun ? (
+            <Alert
+              color={manualRepairRunAlertColor(latestManualRepairRun)}
+              variant="light"
+              title={manualRepairRunAlertTitle(latestManualRepairRun)}
+            >
+              <Stack gap="sm">
+                <Text size="sm">{latestManualRepairRun.summary}</Text>
+                <Text size="xs" c="dimmed">
+                  Action <Code>{latestManualRepairRun.action_id}</Code> finished after{" "}
+                  {formatDurationShort(latestManualRepairRun.duration_ms)}.
+                </Text>
+                {latestManualRepairRun.last_error ? (
+                  <Text size="xs" c="red">
+                    {latestManualRepairRun.last_error}
+                  </Text>
+                ) : null}
+                <JsonBlock value={latestManualRepairRun} />
               </Stack>
             </Alert>
           ) : null}
@@ -1366,6 +1475,43 @@ function repairStatusColor(status: string): string {
     default:
       return "gray";
   }
+}
+
+function indexLatestManualRepairRuns(
+  runs: ManualRepairActionRunRecord[]
+): Map<string, ManualRepairActionRunRecord> {
+  const latestRuns = new Map<string, ManualRepairActionRunRecord>();
+  for (const run of runs) {
+    if (!latestRuns.has(run.action_id)) {
+      latestRuns.set(run.action_id, run);
+    }
+  }
+  return latestRuns;
+}
+
+function formatManualRepairRunStatus(run: ManualRepairActionRunRecord): string {
+  if (run.status === "failed") {
+    return "failed";
+  }
+  return run.dry_run ? "dry run finished" : "completed";
+}
+
+function manualRepairRunStatusColor(run: ManualRepairActionRunRecord): string {
+  if (run.status === "failed") {
+    return "red";
+  }
+  return run.changed ? "teal" : "blue";
+}
+
+function manualRepairRunAlertColor(run: ManualRepairActionRunRecord): string {
+  return manualRepairRunStatusColor(run);
+}
+
+function manualRepairRunAlertTitle(run: ManualRepairActionRunRecord): string {
+  if (run.status === "failed") {
+    return run.dry_run ? "Manual repair dry run failed" : "Manual repair action failed";
+  }
+  return run.dry_run ? "Manual repair dry run finished" : "Manual repair action finished";
 }
 
 function mostRecentScrubRun(runs: DataScrubRunRecord[]): DataScrubRunRecord | null {

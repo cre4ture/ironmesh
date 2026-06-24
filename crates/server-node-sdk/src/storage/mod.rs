@@ -26,7 +26,7 @@ mod turso_impl;
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
 use self::turso_impl::TursoMetadataStore;
-use super::{DataScrubRunRecord, RepairRunRecord};
+use super::{DataScrubRunRecord, ManualRepairActionRunRecord, RepairRunRecord};
 
 pub use data_scrub::DataScrubReport;
 pub use media_cache::{
@@ -844,6 +844,10 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["run_id", "record_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "manual_repair_action_run_history",
+        tracked_columns: &["run_id", "record_json"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "data_scrub_run_history",
         tracked_columns: &["run_id", "record_json"],
     },
@@ -1021,6 +1025,19 @@ trait MetadataStore: Send + Sync {
     ) -> Result<Vec<RepairRunRecord>>;
     async fn persist_repair_run_record(&self, record: &RepairRunRecord) -> Result<()>;
     async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()>;
+    async fn list_manual_repair_action_run_history(
+        &self,
+        limit: Option<usize>,
+        finished_since_unix: Option<u64>,
+    ) -> Result<Vec<ManualRepairActionRunRecord>>;
+    async fn persist_manual_repair_action_run_record(
+        &self,
+        record: &ManualRepairActionRunRecord,
+    ) -> Result<()>;
+    async fn prune_manual_repair_action_run_history_before(
+        &self,
+        finished_before_unix: u64,
+    ) -> Result<()>;
     async fn list_data_scrub_run_history(
         &self,
         limit: Option<usize>,
@@ -2004,6 +2021,34 @@ impl PersistentStore {
     pub async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
         self.metadata_store
             .prune_repair_run_history_before(finished_before_unix)
+            .await
+    }
+
+    pub async fn list_manual_repair_action_run_history(
+        &self,
+        limit: Option<usize>,
+        finished_since_unix: Option<u64>,
+    ) -> Result<Vec<ManualRepairActionRunRecord>> {
+        self.metadata_store
+            .list_manual_repair_action_run_history(limit, finished_since_unix)
+            .await
+    }
+
+    pub async fn persist_manual_repair_action_run_record(
+        &self,
+        record: &ManualRepairActionRunRecord,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_manual_repair_action_run_record(record)
+            .await
+    }
+
+    pub async fn prune_manual_repair_action_run_history_before(
+        &self,
+        finished_before_unix: u64,
+    ) -> Result<()> {
+        self.metadata_store
+            .prune_manual_repair_action_run_history_before(finished_before_unix)
             .await
     }
 
@@ -5372,6 +5417,16 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
+    pub async fn persist_manual_repair_action_run_record_for_test(
+        &self,
+        record: &ManualRepairActionRunRecord,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_manual_repair_action_run_record(record)
+            .await
+    }
+
+    #[cfg(test)]
     pub async fn persist_data_scrub_run_record_for_test(
         &self,
         record: &DataScrubRunRecord,
@@ -5398,6 +5453,16 @@ impl PersistentStore {
     ) -> Result<()> {
         self.metadata_store
             .prune_repair_run_history_before(finished_before_unix)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn prune_manual_repair_action_run_history_before_for_test(
+        &self,
+        finished_before_unix: u64,
+    ) -> Result<()> {
+        self.metadata_store
+            .prune_manual_repair_action_run_history_before(finished_before_unix)
             .await
     }
 

@@ -10,7 +10,7 @@ use turso::params_from_iter;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord,
-    FileVersionIndex, ManifestSummary, MetadataDbLogicalProgress,
+    FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
     MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
     ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
     StorageStatsSample, StorageStatsState, metadata_db_logical_summary_query,
@@ -240,6 +240,98 @@ impl MetadataStore for TursoMetadataStore {
                 "DELETE FROM repair_run_history\n                 WHERE finished_at_unix < ?1",
                 (i64::try_from(finished_before_unix)
                     .context("repair run history prune timestamp overflow")?,),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn list_manual_repair_action_run_history(
+        &self,
+        limit: Option<usize>,
+        finished_since_unix: Option<u64>,
+    ) -> Result<Vec<ManualRepairActionRunRecord>> {
+        let mut rows = match (finished_since_unix, limit) {
+            (Some(finished_since_unix), Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?2",
+                        (
+                            i64::try_from(finished_since_unix)
+                                .context("manual repair action history timestamp overflow")?,
+                            i64::try_from(limit)
+                                .context("manual repair action history limit overflow")?,
+                        ),
+                    )
+                    .await?
+            }
+            (Some(finished_since_unix), None) => {
+                self.connection
+                    .query(
+                        "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC",
+                        (i64::try_from(finished_since_unix)
+                            .context("manual repair action history timestamp overflow")?,),
+                    )
+                    .await?
+            }
+            (None, Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?1",
+                        (i64::try_from(limit)
+                            .context("manual repair action history limit overflow")?,),
+                    )
+                    .await?
+            }
+            (None, None) => {
+                self.connection
+                    .query(
+                        "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC",
+                        (),
+                    )
+                    .await?
+            }
+        };
+
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "manual_repair_action_run_history.record_json")?;
+            records.push(
+                serde_json::from_slice::<ManualRepairActionRunRecord>(&payload)
+                    .context("invalid manual repair action history record in turso")?,
+            );
+        }
+
+        Ok(records)
+    }
+
+    async fn persist_manual_repair_action_run_record(
+        &self,
+        record: &ManualRepairActionRunRecord,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(record)?;
+        self.connection
+            .execute(
+                "INSERT INTO manual_repair_action_run_history (run_id, finished_at_unix, record_json)\n                 VALUES (?1, ?2, ?3)\n                 ON CONFLICT(run_id) DO UPDATE SET\n                     finished_at_unix = excluded.finished_at_unix,\n                     record_json = excluded.record_json",
+                (
+                    record.run_id.as_str(),
+                    i64::try_from(record.finished_at_unix)
+                        .context("manual repair action history timestamp overflow")?,
+                    payload,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn prune_manual_repair_action_run_history_before(
+        &self,
+        finished_before_unix: u64,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM manual_repair_action_run_history\n                 WHERE finished_at_unix < ?1",
+                (i64::try_from(finished_before_unix)
+                    .context("manual repair action history prune timestamp overflow")?,),
             )
             .await?;
         Ok(())
@@ -1418,6 +1510,12 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 record_json BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS manual_repair_action_run_history (
+                run_id TEXT PRIMARY KEY,
+                finished_at_unix INTEGER NOT NULL,
+                record_json BLOB NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS data_scrub_run_history (
                 run_id TEXT PRIMARY KEY,
                 finished_at_unix INTEGER NOT NULL,
@@ -1493,6 +1591,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON storage_stats_history(collected_at_unix DESC);
             CREATE INDEX IF NOT EXISTS idx_repair_run_history_finished
                 ON repair_run_history(finished_at_unix DESC, run_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished
+                ON manual_repair_action_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_data_scrub_run_history_finished
                 ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_admin_audit_created

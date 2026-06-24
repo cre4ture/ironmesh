@@ -5503,6 +5503,87 @@ run_on_all_metadata_backends!(
     repair_run_history_roundtrip_and_prune_turso
 );
 
+async fn manual_repair_action_history_roundtrip_and_prune_impl(backend: StorageTestBackend) {
+    let (root, store) = backend
+        .init_store("manual-repair-action-history-roundtrip")
+        .await;
+
+    let older = super::super::ManualRepairActionRunRecord {
+        run_id: "manual-repair-run-older".to_string(),
+        action_id: super::super::LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID.to_string(),
+        dry_run: true,
+        status: super::super::ManualRepairActionRunStatus::Completed,
+        started_at_unix: 900,
+        finished_at_unix: 1_000,
+        duration_ms: 100,
+        changed: false,
+        summary: "older manual repair dry run".to_string(),
+        report: Some(serde_json::json!({ "status": "older" })),
+        last_error: None,
+    };
+    let newer = super::super::ManualRepairActionRunRecord {
+        run_id: "manual-repair-run-newer".to_string(),
+        action_id: super::super::COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID.to_string(),
+        dry_run: false,
+        status: super::super::ManualRepairActionRunStatus::Failed,
+        started_at_unix: 1_900,
+        finished_at_unix: 2_000,
+        duration_ms: 200,
+        changed: false,
+        summary: "manual repair action failed before completion".to_string(),
+        report: None,
+        last_error: Some("latest manual repair error".to_string()),
+    };
+
+    store
+        .persist_manual_repair_action_run_record_for_test(&older)
+        .await
+        .unwrap();
+    store
+        .persist_manual_repair_action_run_record_for_test(&newer)
+        .await
+        .unwrap();
+
+    let history = store
+        .list_manual_repair_action_run_history(Some(8), None)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].run_id, newer.run_id);
+    assert_eq!(history[1].run_id, older.run_id);
+
+    let filtered = store
+        .list_manual_repair_action_run_history(None, Some(1_500))
+        .await
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].run_id, newer.run_id);
+
+    store
+        .prune_manual_repair_action_run_history_before_for_test(1_500)
+        .await
+        .unwrap();
+
+    let remaining = store
+        .list_manual_repair_action_run_history(Some(8), None)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].run_id, newer.run_id);
+    assert_eq!(
+        remaining[0].last_error.as_deref(),
+        Some("latest manual repair error")
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    manual_repair_action_history_roundtrip_and_prune_impl,
+    manual_repair_action_history_roundtrip_and_prune,
+    manual_repair_action_history_roundtrip_and_prune_turso
+);
+
 async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("data-scrub-history-roundtrip").await;
 

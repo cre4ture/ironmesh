@@ -26,8 +26,10 @@ import type {
   ManagedControlPlanePromotionPackage,
   ManagedRendezvousFailoverImportResponse,
   ManagedRendezvousFailoverPackage,
+  ManualRepairActionActivityStatusResponse,
+  ManualRepairActionHistoryResponse,
   ManualRepairActionListResponse,
-  ManualRepairActionRunResponse,
+  ManualRepairActionTriggerResponse,
   MetadataDbLogicalDistributionStatusResponse,
   MetadataDbLogicalDistributionTriggerResponse,
   NodeCertificateStatusResponse,
@@ -357,14 +359,48 @@ export async function getManualRepairActions(
   });
 }
 
+export async function getManualRepairActionActivityStatus(
+  adminTokenOverride?: string
+): Promise<ManualRepairActionActivityStatusResponse> {
+  return fetchAdminJson<ManualRepairActionActivityStatusResponse>(
+    apiV1("/auth/repair/actions/activity"),
+    {
+      adminTokenOverride
+    }
+  );
+}
+
+export async function getManualRepairActionHistory(
+  options?: {
+    limit?: number;
+    sinceUnix?: number;
+  },
+  adminTokenOverride?: string
+): Promise<ManualRepairActionHistoryResponse> {
+  const query = new URLSearchParams();
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.trunc(options.limit))));
+  }
+  if (typeof options?.sinceUnix === "number" && Number.isFinite(options.sinceUnix)) {
+    query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<ManualRepairActionHistoryResponse>(
+    `${apiV1("/auth/repair/actions/history")}${suffix}`,
+    {
+      adminTokenOverride
+    }
+  );
+}
+
 export async function runManualRepairAction(
   actionId: string,
   options?: {
     dryRun?: boolean;
   },
   adminTokenOverride?: string
-): Promise<ManualRepairActionRunResponse> {
-  return fetchAdminJson<ManualRepairActionRunResponse>(
+): Promise<ManualRepairActionTriggerResponse> {
+  return fetchAdminJson<ManualRepairActionTriggerResponse>(
     `${apiV1("/auth/repair/actions")}/${encodeURIComponent(actionId)}/run`,
     {
       method: "POST",

@@ -7871,6 +7871,9 @@ async fn build_test_state(
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
+            manual_repair_activity: Arc::new(Mutex::new(
+                super::ManualRepairActionActivityRuntime::default(),
+            )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 super::AutonomousPostWriteRepairRuntime::default(),
             )),
@@ -8411,6 +8414,16 @@ async fn repair_run_history(state: &ServerState) -> Vec<super::RepairRunRecord> 
     store.list_repair_run_history(Some(32), None).await.unwrap()
 }
 
+async fn manual_repair_action_history(
+    state: &ServerState,
+) -> Vec<super::ManualRepairActionRunRecord> {
+    let store = read_store(state, "tests.manual_repair.history").await;
+    store
+        .list_manual_repair_action_run_history(Some(32), None)
+        .await
+        .unwrap()
+}
+
 async fn wait_for_data_scrub_completion(state: &ServerState) {
     wait_for_condition("data scrub completion", Duration::from_secs(5), || {
         let state = state.clone();
@@ -8429,6 +8442,18 @@ async fn wait_for_repair_history_len(state: &ServerState, minimum_len: usize) {
         let state = state.clone();
         async move { repair_run_history(&state).await.len() >= minimum_len }
     })
+    .await;
+}
+
+async fn wait_for_manual_repair_action_history_len(state: &ServerState, minimum_len: usize) {
+    wait_for_condition(
+        "manual repair action history growth",
+        Duration::from_secs(5),
+        || {
+            let state = state.clone();
+            async move { manual_repair_action_history(&state).await.len() >= minimum_len }
+        },
+    )
     .await;
 }
 
@@ -9070,6 +9095,8 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
         action.id == super::COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID && action.destructive
     }));
 
+    let baseline_history_len = manual_repair_action_history(&state).await.len();
+
     let run_response = super::run_manual_repair_action(
         State(state.clone()),
         headers,
@@ -9078,18 +9105,37 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
     )
     .await
     .into_response();
-    assert_eq!(run_response.status(), StatusCode::OK);
+    assert_eq!(run_response.status(), StatusCode::ACCEPTED);
     let run_body = to_bytes(run_response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let run_payload: super::ManualRepairActionRunResponse =
+    let run_payload: super::ManualRepairActionTriggerResponse =
         serde_json::from_slice(&run_body).unwrap();
+    assert!(run_payload.started);
     assert_eq!(
-        run_payload.action_id,
+        run_payload
+            .active_run
+            .as_ref()
+            .map(|run| run.action_id.as_str()),
+        Some(super::LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID)
+    );
+    assert_eq!(
+        run_payload.active_run.as_ref().map(|run| run.dry_run),
+        Some(true)
+    );
+    wait_for_manual_repair_action_history_len(&state, baseline_history_len + 1).await;
+    let mut manual_history = manual_repair_action_history(&state).await;
+    let latest_run = manual_history.remove(0);
+    assert_eq!(
+        latest_run.action_id,
         super::LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID
     );
-    assert!(run_payload.dry_run);
-    assert!(!run_payload.changed);
+    assert!(latest_run.dry_run);
+    assert_eq!(
+        latest_run.status,
+        super::ManualRepairActionRunStatus::Completed
+    );
+    assert!(!latest_run.changed);
 
     let destructive_run_response = super::run_manual_repair_action(
         State(state.clone()),
@@ -9103,18 +9149,24 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
     )
     .await
     .into_response();
-    assert_eq!(destructive_run_response.status(), StatusCode::OK);
+    assert_eq!(destructive_run_response.status(), StatusCode::ACCEPTED);
     let destructive_run_body = to_bytes(destructive_run_response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let destructive_run_payload: super::ManualRepairActionRunResponse =
+    let destructive_run_payload: super::ManualRepairActionTriggerResponse =
         serde_json::from_slice(&destructive_run_body).unwrap();
+    assert!(destructive_run_payload.started);
+    wait_for_manual_repair_action_history_len(&state, baseline_history_len + 2).await;
+    let manual_history = manual_repair_action_history(&state).await;
     assert_eq!(
-        destructive_run_payload.action_id,
+        manual_history[0].action_id,
         super::CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID
     );
-    assert!(destructive_run_payload.dry_run);
-    assert!(!destructive_run_payload.changed);
+    assert!(manual_history[0].dry_run);
+    assert_eq!(
+        manual_history[0].status,
+        super::ManualRepairActionRunStatus::Completed
+    );
 
     let snapshot_run_response = super::run_manual_repair_action(
         State(state.clone()),
@@ -9128,18 +9180,63 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
     )
     .await
     .into_response();
-    assert_eq!(snapshot_run_response.status(), StatusCode::OK);
+    assert_eq!(snapshot_run_response.status(), StatusCode::ACCEPTED);
     let snapshot_run_body = to_bytes(snapshot_run_response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let snapshot_run_payload: super::ManualRepairActionRunResponse =
+    let snapshot_run_payload: super::ManualRepairActionTriggerResponse =
         serde_json::from_slice(&snapshot_run_body).unwrap();
+    assert!(snapshot_run_payload.started);
+    wait_for_manual_repair_action_history_len(&state, baseline_history_len + 3).await;
+
+    let activity_response = super::manual_repair_action_activity_status(State(state.clone()), {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+        headers
+    })
+    .await
+    .into_response();
+    assert_eq!(activity_response.status(), StatusCode::OK);
+    let activity_body = to_bytes(activity_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let activity_payload: super::ManualRepairActionActivityStatusResponse =
+        serde_json::from_slice(&activity_body).unwrap();
     assert_eq!(
-        snapshot_run_payload.action_id,
+        activity_payload.state,
+        super::ManualRepairActionActivityState::Idle
+    );
+    assert!(activity_payload.active_runs.is_empty());
+
+    let history_response = super::manual_repair_action_history(
+        State(state.clone()),
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+            headers
+        },
+        Query(super::RepairHistoryQuery {
+            limit: Some(8),
+            since_unix: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(history_response.status(), StatusCode::OK);
+    let history_body = to_bytes(history_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let history_payload: super::ManualRepairActionHistoryResponse =
+        serde_json::from_slice(&history_body).unwrap();
+    assert_eq!(
+        history_payload.runs[0].action_id,
         super::COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID
     );
-    assert!(snapshot_run_payload.dry_run);
-    assert!(!snapshot_run_payload.changed);
+    assert!(history_payload.runs[0].dry_run);
+    assert_eq!(
+        history_payload.runs[0].status,
+        super::ManualRepairActionRunStatus::Completed
+    );
 
     cleanup_test_state(&state).await;
 }

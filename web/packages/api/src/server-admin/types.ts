@@ -277,15 +277,44 @@ export type ManualRepairActionRunRequest = {
   dry_run?: boolean;
 };
 
-export type ManualRepairActionRunResponse = {
+export type ManualRepairActionActivityState = "idle" | "running";
+
+export type ManualRepairActionRunStatus = "completed" | "failed";
+
+export type ManualRepairActionActiveRun = {
+  run_id: string;
   action_id: string;
   dry_run: boolean;
+  started_at_unix: number;
+};
+
+export type ManualRepairActionRunRecord = {
+  run_id: string;
+  action_id: string;
+  dry_run: boolean;
+  status: ManualRepairActionRunStatus;
   started_at_unix: number;
   finished_at_unix: number;
   duration_ms: number;
   changed: boolean;
   summary: string;
-  report: Record<string, unknown>;
+  report?: Record<string, unknown> | null;
+  last_error?: string | null;
+};
+
+export type ManualRepairActionActivityStatusResponse = {
+  state: ManualRepairActionActivityState;
+  active_runs: ManualRepairActionActiveRun[];
+};
+
+export type ManualRepairActionHistoryResponse = {
+  retention_secs: number;
+  runs: ManualRepairActionRunRecord[];
+};
+
+export type ManualRepairActionTriggerResponse = {
+  started: boolean;
+  active_run?: ManualRepairActionActiveRun | null;
 };
 
 export type DataScrubScope = "local" | "cluster";

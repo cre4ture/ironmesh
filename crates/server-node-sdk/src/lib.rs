@@ -281,6 +281,7 @@ struct ServerMaintenanceRuntime {
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
+    manual_repair_activity: Arc<Mutex<ManualRepairActionActivityRuntime>>,
     autonomous_post_write_repair: Arc<Mutex<AutonomousPostWriteRepairRuntime>>,
     data_scrub_enabled: bool,
     data_scrub_interval_secs: u64,
@@ -2536,16 +2537,67 @@ fn default_manual_repair_dry_run() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ManualRepairActionActivityState {
+    Idle,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ManualRepairActionRunStatus {
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManualRepairActionRunResponse {
+struct ManualRepairActionRunRecord {
+    run_id: String,
     action_id: String,
     dry_run: bool,
+    status: ManualRepairActionRunStatus,
     started_at_unix: u64,
     finished_at_unix: u64,
     duration_ms: u64,
     changed: bool,
     summary: String,
-    report: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionHistoryResponse {
+    retention_secs: u64,
+    runs: Vec<ManualRepairActionRunRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionActiveRun {
+    run_id: String,
+    action_id: String,
+    dry_run: bool,
+    started_at_unix: u64,
+}
+
+#[derive(Debug, Default)]
+struct ManualRepairActionActivityRuntime {
+    active_runs: Vec<ManualRepairActionActiveRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionActivityStatusResponse {
+    state: ManualRepairActionActivityState,
+    active_runs: Vec<ManualRepairActionActiveRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManualRepairActionTriggerResponse {
+    started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_run: Option<ManualRepairActionActiveRun>,
 }
 
 struct ManualRepairActionExecution {
@@ -5213,6 +5265,9 @@ async fn run_inner(
             startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
+            manual_repair_activity: Arc::new(Mutex::new(
+                ManualRepairActionActivityRuntime::default(),
+            )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 AutonomousPostWriteRepairRuntime::default(),
             )),
@@ -5430,6 +5485,14 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/repair/activity", get(repair_activity_status))
         .route("/auth/repair/history", get(repair_history))
         .route("/auth/repair/actions", get(list_manual_repair_actions))
+        .route(
+            "/auth/repair/actions/activity",
+            get(manual_repair_action_activity_status),
+        )
+        .route(
+            "/auth/repair/actions/history",
+            get(manual_repair_action_history),
+        )
         .route(
             "/auth/repair/actions/{action_id}/run",
             post(run_manual_repair_action),
@@ -8296,6 +8359,15 @@ fn append_active_repair_log_entry(entry: &replication::ReplicationRepairLogEntry
     let _ = ACTIVE_REPAIR_LOG_HANDLE.try_with(|handle| {
         handle.push_entry(entry.clone());
     });
+}
+
+#[derive(Debug, Clone)]
+struct ManualRepairActionRunTracker {
+    run_id: String,
+    action_id: String,
+    dry_run: bool,
+    started_at_unix: u64,
+    started_at_instant: Instant,
 }
 
 async fn with_active_repair_log_tracking<T>(
@@ -18821,6 +18893,379 @@ async fn list_manual_repair_actions(
         .into_response()
 }
 
+fn current_manual_repair_action_activity_state(
+    active_runs: &[ManualRepairActionActiveRun],
+) -> ManualRepairActionActivityState {
+    if active_runs.is_empty() {
+        ManualRepairActionActivityState::Idle
+    } else {
+        ManualRepairActionActivityState::Running
+    }
+}
+
+async fn local_manual_repair_action_activity_payload(
+    state: &ServerState,
+) -> Result<ManualRepairActionActivityStatusResponse> {
+    let active_runs = state
+        .maintenance
+        .manual_repair_activity
+        .lock()
+        .await
+        .active_runs
+        .clone();
+    Ok(ManualRepairActionActivityStatusResponse {
+        state: current_manual_repair_action_activity_state(&active_runs),
+        active_runs,
+    })
+}
+
+async fn persist_manual_repair_action_run_record_with_retention(
+    state: &ServerState,
+    record: &ManualRepairActionRunRecord,
+) {
+    let store = lock_store(state, "manual_repair.persist").await;
+    if let Err(err) = store.persist_manual_repair_action_run_record(record).await {
+        warn!(
+            error = %err,
+            run_id = %record.run_id,
+            action_id = %record.action_id,
+            "failed to persist manual repair action history record"
+        );
+        return;
+    }
+
+    let retention_cutoff = record
+        .finished_at_unix
+        .saturating_sub(state.maintenance.repair_run_history_retention_secs);
+    if let Err(err) = store
+        .prune_manual_repair_action_run_history_before(retention_cutoff)
+        .await
+    {
+        warn!(
+            error = %err,
+            retention_cutoff,
+            run_id = %record.run_id,
+            action_id = %record.action_id,
+            "failed to prune manual repair action history"
+        );
+    }
+}
+
+async fn finish_manual_repair_action_run_tracking(
+    state: &ServerState,
+    tracker: ManualRepairActionRunTracker,
+    status: ManualRepairActionRunStatus,
+    execution: Option<ManualRepairActionExecution>,
+    last_error: Option<String>,
+) -> ManualRepairActionRunRecord {
+    {
+        let mut activity = state.maintenance.manual_repair_activity.lock().await;
+        activity
+            .active_runs
+            .retain(|active_run| active_run.run_id != tracker.run_id);
+    }
+
+    let duration_ms =
+        u64::try_from(tracker.started_at_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (changed, summary, report) = if let Some(execution) = execution {
+        (execution.changed, execution.summary, Some(execution.report))
+    } else {
+        (
+            false,
+            "Manual repair action failed before producing a report.".to_string(),
+            None,
+        )
+    };
+    let record = ManualRepairActionRunRecord {
+        run_id: tracker.run_id,
+        action_id: tracker.action_id,
+        dry_run: tracker.dry_run,
+        status,
+        started_at_unix: tracker.started_at_unix,
+        finished_at_unix: unix_ts(),
+        duration_ms,
+        changed,
+        summary,
+        report,
+        last_error,
+    };
+
+    persist_manual_repair_action_run_record_with_retention(state, &record).await;
+    record
+}
+
+async fn execute_manual_repair_action_inner(
+    state: &ServerState,
+    action_id: &str,
+    dry_run: bool,
+) -> Result<ManualRepairActionExecution> {
+    Ok(match action_id {
+        LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID => {
+            let report = {
+                let mut store =
+                    lock_store(state, "manual_repair.legacy_rename_logical_paths").await;
+                store.reconcile_legacy_rename_logical_paths(dry_run).await?
+            };
+
+            let changed = !dry_run && report.updated_records > 0;
+            let summary = if dry_run {
+                format!(
+                    "{} legacy rename record(s) are eligible for logical-path correction",
+                    report.eligible_records
+                )
+            } else {
+                format!(
+                    "{} legacy rename record(s) eligible; {} updated",
+                    report.eligible_records, report.updated_records
+                )
+            };
+            ManualRepairActionExecution {
+                changed,
+                summary,
+                report: serialize_manual_repair_report(action_id, &report),
+            }
+        }
+        CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID => {
+            let report = {
+                let mut store =
+                    lock_store(state, "manual_repair.cleanup_delete_recreate_loop_metadata").await;
+                store
+                    .cleanup_duplicate_delete_recreate_loop_metadata(dry_run)
+                    .await?
+            };
+
+            let changed = !dry_run && report.removed_indexes > 0;
+            let summary = if dry_run {
+                format!(
+                    "{} duplicate delete/recreate loop group(s) eligible; {} redundant lineage(s) removable",
+                    report.duplicate_groups, report.removable_indexes
+                )
+            } else {
+                format!(
+                    "{} duplicate delete/recreate loop group(s) eligible; {} redundant lineage(s) removed",
+                    report.duplicate_groups, report.removed_indexes
+                )
+            };
+            ManualRepairActionExecution {
+                changed,
+                summary,
+                report: serialize_manual_repair_report(action_id, &report),
+            }
+        }
+        COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID => {
+            let report = {
+                let mut store = lock_store(state, "manual_repair.compact_snapshot_history").await;
+                store.compact_snapshot_history(dry_run).await?
+            };
+
+            let changed = !dry_run && report.removed_snapshots > 0;
+            let summary = if dry_run {
+                format!(
+                    "{} redundant snapshot(s) removable; {} retained under path-overlap and 2h batch rules",
+                    report.removable_snapshots, report.snapshots_retained
+                )
+            } else {
+                format!(
+                    "{} redundant snapshot(s) removed, metadata DB vacuumed={}, {} retained under path-overlap and 2h batch rules",
+                    report.removed_snapshots,
+                    report.vacuumed_metadata_db,
+                    report.snapshots_retained
+                )
+            };
+            ManualRepairActionExecution {
+                changed,
+                summary,
+                report: serialize_manual_repair_report(action_id, &report),
+            }
+        }
+        _ => bail!("unknown manual repair action id: {action_id}"),
+    })
+}
+
+async fn execute_manual_repair_action_run(
+    state: ServerState,
+    tracker: ManualRepairActionRunTracker,
+) {
+    info!(
+        run_id = %tracker.run_id,
+        action_id = %tracker.action_id,
+        dry_run = tracker.dry_run,
+        "manual repair action started"
+    );
+
+    match execute_manual_repair_action_inner(&state, &tracker.action_id, tracker.dry_run).await {
+        Ok(execution) => {
+            if execution.changed {
+                publish_namespace_change(&state);
+                request_local_availability_refresh(&state);
+            }
+
+            let record = finish_manual_repair_action_run_tracking(
+                &state,
+                tracker,
+                ManualRepairActionRunStatus::Completed,
+                Some(execution),
+                None,
+            )
+            .await;
+            info!(
+                run_id = %record.run_id,
+                action_id = %record.action_id,
+                dry_run = record.dry_run,
+                changed = record.changed,
+                duration_ms = record.duration_ms,
+                "manual repair action finished"
+            );
+        }
+        Err(err) => {
+            let last_error = err.to_string();
+            warn!(
+                run_id = %tracker.run_id,
+                action_id = %tracker.action_id,
+                dry_run = tracker.dry_run,
+                error = %err,
+                "manual repair action failed"
+            );
+            let _ = finish_manual_repair_action_run_tracking(
+                &state,
+                tracker,
+                ManualRepairActionRunStatus::Failed,
+                None,
+                Some(last_error),
+            )
+            .await;
+        }
+    }
+}
+
+async fn start_local_manual_repair_action(
+    state: &ServerState,
+    action_id: String,
+    dry_run: bool,
+) -> ManualRepairActionTriggerResponse {
+    let active_or_new = {
+        let mut activity = state.maintenance.manual_repair_activity.lock().await;
+        if let Some(active_run) = activity.active_runs.first().cloned() {
+            return ManualRepairActionTriggerResponse {
+                started: false,
+                active_run: Some(active_run),
+            };
+        }
+
+        let run_id = Uuid::now_v7().to_string();
+        let started_at_unix = unix_ts();
+        let active_run = ManualRepairActionActiveRun {
+            run_id: run_id.clone(),
+            action_id: action_id.clone(),
+            dry_run,
+            started_at_unix,
+        };
+        activity.active_runs.push(active_run.clone());
+        (
+            active_run,
+            ManualRepairActionRunTracker {
+                run_id,
+                action_id,
+                dry_run,
+                started_at_unix,
+                started_at_instant: Instant::now(),
+            },
+        )
+    };
+
+    let (active_run, tracker) = active_or_new;
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        execute_manual_repair_action_run(state_clone, tracker).await;
+    });
+
+    ManualRepairActionTriggerResponse {
+        started: true,
+        active_run: Some(active_run),
+    }
+}
+
+async fn manual_repair_action_activity_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/repair/actions/activity/get";
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        return status.into_response();
+    }
+
+    match local_manual_repair_action_activity_payload(&state).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed loading manual repair action activity state");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn manual_repair_action_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<RepairHistoryQuery>,
+) -> impl IntoResponse {
+    let action = "auth/repair/actions/history/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "limit": query.limit,
+            "since_unix": query.since_unix,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let limit = query
+        .limit
+        .map(|limit| limit.clamp(1, MAX_REPAIR_RUN_HISTORY_LIMIT))
+        .or_else(|| {
+            if query.since_unix.is_none() {
+                Some(40)
+            } else {
+                None
+            }
+        });
+    let runs = {
+        let store = read_store(&state, "manual_repair.load_history").await;
+        match store
+            .list_manual_repair_action_run_history(limit, query.since_unix)
+            .await
+        {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    ?limit,
+                    since_unix = query.since_unix,
+                    "failed loading manual repair action history"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(ManualRepairActionHistoryResponse {
+            retention_secs: state.maintenance.repair_run_history_retention_secs,
+            runs,
+        }),
+    )
+        .into_response()
+}
+
 async fn run_manual_repair_action(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -18849,149 +19294,8 @@ async fn run_manual_repair_action(
         return status.into_response();
     }
 
-    let started_at_unix = unix_ts();
-    let started = Instant::now();
-    let execution = match action_id.as_str() {
-        LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID => {
-            let report = {
-                let mut store =
-                    lock_store(&state, "manual_repair.legacy_rename_logical_paths").await;
-                match store
-                    .reconcile_legacy_rename_logical_paths(request.dry_run)
-                    .await
-                {
-                    Ok(report) => report,
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            action_id = %action_id,
-                            dry_run = request.dry_run,
-                            "manual repair action failed"
-                        );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                }
-            };
-
-            let changed = !request.dry_run && report.updated_records > 0;
-            let summary = if request.dry_run {
-                format!(
-                    "{} legacy rename record(s) are eligible for logical-path correction",
-                    report.eligible_records
-                )
-            } else {
-                format!(
-                    "{} legacy rename record(s) eligible; {} updated",
-                    report.eligible_records, report.updated_records
-                )
-            };
-            ManualRepairActionExecution {
-                changed,
-                summary,
-                report: serialize_manual_repair_report(&action_id, &report),
-            }
-        }
-        CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID => {
-            let report = {
-                let mut store = lock_store(
-                    &state,
-                    "manual_repair.cleanup_delete_recreate_loop_metadata",
-                )
-                .await;
-                match store
-                    .cleanup_duplicate_delete_recreate_loop_metadata(request.dry_run)
-                    .await
-                {
-                    Ok(report) => report,
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            action_id = %action_id,
-                            dry_run = request.dry_run,
-                            "manual repair action failed"
-                        );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                }
-            };
-
-            let changed = !request.dry_run && report.removed_indexes > 0;
-            let summary = if request.dry_run {
-                format!(
-                    "{} duplicate delete/recreate loop group(s) eligible; {} redundant lineage(s) removable",
-                    report.duplicate_groups, report.removable_indexes
-                )
-            } else {
-                format!(
-                    "{} duplicate delete/recreate loop group(s) eligible; {} redundant lineage(s) removed",
-                    report.duplicate_groups, report.removed_indexes
-                )
-            };
-            ManualRepairActionExecution {
-                changed,
-                summary,
-                report: serialize_manual_repair_report(&action_id, &report),
-            }
-        }
-        COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID => {
-            let report = {
-                let mut store = lock_store(&state, "manual_repair.compact_snapshot_history").await;
-                match store.compact_snapshot_history(request.dry_run).await {
-                    Ok(report) => report,
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            action_id = %action_id,
-                            dry_run = request.dry_run,
-                            "manual repair action failed"
-                        );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                }
-            };
-
-            let changed = !request.dry_run && report.removed_snapshots > 0;
-            let summary = if request.dry_run {
-                format!(
-                    "{} redundant snapshot(s) removable; {} retained under path-overlap and 2h batch rules",
-                    report.removable_snapshots, report.snapshots_retained
-                )
-            } else {
-                format!(
-                    "{} redundant snapshot(s) removed, metadata DB vacuumed={}, {} retained under path-overlap and 2h batch rules",
-                    report.removed_snapshots,
-                    report.vacuumed_metadata_db,
-                    report.snapshots_retained
-                )
-            };
-            ManualRepairActionExecution {
-                changed,
-                summary,
-                report: serialize_manual_repair_report(&action_id, &report),
-            }
-        }
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    if execution.changed {
-        publish_namespace_change(&state);
-        request_local_availability_refresh(&state);
-    }
-
-    (
-        StatusCode::OK,
-        Json(ManualRepairActionRunResponse {
-            action_id,
-            dry_run: request.dry_run,
-            started_at_unix,
-            finished_at_unix: unix_ts(),
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            changed: execution.changed,
-            summary: execution.summary,
-            report: execution.report,
-        }),
-    )
-        .into_response()
+    let response = start_local_manual_repair_action(&state, action_id, request.dry_run).await;
+    (StatusCode::ACCEPTED, Json(response)).into_response()
 }
 
 async fn repair_activity_status(
