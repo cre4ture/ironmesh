@@ -1,3 +1,11 @@
+ironmesh (1.0.26-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Keep retained manual repair action runs visible in server-admin with
+    inspectable stored results, including dry runs and very fast completions.
+  * Roll the workspace release to 1.0.26.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 25 Jun 2026 21:30:26 +0200
+
 ironmesh (1.0.25-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Persist manual repair action status across server-admin navigation and
