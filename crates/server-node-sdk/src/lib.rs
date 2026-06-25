@@ -2504,6 +2504,7 @@ const LEGACY_RENAME_LOGICAL_PATHS_REPAIR_ACTION_ID: &str = "legacy_rename_logica
 const CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID: &str =
     "cleanup_delete_recreate_loop_metadata";
 const COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID: &str = "compact_snapshot_history";
+const COMPRESS_SNAPSHOT_JSON_REPAIR_ACTION_ID: &str = "compress_snapshot_json_data";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManualRepairActionDescriptor {
@@ -18864,6 +18865,13 @@ fn manual_repair_action_descriptors() -> Vec<ManualRepairActionDescriptor> {
             dry_run_supported: true,
             destructive: true,
         },
+        ManualRepairActionDescriptor {
+            id: COMPRESS_SNAPSHOT_JSON_REPAIR_ACTION_ID.to_string(),
+            label: "Compress snapshot JSON data".to_string(),
+            description: "Rewrite snapshot manifests stored as plain JSON to use zstd compression, reducing metadata database size. New snapshots are already written compressed; this converts existing entries.".to_string(),
+            dry_run_supported: true,
+            destructive: false,
+        },
     ]
 }
 
@@ -19070,6 +19078,31 @@ async fn execute_manual_repair_action_inner(
                     report.removed_snapshots,
                     report.vacuumed_metadata_db,
                     report.snapshots_retained
+                )
+            };
+            ManualRepairActionExecution {
+                changed,
+                summary,
+                report: serialize_manual_repair_report(action_id, &report),
+            }
+        }
+        COMPRESS_SNAPSHOT_JSON_REPAIR_ACTION_ID => {
+            let report = {
+                let mut store =
+                    lock_store(state, "manual_repair.compress_snapshot_json_data").await;
+                store.compress_snapshot_json_data(dry_run).await?
+            };
+
+            let changed = !dry_run && report.snapshots_compressed > 0;
+            let summary = if dry_run {
+                format!(
+                    "{} snapshot(s) eligible for JSON compression ({} already compressed)",
+                    report.snapshots_eligible, report.snapshots_already_compressed
+                )
+            } else {
+                format!(
+                    "{} snapshot(s) compressed, {} already compressed",
+                    report.snapshots_compressed, report.snapshots_already_compressed
                 )
             };
             ManualRepairActionExecution {

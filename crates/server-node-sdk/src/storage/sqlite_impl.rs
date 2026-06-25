@@ -15,8 +15,8 @@ use super::{
     FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
     MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
     ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs,
+    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
@@ -522,9 +522,12 @@ impl MetadataStore for SqliteMetadataStore {
             )
             .optional()?;
         match payload {
-            Some(payload) => serde_json::from_slice::<SnapshotManifest>(&payload)
-                .map(Some)
-                .context("invalid snapshot manifest in sqlite"),
+            Some(payload) => {
+                let payload = decompress_snapshot_json(&payload)?;
+                serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .map(Some)
+                    .context("invalid snapshot manifest in sqlite")
+            }
             None => Ok(None),
         }
     }
@@ -928,7 +931,7 @@ impl MetadataStore for SqliteMetadataStore {
     }
 
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(manifest)?;
+        let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
         let db = self.metadata_conn()?;
         db.execute(
             "INSERT INTO snapshots (snapshot_id, created_at_unix, object_count, snapshot_json)
@@ -958,12 +961,28 @@ impl MetadataStore for SqliteMetadataStore {
         let mut snapshots = Vec::new();
         for row in rows {
             let payload = row?;
+            let payload = decompress_snapshot_json(&payload)?;
             snapshots.push(
                 serde_json::from_slice::<SnapshotManifest>(&payload)
                     .context("invalid snapshot manifest in sqlite")?,
             );
         }
         Ok(snapshots)
+    }
+
+    async fn count_uncompressed_snapshot_manifests(&self) -> Result<usize> {
+        const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+        let db = self.metadata_conn()?;
+        let mut stmt = db.prepare("SELECT snapshot_json FROM snapshots")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut count = 0;
+        for row in rows {
+            let payload = row?;
+            if !payload.starts_with(ZSTD_MAGIC) {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {

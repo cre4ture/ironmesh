@@ -3,6 +3,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub(super) fn compress_snapshot_json(data: &[u8]) -> Result<Vec<u8>> {
+    zstd::encode_all(data, 3).context("failed to compress snapshot json")
+}
+
+pub(super) fn decompress_snapshot_json(data: &[u8]) -> Result<Vec<u8>> {
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+    if data.starts_with(ZSTD_MAGIC) {
+        zstd::decode_all(data).context("failed to decompress snapshot json")
+    } else {
+        Ok(data.to_vec())
+    }
+}
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -251,6 +264,15 @@ pub struct SnapshotHistoryCompactionReport {
     pub vacuumed_metadata_db: bool,
     pub sampled_removed_snapshots: Vec<SnapshotHistoryCompactionRemovedSnapshot>,
     pub sampled_removed_snapshots_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CompressSnapshotJsonReport {
+    pub dry_run: bool,
+    pub snapshots_scanned: usize,
+    pub snapshots_eligible: usize,
+    pub snapshots_compressed: usize,
+    pub snapshots_already_compressed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1089,6 +1111,7 @@ trait MetadataStore: Send + Sync {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
+    async fn count_uncompressed_snapshot_manifests(&self) -> Result<usize>;
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()>;
     async fn vacuum_metadata_store(&self) -> Result<bool>;
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>>;
@@ -3327,6 +3350,36 @@ impl PersistentStore {
         }
 
         Ok(report)
+    }
+
+    pub async fn compress_snapshot_json_data(
+        &mut self,
+        dry_run: bool,
+    ) -> Result<CompressSnapshotJsonReport> {
+        let total = self.metadata_store.list_snapshot_infos().await?.len();
+        let eligible = self
+            .metadata_store
+            .count_uncompressed_snapshot_manifests()
+            .await?;
+        let mut compressed = 0;
+
+        if !dry_run && eligible > 0 {
+            let snapshots = self.metadata_store.load_all_snapshots().await?;
+            for snapshot in &snapshots {
+                self.metadata_store
+                    .persist_snapshot_manifest(snapshot)
+                    .await?;
+            }
+            compressed = eligible;
+        }
+
+        Ok(CompressSnapshotJsonReport {
+            dry_run,
+            snapshots_scanned: total,
+            snapshots_eligible: eligible,
+            snapshots_compressed: compressed,
+            snapshots_already_compressed: total.saturating_sub(eligible),
+        })
     }
 
     pub async fn has_manifest_for_key(&self, key: &str, manifest_hash: &str) -> Result<bool> {
