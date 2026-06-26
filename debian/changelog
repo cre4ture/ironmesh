@@ -1,3 +1,13 @@
+ironmesh (1.0.28-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Stream manual repair actions one record at a time so that large databases
+    do not exhaust RAM; adds load_snapshot_by_id, list_uncompressed_snapshot_ids,
+    and list_version_index_object_ids to the MetadataStore trait.
+  * Add test coverage for the compress_snapshot_json_data repair action.
+  * Roll the workspace release to 1.0.28.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 26 Jun 2026 10:29:08 +0200
+
 ironmesh (1.0.27-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Store snapshot manifests as zstd-compressed JSON in the metadata database;
