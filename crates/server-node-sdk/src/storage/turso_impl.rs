@@ -951,6 +951,21 @@ impl MetadataStore for TursoMetadataStore {
         Ok(indexes)
     }
 
+    async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT object_id FROM version_indexes ORDER BY object_id",
+                (),
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row_string(&row, 0, "version_indexes.object_id")?);
+        }
+        Ok(ids)
+    }
+
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
         let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
         self.connection
@@ -994,20 +1009,38 @@ impl MetadataStore for TursoMetadataStore {
         Ok(snapshots)
     }
 
-    async fn count_uncompressed_snapshot_manifests(&self) -> Result<usize> {
+    async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
+                (snapshot_id,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
+        let payload = decompress_snapshot_json(&payload)?;
+        let manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        Ok(Some(manifest))
+    }
+
+    async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>> {
         const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
         let mut rows = self
             .connection
-            .query("SELECT snapshot_json FROM snapshots", ())
+            .query("SELECT snapshot_id, snapshot_json FROM snapshots", ())
             .await?;
-        let mut count = 0;
+        let mut ids = Vec::new();
         while let Some(row) = rows.next().await? {
-            let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
+            let id = row_string(&row, 0, "snapshots.snapshot_id")?;
+            let payload = row_blob(&row, 1, "snapshots.snapshot_json")?;
             if !payload.starts_with(ZSTD_MAGIC) {
-                count += 1;
+                ids.push(id);
             }
         }
-        Ok(count)
+        Ok(ids)
     }
 
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {

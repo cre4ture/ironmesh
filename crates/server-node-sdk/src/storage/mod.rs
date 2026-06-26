@@ -1109,9 +1109,11 @@ trait MetadataStore: Send + Sync {
     ) -> Result<()>;
     async fn persist_current_state(&self, current_state: &CurrentState) -> Result<()>;
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
+    async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
-    async fn count_uncompressed_snapshot_manifests(&self) -> Result<usize>;
+    async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>>;
+    async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>>;
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()>;
     async fn vacuum_metadata_store(&self) -> Result<bool>;
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>>;
@@ -2875,10 +2877,12 @@ impl PersistentStore {
             ..LegacyRenameLogicalPathReconcileReport::default()
         };
 
-        let mut indexes = self.load_all_version_indexes().await?;
-        indexes.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+        let object_ids = self.metadata_store.list_version_index_object_ids().await?;
 
-        for mut index in indexes {
+        for object_id in object_ids {
+            let Some(mut index) = self.load_version_index_by_object_id(&object_id).await? else {
+                continue;
+            };
             report.version_indexes_scanned = report.version_indexes_scanned.saturating_add(1);
 
             if !index
@@ -3003,10 +3007,12 @@ impl PersistentStore {
 
         let mut candidate_groups =
             HashMap::<(String, String), Vec<DeleteRecreateLoopCleanupCandidate>>::new();
-        let mut indexes = self.load_all_version_indexes().await?;
-        indexes.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+        let object_ids = self.metadata_store.list_version_index_object_ids().await?;
 
-        for index in indexes {
+        for object_id in object_ids {
+            let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
+                continue;
+            };
             report.version_indexes_scanned = report.version_indexes_scanned.saturating_add(1);
 
             match self
@@ -3234,16 +3240,16 @@ impl PersistentStore {
             ..SnapshotHistoryCompactionReport::default()
         };
 
-        let mut snapshots = self.load_all_snapshots().await?;
-        snapshots.sort_by(|a, b| {
+        let mut snapshot_infos = self.metadata_store.list_snapshot_infos().await?;
+        snapshot_infos.sort_by(|a, b| {
             a.created_at_unix
                 .cmp(&b.created_at_unix)
                 .then_with(|| a.id.cmp(&b.id))
         });
 
-        report.snapshots_scanned = snapshots.len();
-        report.snapshots_before = snapshots.len();
-        if snapshots.is_empty() {
+        report.snapshots_scanned = snapshot_infos.len();
+        report.snapshots_before = snapshot_infos.len();
+        if snapshot_infos.is_empty() {
             return Ok(report);
         }
 
@@ -3251,11 +3257,17 @@ impl PersistentStore {
         let mut removable_snapshots = Vec::<SnapshotHistoryCompactionRemovedSnapshot>::new();
         let mut dirty_paths = HashSet::<String>::new();
         let mut batch_start_created_at_unix = None;
-        let mut previous_snapshot = None::<&SnapshotManifest>;
+        let mut previous_snapshot: Option<SnapshotManifest> = None;
         let mut previous_snapshot_changed_paths = BTreeSet::<String>::new();
 
-        for (index, snapshot) in snapshots.iter().enumerate() {
-            let changed_paths = snapshot_changed_paths(previous_snapshot, snapshot);
+        for (index, info) in snapshot_infos.iter().enumerate() {
+            let snapshot = self
+                .metadata_store
+                .load_snapshot_by_id(&info.id)
+                .await?
+                .with_context(|| format!("snapshot {} missing during compaction", info.id))?;
+
+            let changed_paths = snapshot_changed_paths(previous_snapshot.as_ref(), &snapshot);
             if changed_paths.is_empty() {
                 report.duplicate_state_snapshots =
                     report.duplicate_state_snapshots.saturating_add(1);
@@ -3274,8 +3286,12 @@ impl PersistentStore {
                     .unwrap_or(false);
 
             if index > 0 && (has_overlap || exceeds_time_window) {
-                let previous = &snapshots[index - 1];
-                retained_snapshot_ids.insert(previous.id.clone());
+                let previous_id = previous_snapshot
+                    .as_ref()
+                    .expect("previous snapshot known to be set when index > 0")
+                    .id
+                    .clone();
+                retained_snapshot_ids.insert(previous_id);
                 if has_overlap {
                     report.overlap_flush_boundaries =
                         report.overlap_flush_boundaries.saturating_add(1);
@@ -3295,7 +3311,7 @@ impl PersistentStore {
                 dirty_paths.extend(changed_paths.iter().cloned());
             }
 
-            if let Some(previous) = previous_snapshot {
+            if let Some(ref previous) = previous_snapshot {
                 let reason = if previous_snapshot_changed_paths.is_empty() {
                     Some(SnapshotHistoryCompactionRemovalReason::DuplicateState)
                 } else if !retained_snapshot_ids.contains(&previous.id) {
@@ -3325,10 +3341,12 @@ impl PersistentStore {
             previous_snapshot_changed_paths = changed_paths;
         }
 
-        let latest_snapshot = snapshots
+        let latest_snapshot_id = snapshot_infos
             .last()
-            .expect("snapshot list is known to be non-empty");
-        retained_snapshot_ids.insert(latest_snapshot.id.clone());
+            .expect("snapshot list is known to be non-empty")
+            .id
+            .clone();
+        retained_snapshot_ids.insert(latest_snapshot_id);
         report.snapshots_retained = retained_snapshot_ids.len();
         report.removable_snapshots = removable_snapshots.len();
         report.sampled_removed_snapshots = removable_snapshots
@@ -3357,20 +3375,19 @@ impl PersistentStore {
         dry_run: bool,
     ) -> Result<CompressSnapshotJsonReport> {
         let total = self.metadata_store.list_snapshot_infos().await?.len();
-        let eligible = self
-            .metadata_store
-            .count_uncompressed_snapshot_manifests()
-            .await?;
+        let uncompressed_ids = self.metadata_store.list_uncompressed_snapshot_ids().await?;
+        let eligible = uncompressed_ids.len();
         let mut compressed = 0;
 
         if !dry_run && eligible > 0 {
-            let snapshots = self.metadata_store.load_all_snapshots().await?;
-            for snapshot in &snapshots {
-                self.metadata_store
-                    .persist_snapshot_manifest(snapshot)
-                    .await?;
+            for id in &uncompressed_ids {
+                if let Some(snapshot) = self.metadata_store.load_snapshot_by_id(id).await? {
+                    self.metadata_store
+                        .persist_snapshot_manifest(&snapshot)
+                        .await?;
+                    compressed += 1;
+                }
             }
-            compressed = eligible;
         }
 
         Ok(CompressSnapshotJsonReport {

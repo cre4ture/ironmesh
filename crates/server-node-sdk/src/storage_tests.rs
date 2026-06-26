@@ -2784,6 +2784,122 @@ run_on_all_metadata_backends!(
     compact_snapshot_history_limits_batch_window_turso
 );
 
+async fn persist_uncompressed_snapshot_fixture(
+    backend: StorageTestBackend,
+    metadata_db_path: &Path,
+    snapshot_id: &str,
+    created_at_unix: u64,
+) {
+    let manifest = SnapshotManifest {
+        id: snapshot_id.to_string(),
+        created_at_unix,
+        objects: HashMap::new(),
+        object_ids: HashMap::new(),
+    };
+    let payload = serde_json::to_vec_pretty(&manifest).unwrap();
+    match backend {
+        StorageTestBackend::Sqlite => {
+            let db = rusqlite::Connection::open(metadata_db_path).unwrap();
+            db.execute(
+                "INSERT INTO snapshots (snapshot_id, created_at_unix, object_count, snapshot_json)
+                 VALUES (?1, ?2, 0, ?3)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET
+                     created_at_unix = excluded.created_at_unix,
+                     object_count = excluded.object_count,
+                     snapshot_json = excluded.snapshot_json",
+                rusqlite::params![snapshot_id, created_at_unix as i64, payload],
+            )
+            .unwrap();
+        }
+        #[cfg(feature = "turso-metadata")]
+        StorageTestBackend::Turso => {
+            let db = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO snapshots (snapshot_id, created_at_unix, object_count, snapshot_json)
+                 VALUES (?1, ?2, 0, ?3)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET
+                     created_at_unix = excluded.created_at_unix,
+                     object_count = excluded.object_count,
+                     snapshot_json = excluded.snapshot_json",
+                (snapshot_id, created_at_unix as i64, payload),
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+async fn compress_snapshot_json_data_compresses_uncompressed_snapshots_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("compress-snapshot-json").await;
+
+    // One compressed snapshot via the normal path.
+    persist_snapshot_fixture(&store, "snap-compress-001", 100).await;
+
+    // Two uncompressed snapshots inserted directly, simulating pre-compression legacy data.
+    persist_uncompressed_snapshot_fixture(
+        backend,
+        &store.metadata_db_path,
+        "snap-compress-002",
+        200,
+    )
+    .await;
+    persist_uncompressed_snapshot_fixture(
+        backend,
+        &store.metadata_db_path,
+        "snap-compress-003",
+        300,
+    )
+    .await;
+
+    let dry_run = store.compress_snapshot_json_data(true).await.unwrap();
+    assert_eq!(dry_run.snapshots_scanned, 3);
+    assert_eq!(dry_run.snapshots_eligible, 2);
+    assert_eq!(dry_run.snapshots_compressed, 0);
+    assert_eq!(dry_run.snapshots_already_compressed, 1);
+    assert!(dry_run.dry_run);
+    // Dry run must not have changed anything.
+    let still_eligible = store
+        .metadata_store
+        .list_uncompressed_snapshot_ids()
+        .await
+        .unwrap();
+    assert_eq!(still_eligible.len(), 2);
+
+    let applied = store.compress_snapshot_json_data(false).await.unwrap();
+    assert_eq!(applied.snapshots_compressed, 2);
+    assert!(!applied.dry_run);
+
+    // No uncompressed snapshots remain.
+    let second_run = store.compress_snapshot_json_data(true).await.unwrap();
+    assert_eq!(second_run.snapshots_eligible, 0);
+    assert_eq!(second_run.snapshots_already_compressed, 3);
+
+    // All snapshots are still readable with correct IDs.
+    let ids = snapshot_ids_chronological(&store).await;
+    assert_eq!(
+        ids,
+        vec![
+            "snap-compress-001".to_string(),
+            "snap-compress-002".to_string(),
+            "snap-compress-003".to_string(),
+        ]
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    compress_snapshot_json_data_compresses_uncompressed_snapshots_impl,
+    compress_snapshot_json_data_compresses_uncompressed_snapshots,
+    compress_snapshot_json_data_compresses_uncompressed_snapshots_turso
+);
+
 async fn live_snapshot_batch_reuses_snapshot_for_distinct_paths_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("live-snapshot-batch-distinct").await;
 

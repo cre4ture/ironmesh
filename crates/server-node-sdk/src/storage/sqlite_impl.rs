@@ -930,6 +930,17 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(indexes)
     }
 
+    async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
+        let db = self.metadata_conn()?;
+        let mut stmt = db.prepare("SELECT object_id FROM version_indexes ORDER BY object_id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
         let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
         let db = self.metadata_conn()?;
@@ -970,19 +981,41 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(snapshots)
     }
 
-    async fn count_uncompressed_snapshot_manifests(&self) -> Result<usize> {
+    async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
+        let db = self.metadata_conn()?;
+        let payload = db
+            .query_row(
+                "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
+                params![snapshot_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        match payload {
+            Some(payload) => {
+                let payload = decompress_snapshot_json(&payload)?;
+                serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .map(Some)
+                    .context("invalid snapshot manifest in sqlite")
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>> {
         const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
         let db = self.metadata_conn()?;
-        let mut stmt = db.prepare("SELECT snapshot_json FROM snapshots")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut count = 0;
+        let mut stmt = db.prepare("SELECT snapshot_id, snapshot_json FROM snapshots")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut ids = Vec::new();
         for row in rows {
-            let payload = row?;
+            let (id, payload) = row?;
             if !payload.starts_with(ZSTD_MAGIC) {
-                count += 1;
+                ids.push(id);
             }
         }
-        Ok(count)
+        Ok(ids)
     }
 
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {
