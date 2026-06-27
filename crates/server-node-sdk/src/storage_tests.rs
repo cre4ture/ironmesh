@@ -2618,6 +2618,138 @@ run_on_all_metadata_backends!(
     reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_turso
 );
 
+async fn reconcile_legacy_rename_logical_paths_repairs_intermediate_stale_paths_impl(
+    backend: StorageTestBackend,
+) {
+    // Regression test for the multi-rename case: legacy rename behavior updated a non-head
+    // version's logical_path to an intermediate path (not the current live head path), so the
+    // original guard that only repaired versions pointing at the current head path would
+    // incorrectly skip them as "unrelated mismatches".
+    let (root, mut store) = backend
+        .init_store("legacy-rename-logical-path-intermediate")
+        .await;
+
+    let put = store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"hello"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let mutation = store
+        .rename_object_path("docs/a.txt", "docs/b.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    let object_id = store
+        .current_state
+        .object_ids
+        .get("docs/b.txt")
+        .cloned()
+        .expect("renamed object should be current at destination");
+
+    // Simulate legacy rename behavior: the original put version's logical_path was incorrectly
+    // updated to the intermediate path "docs/b.txt" when the first rename happened.
+    let mut index = store
+        .load_version_index_by_object_id(&object_id)
+        .await
+        .unwrap()
+        .expect("renamed object should retain version index");
+    index
+        .versions
+        .get_mut(&put.version_id)
+        .expect("original version should remain in renamed object history")
+        .logical_path = Some("docs/b.txt".to_string());
+    store
+        .persist_version_index_by_object_id(&object_id, &index)
+        .await
+        .unwrap();
+
+    // Second rename using the current (correct) behavior, which does not touch non-head paths.
+    let mutation = store
+        .rename_object_path("docs/b.txt", "docs/c.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    // Now the original put version has logical_path = "docs/b.txt" (the intermediate stale path)
+    // but its manifest key is "docs/a.txt". "docs/b.txt" != current head "docs/c.txt", so the
+    // old guard classified this as an "unrelated mismatch" and skipped it.
+    let dirty_scrub = store.run_data_scrub().await.unwrap();
+    assert!(
+        dirty_scrub
+            .issues
+            .iter()
+            .any(|issue| issue.kind == super::DataScrubIssueKind::ManifestKeyMismatch),
+        "stale intermediate logical_path should trigger manifest_key_mismatch, report={dirty_scrub:?}"
+    );
+
+    let dry_run = store
+        .reconcile_legacy_rename_logical_paths(true)
+        .await
+        .unwrap();
+    assert_eq!(
+        dry_run.eligible_records, 1,
+        "record with stale intermediate path should be eligible for repair, report={dry_run:?}"
+    );
+    assert_eq!(dry_run.updated_records, 0);
+    assert_eq!(dry_run.skipped_unrelated_mismatches, 0);
+
+    let after_dry_run = store.list_versions("docs/c.txt").await.unwrap().unwrap();
+    let dry_run_original = after_dry_run
+        .versions
+        .iter()
+        .find(|record| record.version_id == put.version_id)
+        .expect("original version should still be present after dry run");
+    assert_eq!(
+        dry_run_original.logical_path.as_deref(),
+        Some("docs/b.txt"),
+        "dry run must not mutate"
+    );
+
+    let applied = store
+        .reconcile_legacy_rename_logical_paths(false)
+        .await
+        .unwrap();
+    assert_eq!(applied.eligible_records, 1);
+    assert_eq!(applied.updated_records, 1);
+    assert_eq!(applied.sampled_updates.len(), 1);
+    assert_eq!(applied.sampled_updates[0].old_logical_path, "docs/b.txt");
+    assert_eq!(
+        applied.sampled_updates[0].corrected_logical_path,
+        "docs/a.txt"
+    );
+
+    let after_apply = store.list_versions("docs/c.txt").await.unwrap().unwrap();
+    let repaired_original = after_apply
+        .versions
+        .iter()
+        .find(|record| record.version_id == put.version_id)
+        .expect("original version should still be present after repair");
+    assert_eq!(
+        repaired_original.logical_path.as_deref(),
+        Some("docs/a.txt"),
+        "original version should have its path corrected back to the manifest key"
+    );
+
+    let clean_scrub = store.run_data_scrub().await.unwrap();
+    assert_eq!(
+        clean_scrub.issue_count, 0,
+        "reconcile should leave scrub clean after repairing intermediate stale paths, report={clean_scrub:?}"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    reconcile_legacy_rename_logical_paths_repairs_intermediate_stale_paths_impl,
+    reconcile_legacy_rename_logical_paths_repairs_intermediate_stale_paths,
+    reconcile_legacy_rename_logical_paths_repairs_intermediate_stale_paths_turso
+);
+
 async fn compact_snapshot_history_keeps_overlap_boundaries_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("compact-snapshot-history-overlap").await;
 

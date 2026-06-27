@@ -2901,12 +2901,6 @@ impl PersistentStore {
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>();
-            let current_head_paths = index
-                .head_version_ids
-                .iter()
-                .filter_map(|version_id| index.versions.get(version_id))
-                .filter_map(|record| record.logical_path.clone())
-                .collect::<HashSet<_>>();
 
             let mut index_changed = false;
             let mut version_ids = index.versions.keys().cloned().collect::<Vec<_>>();
@@ -2957,12 +2951,6 @@ impl PersistentStore {
 
                 report.manifest_key_mismatches_seen =
                     report.manifest_key_mismatches_seen.saturating_add(1);
-
-                if !current_head_paths.contains(&logical_path) {
-                    report.skipped_unrelated_mismatches =
-                        report.skipped_unrelated_mismatches.saturating_add(1);
-                    continue;
-                }
 
                 report.eligible_records = report.eligible_records.saturating_add(1);
 
