@@ -30,6 +30,17 @@ The app uses a Rust JNI bridge:
 
 Gradle packages the JNI libraries from `app/build/generated/rustJniLibs`.
 
+## Internal release signing
+
+`assembleRelease` uses the same dedicated internal release key flow as the existing Android client app when these environment variables are set:
+
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE`
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD`
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS`
+- `IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD`
+
+In GitHub Actions, keep the keystore as base64 in `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`, decode it to a file, and export `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE` before running `:app:assembleRelease`.
+
 ## Runtime notes
 
 - The Android app binds the public listener to `0.0.0.0:38443`

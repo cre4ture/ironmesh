@@ -67,6 +67,9 @@ private fun escapeBuildConfigString(value: String): String =
         .replace("\n", "\\n")
         .replace("\r", "\\r")
 
+private fun readTrimmedEnvironmentVariable(name: String): String? =
+    System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
+
 private fun parseVersionParts(value: String): List<Int> =
     value.split(".", "-", "_").map { it.toIntOrNull() ?: 0 }
 
@@ -110,6 +113,38 @@ val workspaceRoot = rootDir.parentFile?.parentFile ?: rootDir
 val workspaceVersion = readWorkspacePackageVersion(workspaceRoot)
 val gitBuildRevision = readGitDescribe(workspaceRoot)
 val longVersion = "${workspaceVersion}\nBuild revision: ${gitBuildRevision}"
+val internalReleaseSigningEnvironment = mapOf(
+    "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE"),
+    "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD"),
+    "IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS"),
+    "IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD"),
+)
+val internalReleaseStoreFile = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE"]
+val internalReleaseStorePassword = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD"]
+val internalReleaseKeyAlias = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS"]
+val internalReleaseKeyPassword = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD"]
+val hasAnyInternalReleaseSigning = internalReleaseSigningEnvironment.values.any { it != null }
+val hasCompleteInternalReleaseSigning = internalReleaseSigningEnvironment.values.all { it != null }
+
+if (hasAnyInternalReleaseSigning && !hasCompleteInternalReleaseSigning) {
+    val missingVariables = internalReleaseSigningEnvironment
+        .filterValues { it == null }
+        .keys
+        .sorted()
+        .joinToString(", ")
+    throw GradleException(
+        "Incomplete internal Android release signing configuration. Missing environment variables: $missingVariables",
+    )
+}
+
+if (hasCompleteInternalReleaseSigning) {
+    val keystoreFile = File(requireNotNull(internalReleaseStoreFile))
+    if (!keystoreFile.isFile) {
+        throw GradleException(
+            "Internal Android release keystore not found at ${keystoreFile.absolutePath}",
+        )
+    }
+}
 
 plugins {
     id("com.android.application")
@@ -141,8 +176,22 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasCompleteInternalReleaseSigning) {
+            create("internalRelease") {
+                storeFile = File(requireNotNull(internalReleaseStoreFile))
+                storePassword = requireNotNull(internalReleaseStorePassword)
+                keyAlias = requireNotNull(internalReleaseKeyAlias)
+                keyPassword = requireNotNull(internalReleaseKeyPassword)
+            }
+        }
+    }
+
     buildTypes {
         getByName("release") {
+            if (hasCompleteInternalReleaseSigning) {
+                signingConfig = signingConfigs.getByName("internalRelease")
+            }
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -250,5 +299,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("com.google.android.material:material:1.12.0")
 
+    testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
