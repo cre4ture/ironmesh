@@ -12,6 +12,7 @@ crate-type = ["rlib", "cdylib"]
 anyhow.workspace = true
 jni = "0.21"
 reqwest.workspace = true
+rustls = "0.23"
 serde.workspace = true
 serde_json.workspace = true
 server-node-sdk = { path = "../../crates/server-node-sdk" }

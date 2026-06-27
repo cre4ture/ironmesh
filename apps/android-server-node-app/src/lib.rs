@@ -5,10 +5,10 @@ use jni::sys::{jint, jstring};
 use serde::Serialize;
 use server_node_sdk::EmbeddedManagedServerNodeConfig;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -96,13 +96,160 @@ fn java_string_or_throw(env: &mut JNIEnv, value: String) -> jstring {
     }
 }
 
-fn probe_health(local_url: &str) -> Result<Option<String>> {
-    let health_url = format!("{}/health", local_url.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
+fn bootstrap_ui_cert_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("managed")
+        .join("bootstrap-ui")
+        .join("bootstrap-cert.pem")
+}
+
+fn runtime_public_ca_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("managed")
+        .join("runtime")
+        .join("public")
+        .join("public-ca.pem")
+}
+
+fn load_certificate(path: &Path) -> Result<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+
+    let pem = std::fs::read(path).with_context(|| format!("failed reading {}", path.display()))?;
+    rustls::pki_types::CertificateDer::from_pem_slice(&pem)
+        .with_context(|| format!("failed parsing PEM from {}", path.display()))
+}
+
+#[derive(Debug)]
+struct LocalNodeTlsVerifier {
+    bootstrap_pinned_cert: Option<rustls::pki_types::CertificateDer<'static>>,
+    runtime_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for LocalNodeTlsVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(runtime_verifier) = &self.runtime_verifier
+            && runtime_verifier
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                .is_ok()
+        {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+
+        if let Some(bootstrap_pinned_cert) = &self.bootstrap_pinned_cert
+            && end_entity.as_ref() == bootstrap_pinned_cert.as_ref()
+        {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+
+        Err(rustls::Error::General(
+            "local server-node certificate did not match the expected bootstrap pin or runtime CA"
+                .to_string(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
+}
+
+fn local_tls_verifier(
+    data_dir: &Path,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<LocalNodeTlsVerifier> {
+    let bootstrap_cert_path = bootstrap_ui_cert_path(data_dir);
+    let runtime_ca_path = runtime_public_ca_path(data_dir);
+    let bootstrap_pinned_cert = bootstrap_cert_path
+        .exists()
+        .then(|| load_certificate(&bootstrap_cert_path))
+        .transpose()?;
+    let runtime_verifier = if runtime_ca_path.exists() {
+        let runtime_ca = load_certificate(&runtime_ca_path)?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(runtime_ca).map_err(|err| {
+            anyhow::anyhow!(
+                "failed adding {} as a trust anchor: {err}",
+                runtime_ca_path.display()
+            )
+        })?;
+        Some(
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider.clone(),
+            )
+            .build()
+            .with_context(|| {
+                format!(
+                    "failed building runtime TLS verifier from {}",
+                    runtime_ca_path.display()
+                )
+            })? as Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        )
+    } else {
+        None
+    };
+
+    if bootstrap_pinned_cert.is_none() && runtime_verifier.is_none() {
+        bail!(
+            "no local TLS trust material found at {} or {}",
+            bootstrap_cert_path.display(),
+            runtime_ca_path.display()
+        );
+    }
+
+    Ok(LocalNodeTlsVerifier {
+        bootstrap_pinned_cert,
+        runtime_verifier,
+        supported_algs: provider.signature_verification_algorithms,
+    })
+}
+
+fn local_health_check_client(data_dir: &Path) -> Result<reqwest::blocking::Client> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .context("failed to load default TLS protocol versions for Android server-node")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(local_tls_verifier(data_dir, provider)?))
+        .with_no_client_auth();
+
+    reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(400))
+        .use_preconfigured_tls(tls)
         .build()
-        .context("failed to build Android server-node health-check client")?;
+        .context("failed to build Android server-node health-check client")
+}
+
+fn probe_health(local_url: &str, data_dir: &Path) -> Result<Option<String>> {
+    let health_url = format!("{}/health", local_url.trim_end_matches('/'));
+    let client = local_health_check_client(data_dir)?;
     let response = client
         .get(&health_url)
         .send()
@@ -127,6 +274,7 @@ fn probe_health(local_url: &str) -> Result<Option<String>> {
 
 fn wait_for_server_ready(
     local_url: &str,
+    data_dir: &Path,
     result_rx: &Receiver<Result<()>>,
 ) -> Result<Option<String>> {
     for _ in 0..STARTUP_POLL_ATTEMPTS {
@@ -137,7 +285,7 @@ fn wait_for_server_ready(
             Err(TryRecvError::Empty) => {}
         }
 
-        if let Ok(mode) = probe_health(local_url) {
+        if let Ok(mode) = probe_health(local_url, data_dir) {
             return Ok(mode);
         }
 
@@ -198,7 +346,7 @@ fn start_embedded_server(
         })
         .context("failed to spawn Android server-node thread")?;
 
-    match wait_for_server_ready(local_url.as_str(), &result_rx) {
+    match wait_for_server_ready(local_url.as_str(), &data_dir, &result_rx) {
         Ok(mode) => Ok((
             RunningNode {
                 bind_addr,
@@ -322,7 +470,7 @@ fn snapshot_status() -> AndroidServerNodeStatus {
     next_status.bind_addr = bind_addr.clone();
     next_status.data_dir = data_dir.clone();
 
-    match probe_health(local_url.as_str()) {
+    match probe_health(local_url.as_str(), Path::new(&data_dir)) {
         Ok(mode) => {
             next_status.state = "running".to_string();
             next_status.healthy = true;
