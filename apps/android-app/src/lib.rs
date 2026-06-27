@@ -1,4 +1,6 @@
 mod android_saf_backend;
+#[cfg(debug_assertions)]
+mod android_test_bridge;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
