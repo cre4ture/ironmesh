@@ -5790,7 +5790,14 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
 
     // Write both versions to the local store. v2 is a child of v1, making v1 a non-head version
     // that list_replication_subjects() will not surface in availability syncs.
-    seed_subject_version(&state, &key, &version_old, b"old payload v1".to_vec(), Vec::new()).await;
+    seed_subject_version(
+        &state,
+        &key,
+        &version_old,
+        b"old payload v1".to_vec(),
+        Vec::new(),
+    )
+    .await;
     seed_subject_version(
         &state,
         &key,

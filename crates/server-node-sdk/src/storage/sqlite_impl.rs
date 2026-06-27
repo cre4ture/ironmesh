@@ -610,6 +610,65 @@ impl MetadataStore for SqliteMetadataStore {
         }
     }
 
+    async fn load_cached_media_metadata_many(
+        &self,
+        content_fingerprints: &[String],
+    ) -> Result<std::collections::HashMap<String, CachedMediaMetadata>> {
+        const SQLITE_MEDIA_CACHE_QUERY_BATCH_SIZE: usize = 500;
+
+        let db = self.metadata_conn()?;
+        let mut metadata_by_content_fingerprint =
+            std::collections::HashMap::with_capacity(content_fingerprints.len());
+
+        for chunk in content_fingerprints.chunks(SQLITE_MEDIA_CACHE_QUERY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT content_fingerprint, metadata_json
+                 FROM media_cache
+                 WHERE content_fingerprint IN ({placeholders})"
+            );
+            let mut stmt = db.prepare(&query)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+
+            let mut invalid_rows = Vec::new();
+            for row in rows {
+                let (content_fingerprint, payload) = row?;
+                match serde_json::from_slice::<CachedMediaMetadata>(&payload) {
+                    Ok(metadata) => {
+                        metadata_by_content_fingerprint.insert(content_fingerprint, metadata);
+                    }
+                    Err(err) => invalid_rows.push((content_fingerprint, err.to_string())),
+                }
+            }
+            drop(stmt);
+
+            for (content_fingerprint, error) in invalid_rows {
+                db.execute(
+                    "DELETE FROM media_cache WHERE content_fingerprint = ?1",
+                    params![content_fingerprint],
+                )
+                .with_context(|| {
+                    format!("failed to delete invalid media metadata row for {content_fingerprint}")
+                })?;
+                warn!(
+                    content_fingerprint = %content_fingerprint,
+                    error,
+                    "deleted invalid cached media metadata row from sqlite"
+                );
+            }
+        }
+
+        Ok(metadata_by_content_fingerprint)
+    }
+
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
         let payload = serde_json::to_vec_pretty(metadata)?;
         let db = self.metadata_conn()?;
