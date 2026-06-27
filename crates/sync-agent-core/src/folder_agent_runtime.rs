@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
-    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    RemoteSnapshotUpdate,
+    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
+    RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -25,12 +25,14 @@ use crate::{
     download_transfer_temp_path, load_local_baseline_hashes_with_retries,
     load_local_baseline_with_retries, local_entry_state_for_path, local_file_content_fingerprint,
     local_paths_matching_remote_on_startup, local_paths_to_preserve_on_startup_with_hash,
-    materialize_remote_conflict_copies, parent_directories, remote_file_paths_by_local_path,
-    remove_local_path, scan_local_tree_with_progress, spawn_ui_server,
-    startup_add_delete_conflicts, startup_baseline_state_from_remote_index,
+    materialize_remote_conflict_copies, normalized_optional_string, parent_directories,
+    remote_file_paths_by_local_path, remove_local_path, scan_local_tree_with_progress,
+    spawn_ui_server, startup_add_delete_conflicts, startup_baseline_state_from_remote_index,
     startup_dual_modify_conflicts_with_hash, startup_remote_delete_wins_paths_with_hash,
     try_record_modification, upload_local_file,
 };
+
+pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> Result<()>;
 
 #[derive(Debug, Clone)]
 pub struct FolderAgentRuntimeOptions {
@@ -41,6 +43,7 @@ pub struct FolderAgentRuntimeOptions {
     pub client_bootstrap_json: Option<String>,
     pub server_ca_pem: Option<String>,
     pub client_identity_json: Option<String>,
+    pub persist_client_identity: Option<FolderAgentClientIdentityPersistence>,
     pub prefix: Option<String>,
     pub depth: usize,
     pub remote_refresh_interval_ms: u64,
@@ -1477,6 +1480,36 @@ fn seed_downloaded_remote_files_into_local_state(
 }
 
 fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClient> {
+    let server_ca_pem = normalized_optional_string(options.server_ca_pem.as_deref());
+    let client_bootstrap_json =
+        normalized_optional_string(options.client_bootstrap_json.as_deref());
+    let client_identity_json = normalized_optional_string(options.client_identity_json.as_deref());
+    let mut client_identity = client_identity_json
+        .as_deref()
+        .map(ClientIdentityMaterial::from_json_str)
+        .transpose()
+        .context("failed to parse client identity JSON")?;
+
+    if let Some(raw_bootstrap) = client_bootstrap_json.as_deref()
+        && let Some(identity) = client_identity.as_mut()
+    {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(raw_bootstrap)
+            .context("failed to parse connection bootstrap JSON")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+
+        let original_identity = identity.clone();
+        let client = bootstrap.build_client_with_identity_renewing(identity)?;
+        if identity != &original_identity
+            && let Some(persist_client_identity) = options.persist_client_identity
+        {
+            persist_client_identity(identity)
+                .context("failed to persist renewed folder sync client identity")?;
+        }
+        return Ok(client);
+    }
+
     build_configured_client(
         options.server_base_url.as_deref(),
         options.client_bootstrap_json.as_deref(),
@@ -2923,6 +2956,7 @@ mod tests {
             client_bootstrap_json: None,
             server_ca_pem: None,
             client_identity_json: None,
+            persist_client_identity: None,
             prefix: None,
             depth: 0,
             remote_refresh_interval_ms: 1000,

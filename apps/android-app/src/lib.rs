@@ -1,4 +1,6 @@
 mod android_saf_backend;
+#[cfg(debug_assertions)]
+mod android_test_bridge;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -85,7 +87,8 @@ mod tests {
 }
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    IronMeshClient, enroll_connection_input_blocking,
+    IronMeshClient, build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    enroll_connection_input_blocking,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -101,8 +104,8 @@ use std::thread;
 use sync_agent_core::{
     FolderAgentRuntimeMetrics, FolderAgentRuntimeOptions, FolderAgentRuntimeStatus,
     FolderAgentStatusCallback, ModificationHistoryPage, ModificationLogStore,
-    ModificationOperation, PathScope, build_configured_client, describe_connection_target,
-    run_folder_agent, run_folder_agent_with_control,
+    ModificationOperation, PathScope, describe_connection_target, run_folder_agent,
+    run_folder_agent_with_control,
 };
 use tokio::task::JoinHandle;
 
@@ -199,6 +202,29 @@ fn persist_android_connection_bootstrap(bootstrap: &ConnectionBootstrap) -> Resu
             &[JValue::Object(bootstrap_json.as_ref())],
         )
         .context("failed to persist updated bootstrap JSON to Android preferences")?;
+        Ok(())
+    })
+}
+
+fn persist_android_client_identity(identity: &ClientIdentityMaterial) -> Result<()> {
+    if android_preferences_bridge_state().get().is_none() {
+        return Ok(());
+    }
+
+    let json = identity
+        .to_json_pretty()
+        .context("failed to serialize android client identity for persistence")?;
+    with_android_preferences_env(|env, class| {
+        let client_identity_json = env
+            .new_string(&json)
+            .context("failed to allocate client identity JSON string")?;
+        env.call_static_method(
+            &class,
+            "updateDeviceAuthClientIdentityJson",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(client_identity_json.as_ref())],
+        )
+        .context("failed to persist updated client identity to Android preferences")?;
         Ok(())
     })
 }
@@ -756,11 +782,12 @@ fn start_embedded_web_ui(
         .local_addr()
         .context("failed to read embedded web ui listener address")?;
     let local_url = format!("http://127.0.0.1:{}/", address.port());
-    let client = configured_sdk(
+    let configured = configured_sdk_build(
         connection_input.clone(),
         server_ca_pem.clone(),
         client_identity_json.clone(),
     )?;
+    let client = configured.client;
     let mut web_ui_config =
         web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
     let (_, client_bootstrap_json) = split_connection_input(connection_input.clone())?;
@@ -777,7 +804,7 @@ fn start_embedded_web_ui(
                 persist_android_connection_bootstrap,
             ));
     }
-    if let Some(identity) = parse_client_identity_json(client_identity_json.clone())? {
+    if let Some(identity) = configured.client_identity {
         web_ui_config = web_ui_config.with_client_identity(identity);
     }
     let app = web_ui_backend::router(web_ui_config);
@@ -1025,20 +1052,81 @@ fn split_connection_input(
     }
 }
 
+struct ConfiguredAndroidSdk {
+    client: IronMeshClient,
+    client_identity: Option<ClientIdentityMaterial>,
+}
+
+fn configured_sdk_build(
+    connection_input: impl Into<String>,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<ConfiguredAndroidSdk> {
+    let server_ca_pem = normalize_optional_string(server_ca_pem);
+    let client_identity_json = normalize_optional_string(client_identity_json);
+    let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
+    let parsed_identity = client_identity_json
+        .as_deref()
+        .map(|raw| {
+            ClientIdentityMaterial::from_json_str(raw)
+                .context("failed to parse android client identity JSON")
+        })
+        .transpose()?;
+
+    if let Some(raw_bootstrap) = client_bootstrap_json.as_deref() {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(raw_bootstrap)
+            .context("failed to parse android connection bootstrap JSON")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+
+        return match parsed_identity {
+            Some(mut identity) => {
+                let original_identity = identity.clone();
+                let client = bootstrap.build_client_with_identity_renewing(&mut identity)?;
+                if identity != original_identity
+                    && let Err(err) = persist_android_client_identity(&identity)
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to persist renewed android client identity"
+                    );
+                }
+                Ok(ConfiguredAndroidSdk {
+                    client,
+                    client_identity: Some(identity),
+                })
+            }
+            None => Ok(ConfiguredAndroidSdk {
+                client: bootstrap.build_client()?,
+                client_identity: None,
+            }),
+        };
+    }
+
+    let server_base_url = server_base_url
+        .ok_or_else(|| anyhow::anyhow!("missing server_base_url or client_bootstrap_json"))?;
+    let client = match parsed_identity.as_ref() {
+        Some(identity) => build_http_client_with_identity_from_pem(
+            server_ca_pem.as_deref(),
+            &server_base_url,
+            identity,
+        )?,
+        None => build_http_client_from_pem(server_ca_pem.as_deref(), &server_base_url)?,
+    };
+
+    Ok(ConfiguredAndroidSdk {
+        client,
+        client_identity: parsed_identity,
+    })
+}
+
 fn configured_sdk(
     connection_input: impl Into<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<IronMeshClient> {
-    let server_ca_pem = normalize_optional_string(server_ca_pem);
-    let client_identity_json = normalize_optional_string(client_identity_json);
-    let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
-    build_configured_client(
-        server_base_url.as_deref(),
-        client_bootstrap_json.as_deref(),
-        server_ca_pem.as_deref(),
-        client_identity_json.as_deref(),
-    )
+    Ok(configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?.client)
 }
 
 fn configured_client_node(
@@ -1051,19 +1139,6 @@ fn configured_client_node(
         server_ca_pem,
         client_identity_json,
     )?))
-}
-
-fn parse_client_identity_json(
-    client_identity_json: Option<String>,
-) -> Result<Option<ClientIdentityMaterial>> {
-    let client_identity_json = normalize_optional_string(client_identity_json);
-    client_identity_json
-        .as_deref()
-        .map(|raw| {
-            ClientIdentityMaterial::from_json_str(raw)
-                .context("failed to parse android client identity JSON")
-        })
-        .transpose()
 }
 
 /// # Safety
@@ -1166,6 +1241,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_put
         let key: String = env.get_string(&key)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
         let payload_ref = unsafe { JByteArray::from_raw(payload) };
         let payload = env.convert_byte_array(&payload_ref)?;
 
@@ -1257,6 +1333,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
         let snapshot = optional_jstring(&mut env, snapshot)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
         let sdk = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
         let response = sdk.store_index_blocking(
             prefix.as_deref(),
@@ -1308,6 +1385,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
             u64::try_from(size_bytes).context("streamPutObject requires non-negative sizeBytes")?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
         let mut reader = JavaInputStreamReader::new(&mut env, input_stream)?;
         let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         let report = client.put_large_aware_reader(key, &mut reader, size_bytes)?;
@@ -1340,6 +1418,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_del
         let key: String = env.get_string(&key)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
         let rt = runtime()?;
         let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         rt.block_on(client.delete_path(key))?;
@@ -1417,6 +1496,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let relative_url: String = env.get_string(&relative_url)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
         let rt = runtime()?;
         let client = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
@@ -1481,6 +1561,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
             client_bootstrap_json,
             server_ca_pem,
             client_identity_json,
+            persist_client_identity: Some(persist_android_client_identity),
             prefix,
             depth: usize::try_from(depth).unwrap_or(1).max(1),
             remote_refresh_interval_ms: 3_000,
@@ -1547,6 +1628,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
             client_bootstrap_json,
             server_ca_pem,
             client_identity_json,
+            persist_client_identity: Some(persist_android_client_identity),
             prefix,
             depth: usize::try_from(depth).unwrap_or(1).max(1),
             remote_refresh_interval_ms: 3_000,

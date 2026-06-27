@@ -456,7 +456,7 @@ class MainViewModel(
             status = "Starting Web UI...",
         )
         viewModelScope.launch {
-            runCatching {
+            val result = runCatching {
                 withContext(Dispatchers.IO) {
                     repository.startWebUi(
                         connectionInput,
@@ -465,6 +465,8 @@ class MainViewModel(
                     )
                 }
             }
+            refreshPersistedDeviceAuthState()
+            result
                 .onSuccess { url ->
                     uiState.value = uiState.value.copy(
                         loading = false,
@@ -540,7 +542,9 @@ class MainViewModel(
     private fun execute(loadingMessage: String, action: suspend () -> String) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {
-            runCatching { action() }
+            val result = runCatching { action() }
+            refreshPersistedDeviceAuthState()
+            result
                 .onSuccess { message ->
                     uiState.value = uiState.value.copy(loading = false, status = message)
                 }
@@ -804,16 +808,28 @@ class MainViewModel(
         )
     }
 
+    private fun refreshPersistedDeviceAuthState(): DeviceAuthState {
+        val persisted = IronmeshPreferences.getDeviceAuthState(getApplication())
+        if (persisted != uiState.value.deviceAuthState) {
+            uiState.value = uiState.value.copy(deviceAuthState = persisted)
+        }
+        return persisted
+    }
+
+    private fun currentDeviceAuthState(): DeviceAuthState {
+        return refreshPersistedDeviceAuthState()
+    }
+
     private fun currentClientIdentityJson(): String? {
-        return uiState.value.deviceAuthState.toClientIdentityJson()
+        return currentDeviceAuthState().toClientIdentityJson()
     }
 
     private fun currentConnectionInput(): String {
-        return uiState.value.deviceAuthState.preferredConnectionInput()
+        return currentDeviceAuthState().preferredConnectionInput()
     }
 
     private fun currentServerCaPem(): String? {
-        return uiState.value.deviceAuthState.serverCaPem?.takeIf { it.isNotBlank() }
+        return currentDeviceAuthState().serverCaPem?.takeIf { it.isNotBlank() }
     }
 
     private fun collectGalleryImages(

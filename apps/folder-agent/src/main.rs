@@ -314,6 +314,7 @@ fn run_agent(args: &Args) -> Result<()> {
         client_bootstrap_json: target.client_bootstrap_json.clone(),
         server_ca_pem: target.server_ca_pem.clone(),
         client_identity_json: client_identity_json.clone(),
+        persist_client_identity: None,
         prefix: args.prefix.clone(),
         depth: args.depth,
         remote_refresh_interval_ms: args.remote_refresh_interval_ms,

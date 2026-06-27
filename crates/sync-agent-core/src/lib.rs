@@ -70,7 +70,7 @@ pub fn build_configured_client(
     let server_ca_pem = normalized_optional_string(server_ca_pem);
     let client_bootstrap_json = normalized_optional_string(client_bootstrap_json);
     let client_identity_json = normalized_optional_string(client_identity_json);
-    let client_identity = client_identity_json
+    let mut client_identity = client_identity_json
         .as_deref()
         .map(ClientIdentityMaterial::from_json_str)
         .transpose()
@@ -81,8 +81,8 @@ pub fn build_configured_client(
         if let Some(server_ca_pem) = server_ca_pem.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
-        return match client_identity.as_ref() {
-            Some(identity) => bootstrap.build_client_with_identity(identity),
+        return match client_identity.as_mut() {
+            Some(identity) => bootstrap.build_client_with_identity_renewing(identity),
             None => bootstrap.build_client(),
         };
     }
