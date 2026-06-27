@@ -2236,6 +2236,28 @@ pub struct ServerNodeConfig {
     pub require_client_auth: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct EmbeddedManagedServerNodeConfig {
+    pub data_dir: PathBuf,
+    pub bind_addr: SocketAddr,
+    pub log_directive: String,
+}
+
+impl EmbeddedManagedServerNodeConfig {
+    pub fn new(data_dir: impl Into<PathBuf>, bind_addr: SocketAddr) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            bind_addr,
+            log_directive: "info".to_string(),
+        }
+    }
+
+    pub fn with_log_directive(mut self, log_directive: impl Into<String>) -> Self {
+        self.log_directive = log_directive.into();
+        self
+    }
+}
+
 pub struct LocalNodeHandle {
     base_url: String,
     shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
@@ -4602,6 +4624,24 @@ pub async fn run_from_env() -> Result<()> {
         }
         setup::StartupMode::Setup(config) => {
             setup::run_setup_mode(config, log_buffer, runtime_log_control).await
+        }
+    }
+}
+
+pub async fn run_embedded_managed(config: EmbeddedManagedServerNodeConfig) -> Result<()> {
+    common::logging::init_compact_tracing_default(config.log_directive.as_str());
+    ensure_rustls_crypto_provider_installed();
+
+    let startup_config = setup::managed_startup_bootstrap_config(config.data_dir, config.bind_addr);
+    let log_buffer = Arc::new(LogBuffer::new(500));
+    let runtime_log_control = RuntimeLogControl::disabled(config.log_directive.as_str());
+
+    match setup::load_managed_startup_mode(startup_config)? {
+        setup::StartupMode::Runtime(runtime_config) => {
+            run_inner(runtime_config, Some(log_buffer), runtime_log_control).await
+        }
+        setup::StartupMode::Setup(setup_config) => {
+            setup::run_setup_mode(setup_config, log_buffer, runtime_log_control).await
         }
     }
 }

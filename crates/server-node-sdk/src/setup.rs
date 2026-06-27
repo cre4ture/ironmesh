@@ -230,7 +230,7 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
     load_managed_startup_mode(default_setup_bootstrap_config()?)
 }
 
-fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<StartupMode> {
+pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<StartupMode> {
     tracing::info!(
         data_dir = %config.data_dir.display(),
         state_path = %config.state_path.display(),
@@ -973,13 +973,20 @@ fn default_setup_bootstrap_config() -> Result<SetupBootstrapConfig> {
         .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
         .parse()
         .context("invalid IRONMESH_SERVER_BIND for bootstrap setup mode")?;
-    Ok(SetupBootstrapConfig {
+    Ok(managed_startup_bootstrap_config(data_dir, bind_addr))
+}
+
+pub(crate) fn managed_startup_bootstrap_config(
+    data_dir: PathBuf,
+    bind_addr: SocketAddr,
+) -> SetupBootstrapConfig {
+    SetupBootstrapConfig {
         state_path: managed_setup_state_path(&data_dir),
         bootstrap_cert_path: bootstrap_setup_cert_path(&data_dir),
         bootstrap_key_path: bootstrap_setup_key_path(&data_dir),
         data_dir,
         bind_addr,
-    })
+    }
 }
 
 fn managed_setup_dir(data_dir: &std::path::Path) -> PathBuf {

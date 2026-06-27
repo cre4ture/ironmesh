@@ -20,6 +20,7 @@ members = [
     "apps/config-app",
     "apps/folder-agent",
     "apps/android-app",
+    "apps/android-server-node-app",
     "apps/ios-app",
     "apps/os-integration",
 ]

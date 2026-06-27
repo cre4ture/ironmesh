@@ -1,0 +1,21 @@
+[package]
+name = "android-server-node-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+jni = "0.21"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+server-node-sdk = { path = "../../crates/server-node-sdk" }
+tokio.workspace = true
+
+[lints]
+workspace = true
