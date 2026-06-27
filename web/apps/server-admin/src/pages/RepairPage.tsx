@@ -31,6 +31,7 @@ import {
   Select,
   Stack,
   Table,
+  Tabs,
   Text
 } from "@mantine/core";
 import { JsonBlock, StatCard } from "@ironmesh/ui";
@@ -386,977 +387,996 @@ export function RepairPage() {
       ) : null}
       {error ? <Alert color="red" title="Failed to load maintenance state">{error}</Alert> : null}
 
-      <Card withBorder radius="md" padding="lg">
-        <Stack gap="md">
-          <Group justify="space-between" align="flex-start">
-            <Text fw={700}>Manual repair actions</Text>
-            <Stack gap="xs" align="flex-end">
-              <Badge variant="light">
-                {manualRepairActionsQuery.data
-                  ? `${manualRepairActions.length} available`
-                  : loading
-                    ? "loading"
-                    : "not loaded"}
-              </Badge>
-              <Badge variant="light" color={hasActiveManualRepairRun ? "orange" : "gray"}>
-                {hasActiveManualRepairRun ? "1 running" : "idle"}
-              </Badge>
-              <Badge variant="light">retention {manualRepairRetentionLabel}</Badge>
-              <TablePageControls
-                pagination={pagedManualRepairActions}
-                onPrevious={() => setManualRepairActionsPageIndex((current) => current - 1)}
-                onNext={() => setManualRepairActionsPageIndex((current) => current + 1)}
-              />
-            </Stack>
-          </Group>
-          {manualRepairActions.length > 0 ? (
-            <Table.ScrollContainer minWidth={920}>
-              <Table striped highlightOnHover withTableBorder>
-                <Table.Thead>
-                  <Table.Tr>
-                    <Table.Th>Action</Table.Th>
-                    <Table.Th>Description</Table.Th>
-                    <Table.Th>Mode</Table.Th>
-                    <Table.Th>Status</Table.Th>
-                    <Table.Th />
-                  </Table.Tr>
-                </Table.Thead>
-                <Table.Tbody>
-                  {pagedManualRepairActions.pageItems.map((action) => {
-                    const latestActionRun = latestManualRepairRunsByActionId.get(action.id) ?? null;
-                    const actionStarting =
-                      manualRepairActionMutation.isPending &&
-                      manualRepairActionMutation.variables?.actionId === action.id;
-                    const actionRunning = activeManualRepairRun?.action_id === action.id;
-                    return (
-                      <Table.Tr key={action.id}>
-                        <Table.Td>
-                          <Stack gap={4}>
-                            <Text fw={600}>{action.label}</Text>
-                            <Text size="xs" ff="monospace" c="dimmed">
-                              {action.id}
-                            </Text>
-                          </Stack>
-                        </Table.Td>
-                        <Table.Td maw={420}>
-                          <Text size="sm" c="dimmed">
-                            {action.description}
-                          </Text>
-                        </Table.Td>
-                        <Table.Td>
-                          <Group gap="xs">
-                            {action.dry_run_supported ? (
-                              <Badge variant="light" color="blue">
-                                dry run
-                              </Badge>
-                            ) : null}
-                            <Badge variant="light" color={action.destructive ? "red" : "teal"}>
-                              {action.destructive ? "destructive" : "metadata"}
-                            </Badge>
-                          </Group>
-                        </Table.Td>
-                        <Table.Td miw={220}>
-                          {actionRunning ? (
-                            <Stack gap={4}>
-                              <Badge color="orange" variant="light">
-                                {activeManualRepairRun?.dry_run ? "dry run running" : "running"}
-                              </Badge>
-                              <Text size="xs" c="dimmed">
-                                Started {formatUnixTs(activeManualRepairRun.started_at_unix)}
-                              </Text>
-                            </Stack>
-                          ) : latestActionRun ? (
-                            <Stack gap={4}>
-                              <Badge
-                                color={manualRepairRunStatusColor(latestActionRun)}
-                                variant="light"
-                              >
-                                {formatManualRepairRunStatus(latestActionRun)}
-                              </Badge>
-                              <Text size="xs" c="dimmed">
-                                Finished {formatUnixTs(latestActionRun.finished_at_unix)}
-                              </Text>
-                              <Text size="xs" c="dimmed">
-                                {latestActionRun.summary}
-                              </Text>
-                            </Stack>
-                          ) : (
-                            <Text size="sm" c="dimmed">
-                              No recent run
-                            </Text>
-                          )}
-                        </Table.Td>
-                        <Table.Td>
-                          <Group gap="xs" justify="flex-end" wrap="nowrap">
-                            <Button
-                              size="xs"
-                              variant="default"
-                              disabled={
-                                !canInspectRepair ||
-                                !action.dry_run_supported ||
-                                hasActiveManualRepairRun
-                              }
-                              loading={
-                                actionStarting
-                                  ? manualRepairActionMutation.variables?.dryRun
-                                  : actionRunning && activeManualRepairRun?.dry_run
-                              }
-                              leftSection={<IconSearch size={14} />}
-                              onClick={() =>
-                                void manualRepairActionMutation.mutateAsync({
-                                  actionId: action.id,
-                                  dryRun: true
-                                })
-                              }
-                            >
-                              Dry run
-                            </Button>
-                            <Button
-                              size="xs"
-                              color={action.destructive ? "red" : "teal"}
-                              variant="light"
-                              disabled={!canInspectRepair || hasActiveManualRepairRun}
-                              loading={
-                                actionStarting
-                                  ? !manualRepairActionMutation.variables?.dryRun
-                                  : actionRunning && !activeManualRepairRun?.dry_run
-                              }
-                              leftSection={<IconPlayerPlay size={14} />}
-                              onClick={() =>
-                                void manualRepairActionMutation.mutateAsync({
-                                  actionId: action.id,
-                                  dryRun: false
-                                })
-                              }
-                            >
-                              Run action
-                            </Button>
-                          </Group>
-                        </Table.Td>
-                      </Table.Tr>
-                    );
-                  })}
-                </Table.Tbody>
-              </Table>
-            </Table.ScrollContainer>
-          ) : (
-            <Text c="dimmed">
-              {loading ? "Loading manual repair actions..." : "No manual repair actions are available."}
-            </Text>
-          )}
-          {activeManualRepairRun ? (
-            <Alert
-              color="orange"
-              variant="light"
-              title={
-                activeManualRepairRun.dry_run
-                  ? "Manual repair dry run is running"
-                  : "Manual repair action is running"
-              }
-            >
-              <Stack gap="sm">
-                <Text size="sm">
-                  Action <Code>{activeManualRepairRun.action_id}</Code> started{" "}
-                  {formatUnixTs(activeManualRepairRun.started_at_unix)} and will keep reporting
-                  here even if you switch away from the page.
-                </Text>
-              </Stack>
-            </Alert>
-          ) : null}
-          {latestManualRepairRun ? (
-            <Alert
-              color={manualRepairRunAlertColor(latestManualRepairRun)}
-              variant="light"
-              title={manualRepairRunAlertTitle(latestManualRepairRun)}
-            >
-              <Stack gap="sm">
-                <Text size="sm">{latestManualRepairRun.summary}</Text>
-                <Text size="xs" c="dimmed">
-                  Action <Code>{latestManualRepairRun.action_id}</Code> finished after{" "}
-                  {formatDurationShort(latestManualRepairRun.duration_ms)}.
-                </Text>
-                {latestManualRepairRun.last_error ? (
-                  <Text size="xs" c="red">
-                    {latestManualRepairRun.last_error}
-                  </Text>
-                ) : null}
-                <JsonBlock value={latestManualRepairRun} />
-              </Stack>
-            </Alert>
-          ) : null}
-        </Stack>
-      </Card>
+      <Tabs defaultValue="replication">
+        <Tabs.List>
+          <Tabs.Tab value="replication">Replication Repair</Tabs.Tab>
+          <Tabs.Tab value="manual-actions">Manual Actions</Tabs.Tab>
+          <Tabs.Tab value="data-scrub">Data Scrub</Tabs.Tab>
+        </Tabs.List>
 
-      <Card withBorder radius="md" padding="lg">
-        <Stack gap="md">
-          <Group justify="space-between" align="flex-start">
-            <Stack gap={4}>
-              <Text fw={700}>Retained manual repair runs</Text>
-              <Text size="sm" c="dimmed">
-                Every finished manual repair action, including dry runs, is stored here for later
-                operator review until it ages out of the retention window.
-              </Text>
-            </Stack>
-            <Stack gap="xs" align="flex-end">
-              <Badge variant="light">
-                {manualRepairHistory ? `${manualRepairHistory.runs.length} retained` : "not loaded"}
-              </Badge>
-              <Badge variant="light">retention {manualRepairRetentionLabel}</Badge>
-              <TablePageControls
-                pagination={pagedManualRepairRuns}
-                onPrevious={() => setManualRepairRunsPageIndex((current) => current - 1)}
-                onNext={() => setManualRepairRunsPageIndex((current) => current + 1)}
-              />
-            </Stack>
-          </Group>
-          {manualRepairHistory && manualRepairHistory.runs.length > 0 ? (
-            <Table.ScrollContainer minWidth={980}>
-              <Table striped highlightOnHover withTableBorder>
-                <Table.Thead>
-                  <Table.Tr>
-                    <Table.Th>Finished</Table.Th>
-                    <Table.Th>Action</Table.Th>
-                    <Table.Th>Mode</Table.Th>
-                    <Table.Th>Status</Table.Th>
-                    <Table.Th>Duration</Table.Th>
-                    <Table.Th>Result</Table.Th>
-                    <Table.Th />
-                  </Table.Tr>
-                </Table.Thead>
-                <Table.Tbody>
-                  {pagedManualRepairRuns.pageItems.map((run) => {
-                    const actionDescriptor =
-                      manualRepairActionDescriptorsById.get(run.action_id) ?? null;
-                    return (
-                      <Table.Tr key={run.run_id}>
-                        <Table.Td>
-                          <Stack gap={2}>
-                            <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
-                            <Text size="xs" c="dimmed">
-                              started {formatUnixTs(run.started_at_unix)}
-                            </Text>
-                          </Stack>
-                        </Table.Td>
-                        <Table.Td maw={300}>
-                          <Stack gap={2}>
-                            <Text size="sm" fw={600}>
-                              {actionDescriptor?.label ?? run.action_id}
-                            </Text>
-                            <Text size="xs" ff="monospace" c="dimmed">
-                              {run.action_id}
-                            </Text>
-                          </Stack>
-                        </Table.Td>
-                        <Table.Td>
-                          <Badge color={run.dry_run ? "blue" : "teal"} variant="light">
-                            {run.dry_run ? "dry run" : "live run"}
-                          </Badge>
-                        </Table.Td>
-                        <Table.Td miw={170}>
-                          <Stack gap={4}>
-                            <Badge
-                              color={manualRepairRunStatusColor(run)}
-                              variant="light"
-                            >
-                              {formatManualRepairRunStatus(run)}
-                            </Badge>
-                            {run.status !== "failed" ? (
-                              <Badge
-                                color={run.changed ? "teal" : "gray"}
-                                variant="light"
-                              >
-                                {run.changed ? "changed state" : "no changes"}
-                              </Badge>
-                            ) : null}
-                          </Stack>
-                        </Table.Td>
-                        <Table.Td>{formatDurationShort(run.duration_ms)}</Table.Td>
-                        <Table.Td maw={340}>
-                          <Stack gap={4}>
-                            <Text size="sm">{run.summary}</Text>
-                            {run.last_error ? (
-                              <Text size="xs" c="red">
-                                {run.last_error}
-                              </Text>
-                            ) : null}
-                          </Stack>
-                        </Table.Td>
-                        <Table.Td>
-                          <Button
-                            size="xs"
-                            variant="default"
-                            onClick={() => setSelectedManualRepairRun(run)}
-                          >
-                            Inspect
-                          </Button>
-                        </Table.Td>
-                      </Table.Tr>
-                    );
-                  })}
-                </Table.Tbody>
-              </Table>
-            </Table.ScrollContainer>
-          ) : (
-            <Text c="dimmed">
-              {loading
-                ? "Loading retained manual repair runs..."
-                : "No retained manual repair runs yet."}
-            </Text>
-          )}
-        </Stack>
-      </Card>
+        <Tabs.Panel value="replication" pt="lg">
+          <Stack gap="lg">
+            <Grid>
+              <Grid.Col span={{ base: 12, md: 4 }}>
+                <StatCard
+                  label="Repair Activity"
+                  value={
+                    repairActivity
+                      ? formatRepairActivityState(repairActivity.state)
+                      : loading
+                        ? <Loader size="sm" />
+                        : "unknown"
+                  }
+                  hint={
+                    repairActivity
+                      ? `${activeRuns.length} active run${activeRuns.length === 1 ? "" : "s"}`
+                      : "Node-local repair executor state"
+                  }
+                />
+              </Grid.Col>
+              <Grid.Col span={{ base: 12, md: 4 }}>
+                <StatCard
+                  label="Latest Run"
+                  value={latestRun ? formatUnixTs(latestRun.finished_at_unix) : loading ? <Loader size="sm" /> : "none"}
+                  hint={latestRun ? `${formatRepairTrigger(latestRun.trigger)} · ${formatRepairStatus(latestRun.status)}` : "No retained repair run yet"}
+                />
+              </Grid.Col>
+              <Grid.Col span={{ base: 12, md: 4 }}>
+                <StatCard
+                  label="Planner Attention"
+                  value={replicationPlan ? replicationPlan.items.length : loading ? <Loader size="sm" /> : "unknown"}
+                  hint={replicationPlan ? `${replicationPlan.under_replicated} under · ${replicationPlan.over_replicated} over · ${replicationPlan.cleanup_deferred_items} deferred` : "Outstanding repair or cleanup items"}
+                />
+              </Grid.Col>
+            </Grid>
 
-      <Grid>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Repair Activity"
-            value={
-              repairActivity
-                ? formatRepairActivityState(repairActivity.state)
-                : loading
-                  ? <Loader size="sm" />
-                  : "unknown"
-            }
-            hint={
-              repairActivity
-                ? `${activeRuns.length} active run${activeRuns.length === 1 ? "" : "s"}`
-                : "Node-local repair executor state"
-            }
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Latest Run"
-            value={latestRun ? formatUnixTs(latestRun.finished_at_unix) : loading ? <Loader size="sm" /> : "none"}
-            hint={latestRun ? `${formatRepairTrigger(latestRun.trigger)} · ${formatRepairStatus(latestRun.status)}` : "No retained repair run yet"}
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Planner Attention"
-            value={replicationPlan ? replicationPlan.items.length : loading ? <Loader size="sm" /> : "unknown"}
-            hint={replicationPlan ? `${replicationPlan.under_replicated} under · ${replicationPlan.over_replicated} over · ${replicationPlan.cleanup_deferred_items} deferred` : "Outstanding repair or cleanup items"}
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Scrub Coverage"
-            value={scrubCluster ? scrubNodes.length : loading ? <Loader size="sm" /> : "unknown"}
-            hint={scrubCluster ? `${scrubCluster.skipped_nodes.length} skipped node${scrubCluster.skipped_nodes.length === 1 ? "" : "s"}` : "Reachable nodes reporting scrub state"}
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Latest Scrub"
-            value={latestScrubRun ? formatUnixTs(latestScrubRun.finished_at_unix) : loading ? <Loader size="sm" /> : "none"}
-            hint={latestScrubRun ? `${formatDataScrubStatus(latestScrubRun.status)} · ${latestScrubRun.summary.issue_count} issue${latestScrubRun.summary.issue_count === 1 ? "" : "s"}` : "No retained scrub run yet"}
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Latest Scrub Findings"
-            value={latestScrubRun ? latestScrubRun.summary.issue_count : loading ? <Loader size="sm" /> : "unknown"}
-            hint={latestScrubRun ? `${latestScrubRun.summary.manifests_scanned} manifests · ${latestScrubRun.summary.chunks_scanned} chunks verified` : "Latest clustered scrub findings"}
-          />
-        </Grid.Col>
-      </Grid>
-
-      <Grid>
-        <Grid.Col span={12}>
-          <Card withBorder radius="md" padding="lg">
-            <Stack gap="md">
-              <Group justify="space-between" align="flex-start">
-                <Stack gap={4}>
-                  <Text fw={700}>Current repair state</Text>
-                  <Text size="sm" c="dimmed">
-                    Live activity is node-local. Cluster-wide manual repair runs appear here when
-                    they originate from this node.
-                  </Text>
-                </Stack>
-                <Badge color={repairActivityBadgeColor(repairActivity?.state)} variant="light">
-                  {repairActivity ? formatRepairActivityState(repairActivity.state) : "unknown"}
-                </Badge>
-              </Group>
-              <Group gap="xs">
-                <Badge variant="light" color={startupStatusColor(repairActivity?.startup_status)}>
-                  startup {formatStartupRepairStatus(repairActivity?.startup_status ?? "disabled")}
-                </Badge>
-                <Badge variant="light">retention {retentionLabel}</Badge>
-              </Group>
-              {activeRuns.length > 0 ? (
-                <Stack gap="sm">
-                  {activeRuns.map((activeRun) => (
-                    <Card key={activeRun.run_id} withBorder radius="md" padding="sm">
-                      <Stack gap={6}>
-                        <Group gap="xs">
-                          <Badge color="orange" variant="light">
-                            {formatRepairTrigger(activeRun.trigger)}
-                          </Badge>
-                          <Badge color="blue" variant="light">
-                            {activeRun.scope}
-                          </Badge>
-                        </Group>
-                        <Text size="sm">
-                          Started {formatUnixTs(activeRun.started_at_unix)}
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          Run ID <Code>{activeRun.run_id}</Code>
-                        </Text>
-                        {activeRun.live_log.length > 0 ? (
-                          <Card withBorder radius="sm" padding="sm">
-                            <Stack gap={6}>
-                              <Group justify="space-between" align="flex-start">
-                                <Text fw={600} size="sm">
-                                  Live progress log
-                                </Text>
-                                <Group gap="xs">
-                                  <Badge variant="light" color="teal">
-                                    {activeRun.live_log.length} event
-                                    {activeRun.live_log.length === 1 ? "" : "s"}
-                                  </Badge>
-                                  {activeRun.live_log_truncated ? (
-                                    <Badge variant="light" color="yellow">
-                                      latest slice
-                                    </Badge>
-                                  ) : null}
-                                </Group>
-                              </Group>
-                              <Text size="xs" c="dimmed">
-                                Latest event{" "}
-                                {formatUnixTs(
-                                  activeRun.last_log_at_unix ?? activeRun.started_at_unix
-                                )}
-                              </Text>
-                              <div
-                                role="log"
-                                aria-live="polite"
-                                style={{
-                                  maxHeight: 240,
-                                  overflowY: "auto",
-                                  overflowX: "auto",
-                                  paddingRight: 8
-                                }}
-                              >
-                                <Text ff="monospace" size="xs" style={{ whiteSpace: "pre-wrap" }}>
-                                  {activeRun.live_log
-                                    .slice()
-                                    .reverse()
-                                    .map(formatRepairLogLine)
-                                    .join("\n")}
-                                </Text>
-                              </div>
-                            </Stack>
-                          </Card>
-                        ) : (
-                          <Text size="xs" c="dimmed">
-                            Waiting for live progress entries from this run.
-                          </Text>
-                        )}
-                      </Stack>
-                    </Card>
-                  ))}
-                </Stack>
-              ) : (
-                <Text size="sm" c="dimmed">
-                  No repair runs are active on this node.
-                </Text>
-              )}
-              {latestRun ? (
-                <Card withBorder radius="md" padding="sm">
-                  <Stack gap={6}>
-                    <Group justify="space-between" align="flex-start">
-                      <Text fw={600}>Latest finished run</Text>
-                      <Badge color={repairStatusColor(latestRun.status)} variant="light">
-                        {formatRepairStatus(latestRun.status)}
-                      </Badge>
-                    </Group>
-                    <Text size="sm">
-                      {formatRepairTrigger(latestRun.trigger)} on {latestRun.scope} scope, finished{" "}
-                      {formatUnixTs(latestRun.finished_at_unix)} after {formatDurationShort(latestRun.duration_ms)}.
-                    </Text>
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
+                <Group justify="space-between" align="flex-start">
+                  <Stack gap={4}>
+                    <Text fw={700}>Current repair state</Text>
                     <Text size="sm" c="dimmed">
-                      {describeRepairRunSummary(latestRun)}
+                      Live activity is node-local. Cluster-wide manual repair runs appear here when
+                      they originate from this node.
                     </Text>
                   </Stack>
-                </Card>
-              ) : null}
-            </Stack>
-          </Card>
-        </Grid.Col>
-      </Grid>
-
-      <Card withBorder radius="md" padding="lg">
-        <Stack gap="md">
-          <Group justify="space-between" align="flex-start">
-            <Stack gap={4}>
-              <Text fw={700}>Retained repair runs</Text>
-              <Text size="sm" c="dimmed">
-                Each finished repair run is stored persistently for postmortem debugging until it ages out of the retention window.
-              </Text>
-            </Stack>
-            <Stack gap="xs" align="flex-end">
-              <Badge variant="light">{repairHistory ? `${repairHistory.runs.length} retained` : "not loaded"}</Badge>
-              <TablePageControls
-                pagination={pagedRepairRuns}
-                onPrevious={() => setRepairRunsPageIndex((current) => current - 1)}
-                onNext={() => setRepairRunsPageIndex((current) => current + 1)}
-              />
-            </Stack>
-          </Group>
-          {repairHistory && repairHistory.runs.length > 0 ? (
-            <Table.ScrollContainer minWidth={960}>
-              <Table striped highlightOnHover withTableBorder>
-                <Table.Thead>
-                  <Table.Tr>
-                    <Table.Th>Finished</Table.Th>
-                    <Table.Th>Trigger</Table.Th>
-                    <Table.Th>Scope</Table.Th>
-                    <Table.Th>Status</Table.Th>
-                    <Table.Th>Duration</Table.Th>
-                    <Table.Th>Plan</Table.Th>
-                    <Table.Th>Outcome</Table.Th>
-                    <Table.Th />
-                  </Table.Tr>
-                </Table.Thead>
-                <Table.Tbody>
-                  {pagedRepairRuns.pageItems.map((run) => (
-                    <Table.Tr key={run.run_id}>
-                      <Table.Td>
-                        <Stack gap={2}>
-                          <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
-                          <Text size="xs" c="dimmed">
-                            started {formatUnixTs(run.started_at_unix)}
-                          </Text>
-                        </Stack>
-                      </Table.Td>
-                      <Table.Td>
-                        <Badge color="blue" variant="light">
-                          {formatRepairTrigger(run.trigger)}
-                        </Badge>
-                      </Table.Td>
-                      <Table.Td>
-                        <Badge color={run.scope === "cluster" ? "teal" : "gray"} variant="light">
-                          {run.scope}
-                        </Badge>
-                      </Table.Td>
-                      <Table.Td>
-                        <Badge color={repairStatusColor(run.status)} variant="light">
-                          {formatRepairStatus(run.status)}
-                        </Badge>
-                      </Table.Td>
-                      <Table.Td>{formatDurationShort(run.duration_ms)}</Table.Td>
-                      <Table.Td>
-                        <Text size="sm">
-                          {run.plan_summary.under_replicated} under / {run.plan_summary.over_replicated} over
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          {run.plan_summary.item_count} item{run.plan_summary.item_count === 1 ? "" : "s"}
-                        </Text>
-                      </Table.Td>
-                      <Table.Td maw={280}>
-                        <Text size="sm">{describeRepairRunSummary(run)}</Text>
-                      </Table.Td>
-                      <Table.Td>
-                        <Button size="xs" variant="default" onClick={() => setSelectedRun(run)}>
-                          Inspect
-                        </Button>
-                      </Table.Td>
-                    </Table.Tr>
-                  ))}
-                </Table.Tbody>
-              </Table>
-            </Table.ScrollContainer>
-          ) : (
-            <Text c="dimmed">
-              {loading ? "Loading retained repair runs..." : "No retained repair runs yet."}
-            </Text>
-          )}
-        </Stack>
-      </Card>
-
-      <Card withBorder radius="md" padding="lg">
-        <Stack gap="md">
-          <Group justify="space-between" align="flex-start">
-            <Stack gap={4}>
-              <Text fw={700}>Replication plan</Text>
-              <Text size="sm" c="dimmed">
-                Only subjects that still need repair or cleanup attention are listed here.
-              </Text>
-            </Stack>
-            <Stack gap="xs" align="flex-end">
-              <Badge variant="light">
-                {replicationPlan ? formatUnixTs(replicationPlan.generated_at_unix) : "not loaded"}
-              </Badge>
-              <Badge
-                variant="light"
-                color={!replicationPlan ? "gray" : replicationPlanEntries.length === 0 ? "teal" : "orange"}
-              >
-                {replicationPlan
-                  ? `${replicationPlanEntries.length} attention item${replicationPlanEntries.length === 1 ? "" : "s"}`
-                  : "loading"}
-              </Badge>
-              <TablePageControls
-                pagination={pagedReplicationPlanEntries}
-                onPrevious={() => setReplicationPlanPageIndex((current) => current - 1)}
-                onNext={() => setReplicationPlanPageIndex((current) => current + 1)}
-              />
-            </Stack>
-          </Group>
-          {replicationPlan ? (
-            <Stack gap="md">
-              <Group gap="xs">
-                <Badge
-                  variant="light"
-                  color={replicationPlan.under_replicated > 0 ? "orange" : "teal"}
-                >
-                  {replicationPlan.under_replicated} under-replicated
-                </Badge>
-                <Badge
-                  variant="light"
-                  color={replicationPlan.over_replicated > 0 ? "yellow" : "gray"}
-                >
-                  {replicationPlan.over_replicated} cleanup recommended
-                </Badge>
-                <Badge
-                  variant="light"
-                  color={replicationPlan.cleanup_deferred_items > 0 ? "blue" : "gray"}
-                >
-                  {replicationPlan.cleanup_deferred_items} cleanup deferred
-                </Badge>
-              </Group>
-
-              {replicationPlanEntries.length > 0 ? (
-                <Table.ScrollContainer minWidth={980}>
-                  <Table striped highlightOnHover withTableBorder>
-                    <Table.Thead>
-                      <Table.Tr>
-                        <Table.Th>Subject</Table.Th>
-                        <Table.Th>Status</Table.Th>
-                        <Table.Th>Replication progress</Table.Th>
-                        <Table.Th>Desired nodes</Table.Th>
-                        <Table.Th>Current nodes</Table.Th>
-                        <Table.Th>Cleanup</Table.Th>
-                      </Table.Tr>
-                    </Table.Thead>
-                    <Table.Tbody>
-                      {pagedReplicationPlanEntries.pageItems.map(({ item, status, progress }) => (
-                        <Table.Tr key={item.key}>
-                          <Table.Td maw={260}>
-                            <Text size="sm" fw={600} ff="monospace" style={{ wordBreak: "break-word" }}>
-                              {item.key}
-                            </Text>
-                          </Table.Td>
-                          <Table.Td miw={180}>
-                            <Stack gap={4}>
-                              <Badge color={status.color} variant="light">
-                                {status.label}
-                              </Badge>
-                              <Text size="xs" c="dimmed">
-                                {status.detail}
-                              </Text>
-                            </Stack>
-                          </Table.Td>
-                          <Table.Td miw={220}>
-                            <Stack gap={6}>
-                              <Group gap="xs" wrap="nowrap">
-                                <Progress
-                                  value={progress.percent}
-                                  color={status.color}
-                                  animated={progress.percent < 100}
-                                  style={{ flex: 1 }}
-                                />
-                                <Text size="xs" c="dimmed" miw={40}>
-                                  {progress.percent}%
-                                </Text>
-                              </Group>
-                              <Text size="xs" c="dimmed">
-                                {progress.present} / {progress.total} desired nodes currently present
-                              </Text>
-                              {item.missing_nodes.length > 0 ? (
-                                <Stack gap={4}>
-                                  <Text size="xs" c="dimmed">
-                                    Missing nodes
-                                  </Text>
-                                  {renderNodeBadges(item.missing_nodes, "orange", "none")}
-                                </Stack>
-                              ) : null}
-                            </Stack>
-                          </Table.Td>
-                          <Table.Td miw={220}>
-                            {renderNodeBadges(item.desired_nodes, "blue", "none planned")}
-                          </Table.Td>
-                          <Table.Td miw={220}>
-                            {renderNodeBadges(item.current_nodes, "teal", "not stored anywhere")}
-                          </Table.Td>
-                          <Table.Td miw={220}>
-                            <Stack gap={6}>
-                              <Badge color={replicationCleanupColor(item.cleanup_option)} variant="light">
-                                {formatReplicationCleanupOption(item.cleanup_option)}
-                              </Badge>
-                              {item.extra_nodes.length > 0 ? (
-                                <Stack gap={4}>
-                                  <Text size="xs" c="dimmed">
-                                    Extra nodes
-                                  </Text>
-                                  {renderNodeBadges(item.extra_nodes, "yellow", "none")}
-                                </Stack>
-                              ) : null}
-                              {item.deferred_extra_nodes > 0 ? (
-                                <Text size="xs" c="dimmed">
-                                  {item.deferred_extra_nodes} extra node
-                                  {item.deferred_extra_nodes === 1 ? "" : "s"} retained within tolerance.
-                                </Text>
-                              ) : item.cleanup_option === "none" ? (
-                                <Text size="xs" c="dimmed">
-                                  No cleanup action pending.
-                                </Text>
-                              ) : null}
-                            </Stack>
-                          </Table.Td>
-                        </Table.Tr>
-                      ))}
-                    </Table.Tbody>
-                  </Table>
-                </Table.ScrollContainer>
-              ) : (
-                <Alert color="teal" variant="light" title="Replication plan is healthy">
-                  The planner does not currently report any subjects that need repair or cleanup.
-                </Alert>
-              )}
-            </Stack>
-          ) : (
-            <Text c="dimmed">{loading ? "Loading replication plan..." : "Replication plan not loaded."}</Text>
-          )}
-        </Stack>
-      </Card>
-
-      <Card withBorder radius="md" padding="lg">
-        <Stack gap="md">
-          <Group justify="space-between" align="flex-start">
-            <Stack gap={4}>
-              <Text fw={700}>Data scrub status across reachable nodes</Text>
-              <Text size="sm" c="dimmed">
-                Each reachable node reports its own scrub scheduler state and latest retained scrub
-                result here.
-              </Text>
-            </Stack>
-            <Stack gap="xs" align="flex-end">
-              <Badge variant="light">retention {scrubRetentionLabel}</Badge>
-              <Badge variant="light" color={scrubNodes.length > 0 ? "teal" : "gray"}>
-                {scrubNodes.length} reachable node{scrubNodes.length === 1 ? "" : "s"}
-              </Badge>
-              <TablePageControls
-                pagination={pagedScrubNodes}
-                onPrevious={() => setScrubNodesPageIndex((current) => current - 1)}
-                onNext={() => setScrubNodesPageIndex((current) => current + 1)}
-              />
-            </Stack>
-          </Group>
-
-          {scrubCluster && scrubCluster.skipped_nodes.length > 0 ? (
-            <Alert color="yellow" variant="light" title="Some nodes did not return scrub state">
-              {scrubCluster.skipped_nodes
-                .map((node) => `${node.node_id}: ${node.error}`)
-                .join(" | ")}
-            </Alert>
-          ) : null}
-
-          {scrubNodes.length > 0 ? (
-            <Grid>
-              {pagedScrubNodes.pageItems.map((node) => (
-                <Grid.Col key={node.node_id} span={{ base: 12, md: 6, xl: 4 }}>
-                  <Card withBorder radius="md" padding="md">
-                    <Stack gap="sm">
-                      <Group justify="space-between" align="flex-start">
-                        <Stack gap={4}>
-                          <Text fw={600} ff="monospace" style={{ wordBreak: "break-word" }}>
-                            {node.node_id}
-                          </Text>
-                          <Text size="xs" c="dimmed">
-                            {node.enabled
-                              ? `scheduled every ${formatIntervalShort(node.interval_secs)}`
-                              : "background schedule disabled"}
-                          </Text>
-                        </Stack>
-                        <Badge color={dataScrubStateColor(node.state)} variant="light">
-                          {formatDataScrubActivityState(node.state)}
-                        </Badge>
-                      </Group>
-                      <Group gap="xs">
-                        <Badge variant="light" color={node.enabled ? "teal" : "gray"}>
-                          {node.enabled ? "scheduled" : "manual only"}
-                        </Badge>
-                        <Badge variant="light">retention {formatRetentionWindow(node.retention_secs)}</Badge>
-                      </Group>
-                      {node.active_runs.length > 0 ? (
+                  <Badge color={repairActivityBadgeColor(repairActivity?.state)} variant="light">
+                    {repairActivity ? formatRepairActivityState(repairActivity.state) : "unknown"}
+                  </Badge>
+                </Group>
+                <Group gap="xs">
+                  <Badge variant="light" color={startupStatusColor(repairActivity?.startup_status)}>
+                    startup {formatStartupRepairStatus(repairActivity?.startup_status ?? "disabled")}
+                  </Badge>
+                  <Badge variant="light">retention {retentionLabel}</Badge>
+                </Group>
+                {activeRuns.length > 0 ? (
+                  <Stack gap="sm">
+                    {activeRuns.map((activeRun) => (
+                      <Card key={activeRun.run_id} withBorder radius="md" padding="sm">
                         <Stack gap={6}>
-                          {node.active_runs.map((activeRun) => (
-                            <Card key={activeRun.run_id} withBorder radius="md" padding="sm">
-                              <Stack gap={4}>
-                                <Group gap="xs">
-                                  <Badge color="orange" variant="light">
-                                    {formatDataScrubTrigger(activeRun.trigger)}
-                                  </Badge>
-                                  <Badge color="orange" variant="light">
-                                    running
-                                  </Badge>
+                          <Group gap="xs">
+                            <Badge color="orange" variant="light">
+                              {formatRepairTrigger(activeRun.trigger)}
+                            </Badge>
+                            <Badge color="blue" variant="light">
+                              {activeRun.scope}
+                            </Badge>
+                          </Group>
+                          <Text size="sm">
+                            Started {formatUnixTs(activeRun.started_at_unix)}
+                          </Text>
+                          <Text size="xs" c="dimmed">
+                            Run ID <Code>{activeRun.run_id}</Code>
+                          </Text>
+                          {activeRun.live_log.length > 0 ? (
+                            <Card withBorder radius="sm" padding="sm">
+                              <Stack gap={6}>
+                                <Group justify="space-between" align="flex-start">
+                                  <Text fw={600} size="sm">
+                                    Live progress log
+                                  </Text>
+                                  <Group gap="xs">
+                                    <Badge variant="light" color="teal">
+                                      {activeRun.live_log.length} event
+                                      {activeRun.live_log.length === 1 ? "" : "s"}
+                                    </Badge>
+                                    {activeRun.live_log_truncated ? (
+                                      <Badge variant="light" color="yellow">
+                                        latest slice
+                                      </Badge>
+                                    ) : null}
+                                  </Group>
                                 </Group>
-                                <Text size="sm">Started {formatUnixTs(activeRun.started_at_unix)}</Text>
                                 <Text size="xs" c="dimmed">
-                                  Run ID <Code>{activeRun.run_id}</Code>
+                                  Latest event{" "}
+                                  {formatUnixTs(
+                                    activeRun.last_log_at_unix ?? activeRun.started_at_unix
+                                  )}
                                 </Text>
+                                <div
+                                  role="log"
+                                  aria-live="polite"
+                                  style={{
+                                    maxHeight: 240,
+                                    overflowY: "auto",
+                                    overflowX: "auto",
+                                    paddingRight: 8
+                                  }}
+                                >
+                                  <Text ff="monospace" size="xs" style={{ whiteSpace: "pre-wrap" }}>
+                                    {activeRun.live_log
+                                      .slice()
+                                      .reverse()
+                                      .map(formatRepairLogLine)
+                                      .join("\n")}
+                                  </Text>
+                                </div>
                               </Stack>
                             </Card>
-                          ))}
+                          ) : (
+                            <Text size="xs" c="dimmed">
+                              Waiting for live progress entries from this run.
+                            </Text>
+                          )}
                         </Stack>
-                      ) : node.latest_run ? (
-                        <Card withBorder radius="md" padding="sm">
-                          <Stack gap={6}>
-                            <Group justify="space-between" align="flex-start">
-                              <Text fw={600}>Latest retained scrub</Text>
-                              <Badge color={dataScrubStatusColor(node.latest_run.status)} variant="light">
-                                {formatDataScrubStatus(node.latest_run.status)}
-                              </Badge>
-                            </Group>
-                            <Text size="sm">
-                              Finished {formatUnixTs(node.latest_run.finished_at_unix)} after {formatDurationShort(node.latest_run.duration_ms)}.
-                            </Text>
-                            <Text size="sm" c="dimmed">
-                              {describeDataScrubRunSummary(node.latest_run)}
-                            </Text>
-                          </Stack>
-                        </Card>
-                      ) : (
-                        <Text size="sm" c="dimmed">
-                          No retained scrub run yet for this node.
-                        </Text>
-                      )}
+                      </Card>
+                    ))}
+                  </Stack>
+                ) : (
+                  <Text size="sm" c="dimmed">
+                    No repair runs are active on this node.
+                  </Text>
+                )}
+                {latestRun ? (
+                  <Card withBorder radius="md" padding="sm">
+                    <Stack gap={6}>
+                      <Group justify="space-between" align="flex-start">
+                        <Text fw={600}>Latest finished run</Text>
+                        <Badge color={repairStatusColor(latestRun.status)} variant="light">
+                          {formatRepairStatus(latestRun.status)}
+                        </Badge>
+                      </Group>
+                      <Text size="sm">
+                        {formatRepairTrigger(latestRun.trigger)} on {latestRun.scope} scope, finished{" "}
+                        {formatUnixTs(latestRun.finished_at_unix)} after {formatDurationShort(latestRun.duration_ms)}.
+                      </Text>
+                      <Text size="sm" c="dimmed">
+                        {describeRepairRunSummary(latestRun)}
+                      </Text>
                     </Stack>
                   </Card>
-                </Grid.Col>
-              ))}
+                ) : null}
+              </Stack>
+            </Card>
+
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
+                <Group justify="space-between" align="flex-start">
+                  <Stack gap={4}>
+                    <Text fw={700}>Retained repair runs</Text>
+                    <Text size="sm" c="dimmed">
+                      Each finished repair run is stored persistently for postmortem debugging until it ages out of the retention window.
+                    </Text>
+                  </Stack>
+                  <Stack gap="xs" align="flex-end">
+                    <Badge variant="light">{repairHistory ? `${repairHistory.runs.length} retained` : "not loaded"}</Badge>
+                    <TablePageControls
+                      pagination={pagedRepairRuns}
+                      onPrevious={() => setRepairRunsPageIndex((current) => current - 1)}
+                      onNext={() => setRepairRunsPageIndex((current) => current + 1)}
+                    />
+                  </Stack>
+                </Group>
+                {repairHistory && repairHistory.runs.length > 0 ? (
+                  <Table.ScrollContainer minWidth={960}>
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>Finished</Table.Th>
+                          <Table.Th>Trigger</Table.Th>
+                          <Table.Th>Scope</Table.Th>
+                          <Table.Th>Status</Table.Th>
+                          <Table.Th>Duration</Table.Th>
+                          <Table.Th>Plan</Table.Th>
+                          <Table.Th>Outcome</Table.Th>
+                          <Table.Th />
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {pagedRepairRuns.pageItems.map((run) => (
+                          <Table.Tr key={run.run_id}>
+                            <Table.Td>
+                              <Stack gap={2}>
+                                <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
+                                <Text size="xs" c="dimmed">
+                                  started {formatUnixTs(run.started_at_unix)}
+                                </Text>
+                              </Stack>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge color="blue" variant="light">
+                                {formatRepairTrigger(run.trigger)}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge color={run.scope === "cluster" ? "teal" : "gray"} variant="light">
+                                {run.scope}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge color={repairStatusColor(run.status)} variant="light">
+                                {formatRepairStatus(run.status)}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>{formatDurationShort(run.duration_ms)}</Table.Td>
+                            <Table.Td>
+                              <Text size="sm">
+                                {run.plan_summary.under_replicated} under / {run.plan_summary.over_replicated} over
+                              </Text>
+                              <Text size="xs" c="dimmed">
+                                {run.plan_summary.item_count} item{run.plan_summary.item_count === 1 ? "" : "s"}
+                              </Text>
+                            </Table.Td>
+                            <Table.Td maw={280}>
+                              <Text size="sm">{describeRepairRunSummary(run)}</Text>
+                            </Table.Td>
+                            <Table.Td>
+                              <Button size="xs" variant="default" onClick={() => setSelectedRun(run)}>
+                                Inspect
+                              </Button>
+                            </Table.Td>
+                          </Table.Tr>
+                        ))}
+                      </Table.Tbody>
+                    </Table>
+                  </Table.ScrollContainer>
+                ) : (
+                  <Text c="dimmed">
+                    {loading ? "Loading retained repair runs..." : "No retained repair runs yet."}
+                  </Text>
+                )}
+              </Stack>
+            </Card>
+
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
+                <Group justify="space-between" align="flex-start">
+                  <Stack gap={4}>
+                    <Text fw={700}>Replication plan</Text>
+                    <Text size="sm" c="dimmed">
+                      Only subjects that still need repair or cleanup attention are listed here.
+                    </Text>
+                  </Stack>
+                  <Stack gap="xs" align="flex-end">
+                    <Badge variant="light">
+                      {replicationPlan ? formatUnixTs(replicationPlan.generated_at_unix) : "not loaded"}
+                    </Badge>
+                    <Badge
+                      variant="light"
+                      color={!replicationPlan ? "gray" : replicationPlanEntries.length === 0 ? "teal" : "orange"}
+                    >
+                      {replicationPlan
+                        ? `${replicationPlanEntries.length} attention item${replicationPlanEntries.length === 1 ? "" : "s"}`
+                        : "loading"}
+                    </Badge>
+                    <TablePageControls
+                      pagination={pagedReplicationPlanEntries}
+                      onPrevious={() => setReplicationPlanPageIndex((current) => current - 1)}
+                      onNext={() => setReplicationPlanPageIndex((current) => current + 1)}
+                    />
+                  </Stack>
+                </Group>
+                {replicationPlan ? (
+                  <Stack gap="md">
+                    <Group gap="xs">
+                      <Badge
+                        variant="light"
+                        color={replicationPlan.under_replicated > 0 ? "orange" : "teal"}
+                      >
+                        {replicationPlan.under_replicated} under-replicated
+                      </Badge>
+                      <Badge
+                        variant="light"
+                        color={replicationPlan.over_replicated > 0 ? "yellow" : "gray"}
+                      >
+                        {replicationPlan.over_replicated} cleanup recommended
+                      </Badge>
+                      <Badge
+                        variant="light"
+                        color={replicationPlan.cleanup_deferred_items > 0 ? "blue" : "gray"}
+                      >
+                        {replicationPlan.cleanup_deferred_items} cleanup deferred
+                      </Badge>
+                    </Group>
+
+                    {replicationPlanEntries.length > 0 ? (
+                      <Table.ScrollContainer minWidth={980}>
+                        <Table striped highlightOnHover withTableBorder>
+                          <Table.Thead>
+                            <Table.Tr>
+                              <Table.Th>Subject</Table.Th>
+                              <Table.Th>Status</Table.Th>
+                              <Table.Th>Replication progress</Table.Th>
+                              <Table.Th>Desired nodes</Table.Th>
+                              <Table.Th>Current nodes</Table.Th>
+                              <Table.Th>Cleanup</Table.Th>
+                            </Table.Tr>
+                          </Table.Thead>
+                          <Table.Tbody>
+                            {pagedReplicationPlanEntries.pageItems.map(({ item, status, progress }) => (
+                              <Table.Tr key={item.key}>
+                                <Table.Td maw={260}>
+                                  <Text size="sm" fw={600} ff="monospace" style={{ wordBreak: "break-word" }}>
+                                    {item.key}
+                                  </Text>
+                                </Table.Td>
+                                <Table.Td miw={180}>
+                                  <Stack gap={4}>
+                                    <Badge color={status.color} variant="light">
+                                      {status.label}
+                                    </Badge>
+                                    <Text size="xs" c="dimmed">
+                                      {status.detail}
+                                    </Text>
+                                  </Stack>
+                                </Table.Td>
+                                <Table.Td miw={220}>
+                                  <Stack gap={6}>
+                                    <Group gap="xs" wrap="nowrap">
+                                      <Progress
+                                        value={progress.percent}
+                                        color={status.color}
+                                        animated={progress.percent < 100}
+                                        style={{ flex: 1 }}
+                                      />
+                                      <Text size="xs" c="dimmed" miw={40}>
+                                        {progress.percent}%
+                                      </Text>
+                                    </Group>
+                                    <Text size="xs" c="dimmed">
+                                      {progress.present} / {progress.total} desired nodes currently present
+                                    </Text>
+                                    {item.missing_nodes.length > 0 ? (
+                                      <Stack gap={4}>
+                                        <Text size="xs" c="dimmed">
+                                          Missing nodes
+                                        </Text>
+                                        {renderNodeBadges(item.missing_nodes, "orange", "none")}
+                                      </Stack>
+                                    ) : null}
+                                  </Stack>
+                                </Table.Td>
+                                <Table.Td miw={220}>
+                                  {renderNodeBadges(item.desired_nodes, "blue", "none planned")}
+                                </Table.Td>
+                                <Table.Td miw={220}>
+                                  {renderNodeBadges(item.current_nodes, "teal", "not stored anywhere")}
+                                </Table.Td>
+                                <Table.Td miw={220}>
+                                  <Stack gap={6}>
+                                    <Badge color={replicationCleanupColor(item.cleanup_option)} variant="light">
+                                      {formatReplicationCleanupOption(item.cleanup_option)}
+                                    </Badge>
+                                    {item.extra_nodes.length > 0 ? (
+                                      <Stack gap={4}>
+                                        <Text size="xs" c="dimmed">
+                                          Extra nodes
+                                        </Text>
+                                        {renderNodeBadges(item.extra_nodes, "yellow", "none")}
+                                      </Stack>
+                                    ) : null}
+                                    {item.deferred_extra_nodes > 0 ? (
+                                      <Text size="xs" c="dimmed">
+                                        {item.deferred_extra_nodes} extra node
+                                        {item.deferred_extra_nodes === 1 ? "" : "s"} retained within tolerance.
+                                      </Text>
+                                    ) : item.cleanup_option === "none" ? (
+                                      <Text size="xs" c="dimmed">
+                                        No cleanup action pending.
+                                      </Text>
+                                    ) : null}
+                                  </Stack>
+                                </Table.Td>
+                              </Table.Tr>
+                            ))}
+                          </Table.Tbody>
+                        </Table>
+                      </Table.ScrollContainer>
+                    ) : (
+                      <Alert color="teal" variant="light" title="Replication plan is healthy">
+                        The planner does not currently report any subjects that need repair or cleanup.
+                      </Alert>
+                    )}
+                  </Stack>
+                ) : (
+                  <Text c="dimmed">{loading ? "Loading replication plan..." : "Replication plan not loaded."}</Text>
+                )}
+              </Stack>
+            </Card>
+          </Stack>
+        </Tabs.Panel>
+
+        <Tabs.Panel value="manual-actions" pt="lg">
+          <Stack gap="lg">
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
+                <Group justify="space-between" align="flex-start">
+                  <Text fw={700}>Manual repair actions</Text>
+                  <Stack gap="xs" align="flex-end">
+                    <Badge variant="light">
+                      {manualRepairActionsQuery.data
+                        ? `${manualRepairActions.length} available`
+                        : loading
+                          ? "loading"
+                          : "not loaded"}
+                    </Badge>
+                    <Badge variant="light" color={hasActiveManualRepairRun ? "orange" : "gray"}>
+                      {hasActiveManualRepairRun ? "1 running" : "idle"}
+                    </Badge>
+                    <Badge variant="light">retention {manualRepairRetentionLabel}</Badge>
+                    <TablePageControls
+                      pagination={pagedManualRepairActions}
+                      onPrevious={() => setManualRepairActionsPageIndex((current) => current - 1)}
+                      onNext={() => setManualRepairActionsPageIndex((current) => current + 1)}
+                    />
+                  </Stack>
+                </Group>
+                {manualRepairActions.length > 0 ? (
+                  <Table.ScrollContainer minWidth={920}>
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>Action</Table.Th>
+                          <Table.Th>Description</Table.Th>
+                          <Table.Th>Mode</Table.Th>
+                          <Table.Th>Status</Table.Th>
+                          <Table.Th />
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {pagedManualRepairActions.pageItems.map((action) => {
+                          const latestActionRun = latestManualRepairRunsByActionId.get(action.id) ?? null;
+                          const actionStarting =
+                            manualRepairActionMutation.isPending &&
+                            manualRepairActionMutation.variables?.actionId === action.id;
+                          const actionRunning = activeManualRepairRun?.action_id === action.id;
+                          return (
+                            <Table.Tr key={action.id}>
+                              <Table.Td>
+                                <Stack gap={4}>
+                                  <Text fw={600}>{action.label}</Text>
+                                  <Text size="xs" ff="monospace" c="dimmed">
+                                    {action.id}
+                                  </Text>
+                                </Stack>
+                              </Table.Td>
+                              <Table.Td maw={420}>
+                                <Text size="sm" c="dimmed">
+                                  {action.description}
+                                </Text>
+                              </Table.Td>
+                              <Table.Td>
+                                <Group gap="xs">
+                                  {action.dry_run_supported ? (
+                                    <Badge variant="light" color="blue">
+                                      dry run
+                                    </Badge>
+                                  ) : null}
+                                  <Badge variant="light" color={action.destructive ? "red" : "teal"}>
+                                    {action.destructive ? "destructive" : "metadata"}
+                                  </Badge>
+                                </Group>
+                              </Table.Td>
+                              <Table.Td miw={220}>
+                                {actionRunning ? (
+                                  <Stack gap={4}>
+                                    <Badge color="orange" variant="light">
+                                      {activeManualRepairRun?.dry_run ? "dry run running" : "running"}
+                                    </Badge>
+                                    <Text size="xs" c="dimmed">
+                                      Started {formatUnixTs(activeManualRepairRun.started_at_unix)}
+                                    </Text>
+                                  </Stack>
+                                ) : latestActionRun ? (
+                                  <Stack gap={4}>
+                                    <Badge
+                                      color={manualRepairRunStatusColor(latestActionRun)}
+                                      variant="light"
+                                    >
+                                      {formatManualRepairRunStatus(latestActionRun)}
+                                    </Badge>
+                                    <Text size="xs" c="dimmed">
+                                      Finished {formatUnixTs(latestActionRun.finished_at_unix)}
+                                    </Text>
+                                    <Text size="xs" c="dimmed">
+                                      {latestActionRun.summary}
+                                    </Text>
+                                  </Stack>
+                                ) : (
+                                  <Text size="sm" c="dimmed">
+                                    No recent run
+                                  </Text>
+                                )}
+                              </Table.Td>
+                              <Table.Td>
+                                <Group gap="xs" justify="flex-end" wrap="nowrap">
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    disabled={
+                                      !canInspectRepair ||
+                                      !action.dry_run_supported ||
+                                      hasActiveManualRepairRun
+                                    }
+                                    loading={
+                                      actionStarting
+                                        ? manualRepairActionMutation.variables?.dryRun
+                                        : actionRunning && activeManualRepairRun?.dry_run
+                                    }
+                                    leftSection={<IconSearch size={14} />}
+                                    onClick={() =>
+                                      void manualRepairActionMutation.mutateAsync({
+                                        actionId: action.id,
+                                        dryRun: true
+                                      })
+                                    }
+                                  >
+                                    Dry run
+                                  </Button>
+                                  <Button
+                                    size="xs"
+                                    color={action.destructive ? "red" : "teal"}
+                                    variant="light"
+                                    disabled={!canInspectRepair || hasActiveManualRepairRun}
+                                    loading={
+                                      actionStarting
+                                        ? !manualRepairActionMutation.variables?.dryRun
+                                        : actionRunning && !activeManualRepairRun?.dry_run
+                                    }
+                                    leftSection={<IconPlayerPlay size={14} />}
+                                    onClick={() =>
+                                      void manualRepairActionMutation.mutateAsync({
+                                        actionId: action.id,
+                                        dryRun: false
+                                      })
+                                    }
+                                  >
+                                    Run action
+                                  </Button>
+                                </Group>
+                              </Table.Td>
+                            </Table.Tr>
+                          );
+                        })}
+                      </Table.Tbody>
+                    </Table>
+                  </Table.ScrollContainer>
+                ) : (
+                  <Text c="dimmed">
+                    {loading ? "Loading manual repair actions..." : "No manual repair actions are available."}
+                  </Text>
+                )}
+                {activeManualRepairRun ? (
+                  <Alert
+                    color="orange"
+                    variant="light"
+                    title={
+                      activeManualRepairRun.dry_run
+                        ? "Manual repair dry run is running"
+                        : "Manual repair action is running"
+                    }
+                  >
+                    <Stack gap="sm">
+                      <Text size="sm">
+                        Action <Code>{activeManualRepairRun.action_id}</Code> started{" "}
+                        {formatUnixTs(activeManualRepairRun.started_at_unix)} and will keep reporting
+                        here even if you switch away from the page.
+                      </Text>
+                    </Stack>
+                  </Alert>
+                ) : null}
+                {latestManualRepairRun ? (
+                  <Alert
+                    color={manualRepairRunAlertColor(latestManualRepairRun)}
+                    variant="light"
+                    title={manualRepairRunAlertTitle(latestManualRepairRun)}
+                  >
+                    <Stack gap="sm">
+                      <Text size="sm">{latestManualRepairRun.summary}</Text>
+                      <Text size="xs" c="dimmed">
+                        Action <Code>{latestManualRepairRun.action_id}</Code> finished after{" "}
+                        {formatDurationShort(latestManualRepairRun.duration_ms)}.
+                      </Text>
+                      {latestManualRepairRun.last_error ? (
+                        <Text size="xs" c="red">
+                          {latestManualRepairRun.last_error}
+                        </Text>
+                      ) : null}
+                      <JsonBlock value={latestManualRepairRun} />
+                    </Stack>
+                  </Alert>
+                ) : null}
+              </Stack>
+            </Card>
+
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
+                <Group justify="space-between" align="flex-start">
+                  <Stack gap={4}>
+                    <Text fw={700}>Retained manual repair runs</Text>
+                    <Text size="sm" c="dimmed">
+                      Every finished manual repair action, including dry runs, is stored here for later
+                      operator review until it ages out of the retention window.
+                    </Text>
+                  </Stack>
+                  <Stack gap="xs" align="flex-end">
+                    <Badge variant="light">
+                      {manualRepairHistory ? `${manualRepairHistory.runs.length} retained` : "not loaded"}
+                    </Badge>
+                    <Badge variant="light">retention {manualRepairRetentionLabel}</Badge>
+                    <TablePageControls
+                      pagination={pagedManualRepairRuns}
+                      onPrevious={() => setManualRepairRunsPageIndex((current) => current - 1)}
+                      onNext={() => setManualRepairRunsPageIndex((current) => current + 1)}
+                    />
+                  </Stack>
+                </Group>
+                {manualRepairHistory && manualRepairHistory.runs.length > 0 ? (
+                  <Table.ScrollContainer minWidth={980}>
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>Finished</Table.Th>
+                          <Table.Th>Action</Table.Th>
+                          <Table.Th>Mode</Table.Th>
+                          <Table.Th>Status</Table.Th>
+                          <Table.Th>Duration</Table.Th>
+                          <Table.Th>Result</Table.Th>
+                          <Table.Th />
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {pagedManualRepairRuns.pageItems.map((run) => {
+                          const actionDescriptor =
+                            manualRepairActionDescriptorsById.get(run.action_id) ?? null;
+                          return (
+                            <Table.Tr key={run.run_id}>
+                              <Table.Td>
+                                <Stack gap={2}>
+                                  <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
+                                  <Text size="xs" c="dimmed">
+                                    started {formatUnixTs(run.started_at_unix)}
+                                  </Text>
+                                </Stack>
+                              </Table.Td>
+                              <Table.Td maw={300}>
+                                <Stack gap={2}>
+                                  <Text size="sm" fw={600}>
+                                    {actionDescriptor?.label ?? run.action_id}
+                                  </Text>
+                                  <Text size="xs" ff="monospace" c="dimmed">
+                                    {run.action_id}
+                                  </Text>
+                                </Stack>
+                              </Table.Td>
+                              <Table.Td>
+                                <Badge color={run.dry_run ? "blue" : "teal"} variant="light">
+                                  {run.dry_run ? "dry run" : "live run"}
+                                </Badge>
+                              </Table.Td>
+                              <Table.Td miw={170}>
+                                <Stack gap={4}>
+                                  <Badge
+                                    color={manualRepairRunStatusColor(run)}
+                                    variant="light"
+                                  >
+                                    {formatManualRepairRunStatus(run)}
+                                  </Badge>
+                                  {run.status !== "failed" ? (
+                                    <Badge
+                                      color={run.changed ? "teal" : "gray"}
+                                      variant="light"
+                                    >
+                                      {run.changed ? "changed state" : "no changes"}
+                                    </Badge>
+                                  ) : null}
+                                </Stack>
+                              </Table.Td>
+                              <Table.Td>{formatDurationShort(run.duration_ms)}</Table.Td>
+                              <Table.Td maw={340}>
+                                <Stack gap={4}>
+                                  <Text size="sm">{run.summary}</Text>
+                                  {run.last_error ? (
+                                    <Text size="xs" c="red">
+                                      {run.last_error}
+                                    </Text>
+                                  ) : null}
+                                </Stack>
+                              </Table.Td>
+                              <Table.Td>
+                                <Button
+                                  size="xs"
+                                  variant="default"
+                                  onClick={() => setSelectedManualRepairRun(run)}
+                                >
+                                  Inspect
+                                </Button>
+                              </Table.Td>
+                            </Table.Tr>
+                          );
+                        })}
+                      </Table.Tbody>
+                    </Table>
+                  </Table.ScrollContainer>
+                ) : (
+                  <Text c="dimmed">
+                    {loading
+                      ? "Loading retained manual repair runs..."
+                      : "No retained manual repair runs yet."}
+                  </Text>
+                )}
+              </Stack>
+            </Card>
+          </Stack>
+        </Tabs.Panel>
+
+        <Tabs.Panel value="data-scrub" pt="lg">
+          <Stack gap="lg">
+            <Grid>
+              <Grid.Col span={{ base: 12, md: 4 }}>
+                <StatCard
+                  label="Scrub Coverage"
+                  value={scrubCluster ? scrubNodes.length : loading ? <Loader size="sm" /> : "unknown"}
+                  hint={scrubCluster ? `${scrubCluster.skipped_nodes.length} skipped node${scrubCluster.skipped_nodes.length === 1 ? "" : "s"}` : "Reachable nodes reporting scrub state"}
+                />
+              </Grid.Col>
+              <Grid.Col span={{ base: 12, md: 4 }}>
+                <StatCard
+                  label="Latest Scrub"
+                  value={latestScrubRun ? formatUnixTs(latestScrubRun.finished_at_unix) : loading ? <Loader size="sm" /> : "none"}
+                  hint={latestScrubRun ? `${formatDataScrubStatus(latestScrubRun.status)} · ${latestScrubRun.summary.issue_count} issue${latestScrubRun.summary.issue_count === 1 ? "" : "s"}` : "No retained scrub run yet"}
+                />
+              </Grid.Col>
+              <Grid.Col span={{ base: 12, md: 4 }}>
+                <StatCard
+                  label="Latest Scrub Findings"
+                  value={latestScrubRun ? latestScrubRun.summary.issue_count : loading ? <Loader size="sm" /> : "unknown"}
+                  hint={latestScrubRun ? `${latestScrubRun.summary.manifests_scanned} manifests · ${latestScrubRun.summary.chunks_scanned} chunks verified` : "Latest clustered scrub findings"}
+                />
+              </Grid.Col>
             </Grid>
-          ) : (
-            <Text c="dimmed">
-              {loading ? "Loading clustered scrub state..." : "No reachable nodes reported scrub state."}
-            </Text>
-          )}
-        </Stack>
-      </Card>
 
-      <Card withBorder radius="md" padding="lg">
-        <Stack gap="md">
-          <Group justify="space-between" align="flex-start">
-            <Stack gap={4}>
-              <Text fw={700}>Retained data scrub runs</Text>
-              <Text size="sm" c="dimmed">
-                Retained scrub results are aggregated from reachable nodes so corruption checks can
-                be reviewed without jumping between node admin pages.
-              </Text>
-            </Stack>
-            <Stack gap="xs" align="flex-end">
-              <Badge variant="light">{scrubCluster ? `${scrubRuns.length} retained` : "not loaded"}</Badge>
-              <TablePageControls
-                pagination={pagedScrubRuns}
-                onPrevious={() => setScrubRunsPageIndex((current) => current - 1)}
-                onNext={() => setScrubRunsPageIndex((current) => current + 1)}
-              />
-            </Stack>
-          </Group>
-          {scrubRuns.length > 0 ? (
-            <Table.ScrollContainer minWidth={980}>
-              <Table striped highlightOnHover withTableBorder>
-                <Table.Thead>
-                  <Table.Tr>
-                    <Table.Th>Finished</Table.Th>
-                    <Table.Th>Node</Table.Th>
-                    <Table.Th>Trigger</Table.Th>
-                    <Table.Th>Status</Table.Th>
-                    <Table.Th>Duration</Table.Th>
-                    <Table.Th>Verified</Table.Th>
-                    <Table.Th>Findings</Table.Th>
-                    <Table.Th>Auto-repair</Table.Th>
-                    <Table.Th />
-                  </Table.Tr>
-                </Table.Thead>
-                <Table.Tbody>
-                  {pagedScrubRuns.pageItems.map((run) => {
-                    const relatedRepairRuns = findRelatedRepairRuns(run, scrubAutoRepairRuns);
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
+                <Group justify="space-between" align="flex-start">
+                  <Stack gap={4}>
+                    <Text fw={700}>Data scrub status across reachable nodes</Text>
+                    <Text size="sm" c="dimmed">
+                      Each reachable node reports its own scrub scheduler state and latest retained scrub
+                      result here.
+                    </Text>
+                  </Stack>
+                  <Stack gap="xs" align="flex-end">
+                    <Badge variant="light">retention {scrubRetentionLabel}</Badge>
+                    <Badge variant="light" color={scrubNodes.length > 0 ? "teal" : "gray"}>
+                      {scrubNodes.length} reachable node{scrubNodes.length === 1 ? "" : "s"}
+                    </Badge>
+                    <TablePageControls
+                      pagination={pagedScrubNodes}
+                      onPrevious={() => setScrubNodesPageIndex((current) => current - 1)}
+                      onNext={() => setScrubNodesPageIndex((current) => current + 1)}
+                    />
+                  </Stack>
+                </Group>
 
-                    return <Table.Tr key={run.run_id}>
-                      <Table.Td>
-                        <Stack gap={2}>
-                          <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
-                          <Text size="xs" c="dimmed">
-                            started {formatUnixTs(run.started_at_unix)}
-                          </Text>
-                        </Stack>
-                      </Table.Td>
-                      <Table.Td>
-                        <Text size="sm" ff="monospace" style={{ wordBreak: "break-word" }}>
-                          {run.reporting_node_id}
-                        </Text>
-                      </Table.Td>
-                      <Table.Td>
-                        <Badge color="blue" variant="light">
-                          {formatDataScrubTrigger(run.trigger)}
-                        </Badge>
-                      </Table.Td>
-                      <Table.Td>
-                        <Badge color={dataScrubStatusColor(run.status)} variant="light">
-                          {formatDataScrubStatus(run.status)}
-                        </Badge>
-                      </Table.Td>
-                      <Table.Td>{formatDurationShort(run.duration_ms)}</Table.Td>
-                      <Table.Td>
-                        <Text size="sm">
-                          {run.summary.manifests_scanned} manifests / {run.summary.chunks_scanned} chunks
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          {formatBytesShort(run.summary.bytes_scanned)} read
-                        </Text>
-                      </Table.Td>
-                      <Table.Td maw={280}>
-                        <Text size="sm">{describeDataScrubRunSummary(run)}</Text>
-                      </Table.Td>
-                      <Table.Td miw={180}>
-                        {relatedRepairRuns.length > 0 ? (
-                          <Stack gap={6}>
-                            <Badge color="teal" variant="light">
-                              {relatedRepairRuns.length} follow-on auto-repair
-                              {relatedRepairRuns.length === 1 ? "" : "s"}
-                            </Badge>
-                            <Button
-                              size="xs"
-                              variant="light"
-                              onClick={() => setSelectedRun(relatedRepairRuns[0] ?? null)}
-                            >
-                              Inspect repair
-                            </Button>
+                {scrubCluster && scrubCluster.skipped_nodes.length > 0 ? (
+                  <Alert color="yellow" variant="light" title="Some nodes did not return scrub state">
+                    {scrubCluster.skipped_nodes
+                      .map((node) => `${node.node_id}: ${node.error}`)
+                      .join(" | ")}
+                  </Alert>
+                ) : null}
+
+                {scrubNodes.length > 0 ? (
+                  <Grid>
+                    {pagedScrubNodes.pageItems.map((node) => (
+                      <Grid.Col key={node.node_id} span={{ base: 12, md: 6, xl: 4 }}>
+                        <Card withBorder radius="md" padding="md">
+                          <Stack gap="sm">
+                            <Group justify="space-between" align="flex-start">
+                              <Stack gap={4}>
+                                <Text fw={600} ff="monospace" style={{ wordBreak: "break-word" }}>
+                                  {node.node_id}
+                                </Text>
+                                <Text size="xs" c="dimmed">
+                                  {node.enabled
+                                    ? `scheduled every ${formatIntervalShort(node.interval_secs)}`
+                                    : "background schedule disabled"}
+                                </Text>
+                              </Stack>
+                              <Badge color={dataScrubStateColor(node.state)} variant="light">
+                                {formatDataScrubActivityState(node.state)}
+                              </Badge>
+                            </Group>
+                            <Group gap="xs">
+                              <Badge variant="light" color={node.enabled ? "teal" : "gray"}>
+                                {node.enabled ? "scheduled" : "manual only"}
+                              </Badge>
+                              <Badge variant="light">retention {formatRetentionWindow(node.retention_secs)}</Badge>
+                            </Group>
+                            {node.active_runs.length > 0 ? (
+                              <Stack gap={6}>
+                                {node.active_runs.map((activeRun) => (
+                                  <Card key={activeRun.run_id} withBorder radius="md" padding="sm">
+                                    <Stack gap={4}>
+                                      <Group gap="xs">
+                                        <Badge color="orange" variant="light">
+                                          {formatDataScrubTrigger(activeRun.trigger)}
+                                        </Badge>
+                                        <Badge color="orange" variant="light">
+                                          running
+                                        </Badge>
+                                      </Group>
+                                      <Text size="sm">Started {formatUnixTs(activeRun.started_at_unix)}</Text>
+                                      <Text size="xs" c="dimmed">
+                                        Run ID <Code>{activeRun.run_id}</Code>
+                                      </Text>
+                                    </Stack>
+                                  </Card>
+                                ))}
+                              </Stack>
+                            ) : node.latest_run ? (
+                              <Card withBorder radius="md" padding="sm">
+                                <Stack gap={6}>
+                                  <Group justify="space-between" align="flex-start">
+                                    <Text fw={600}>Latest retained scrub</Text>
+                                    <Badge color={dataScrubStatusColor(node.latest_run.status)} variant="light">
+                                      {formatDataScrubStatus(node.latest_run.status)}
+                                    </Badge>
+                                  </Group>
+                                  <Text size="sm">
+                                    Finished {formatUnixTs(node.latest_run.finished_at_unix)} after {formatDurationShort(node.latest_run.duration_ms)}.
+                                  </Text>
+                                  <Text size="sm" c="dimmed">
+                                    {describeDataScrubRunSummary(node.latest_run)}
+                                  </Text>
+                                </Stack>
+                              </Card>
+                            ) : (
+                              <Text size="sm" c="dimmed">
+                                No retained scrub run yet for this node.
+                              </Text>
+                            )}
                           </Stack>
-                        ) : (
-                          <Text size="sm" c="dimmed">
-                            none linked
-                          </Text>
-                        )}
-                      </Table.Td>
-                      <Table.Td>
-                        <Button size="xs" variant="default" onClick={() => setSelectedScrubRun(run)}>
-                          Inspect
-                        </Button>
-                      </Table.Td>
-                    </Table.Tr>;
-                  })}
-                </Table.Tbody>
-              </Table>
-            </Table.ScrollContainer>
-          ) : (
-            <Text c="dimmed">
-              {loading ? "Loading retained scrub runs..." : "No retained scrub runs yet."}
-            </Text>
-          )}
-        </Stack>
-      </Card>
+                        </Card>
+                      </Grid.Col>
+                    ))}
+                  </Grid>
+                ) : (
+                  <Text c="dimmed">
+                    {loading ? "Loading clustered scrub state..." : "No reachable nodes reported scrub state."}
+                  </Text>
+                )}
+              </Stack>
+            </Card>
+
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
+                <Group justify="space-between" align="flex-start">
+                  <Stack gap={4}>
+                    <Text fw={700}>Retained data scrub runs</Text>
+                    <Text size="sm" c="dimmed">
+                      Retained scrub results are aggregated from reachable nodes so corruption checks can
+                      be reviewed without jumping between node admin pages.
+                    </Text>
+                  </Stack>
+                  <Stack gap="xs" align="flex-end">
+                    <Badge variant="light">{scrubCluster ? `${scrubRuns.length} retained` : "not loaded"}</Badge>
+                    <TablePageControls
+                      pagination={pagedScrubRuns}
+                      onPrevious={() => setScrubRunsPageIndex((current) => current - 1)}
+                      onNext={() => setScrubRunsPageIndex((current) => current + 1)}
+                    />
+                  </Stack>
+                </Group>
+                {scrubRuns.length > 0 ? (
+                  <Table.ScrollContainer minWidth={980}>
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>Finished</Table.Th>
+                          <Table.Th>Node</Table.Th>
+                          <Table.Th>Trigger</Table.Th>
+                          <Table.Th>Status</Table.Th>
+                          <Table.Th>Duration</Table.Th>
+                          <Table.Th>Verified</Table.Th>
+                          <Table.Th>Findings</Table.Th>
+                          <Table.Th>Auto-repair</Table.Th>
+                          <Table.Th />
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {pagedScrubRuns.pageItems.map((run) => {
+                          const relatedRepairRuns = findRelatedRepairRuns(run, scrubAutoRepairRuns);
+
+                          return <Table.Tr key={run.run_id}>
+                            <Table.Td>
+                              <Stack gap={2}>
+                                <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
+                                <Text size="xs" c="dimmed">
+                                  started {formatUnixTs(run.started_at_unix)}
+                                </Text>
+                              </Stack>
+                            </Table.Td>
+                            <Table.Td>
+                              <Text size="sm" ff="monospace" style={{ wordBreak: "break-word" }}>
+                                {run.reporting_node_id}
+                              </Text>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge color="blue" variant="light">
+                                {formatDataScrubTrigger(run.trigger)}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge color={dataScrubStatusColor(run.status)} variant="light">
+                                {formatDataScrubStatus(run.status)}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>{formatDurationShort(run.duration_ms)}</Table.Td>
+                            <Table.Td>
+                              <Text size="sm">
+                                {run.summary.manifests_scanned} manifests / {run.summary.chunks_scanned} chunks
+                              </Text>
+                              <Text size="xs" c="dimmed">
+                                {formatBytesShort(run.summary.bytes_scanned)} read
+                              </Text>
+                            </Table.Td>
+                            <Table.Td maw={280}>
+                              <Text size="sm">{describeDataScrubRunSummary(run)}</Text>
+                            </Table.Td>
+                            <Table.Td miw={180}>
+                              {relatedRepairRuns.length > 0 ? (
+                                <Stack gap={6}>
+                                  <Badge color="teal" variant="light">
+                                    {relatedRepairRuns.length} follow-on auto-repair
+                                    {relatedRepairRuns.length === 1 ? "" : "s"}
+                                  </Badge>
+                                  <Button
+                                    size="xs"
+                                    variant="light"
+                                    onClick={() => setSelectedRun(relatedRepairRuns[0] ?? null)}
+                                  >
+                                    Inspect repair
+                                  </Button>
+                                </Stack>
+                              ) : (
+                                <Text size="sm" c="dimmed">
+                                  none linked
+                                </Text>
+                              )}
+                            </Table.Td>
+                            <Table.Td>
+                              <Button size="xs" variant="default" onClick={() => setSelectedScrubRun(run)}>
+                                Inspect
+                              </Button>
+                            </Table.Td>
+                          </Table.Tr>;
+                        })}
+                      </Table.Tbody>
+                    </Table>
+                  </Table.ScrollContainer>
+                ) : (
+                  <Text c="dimmed">
+                    {loading ? "Loading retained scrub runs..." : "No retained scrub runs yet."}
+                  </Text>
+                )}
+              </Stack>
+            </Card>
+          </Stack>
+        </Tabs.Panel>
+      </Tabs>
 
       <Modal
         opened={selectedManualRepairRun !== null}

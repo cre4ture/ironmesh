@@ -44,7 +44,7 @@ import {
   type ClusterableScreenPoint,
   type ScreenPointCluster
 } from "./gallery-marker-clusters";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   MediaLightboxModal,
   type MediaLightboxItem,
@@ -274,7 +274,7 @@ export function GallerySurface({
   const [gridCollection, setGridCollection] = useState<GalleryGridCollection | null>(null);
   const [gridPages, setGridPages] = useState<Record<number, GalleryGridPageState>>({});
   const [gridPageHeights, setGridPageHeights] = useState<Record<number, number>>({});
-  const [gridActivePageIndex, setGridActivePageIndex] = useState(0);
+  const [visiblePageSet, setVisiblePageSet] = useState<ReadonlySet<number>>(new Set());
   const [selection, setSelection] = useState<GallerySelection | null>(null);
   const [versionHistoryOpened, setVersionHistoryOpened] = useState(false);
   const [versionKey, setVersionKey] = useState("");
@@ -495,19 +495,23 @@ export function GallerySurface({
       return;
     }
 
-    const anchorPageIndex =
+    const minVisible = visiblePageSet.size > 0 ? Math.min(...visiblePageSet) : 0;
+    const maxVisible = visiblePageSet.size > 0 ? Math.max(...visiblePageSet) : 0;
+    const selectionPageIndex =
       selection?.source === "grid"
         ? pageIndexForGalleryEntry(selection.index, gridCollection.pageSize)
-        : gridActivePageIndex;
-    const preloadStart = Math.max(0, anchorPageIndex - GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS);
+        : null;
+    const rangeMin = selectionPageIndex !== null ? Math.min(minVisible, selectionPageIndex) : minVisible;
+    const rangeMax = selectionPageIndex !== null ? Math.max(maxVisible, selectionPageIndex) : maxVisible;
+    const preloadStart = Math.max(0, rangeMin - GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS);
     const preloadEnd = Math.min(
       gridCollection.pageCount - 1,
-      anchorPageIndex + GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS
+      rangeMax + GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS
     );
-    const keepStart = Math.max(0, anchorPageIndex - GALLERY_VIRTUAL_PAGE_KEEP_RADIUS);
+    const keepStart = Math.max(0, rangeMin - GALLERY_VIRTUAL_PAGE_KEEP_RADIUS);
     const keepEnd = Math.min(
       gridCollection.pageCount - 1,
-      anchorPageIndex + GALLERY_VIRTUAL_PAGE_KEEP_RADIUS
+      rangeMax + GALLERY_VIRTUAL_PAGE_KEEP_RADIUS
     );
 
     for (let pageIndex = preloadStart; pageIndex <= preloadEnd; pageIndex += 1) {
@@ -535,7 +539,7 @@ export function GallerySurface({
       }
       return changed ? next : current;
     });
-  }, [gridActivePageIndex, gridCollection, selection, viewMode]);
+  }, [visiblePageSet, gridCollection, selection, viewMode]);
 
   useEffect(() => {
     if (!loadedScopeRef.current) {
@@ -678,7 +682,7 @@ export function GallerySurface({
     setGridCollection(null);
     setGridPages({});
     setGridPageHeights({});
-    setGridActivePageIndex(0);
+    setVisiblePageSet(new Set());
 
     try {
       const navigationPromise = loadEntries(targetScope.prefix, 1, targetScope.snapshotId, {
@@ -852,6 +856,14 @@ export function GallerySurface({
       };
     });
   }
+
+  const handleGridPageVisibilityChanged = useCallback((index: number, visible: boolean) => {
+    setVisiblePageSet((prev) => {
+      const next = new Set(prev);
+      visible ? next.add(index) : next.delete(index);
+      return next;
+    });
+  }, []);
 
   function replaceGalleryEntryMedia(path: string, media: GalleryEntry["media"] | null) {
     setMapPayload((current) => {
@@ -1500,7 +1512,7 @@ export function GallerySurface({
                         index={pageIndex}
                         minHeight={pageMinHeight}
                         measure={page?.status === "ready"}
-                        onVisible={setGridActivePageIndex}
+                        onVisibilityChanged={handleGridPageVisibilityChanged}
                         onMeasured={handleGridPageMeasured}
                       >
                         {page?.status === "ready" ? (
@@ -1717,7 +1729,7 @@ type GalleryVirtualPageSlotProps = {
   index: number;
   minHeight: number;
   measure: boolean;
-  onVisible: (index: number) => void;
+  onVisibilityChanged: (index: number, visible: boolean) => void;
   onMeasured: (index: number, height: number) => void;
   children: ReactNode;
 };
@@ -1726,7 +1738,7 @@ function GalleryVirtualPageSlot({
   index,
   minHeight,
   measure,
-  onVisible,
+  onVisibilityChanged,
   onMeasured,
   children
 }: GalleryVirtualPageSlotProps) {
@@ -1740,21 +1752,21 @@ function GalleryVirtualPageSlot({
     }
 
     if (typeof IntersectionObserver === "undefined") {
-      onVisible(index);
+      onVisibilityChanged(index, true);
       return;
     }
 
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          onVisible(index);
+        for (const entry of entries) {
+          onVisibilityChanged(index, entry.isIntersecting);
         }
       },
       { rootMargin: GALLERY_VIRTUAL_PAGE_ROOT_MARGIN }
     );
     observer.observe(element);
     return () => observer.disconnect();
-  }, [index, onVisible]);
+  }, [index, onVisibilityChanged]);
 
   useEffect(() => {
     if (!measure) {
