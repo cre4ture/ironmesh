@@ -20671,7 +20671,9 @@ async fn login_admin_session(
 
     let password_upgraded = is_legacy_password_hash(&expected_hash);
     if password_upgraded {
-        info!("admin password hash is legacy blake3; upgrading to pbkdf2 before session is created");
+        info!(
+            "admin password hash is legacy blake3; upgrading to pbkdf2 before session is created"
+        );
         upgrade_password_hash_if_legacy(&state, &request.password).await;
     }
 
@@ -20843,9 +20845,10 @@ pub(crate) async fn change_admin_password(
     }
 
     let new_password_for_hash = request.new_password.clone();
-    let new_hash = tokio::task::spawn_blocking(move || setup::hash_admin_password(&new_password_for_hash))
-        .await
-        .expect("hash_admin_password task panicked");
+    let new_hash =
+        tokio::task::spawn_blocking(move || setup::hash_admin_password(&new_password_for_hash))
+            .await
+            .expect("hash_admin_password task panicked");
 
     let state_path = setup::managed_setup_state_path(&state.data_dir);
     match setup::read_managed_setup_state(&state_path) {

@@ -3110,10 +3110,7 @@ async fn change_admin_password_accepts_correct_current_password_and_updates_hash
         .unwrap() = Some(make_test_pbkdf2_hash("old-password"));
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-ironmesh-admin-token",
-        TEST_ADMIN_TOKEN.parse().unwrap(),
-    );
+    headers.insert("x-ironmesh-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
     let response = super::change_admin_password(
         State(state.clone()),
         headers,
@@ -3165,10 +3162,7 @@ async fn change_admin_password_rejects_wrong_current_password() {
         .unwrap() = Some(make_test_pbkdf2_hash("correct"));
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-ironmesh-admin-token",
-        TEST_ADMIN_TOKEN.parse().unwrap(),
-    );
+    headers.insert("x-ironmesh-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
     let response = super::change_admin_password(
         State(state.clone()),
         headers,
@@ -5975,7 +5969,14 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
 
     // Write both versions to the local store. v2 is a child of v1, making v1 a non-head version
     // that list_replication_subjects() will not surface in availability syncs.
-    seed_subject_version(&state, &key, &version_old, b"old payload v1".to_vec(), Vec::new()).await;
+    seed_subject_version(
+        &state,
+        &key,
+        &version_old,
+        b"old payload v1".to_vec(),
+        Vec::new(),
+    )
+    .await;
     seed_subject_version(
         &state,
         &key,
