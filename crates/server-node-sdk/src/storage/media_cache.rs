@@ -955,44 +955,12 @@ fn parse_http_byte_range(range: &str, total: u64) -> Option<(u64, u64)> {
     }
 }
 
-/// Starts a local HTTP server that presents the chunked video as a single
-/// seekable file via Range requests.
+/// Starts a local HTTP server on 127.0.0.1 that presents the chunked video
+/// as a single seekable file via Range requests.
 ///
-/// On Unix: serves over a Unix domain socket in `temp_dir` (mode 0700),
-/// so only the current user can connect.
-///
-/// On Windows: serves over a loopback TCP port with a random UUID token
-/// embedded in the URL path, since tokio does not expose AF_UNIX on Windows.
-#[cfg(unix)]
-async fn start_chunk_video_server(
-    index: Arc<ChunkVideoIndex>,
-    temp_dir: &Path,
-) -> Result<(tokio::task::JoinHandle<()>, String)> {
-    use std::os::unix::fs::PermissionsExt;
-    use tokio::net::UnixListener;
-
-    fs::set_permissions(temp_dir, std::fs::Permissions::from_mode(0o700))
-        .await
-        .context("failed to restrict temp dir permissions")?;
-
-    let socket_path = temp_dir.join("v.sock");
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind Unix socket {}", socket_path.display()))?;
-
-    let app = Router::new()
-        .route("/video", axum::routing::get(serve_video_range))
-        .with_state(index);
-
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let encoded = socket_path.to_string_lossy().replace('/', "%2F");
-    let url = format!("http+unix://{encoded}/video");
-    Ok((handle, url))
-}
-
-#[cfg(windows)]
+/// A random UUID token is embedded as a literal route segment so that other
+/// local processes cannot reach the endpoint without knowing the token.
+/// The server is torn down (task aborted) as soon as ffprobe/ffmpeg finish.
 async fn start_chunk_video_server(
     index: Arc<ChunkVideoIndex>,
     _temp_dir: &Path,
@@ -1016,14 +984,6 @@ async fn start_chunk_video_server(
 
     let url = format!("http://127.0.0.1:{port}/{token}/video");
     Ok((handle, url))
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn start_chunk_video_server(
-    _index: Arc<ChunkVideoIndex>,
-    _temp_dir: &Path,
-) -> Result<(tokio::task::JoinHandle<()>, String)> {
-    bail!("video thumbnail generation is not supported on this platform (no Unix socket support)")
 }
 
 async fn derive_video_media_cache(
