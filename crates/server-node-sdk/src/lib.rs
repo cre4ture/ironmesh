@@ -57,7 +57,7 @@ use serde_json::json;
 use time::OffsetDateTime;
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::sync::{Mutex, Notify, RwLock, watch};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, watch};
 use tower::Service;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
@@ -2275,10 +2275,23 @@ struct PeerHeartbeatConfig {
     interval_secs: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+pub(crate) const ADMIN_PASSWORD_VERIFY_CONCURRENCY: usize = 4;
+
+#[derive(Debug, Clone)]
 struct AdminControl {
     admin_token: Option<String>,
     admin_password_hash: Arc<StdMutex<Option<String>>>,
+    password_verify_semaphore: Arc<Semaphore>,
+}
+
+impl Default for AdminControl {
+    fn default() -> Self {
+        Self {
+            admin_token: None,
+            admin_password_hash: Arc::new(StdMutex::new(None)),
+            password_verify_semaphore: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_CONCURRENCY)),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4440,6 +4453,7 @@ impl ServerNodeConfig {
         AdminControl {
             admin_token: self.admin_token.clone(),
             admin_password_hash: Arc::new(StdMutex::new(self.admin_password_hash.clone())),
+            password_verify_semaphore: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_CONCURRENCY)),
         }
     }
 
@@ -13589,9 +13603,9 @@ struct AdminSessionStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct AdminChangePasswordRequest {
-    current_password: String,
-    new_password: String,
+pub(crate) struct AdminChangePasswordRequest {
+    pub(crate) current_password: String,
+    pub(crate) new_password: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -20457,6 +20471,7 @@ fn password_hash_matches(expected_hash: &str, password: &str) -> bool {
 }
 
 async fn upgrade_password_hash_if_legacy(state: &ServerState, password: &str) {
+    let upgrade_start = Instant::now();
     let new_hash = setup::hash_admin_password(password);
     *state
         .access
@@ -20469,6 +20484,11 @@ async fn upgrade_password_hash_if_legacy(state: &ServerState, password: &str) {
         managed.admin_password_hash = Some(new_hash);
         if let Err(err) = setup::write_managed_setup_state(&state_path, &managed) {
             warn!(error = %err, "failed to persist upgraded admin password hash");
+        } else {
+            info!(
+                upgrade_ms = upgrade_start.elapsed().as_millis(),
+                "admin password hash upgraded from blake3 to pbkdf2 and persisted"
+            );
         }
     }
 }
@@ -20595,7 +20615,39 @@ async fn login_admin_session(
             .into_response();
     };
 
-    if !password_hash_matches(&expected_hash, &request.password) {
+    let Ok(_verify_permit) = state
+        .access
+        .admin_control
+        .password_verify_semaphore
+        .try_acquire()
+    else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "too many concurrent login attempts" })),
+        )
+            .into_response();
+    };
+
+    let hash_kind = if is_legacy_password_hash(&expected_hash) {
+        "blake3_legacy"
+    } else {
+        "pbkdf2sha256"
+    };
+    let password_for_check = request.password.clone();
+    let expected_hash_for_check = expected_hash.clone();
+    let verify_start = Instant::now();
+    let password_matches = tokio::task::spawn_blocking(move || {
+        password_hash_matches(&expected_hash_for_check, &password_for_check)
+    })
+    .await
+    .unwrap_or(false);
+    info!(
+        hash_kind,
+        verify_ms = verify_start.elapsed().as_millis(),
+        "admin password verification complete"
+    );
+
+    if !password_matches {
         append_admin_audit(
             &state,
             action,
@@ -20616,7 +20668,12 @@ async fn login_admin_session(
 
     let password_upgraded = is_legacy_password_hash(&expected_hash);
     if password_upgraded {
-        upgrade_password_hash_if_legacy(&state, &request.password).await;
+        info!("admin password hash is legacy blake3; upgrading to pbkdf2 in background");
+        let state_for_upgrade = state.clone();
+        let password_for_upgrade = request.password.clone();
+        tokio::spawn(async move {
+            upgrade_password_hash_if_legacy(&state_for_upgrade, &password_for_upgrade).await;
+        });
     }
 
     let (session_id, session_expires_at_unix) = {
@@ -20721,7 +20778,7 @@ async fn logout_admin_session(
         .into_response()
 }
 
-async fn change_admin_password(
+pub(crate) async fn change_admin_password(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(request): Json<AdminChangePasswordRequest>,
@@ -20755,7 +20812,15 @@ async fn change_admin_password(
             .into_response();
     };
 
-    if !password_hash_matches(&expected_hash, &request.current_password) {
+    let current_password_for_check = request.current_password.clone();
+    let expected_hash_for_check = expected_hash.clone();
+    let current_password_matches = tokio::task::spawn_blocking(move || {
+        password_hash_matches(&expected_hash_for_check, &current_password_for_check)
+    })
+    .await
+    .unwrap_or(false);
+
+    if !current_password_matches {
         append_admin_audit(
             &state,
             "auth/admin/change-password",
@@ -20778,7 +20843,10 @@ async fn change_admin_password(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
     }
 
-    let new_hash = setup::hash_admin_password(&request.new_password);
+    let new_password_for_hash = request.new_password.clone();
+    let new_hash = tokio::task::spawn_blocking(move || setup::hash_admin_password(&new_password_for_hash))
+        .await
+        .expect("hash_admin_password task panicked");
 
     let state_path = setup::managed_setup_state_path(&state.data_dir);
     match setup::read_managed_setup_state(&state_path) {

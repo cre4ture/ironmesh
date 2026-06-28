@@ -3000,6 +3000,191 @@ async fn admin_session_cookies_are_isolated_per_node() {
     cleanup_test_state(&node_b).await;
 }
 
+fn make_test_pbkdf2_hash(password: &str) -> String {
+    use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha256;
+    const TEST_ROUNDS: u32 = 1;
+    let salt = [0u8; 16];
+    let mut hash = vec![0u8; 32];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, TEST_ROUNDS, &mut hash);
+    let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+    let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("pbkdf2sha256:{TEST_ROUNDS}:{salt_hex}:{hash_hex}")
+}
+
+#[tokio::test]
+async fn admin_password_login_accepts_pbkdf2_hash() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(make_test_pbkdf2_hash("correct-horse-battery-staple"));
+
+    let response = super::login_admin_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "correct-horse-battery-staple".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn admin_password_login_rejects_wrong_pbkdf2_password() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(make_test_pbkdf2_hash("correct"));
+
+    let response = super::login_admin_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "wrong".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn admin_password_login_returns_429_when_concurrency_limit_reached() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(make_test_pbkdf2_hash("password"));
+
+    let _permits: Vec<_> = (0..super::ADMIN_PASSWORD_VERIFY_CONCURRENCY)
+        .map(|_| {
+            state
+                .access
+                .admin_control
+                .password_verify_semaphore
+                .try_acquire()
+                .expect("semaphore should have permits available")
+        })
+        .collect();
+
+    let response = super::login_admin_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "password".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn change_admin_password_accepts_correct_current_password_and_updates_hash() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(make_test_pbkdf2_hash("old-password"));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-ironmesh-admin-token",
+        TEST_ADMIN_TOKEN.parse().unwrap(),
+    );
+    let response = super::change_admin_password(
+        State(state.clone()),
+        headers,
+        Json(super::AdminChangePasswordRequest {
+            current_password: "old-password".to_string(),
+            new_password: "new-password-long-enough".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // New password must work; old password must not
+    let login_new = super::login_admin_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "new-password-long-enough".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(login_new.status(), StatusCode::OK);
+
+    let login_old = super::login_admin_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "old-password".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(login_old.status(), StatusCode::UNAUTHORIZED);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn change_admin_password_rejects_wrong_current_password() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    *state
+        .access
+        .admin_control
+        .admin_password_hash
+        .lock()
+        .unwrap() = Some(make_test_pbkdf2_hash("correct"));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-ironmesh-admin-token",
+        TEST_ADMIN_TOKEN.parse().unwrap(),
+    );
+    let response = super::change_admin_password(
+        State(state.clone()),
+        headers,
+        Json(super::AdminChangePasswordRequest {
+            current_password: "wrong".to_string(),
+            new_password: "new-password-long-enough".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    cleanup_test_state(&state).await;
+}
+
 #[tokio::test]
 async fn import_managed_signer_backup_persists_signer_material_and_requires_restart() {
     let mut exporter = build_test_state(1, false, MainTestBackend::Sqlite).await;
