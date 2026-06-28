@@ -41,9 +41,28 @@ class FolderSyncWorker(
             return@withContext Result.success()
         }
 
+        val networkDecisions = FolderSyncNetworkGate.evaluateProfiles(applicationContext, profiles)
+        val eligibleProfiles = networkDecisions
+            .filter { evaluation -> evaluation.decision.allowed }
+            .map { evaluation -> evaluation.profile }
+        val skippedProfiles = networkDecisions
+            .filterNot { evaluation -> evaluation.decision.allowed }
+
+        skippedProfiles.forEach { evaluation ->
+            Log.i(
+                TAG,
+                "skipping one-shot sync profile=${evaluation.profile.id} reason=${evaluation.decision.reason}",
+            )
+        }
+
+        if (eligibleProfiles.isEmpty()) {
+            Log.i(TAG, "one-shot sync skipped because no enabled profile matches the current network policy")
+            return@withContext Result.success()
+        }
+
         val failures = mutableListOf<String>()
 
-        for (profile in profiles) {
+        for (profile in eligibleProfiles) {
             runCatching {
                 syncProfile(connectionInput, serverCaPem, clientIdentityJson, profile)
             }.onFailure { error ->

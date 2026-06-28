@@ -95,11 +95,14 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import io.ironmesh.android.data.FolderSyncConfig
+import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.data.RustPreferencesBridge
+import io.ironmesh.android.data.formatAllowedWifiSsidsInput
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import io.ironmesh.android.ui.FolderSyncHistoryState
 import io.ironmesh.android.ui.GalleryViewMode
@@ -351,6 +354,21 @@ private fun SettingsView(
             vm.setStatus("Photo GPS EXIF may be stripped until photo permissions are granted")
         }
     }
+    val wifiNamePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        val denied = grants
+            .filterValues { granted -> !granted }
+            .keys
+            .toList()
+        if (denied.isEmpty()) {
+            vm.setStatus("Wi-Fi name access granted for restricted sync rules")
+        } else {
+            vm.setStatus(
+                "Allowed Wi-Fi names need Android Wi-Fi/location access before they can be enforced",
+            )
+        }
+    }
     val folderPickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
@@ -388,6 +406,13 @@ private fun SettingsView(
             onError = vm::setStatus,
         )
     }
+    val onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit = { policy ->
+        requestWifiNameAccessIfNeeded(
+            context = context,
+            launcher = wifiNamePermissionLauncher,
+            policy = policy,
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -406,6 +431,7 @@ private fun SettingsView(
             state = state,
             vm = vm,
             onPickLocalFolder = onPickLocalFolder,
+            onEnsureWifiNameAccess = onEnsureWifiNameAccess,
         )
     }
 }
@@ -606,8 +632,11 @@ private fun FolderSyncControls(
     state: MainUiState,
     vm: MainViewModel,
     onPickLocalFolder: () -> Unit,
+    onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
+    var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
+    val editingProfile = state.syncProfiles.firstOrNull { profile -> profile.id == editingProfileId }
 
     Text(
         "Folder Sync Profiles",
@@ -701,8 +730,39 @@ private fun FolderSyncControls(
         singleLine = true,
     )
 
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Network Rules", style = MaterialTheme.typography.titleSmall)
+            FolderSyncNetworkPolicyEditor(
+                allowWifi = state.newSyncAllowWifi,
+                onAllowWifiChange = vm::updateNewSyncAllowWifi,
+                allowCellular = state.newSyncAllowCellular,
+                onAllowCellularChange = vm::updateNewSyncAllowCellular,
+                allowOtherConnections = state.newSyncAllowOtherConnections,
+                onAllowOtherConnectionsChange = vm::updateNewSyncAllowOtherConnections,
+                allowRoaming = state.newSyncAllowRoaming,
+                onAllowRoamingChange = vm::updateNewSyncAllowRoaming,
+                allowedWifiSsids = state.newSyncAllowedWifiSsids,
+                onAllowedWifiSsidsChange = vm::updateNewSyncAllowedWifiSsids,
+            )
+        }
+    }
+
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = vm::addFolderSyncProfile) {
+        Button(
+            onClick = {
+                vm.addFolderSyncProfile()?.let(onEnsureWifiNameAccess)
+            },
+        ) {
             Text("Add Sync Profile")
         }
         OutlinedButton(onClick = onPickLocalFolder) {
@@ -733,113 +793,124 @@ private fun FolderSyncControls(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 Text(profile.label, style = MaterialTheme.typography.titleSmall)
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        FolderSyncBadge(
-                            if (profile.enabled) {
-                                displayStatusToken(profileStatus?.state ?: "waiting")
-                            } else {
-                                "Disabled"
-                            },
-                        )
-                        profileStatus?.phase
-                            ?.takeIf { it.isNotBlank() }
-                            ?.let { phase ->
-                                FolderSyncBadge(displayStatusToken(phase))
-                            }
-                        profileStatus?.storageMode
-                            ?.takeIf { it.isNotBlank() }
-                            ?.let { storageMode ->
-                                FolderSyncBadge(displayStatusToken(storageMode))
-                            }
-                        profileStatus?.watchMode
-                            ?.takeIf { it.isNotBlank() }
-                            ?.let { watchMode ->
-                                FolderSyncBadge(displayStatusToken(watchMode))
-                            }
-                        FolderSyncBadge(
-                            "Scope ${profileStatus?.scopeLabel ?: profile.prefix.ifBlank { "<root>" }}",
-                        )
-                    }
-                    Text(
-                        profileStatus?.message ?: if (profile.enabled) {
-                            "Waiting for continuous sync to start"
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FolderSyncBadge(
+                        if (profile.enabled) {
+                            displayStatusToken(profileStatus?.state ?: "waiting")
                         } else {
-                            "This profile is disabled"
+                            "Disabled"
                         },
-                        style = MaterialTheme.typography.bodySmall,
                     )
-                    profileStatus?.activity
+                    profileStatus?.phase
                         ?.takeIf { it.isNotBlank() }
-                        ?.let { activity ->
-                            Text(
-                                "Activity: ${displayStatusToken(activity)}",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+                        ?.let { phase ->
+                            FolderSyncBadge(displayStatusToken(phase))
                         }
-                    Text(
-                        "Local root: ${profileStatus?.rootDir?.ifBlank { profile.localFolder } ?: profile.localFolder}",
-                        style = MaterialTheme.typography.bodySmall,
+                    profileStatus?.storageMode
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { storageMode ->
+                            FolderSyncBadge(displayStatusToken(storageMode))
+                        }
+                    profileStatus?.watchMode
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { watchMode ->
+                            FolderSyncBadge(displayStatusToken(watchMode))
+                        }
+                    FolderSyncBadge(
+                        "Scope ${profileStatus?.scopeLabel ?: profile.prefix.ifBlank { "<root>" }}",
                     )
-                    profileStatus?.connectionTarget
-                        ?.takeIf { it.isNotBlank() }
-                        ?.let { connectionTarget ->
-                            Text(
-                                "Connection: $connectionTarget",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                    profileStatus?.localTreeUri
-                        ?.takeIf { it.isNotBlank() }
-                        ?.let { treeUri ->
-                            Text(
-                                "Tree URI: $treeUri",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                    profileStatus?.let { status ->
+                    FolderSyncBadge("Network ${folderSyncAllowedTransportLabel(profile.networkPolicy)}")
+                    if (profile.networkPolicy.allowCellular && !profile.networkPolicy.allowRoaming) {
+                        FolderSyncBadge("No roaming")
+                    }
+                    if (profile.networkPolicy.allowedWifiSsids.isNotEmpty()) {
+                        FolderSyncBadge("Wi-Fi names ${profile.networkPolicy.allowedWifiSsids.size}")
+                    }
+                }
+                Text(
+                    profileStatus?.message ?: if (profile.enabled) {
+                        "Waiting for continuous sync to start"
+                    } else {
+                        "This profile is disabled"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    "Network rules: ${folderSyncNetworkPolicySummary(profile.networkPolicy)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                profileStatus?.activity
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { activity ->
                         Text(
-                            profileInventorySummary(status),
+                            "Activity: ${displayStatusToken(activity)}",
                             style = MaterialTheme.typography.bodySmall,
                         )
-                        recentWorkSummary(status.metrics)
-                            ?.let { summary ->
-                                Text(
-                                    "Recent: $summary",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                            }
-                        startupDetailSummary(status.metrics)
-                            ?.let { summary ->
-                                Text(
-                                    "Startup: $summary",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                            }
-                        status.lastSuccessUnixMs?.let { lastSuccess ->
-                            Text(
-                                "Last success ${formatTimestamp(lastSuccess)}",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                        if (status.updatedUnixMs > 0L) {
-                            Text(
-                                "Updated ${formatTimestamp(status.updatedUnixMs)}",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                        status.lastError
-                            ?.takeIf { it.isNotBlank() }
-                            ?.let { lastError ->
-                                Text(
-                                    "Last error: $lastError",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                )
-                            }
                     }
+                Text(
+                    "Local root: ${profileStatus?.rootDir?.ifBlank { profile.localFolder } ?: profile.localFolder}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                profileStatus?.connectionTarget
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { connectionTarget ->
+                        Text(
+                            "Connection: $connectionTarget",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                profileStatus?.localTreeUri
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { treeUri ->
+                        Text(
+                            "Tree URI: $treeUri",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                profileStatus?.let { status ->
+                    Text(
+                        profileInventorySummary(status),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    recentWorkSummary(status.metrics)
+                        ?.let { summary ->
+                            Text(
+                                "Recent: $summary",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    startupDetailSummary(status.metrics)
+                        ?.let { summary ->
+                            Text(
+                                "Startup: $summary",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    status.lastSuccessUnixMs?.let { lastSuccess ->
+                        Text(
+                            "Last success ${formatTimestamp(lastSuccess)}",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    if (status.updatedUnixMs > 0L) {
+                        Text(
+                            "Updated ${formatTimestamp(status.updatedUnixMs)}",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    status.lastError
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { lastError ->
+                            Text(
+                                "Last error: $lastError",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                }
                 FolderSyncHistoryPanel(
                     profileId = profile.id,
                     historyState = historyState,
@@ -853,6 +924,11 @@ private fun FolderSyncControls(
                         },
                     )
                     OutlinedButton(
+                        onClick = { editingProfileId = profile.id },
+                    ) {
+                        Text("Network Rules")
+                    }
+                    OutlinedButton(
                         onClick = { vm.removeFolderSyncProfile(profile.id) },
                     ) {
                         Text("Remove")
@@ -860,6 +936,15 @@ private fun FolderSyncControls(
                 }
             }
         }
+    }
+
+    if (editingProfile != null) {
+        FolderSyncNetworkPolicyDialog(
+            profile = editingProfile,
+            vm = vm,
+            onEnsureWifiNameAccess = onEnsureWifiNameAccess,
+            onDismiss = { editingProfileId = null },
+        )
     }
 }
 
@@ -874,6 +959,206 @@ private fun FolderSyncBadge(text: String) {
             text = text,
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+        )
+    }
+}
+
+private fun folderSyncAllowedTransportLabel(policy: FolderSyncNetworkPolicy): String {
+    val normalizedPolicy = policy.normalized()
+    val parts = mutableListOf<String>()
+    if (normalizedPolicy.allowWifi) {
+        parts += "Wi-Fi"
+    }
+    if (normalizedPolicy.allowCellular) {
+        parts += "Mobile"
+    }
+    if (normalizedPolicy.allowOtherConnections) {
+        parts += "Other"
+    }
+    return parts.takeIf { it.isNotEmpty() }?.joinToString("/") ?: "Blocked"
+}
+
+private fun folderSyncNetworkPolicySummary(policy: FolderSyncNetworkPolicy): String {
+    val normalizedPolicy = policy.normalized()
+    val parts = mutableListOf<String>()
+    parts += folderSyncAllowedTransportLabel(normalizedPolicy)
+    if (normalizedPolicy.allowCellular) {
+        parts += if (normalizedPolicy.allowRoaming) {
+            "roaming allowed"
+        } else {
+            "no roaming"
+        }
+    }
+    if (normalizedPolicy.allowWifi && normalizedPolicy.allowedWifiSsids.isNotEmpty()) {
+        parts += "Wi-Fi names: ${formatAllowedWifiSsidsInput(normalizedPolicy)}"
+    }
+    return parts.joinToString(" | ")
+}
+
+@Composable
+private fun FolderSyncNetworkPolicyDialog(
+    profile: FolderSyncConfig,
+    vm: MainViewModel,
+    onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val initialPolicy = profile.networkPolicy.normalized()
+    var allowWifi by rememberSaveable(profile.id) { mutableStateOf(initialPolicy.allowWifi) }
+    var allowCellular by rememberSaveable(profile.id) { mutableStateOf(initialPolicy.allowCellular) }
+    var allowOtherConnections by rememberSaveable(profile.id) {
+        mutableStateOf(initialPolicy.allowOtherConnections)
+    }
+    var allowRoaming by rememberSaveable(profile.id) { mutableStateOf(initialPolicy.allowRoaming) }
+    var allowedWifiSsids by rememberSaveable(profile.id) {
+        mutableStateOf(formatAllowedWifiSsidsInput(initialPolicy))
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(),
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            shape = RoundedCornerShape(24.dp),
+            tonalElevation = 4.dp,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("Network Rules", style = MaterialTheme.typography.titleMedium)
+                Text(profile.label, style = MaterialTheme.typography.bodyMedium)
+                FolderSyncNetworkPolicyEditor(
+                    allowWifi = allowWifi,
+                    onAllowWifiChange = { allowWifi = it },
+                    allowCellular = allowCellular,
+                    onAllowCellularChange = { allowCellular = it },
+                    allowOtherConnections = allowOtherConnections,
+                    onAllowOtherConnectionsChange = { allowOtherConnections = it },
+                    allowRoaming = allowRoaming,
+                    onAllowRoamingChange = { allowRoaming = it },
+                    allowedWifiSsids = allowedWifiSsids,
+                    onAllowedWifiSsidsChange = { allowedWifiSsids = it },
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                ) {
+                    OutlinedButton(onClick = onDismiss) {
+                        Text("Cancel")
+                    }
+                    Button(
+                        onClick = {
+                            val updatedPolicy = FolderSyncNetworkPolicy(
+                                allowWifi = allowWifi,
+                                allowCellular = allowCellular,
+                                allowOtherConnections = allowOtherConnections,
+                                allowRoaming = allowRoaming,
+                                allowedWifiSsids = io.ironmesh.android.data.parseAllowedWifiSsidsInput(
+                                    allowedWifiSsids,
+                                ),
+                            ).normalized()
+                            if (vm.updateFolderSyncProfileNetworkPolicy(profile.id, updatedPolicy)) {
+                                onEnsureWifiNameAccess(updatedPolicy)
+                                onDismiss()
+                            }
+                        },
+                    ) {
+                        Text("Save")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FolderSyncNetworkPolicyEditor(
+    allowWifi: Boolean,
+    onAllowWifiChange: (Boolean) -> Unit,
+    allowCellular: Boolean,
+    onAllowCellularChange: (Boolean) -> Unit,
+    allowOtherConnections: Boolean,
+    onAllowOtherConnectionsChange: (Boolean) -> Unit,
+    allowRoaming: Boolean,
+    onAllowRoamingChange: (Boolean) -> Unit,
+    allowedWifiSsids: String,
+    onAllowedWifiSsidsChange: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        FolderSyncToggleRow(
+            label = "Wi-Fi",
+            detail = "Allow sync when the active connection is Wi-Fi.",
+            checked = allowWifi,
+            onCheckedChange = onAllowWifiChange,
+        )
+        FolderSyncToggleRow(
+            label = "Mobile data",
+            detail = "Allow sync over cellular data.",
+            checked = allowCellular,
+            onCheckedChange = onAllowCellularChange,
+        )
+        FolderSyncToggleRow(
+            label = "Roaming",
+            detail = "Only applies when mobile data is enabled.",
+            checked = allowRoaming,
+            enabled = allowCellular,
+            onCheckedChange = onAllowRoamingChange,
+        )
+        FolderSyncToggleRow(
+            label = "Other connections",
+            detail = "Allow Ethernet, VPN or other non-Wi-Fi/non-cellular connections.",
+            checked = allowOtherConnections,
+            onCheckedChange = onAllowOtherConnectionsChange,
+        )
+        OutlinedTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = allowedWifiSsids,
+            onValueChange = onAllowedWifiSsidsChange,
+            enabled = allowWifi,
+            label = { Text("Allowed Wi-Fi Names (optional)") },
+            placeholder = { Text("Home WiFi, Office WiFi") },
+        )
+        Text(
+            "Leave the Wi-Fi list empty to allow any Wi-Fi. Exact Wi-Fi names need Android Wi-Fi/location access.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun FolderSyncToggleRow(
+    label: String,
+    detail: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled,
         )
     }
 }
@@ -1733,6 +2018,36 @@ private fun requestOriginalPhotoAccessIfNeeded(
     launcher: ManagedActivityResultLauncher<Array<String>, Map<String, Boolean>>,
 ) {
     val missing = missingOriginalPhotoAccessPermissions(context)
+    if (missing.isNotEmpty()) {
+        launcher.launch(missing)
+    }
+}
+
+private fun missingWifiNameAccessPermissions(context: Context): Array<String> {
+    val required = buildList {
+        add(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+    }
+
+    return required
+        .filter { permission ->
+            ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED
+        }
+        .toTypedArray()
+}
+
+private fun requestWifiNameAccessIfNeeded(
+    context: Context,
+    launcher: ManagedActivityResultLauncher<Array<String>, Map<String, Boolean>>,
+    policy: FolderSyncNetworkPolicy,
+) {
+    if (policy.normalized().allowedWifiSsids.isEmpty()) {
+        return
+    }
+
+    val missing = missingWifiNameAccessPermissions(context)
     if (missing.isNotEmpty()) {
         launcher.launch(missing)
     }

@@ -5,6 +5,9 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -23,6 +26,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -30,8 +35,28 @@ class FolderSyncForegroundService : Service() {
 
     private val repository = IronmeshRepository()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val reconcileMutex = Mutex()
     private var statusJob: Job? = null
     private var lastLoggedStatusLine: String? = null
+    private var lastDesiredSignature: String? = null
+    private var waitingSummary: String? = null
+    private var networkCallbackRegistered = false
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            requestReconcile("network available")
+        }
+
+        override fun onLost(network: Network) {
+            requestReconcile("network lost")
+        }
+
+        override fun onCapabilitiesChanged(
+            network: Network,
+            networkCapabilities: NetworkCapabilities,
+        ) {
+            requestReconcile("network capabilities changed")
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -42,6 +67,7 @@ class FolderSyncForegroundService : Service() {
             NOTIFICATION_ID,
             buildNotification("Starting continuous sync", "Preparing folder sync runtime"),
         )
+        registerNetworkCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -51,16 +77,7 @@ class FolderSyncForegroundService : Service() {
                 return START_NOT_STICKY
             }
             else -> {
-                scope.launch {
-                    val started = runCatching { reconcileProfiles() }
-                        .getOrElse { error ->
-                            updateNotification("Ironmesh sync issue", error.message ?: "Failed to start sync")
-                            false
-                        }
-                    if (started) {
-                        startStatusLoop()
-                    }
-                }
+                requestReconcile("service start")
                 return START_STICKY
             }
         }
@@ -68,6 +85,7 @@ class FolderSyncForegroundService : Service() {
 
     override fun onDestroy() {
         statusJob?.cancel()
+        unregisterNetworkCallback()
         repository.stopAllContinuousFolderSync()
         scope.cancel()
         super.onDestroy()
@@ -76,49 +94,85 @@ class FolderSyncForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private suspend fun reconcileProfiles(): Boolean {
-        return withContext(Dispatchers.IO) {
-            val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
-            val connectionInput = deviceAuth.preferredConnectionInput()
-            val clientIdentityJson = deviceAuth.toClientIdentityJson()
-            val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
-            val profiles = IronmeshPreferences
-                .getFolderSyncConfigs(applicationContext)
-                .filter { it.enabled }
+        return reconcileMutex.withLock {
+            withContext(Dispatchers.IO) {
+                val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
+                val connectionInput = deviceAuth.preferredConnectionInput()
+                val clientIdentityJson = deviceAuth.toClientIdentityJson()
+                val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
+                val profiles = IronmeshPreferences
+                    .getFolderSyncConfigs(applicationContext)
+                    .filter { it.enabled }
 
-            repository.stopAllContinuousFolderSync()
-
-            if (profiles.isEmpty()) {
-                withContext(Dispatchers.Main) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                if (profiles.isEmpty()) {
+                    repository.stopAllContinuousFolderSync()
+                    waitingSummary = null
+                    lastDesiredSignature = null
+                    withContext(Dispatchers.Main) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                    return@withContext false
                 }
-                return@withContext false
-            }
 
-            for (profile in profiles) {
-                val localFolder = File(profile.localFolder)
-                val storageDiagnostics = FolderSyncStorageDiagnosticsHelper.collect(
-                    contentResolver = applicationContext.contentResolver,
-                    localFolder = profile.localFolder,
-                    explicitTreeUri = profile.localFolderTreeUri,
-                )
-                Log.i(
-                    TAG,
-                    "starting continuous sync profile=${profile.id} label=${profile.label} prefix=${profile.prefix.ifBlank { "<root>" }} localFolder=${profile.localFolder} exists=${localFolder.exists()} isDirectory=${localFolder.isDirectory} canRead=${localFolder.canRead()} rawSampleChildren=${storageDiagnostics.rawSampleChildren} treeUriSource=${storageDiagnostics.treeUriSource} treeUri=${storageDiagnostics.treeUri ?: "<none>"} safSampleChildren=${storageDiagnostics.safSampleChildren}",
-                )
-                repository.startContinuousFolderSync(
-                    profileId = profile.id,
-                    label = profile.label,
+                if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                    applyDesiredState(
+                        desiredSignature = "",
+                        desiredProfiles = emptyList(),
+                        connectionInput = connectionInput,
+                        serverCaPem = serverCaPem,
+                        clientIdentityJson = clientIdentityJson,
+                    )
+                    waitingSummary = "Enroll this device before continuous sync can run"
+                    updateNotification("Ironmesh sync paused", requireNotNull(waitingSummary))
+                    return@withContext true
+                }
+
+                val networkDecisions = FolderSyncNetworkGate.evaluateProfiles(applicationContext, profiles)
+                val allowedProfiles = networkDecisions
+                    .filter { evaluation -> evaluation.decision.allowed }
+                    .map { evaluation -> evaluation.profile }
+                val blockedProfiles = networkDecisions
+                    .filterNot { evaluation -> evaluation.decision.allowed }
+
+                blockedProfiles.forEach { evaluation ->
+                    Log.i(
+                        TAG,
+                        "holding continuous sync profile=${evaluation.profile.id} reason=${evaluation.decision.reason}",
+                    )
+                }
+
+                waitingSummary = blockedProfiles.firstOrNull()?.let { evaluation ->
+                    buildWaitingSummary(
+                        blockedProfileCount = blockedProfiles.size,
+                        profileLabel = evaluation.profile.label,
+                        reason = evaluation.decision.reason,
+                    )
+                }
+
+                val desiredSignature = buildDesiredSignature(
                     connectionInput = connectionInput,
-                    localFolder = profile.localFolder,
-                    localFolderTreeUri = profile.localFolderTreeUri,
-                    prefix = profile.prefix.ifBlank { null },
-                    depth = profile.depth,
+                    serverCaPem = serverCaPem,
+                    clientIdentityJson = clientIdentityJson,
+                    profiles = allowedProfiles,
+                )
+                applyDesiredState(
+                    desiredSignature = desiredSignature,
+                    desiredProfiles = allowedProfiles,
+                    connectionInput = connectionInput,
                     serverCaPem = serverCaPem,
                     clientIdentityJson = clientIdentityJson,
                 )
+
+                if (allowedProfiles.isEmpty()) {
+                    updateNotification(
+                        "Waiting for allowed network",
+                        waitingSummary ?: "No enabled sync profile is allowed on the current network",
+                    )
+                }
+
+                true
             }
-            true
         }
     }
 
@@ -132,19 +186,27 @@ class FolderSyncForegroundService : Service() {
                 val status = withContext(Dispatchers.IO) {
                     runCatching { repository.getContinuousFolderSyncStatus() }.getOrNull()
                 }
-                val contentText = status?.serviceMessage ?: "Continuous sync is starting"
-                val title = when (status?.serviceState) {
-                    "error" -> "Ironmesh sync issue"
-                    "syncing" -> "Ironmesh syncing ${status.syncingProfileCount}/${status.activeProfileCount}"
-                    "running" -> "Ironmesh sync active"
-                    else -> "Ironmesh sync idle"
-                }
-                val detail = status?.currentActivity
-                    ?.takeIf { it.isNotBlank() }
-                    ?: status?.activeSummary
+                val activeProfileCount = status?.activeProfileCount ?: 0L
+                val waitingMessage = waitingSummary
+                val (title, detail) = if (!waitingMessage.isNullOrBlank() && activeProfileCount == 0L) {
+                    "Waiting for allowed network" to waitingMessage
+                } else {
+                    val contentText = status?.serviceMessage ?: "Continuous sync is starting"
+                    val notificationTitle = when (status?.serviceState) {
+                        "error" -> "Ironmesh sync issue"
+                        "syncing" -> "Ironmesh syncing ${status.syncingProfileCount}/${status.activeProfileCount}"
+                        "running" -> "Ironmesh sync active"
+                        else -> "Ironmesh sync idle"
+                    }
+                    val notificationDetail = status?.currentActivity
                         ?.takeIf { it.isNotBlank() }
-                    ?: contentText
+                        ?: status?.activeSummary
+                            ?.takeIf { it.isNotBlank() }
+                        ?: contentText
+                    notificationTitle to notificationDetail
+                }
                 val logLine = status?.profiles
+                    ?.takeIf { it.isNotEmpty() }
                     ?.joinToString(" | ") { profile ->
                         listOf(
                             profile.label,
@@ -168,10 +230,126 @@ class FolderSyncForegroundService : Service() {
     private fun stopContinuousSyncAndSelf() {
         scope.launch(Dispatchers.IO) {
             repository.stopAllContinuousFolderSync()
+            waitingSummary = null
+            lastDesiredSignature = null
             withContext(Dispatchers.Main) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
+        }
+    }
+
+    private suspend fun applyDesiredState(
+        desiredSignature: String,
+        desiredProfiles: List<io.ironmesh.android.data.FolderSyncConfig>,
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ) {
+        if (desiredSignature == lastDesiredSignature) {
+            return
+        }
+
+        repository.stopAllContinuousFolderSync()
+
+        for (profile in desiredProfiles) {
+            val localFolder = File(profile.localFolder)
+            val storageDiagnostics = FolderSyncStorageDiagnosticsHelper.collect(
+                contentResolver = applicationContext.contentResolver,
+                localFolder = profile.localFolder,
+                explicitTreeUri = profile.localFolderTreeUri,
+            )
+            Log.i(
+                TAG,
+                "starting continuous sync profile=${profile.id} label=${profile.label} prefix=${profile.prefix.ifBlank { "<root>" }} localFolder=${profile.localFolder} exists=${localFolder.exists()} isDirectory=${localFolder.isDirectory} canRead=${localFolder.canRead()} rawSampleChildren=${storageDiagnostics.rawSampleChildren} treeUriSource=${storageDiagnostics.treeUriSource} treeUri=${storageDiagnostics.treeUri ?: "<none>"} safSampleChildren=${storageDiagnostics.safSampleChildren}",
+            )
+            repository.startContinuousFolderSync(
+                profileId = profile.id,
+                label = profile.label,
+                connectionInput = connectionInput,
+                localFolder = profile.localFolder,
+                localFolderTreeUri = profile.localFolderTreeUri,
+                prefix = profile.prefix.ifBlank { null },
+                depth = profile.depth,
+                serverCaPem = serverCaPem,
+                clientIdentityJson = clientIdentityJson,
+            )
+        }
+
+        lastDesiredSignature = desiredSignature
+    }
+
+    private fun requestReconcile(reason: String) {
+        scope.launch {
+            val started = runCatching {
+                Log.i(TAG, "reconciling continuous sync: $reason")
+                reconcileProfiles()
+            }.getOrElse { error ->
+                updateNotification("Ironmesh sync issue", error.message ?: "Failed to start sync")
+                false
+            }
+            if (started) {
+                startStatusLoop()
+            }
+        }
+    }
+
+    private fun registerNetworkCallback() {
+        if (networkCallbackRegistered) {
+            return
+        }
+        val connectivityManager = getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback)
+            networkCallbackRegistered = true
+        }.onFailure { error ->
+            Log.w(TAG, "failed to register network callback: ${error.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        if (!networkCallbackRegistered) {
+            return
+        }
+        val connectivityManager = getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching {
+            connectivityManager.unregisterNetworkCallback(networkCallback)
+        }
+        networkCallbackRegistered = false
+    }
+
+    private fun buildDesiredSignature(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+        profiles: List<io.ironmesh.android.data.FolderSyncConfig>,
+    ): String {
+        return buildString {
+            append(connectionInput.trim())
+            append('|')
+            append(serverCaPem.orEmpty())
+            append('|')
+            append(clientIdentityJson.orEmpty())
+            profiles
+                .sortedBy { profile -> profile.id }
+                .forEach { profile ->
+                    append('|')
+                    append(profile.id)
+                    append(':')
+                    append(profile.hashCode())
+                }
+        }
+    }
+
+    private fun buildWaitingSummary(
+        blockedProfileCount: Int,
+        profileLabel: String,
+        reason: String,
+    ): String {
+        return if (blockedProfileCount <= 1) {
+            "$profileLabel is waiting: $reason"
+        } else {
+            "$blockedProfileCount sync profiles are waiting. First block: $profileLabel: $reason"
         }
     }
 

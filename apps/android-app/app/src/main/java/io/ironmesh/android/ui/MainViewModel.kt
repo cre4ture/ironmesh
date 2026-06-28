@@ -7,10 +7,13 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.FolderSyncConfig
+import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.data.parseAllowedWifiSsidsInput
+import io.ironmesh.android.work.FolderSyncNetworkGate
 import io.ironmesh.android.saf.IronmeshDocumentColumns
 import io.ironmesh.android.work.FolderSyncScheduler
 import kotlinx.coroutines.Dispatchers
@@ -96,6 +99,11 @@ data class MainUiState(
     val newSyncPrefix: String = "",
     val newSyncLocalFolder: String = "",
     val newSyncLocalFolderTreeUri: String? = null,
+    val newSyncAllowWifi: Boolean = true,
+    val newSyncAllowCellular: Boolean = true,
+    val newSyncAllowOtherConnections: Boolean = true,
+    val newSyncAllowRoaming: Boolean = false,
+    val newSyncAllowedWifiSsids: String = "",
     val selectedSection: MainSection = MainSection.SETTINGS,
     val webUiUrl: String = "",
     val galleryMode: GalleryViewMode = GalleryViewMode.FLATTENED_ALL_IMAGES,
@@ -201,6 +209,26 @@ class MainViewModel(
             newSyncLocalFolder = localFolder,
             newSyncLocalFolderTreeUri = treeUri,
         )
+    }
+
+    fun updateNewSyncAllowWifi(value: Boolean) {
+        uiState.value = uiState.value.copy(newSyncAllowWifi = value)
+    }
+
+    fun updateNewSyncAllowCellular(value: Boolean) {
+        uiState.value = uiState.value.copy(newSyncAllowCellular = value)
+    }
+
+    fun updateNewSyncAllowOtherConnections(value: Boolean) {
+        uiState.value = uiState.value.copy(newSyncAllowOtherConnections = value)
+    }
+
+    fun updateNewSyncAllowRoaming(value: Boolean) {
+        uiState.value = uiState.value.copy(newSyncAllowRoaming = value)
+    }
+
+    fun updateNewSyncAllowedWifiSsids(value: String) {
+        uiState.value = uiState.value.copy(newSyncAllowedWifiSsids = value)
     }
 
     fun selectSection(section: MainSection) {
@@ -329,16 +357,27 @@ class MainViewModel(
         refreshGallery()
     }
 
-    fun addFolderSyncProfile() {
+    fun addFolderSyncProfile(): FolderSyncNetworkPolicy? {
         val localFolder = uiState.value.newSyncLocalFolder.trim()
         if (localFolder.isBlank()) {
             setStatus("Error: Local folder path is required")
-            return
+            return null
         }
 
         val prefix = uiState.value.newSyncPrefix.trim().trim('/').replace('\\', '/')
         val label = uiState.value.newSyncLabel.trim().ifBlank {
             localFolder.substringAfterLast('/').ifBlank { "Sync Profile" }
+        }
+        val networkPolicy = FolderSyncNetworkPolicy(
+            allowWifi = uiState.value.newSyncAllowWifi,
+            allowCellular = uiState.value.newSyncAllowCellular,
+            allowOtherConnections = uiState.value.newSyncAllowOtherConnections,
+            allowRoaming = uiState.value.newSyncAllowRoaming,
+            allowedWifiSsids = parseAllowedWifiSsidsInput(uiState.value.newSyncAllowedWifiSsids),
+        ).normalized()
+        if (!networkPolicy.hasAnyAllowedTransport()) {
+            setStatus("Error: Select at least one allowed network type")
+            return null
         }
 
         val profile = FolderSyncConfig(
@@ -349,6 +388,7 @@ class MainViewModel(
             localFolderTreeUri = uiState.value.newSyncLocalFolderTreeUri?.takeIf { it.isNotBlank() },
             depth = 64,
             enabled = true,
+            networkPolicy = networkPolicy,
         )
 
         val updated = uiState.value.syncProfiles + profile
@@ -359,11 +399,17 @@ class MainViewModel(
             newSyncPrefix = "",
             newSyncLocalFolder = "",
             newSyncLocalFolderTreeUri = null,
+            newSyncAllowWifi = true,
+            newSyncAllowCellular = true,
+            newSyncAllowOtherConnections = true,
+            newSyncAllowRoaming = false,
+            newSyncAllowedWifiSsids = "",
             status = "Added sync profile '${profile.label}'",
         )
 
         FolderSyncScheduler.reschedule(getApplication())
         FolderSyncScheduler.runNow(getApplication())
+        return profile.networkPolicy
     }
 
     fun setFolderSyncProfileEnabled(profileId: String, enabled: Boolean) {
@@ -389,6 +435,34 @@ class MainViewModel(
         FolderSyncScheduler.reschedule(getApplication())
     }
 
+    fun updateFolderSyncProfileNetworkPolicy(
+        profileId: String,
+        networkPolicy: FolderSyncNetworkPolicy,
+    ): Boolean {
+        val normalizedPolicy = networkPolicy.normalized()
+        if (!normalizedPolicy.hasAnyAllowedTransport()) {
+            setStatus("Error: Select at least one allowed network type")
+            return false
+        }
+
+        val targetProfile = uiState.value.syncProfiles.firstOrNull { profile -> profile.id == profileId }
+            ?: return false
+        val updated = uiState.value.syncProfiles.map { profile ->
+            if (profile.id == profileId) {
+                profile.copy(networkPolicy = normalizedPolicy)
+            } else {
+                profile
+            }
+        }
+        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
+        uiState.value = uiState.value.copy(
+            syncProfiles = updated,
+            status = "Updated network rules for '${targetProfile.label}'",
+        )
+        FolderSyncScheduler.reschedule(getApplication())
+        return true
+    }
+
     fun runFolderSyncNow() {
         val status = uiState.value.folderSyncStatus
         val continuousSyncActive = status.activeProfileCount > 0L &&
@@ -396,6 +470,20 @@ class MainViewModel(
         if (continuousSyncActive) {
             refreshExpandedFolderSyncHistory(force = true)
             setStatus("Continuous folder sync already active; manual one-shot run skipped")
+            return
+        }
+
+        val enabledProfiles = uiState.value.syncProfiles.filter { profile -> profile.enabled }
+        if (enabledProfiles.isEmpty()) {
+            setStatus("No enabled sync profile is configured")
+            return
+        }
+        val eligibleProfiles = FolderSyncNetworkGate
+            .evaluateProfiles(getApplication(), enabledProfiles)
+        val firstBlocked = eligibleProfiles.firstOrNull { evaluation -> !evaluation.decision.allowed }
+        if (eligibleProfiles.none { evaluation -> evaluation.decision.allowed }) {
+            val reason = firstBlocked?.decision?.reason ?: "No profile is allowed on the current network"
+            setStatus("Sync skipped: $reason")
             return
         }
 

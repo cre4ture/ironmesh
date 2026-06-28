@@ -18,9 +18,10 @@ object FolderSyncScheduler {
 
     fun reschedule(context: Context) {
         val workManager = WorkManager.getInstance(context)
-        val hasEnabledProfiles = IronmeshPreferences
+        val enabledProfiles = IronmeshPreferences
             .getFolderSyncConfigs(context)
-            .any { it.enabled }
+            .filter { it.enabled }
+        val hasEnabledProfiles = enabledProfiles.isNotEmpty()
 
         if (!hasEnabledProfiles) {
             workManager.cancelUniqueWork(UNIQUE_PERIODIC_WORK)
@@ -32,7 +33,7 @@ object FolderSyncScheduler {
         FolderSyncForegroundService.syncConfigChanged(context)
 
         val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .setRequiredNetworkType(requiredNetworkType(enabledProfiles))
             .build()
 
         val request = PeriodicWorkRequestBuilder<FolderSyncWorker>(
@@ -50,9 +51,10 @@ object FolderSyncScheduler {
     }
 
     fun runNow(context: Context) {
-        val hasEnabledProfiles = IronmeshPreferences
+        val enabledProfiles = IronmeshPreferences
             .getFolderSyncConfigs(context)
-            .any { it.enabled }
+            .filter { it.enabled }
+        val hasEnabledProfiles = enabledProfiles.isNotEmpty()
         if (!hasEnabledProfiles) {
             FolderSyncForegroundService.stop(context)
             return
@@ -61,7 +63,7 @@ object FolderSyncScheduler {
         FolderSyncForegroundService.syncConfigChanged(context)
 
         val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .setRequiredNetworkType(requiredNetworkType(enabledProfiles))
             .build()
 
         val request = OneTimeWorkRequestBuilder<FolderSyncWorker>()
@@ -73,5 +75,17 @@ object FolderSyncScheduler {
             ExistingWorkPolicy.REPLACE,
             request,
         )
+    }
+
+    private fun requiredNetworkType(enabledProfiles: List<io.ironmesh.android.data.FolderSyncConfig>): NetworkType {
+        val mayUseMeteredNetwork = enabledProfiles.any { profile ->
+            val policy = profile.networkPolicy.normalized()
+            policy.allowCellular || policy.allowOtherConnections
+        }
+        return if (mayUseMeteredNetwork) {
+            NetworkType.CONNECTED
+        } else {
+            NetworkType.UNMETERED
+        }
     }
 }

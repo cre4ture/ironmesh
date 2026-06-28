@@ -8,4 +8,5 @@ data class FolderSyncConfig(
     val localFolderTreeUri: String? = null,
     val depth: Int = 64,
     val enabled: Boolean = true,
+    val networkPolicy: FolderSyncNetworkPolicy = FolderSyncNetworkPolicy(),
 )
