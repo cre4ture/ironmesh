@@ -1,3 +1,20 @@
+ironmesh (1.0.29-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add Android server node app with foreground service, Web UI activity, and
+    network-origins APIs.
+  * Add Android rendezvous certificate renewal with instrumentation test coverage.
+  * Fix admin login blocking async runtime and add DDoS concurrency limit.
+  * Fix race between background legacy hash upgrade and change-password.
+  * Fix legacy rename repair skipping intermediate stale logical paths; fix
+    converging repair with inconsistent local replica state.
+  * Split Repair page into three navigable sub-pages via Mantine Tabs; fix
+    gallery virtual scroll evicting pages still in the viewport.
+  * Optimize server node indexing and repair bookkeeping; keep media cache batch
+    failures non-fatal.
+  * Roll the workspace release to 1.0.29.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 28 Jun 2026 03:45:30 +0200
+
 ironmesh (1.0.28-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Stream manual repair actions one record at a time so that large databases
