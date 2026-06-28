@@ -1080,6 +1080,10 @@ trait MetadataStore: Send + Sync {
         &self,
         content_fingerprint: &str,
     ) -> Result<Option<CachedMediaMetadata>>;
+    async fn load_cached_media_metadata_many(
+        &self,
+        content_fingerprints: &[String],
+    ) -> Result<HashMap<String, CachedMediaMetadata>>;
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()>;
     async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()>;
     async fn list_snapshot_infos(&self) -> Result<Vec<SnapshotInfo>>;
@@ -1634,30 +1638,59 @@ impl StoreIndexInspector {
         }))
     }
 
-    pub(crate) async fn lookup_media_cache_by_content_fingerprint(
+    pub(crate) async fn lookup_media_cache_many_by_content_fingerprint(
         &self,
-        content_fingerprint: &str,
-    ) -> Result<Option<MediaCacheLookup>> {
+        content_fingerprints: &[String],
+    ) -> Result<HashMap<String, MediaCacheLookup>> {
+        let unique_content_fingerprints = content_fingerprints
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if unique_content_fingerprints.is_empty() {
+            return Ok(HashMap::new());
+        }
+
         let lookup_started_at = Instant::now();
-        let metadata = current_media_cache_metadata(
-            self.metadata_store
-                .load_cached_media_metadata(content_fingerprint)
-                .await?,
-        );
+        let metadata_by_content_fingerprint = self
+            .metadata_store
+            .load_cached_media_metadata_many(&unique_content_fingerprints)
+            .await?;
         let total_ms = lookup_started_at.elapsed().as_millis();
-        if total_ms >= SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS {
-            warn!(
-                content_fingerprint = %content_fingerprint,
-                total_ms,
-                metadata_present = metadata.is_some(),
-                "slow media cache lookup by content fingerprint"
+
+        let mut lookups = HashMap::with_capacity(unique_content_fingerprints.len());
+        let mut metadata_present = 0usize;
+        for content_fingerprint in unique_content_fingerprints {
+            let metadata = current_media_cache_metadata(
+                metadata_by_content_fingerprint
+                    .get(&content_fingerprint)
+                    .cloned(),
+            );
+            if metadata.is_some() {
+                metadata_present += 1;
+            }
+            lookups.insert(
+                content_fingerprint.clone(),
+                MediaCacheLookup {
+                    content_fingerprint,
+                    metadata,
+                },
             );
         }
 
-        Ok(Some(MediaCacheLookup {
-            content_fingerprint: content_fingerprint.to_string(),
-            metadata,
-        }))
+        if total_ms >= SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS {
+            warn!(
+                requested = lookups.len(),
+                metadata_present,
+                total_ms,
+                "slow batched media cache lookup by content fingerprint"
+            );
+        }
+
+        Ok(lookups)
     }
 }
 

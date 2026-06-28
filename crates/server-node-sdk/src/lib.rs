@@ -11207,13 +11207,40 @@ async fn list_store_index_response(
         .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
         .count();
     let media_lookup_started_at = Instant::now();
+    let media_content_fingerprints = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .filter_map(|entry| entry.content_fingerprint.clone())
+        .collect::<Vec<_>>();
+    let (media_lookups_by_content_fingerprint, batch_media_lookup_error_count) =
+        match store_index_inspector
+            .lookup_media_cache_many_by_content_fingerprint(&media_content_fingerprints)
+            .await
+        {
+            Ok(lookups) => (Some(lookups), 0usize),
+            Err(err) => {
+                if query.snapshot.is_some() {
+                    tracing::error!(
+                        snapshot = snapshot_label,
+                        error = %err,
+                        "failed to batch load cached media metadata for snapshot store index; continuing without cached media details"
+                    );
+                } else {
+                    tracing::error!(
+                        error = %err,
+                        "failed to batch load cached media metadata; continuing without cached media details"
+                    );
+                }
+                (None, media_content_fingerprints.len())
+            }
+        };
     let mut media_ready_count = 0;
     let mut media_pending_count = 0;
     let mut media_incomplete_count = 0;
     let mut media_unsupported_count = 0;
     let mut media_failed_count = 0;
     let mut media_missing_count = 0;
-    let mut media_error_count = 0;
+    let mut media_error_count = batch_media_lookup_error_count;
     let media_lookup_waited_ms = 0;
     for entry in &mut entries {
         if entry.entry_type != "key" || !looks_like_media_path(&entry.path) {
@@ -11221,9 +11248,10 @@ async fn list_store_index_response(
         }
 
         let media_lookup = if let Some(content_fingerprint) = entry.content_fingerprint.as_deref() {
-            store_index_inspector
-                .lookup_media_cache_by_content_fingerprint(content_fingerprint)
-                .await
+            let Some(lookups) = media_lookups_by_content_fingerprint.as_ref() else {
+                continue;
+            };
+            Ok(lookups.get(content_fingerprint).cloned())
         } else if let Some(manifest_hash) = entry.content_hash.as_deref() {
             store_index_inspector
                 .lookup_media_cache(manifest_hash)
