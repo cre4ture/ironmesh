@@ -122,7 +122,7 @@ start_node() {
 
   mkdir -p "$data_dir"
   printf -v start_command \
-    'cd %q && export IRONMESH_DATA_DIR=%q IRONMESH_SERVER_BIND=%q && cargo run -p server-node' \
+    'ulimit -n 1024 && cd %q && export IRONMESH_DATA_DIR=%q IRONMESH_SERVER_BIND=%q && cargo run -p server-node' \
     "$REPO_ROOT" "$data_dir" "$bind_addr"
 
   screen -L -Logfile "$log_file" -DdmS "$session_name" bash -lc "$start_command"
