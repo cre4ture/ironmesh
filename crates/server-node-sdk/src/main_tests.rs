@@ -162,6 +162,37 @@ fn sample_large_chunked_payload() -> Vec<u8> {
     (0..size).map(|index| (index % 251) as u8).collect()
 }
 
+fn metadata_db_path_for_backend(root: &std::path::Path, backend: MainTestBackend) -> PathBuf {
+    let filename = match backend {
+        MainTestBackend::Sqlite => "metadata.sqlite",
+        #[cfg(feature = "turso-metadata")]
+        MainTestBackend::Turso => "metadata.turso.db",
+    };
+    root.join("state").join(filename)
+}
+
+async fn drop_media_cache_table_for_test(root: &std::path::Path, backend: MainTestBackend) {
+    let metadata_db_path = metadata_db_path_for_backend(root, backend);
+    match backend {
+        MainTestBackend::Sqlite => {
+            let connection = rusqlite::Connection::open(&metadata_db_path).unwrap();
+            connection.execute_batch("DROP TABLE media_cache").unwrap();
+        }
+        #[cfg(feature = "turso-metadata")]
+        MainTestBackend::Turso => {
+            let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let connection = database.connect().unwrap();
+            connection
+                .execute_batch("DROP TABLE media_cache")
+                .await
+                .unwrap();
+        }
+    }
+}
+
 #[cfg(unix)]
 fn sample_video_thumbnail_bytes() -> Vec<u8> {
     let mut image = image::RgbImage::new(256, 144);
@@ -6216,6 +6247,155 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_impl,
     list_store_index_includes_cached_media_metadata_for_images,
     list_store_index_includes_cached_media_metadata_for_images_turso
+);
+
+async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let first_put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/cat-a.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let second_put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/cat-b.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .ensure_media_cache(&first_put.manifest_hash)
+            .await
+            .unwrap();
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(payload["media_summary"]["ready_count"], 2);
+    assert_eq!(payload["media_summary"]["image_count"], 2);
+    assert_eq!(entries[0]["path"], "gallery/cat-a.png");
+    assert_eq!(entries[1]["path"], "gallery/cat-b.png");
+    assert_eq!(
+        entries[0]["content_fingerprint"], entries[1]["content_fingerprint"],
+        "duplicate payloads should share the same media cache fingerprint"
+    );
+    assert_eq!(entries[0]["media"]["status"], "ready");
+    assert_eq!(entries[1]["media"]["status"], "ready");
+    assert_eq!(entries[0]["media"]["mime_type"], "image/png");
+    assert_eq!(entries[1]["media"]["mime_type"], "image/png");
+    assert_ne!(
+        first_put.manifest_hash, second_put.manifest_hash,
+        "manifests remain key-specific even when payloads match"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_impl,
+    list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints,
+    list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_turso
+);
+
+async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let root = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+        locked.root_dir().to_path_buf()
+    };
+    drop_media_cache_table_for_test(&root, backend).await;
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "gallery/cat.png");
+    assert_eq!(payload["media_summary"]["image_count"], 1);
+    assert_eq!(payload["media_summary"]["ready_count"], 0);
+    assert!(
+        entries[0]["content_fingerprint"].as_str().is_some(),
+        "listing should still expose the manifest-derived content fingerprint"
+    );
+    assert!(
+        entries[0].get("media").is_none(),
+        "listing should stay available even when media cache reads fail"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_keeps_batch_media_lookup_failures_best_effort_impl,
+    list_store_index_keeps_batch_media_lookup_failures_best_effort,
+    list_store_index_keeps_batch_media_lookup_failures_best_effort_turso
 );
 
 async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(

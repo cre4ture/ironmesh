@@ -3,6 +3,8 @@ use std::collections::BTreeSet;
 use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
 const REPAIR_PROGRESS_CHUNK_LOG_INTERVAL: usize = 128;
+const MAX_REPAIR_REPORT_LOG_ENTRIES: usize = 2_048;
+const MAX_REPAIR_REPORT_SKIPPED_DETAILS: usize = 2_048;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationRepairReport {
@@ -2088,12 +2090,24 @@ fn accumulate_repair_report(
     totals.skipped_max_retries = totals
         .skipped_max_retries
         .saturating_add(report.skipped_max_retries);
-    totals
-        .skipped_details
-        .extend(report.skipped_details.iter().cloned());
-    totals
-        .detailed_log
-        .extend(report.detailed_log.iter().cloned());
+    let skipped_detail_capacity =
+        MAX_REPAIR_REPORT_SKIPPED_DETAILS.saturating_sub(totals.skipped_details.len());
+    totals.skipped_details.extend(
+        report
+            .skipped_details
+            .iter()
+            .take(skipped_detail_capacity)
+            .cloned(),
+    );
+    let detailed_log_capacity =
+        MAX_REPAIR_REPORT_LOG_ENTRIES.saturating_sub(totals.detailed_log.len());
+    totals.detailed_log.extend(
+        report
+            .detailed_log
+            .iter()
+            .take(detailed_log_capacity)
+            .cloned(),
+    );
     if report.last_error.is_some() {
         totals.last_error = report.last_error.clone();
     }
@@ -2125,6 +2139,9 @@ fn push_repair_log_entry(
         context,
     };
     append_active_repair_log_entry(&entry);
+    if detailed_log.len() >= MAX_REPAIR_REPORT_LOG_ENTRIES {
+        return;
+    }
     detailed_log.push(entry);
 }
 
@@ -2140,6 +2157,9 @@ fn push_repair_skipped_detail(
     reason: ReplicationRepairSkipReason,
     detail: impl Into<String>,
 ) {
+    if skipped_details.len() >= MAX_REPAIR_REPORT_SKIPPED_DETAILS {
+        return;
+    }
     skipped_details.push(ReplicationRepairSkippedItem {
         report_node_id,
         subject,
@@ -2591,4 +2611,112 @@ pub(crate) fn build_replication_bundle_push_path() -> String {
 
 fn encode_query_value(value: &str) -> String {
     utf8_percent_encode(value, QUERY_COMPONENT_ENCODE_SET).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_report() -> ReplicationRepairReport {
+        ReplicationRepairReport {
+            attempted_transfers: 0,
+            successful_transfers: 0,
+            failed_transfers: 0,
+            skipped_items: 0,
+            skipped_backoff: 0,
+            skipped_max_retries: 0,
+            skipped_details: Vec::new(),
+            detailed_log: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn push_repair_log_entry_caps_retained_report_log() {
+        let node_id = NodeId::new_v4();
+        let mut detailed_log = Vec::new();
+
+        for idx in 0..(MAX_REPAIR_REPORT_LOG_ENTRIES + 32) {
+            push_repair_log_entry(
+                &mut detailed_log,
+                node_id,
+                "log_entry",
+                format!("detail-{idx}"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(detailed_log.len(), MAX_REPAIR_REPORT_LOG_ENTRIES);
+        assert_eq!(
+            detailed_log.first().map(|entry| entry.detail.as_str()),
+            Some("detail-0")
+        );
+        let expected_last = format!("detail-{}", MAX_REPAIR_REPORT_LOG_ENTRIES - 1);
+        assert_eq!(
+            detailed_log.last().map(|entry| entry.detail.as_str()),
+            Some(expected_last.as_str())
+        );
+    }
+
+    #[test]
+    fn accumulate_repair_report_caps_aggregate_log_and_skip_buffers() {
+        let node_id = NodeId::new_v4();
+        let oversized_report = ReplicationRepairReport {
+            attempted_transfers: 1,
+            successful_transfers: 2,
+            failed_transfers: 3,
+            skipped_items: 4,
+            skipped_backoff: 5,
+            skipped_max_retries: 6,
+            skipped_details: (0..(MAX_REPAIR_REPORT_SKIPPED_DETAILS + 32))
+                .map(|idx| ReplicationRepairSkippedItem {
+                    report_node_id: node_id,
+                    subject: format!("subject-{idx}"),
+                    key: None,
+                    version_id: None,
+                    source_node_id: None,
+                    target_node_id: None,
+                    reason: ReplicationRepairSkipReason::InvalidSubject,
+                    detail: format!("detail-{idx}"),
+                })
+                .collect(),
+            detailed_log: (0..(MAX_REPAIR_REPORT_LOG_ENTRIES + 32))
+                .map(|idx| ReplicationRepairLogEntry {
+                    captured_at_unix: idx as u64,
+                    report_node_id: node_id,
+                    event: "event".to_string(),
+                    detail: format!("detail-{idx}"),
+                    subject: None,
+                    key: None,
+                    version_id: None,
+                    source_node_id: None,
+                    target_node_id: None,
+                    context: None,
+                })
+                .collect(),
+            last_error: Some("boom".to_string()),
+        };
+
+        let mut totals = empty_report();
+        accumulate_repair_report(&mut totals, &oversized_report);
+        accumulate_repair_report(&mut totals, &oversized_report);
+
+        assert_eq!(totals.attempted_transfers, 2);
+        assert_eq!(totals.successful_transfers, 4);
+        assert_eq!(totals.failed_transfers, 6);
+        assert_eq!(totals.skipped_items, 8);
+        assert_eq!(totals.skipped_backoff, 10);
+        assert_eq!(totals.skipped_max_retries, 12);
+        assert_eq!(
+            totals.skipped_details.len(),
+            MAX_REPAIR_REPORT_SKIPPED_DETAILS
+        );
+        assert_eq!(totals.detailed_log.len(), MAX_REPAIR_REPORT_LOG_ENTRIES);
+        assert_eq!(totals.last_error.as_deref(), Some("boom"));
+    }
 }

@@ -4645,6 +4645,126 @@ run_on_all_metadata_backends!(
     lookup_media_cache_deletes_invalid_metadata_records_turso
 );
 
+async fn lookup_media_cache_many_preserves_valid_entries_and_cleans_invalid_rows_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("media-cache-batch-invalid-row-cleanup")
+        .await;
+
+    let first_put = store
+        .put_object_versioned(
+            "photos/first.jpg",
+            Bytes::from(sample_oriented_jpeg_bytes(6)),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let second_put = store
+        .put_object_versioned(
+            "photos/second.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let first_metadata = store
+        .ensure_media_cache(&first_put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected first media metadata");
+    let second_metadata = store
+        .ensure_media_cache(&second_put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected second media metadata");
+
+    let invalid_payload = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": MEDIA_CACHE_SCHEMA_VERSION,
+        "content_fingerprint": first_metadata.content_fingerprint,
+        "source_manifest_hash": first_metadata.source_manifest_hash,
+        "status": "ready",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "width": first_metadata.width,
+        "height": first_metadata.height,
+        "orientation": first_metadata.orientation,
+        "taken_at_unix": first_metadata.taken_at_unix,
+        "gps": {
+            "latitude": serde_json::Value::Null,
+            "longitude": serde_json::Value::Null,
+        },
+        "thumbnail": serde_json::Value::Null,
+        "source_size_bytes": first_metadata.source_size_bytes,
+        "generated_at_unix": first_metadata.generated_at_unix,
+        "error": first_metadata.error,
+    }))
+    .unwrap();
+    persist_raw_media_cache_record(
+        backend,
+        &store.metadata_db_path,
+        &first_metadata.content_fingerprint,
+        &invalid_payload,
+    )
+    .await;
+
+    let inspector = store.store_index_inspector();
+    let lookups = inspector
+        .lookup_media_cache_many_by_content_fingerprint(&[
+            first_metadata.content_fingerprint.clone(),
+            second_metadata.content_fingerprint.clone(),
+            first_metadata.content_fingerprint.clone(),
+            "   ".to_string(),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(lookups.len(), 2);
+    assert!(
+        lookups
+            .get(&first_metadata.content_fingerprint)
+            .expect("expected invalid lookup entry")
+            .metadata
+            .is_none()
+    );
+    assert!(
+        lookups
+            .get(&second_metadata.content_fingerprint)
+            .expect("expected valid lookup entry")
+            .metadata
+            .is_some()
+    );
+    assert!(
+        !store
+            .metadata_store
+            .has_media_cache_record(&first_metadata.content_fingerprint)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .metadata_store
+            .has_media_cache_record(&second_metadata.content_fingerprint)
+            .await
+            .unwrap()
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    lookup_media_cache_many_preserves_valid_entries_and_cleans_invalid_rows_impl,
+    lookup_media_cache_many_preserves_valid_entries_and_cleans_invalid_rows,
+    lookup_media_cache_many_preserves_valid_entries_and_cleans_invalid_rows_turso
+);
+
 async fn ensure_media_metadata_refreshes_gps_after_overwrite_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("media-cache-overwrite-gps").await;
 

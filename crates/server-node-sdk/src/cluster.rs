@@ -158,6 +158,8 @@ pub struct ClusterService {
     nodes: HashMap<NodeId, NodeDescriptor>,
     replicas_by_key: HashMap<String, HashSet<NodeId>>,
     available_by_key: HashMap<String, HashSet<NodeId>>,
+    replica_subjects_by_node: HashMap<NodeId, HashSet<String>>,
+    available_subjects_by_node: HashMap<NodeId, HashSet<String>>,
 }
 
 impl ClusterService {
@@ -169,7 +171,50 @@ impl ClusterService {
             nodes: HashMap::new(),
             replicas_by_key: HashMap::new(),
             available_by_key: HashMap::new(),
+            replica_subjects_by_node: HashMap::new(),
+            available_subjects_by_node: HashMap::new(),
         }
+    }
+
+    fn insert_subject_membership(
+        subjects_by_key: &mut HashMap<String, HashSet<NodeId>>,
+        subjects_by_node: &mut HashMap<NodeId, HashSet<String>>,
+        subject: String,
+        node_id: NodeId,
+    ) -> bool {
+        let inserted = subjects_by_key
+            .entry(subject.clone())
+            .or_default()
+            .insert(node_id);
+        subjects_by_node.entry(node_id).or_default().insert(subject) || inserted
+    }
+
+    fn remove_subject_membership(
+        subjects_by_key: &mut HashMap<String, HashSet<NodeId>>,
+        subjects_by_node: &mut HashMap<NodeId, HashSet<String>>,
+        subject: &str,
+        node_id: NodeId,
+    ) -> bool {
+        let (changed, remove_subject_entry) = match subjects_by_key.get_mut(subject) {
+            Some(nodes) => {
+                let changed = nodes.remove(&node_id);
+                let remove_subject_entry = nodes.is_empty();
+                (changed, remove_subject_entry)
+            }
+            None => (false, false),
+        };
+        if remove_subject_entry {
+            subjects_by_key.remove(subject);
+        }
+
+        if let Some(subjects) = subjects_by_node.get_mut(&node_id) {
+            subjects.remove(subject);
+            if subjects.is_empty() {
+                subjects_by_node.remove(&node_id);
+            }
+        }
+
+        changed
     }
 
     pub fn register_node(&mut self, mut descriptor: NodeDescriptor) {
@@ -188,14 +233,34 @@ impl ClusterService {
             return false;
         }
 
-        self.replicas_by_key.retain(|_, replicas| {
-            replicas.remove(&node_id);
-            !replicas.is_empty()
-        });
-        self.available_by_key.retain(|_, nodes| {
-            nodes.remove(&node_id);
-            !nodes.is_empty()
-        });
+        if let Some(subjects) = self.replica_subjects_by_node.remove(&node_id) {
+            for subject in subjects {
+                let remove_subject_entry =
+                    if let Some(nodes) = self.replicas_by_key.get_mut(&subject) {
+                        nodes.remove(&node_id);
+                        nodes.is_empty()
+                    } else {
+                        false
+                    };
+                if remove_subject_entry {
+                    self.replicas_by_key.remove(&subject);
+                }
+            }
+        }
+        if let Some(subjects) = self.available_subjects_by_node.remove(&node_id) {
+            for subject in subjects {
+                let remove_subject_entry =
+                    if let Some(nodes) = self.available_by_key.get_mut(&subject) {
+                        nodes.remove(&node_id);
+                        nodes.is_empty()
+                    } else {
+                        false
+                    };
+                if remove_subject_entry {
+                    self.available_by_key.remove(&subject);
+                }
+            }
+        }
 
         true
     }
@@ -328,27 +393,28 @@ impl ClusterService {
 
     pub fn note_replica(&mut self, key: impl Into<String>, node_id: NodeId) -> bool {
         let key = key.into();
-        let replica_inserted = self
-            .replicas_by_key
-            .entry(key.clone())
-            .or_default()
-            .insert(node_id);
-        let available_inserted = self
-            .available_by_key
-            .entry(key)
-            .or_default()
-            .insert(node_id);
+        let replica_inserted = Self::insert_subject_membership(
+            &mut self.replicas_by_key,
+            &mut self.replica_subjects_by_node,
+            key.clone(),
+            node_id,
+        );
+        let available_inserted = Self::insert_subject_membership(
+            &mut self.available_by_key,
+            &mut self.available_subjects_by_node,
+            key,
+            node_id,
+        );
         replica_inserted || available_inserted
     }
 
     pub fn replace_node_available_view(&mut self, node_id: NodeId, subjects: &[String]) -> bool {
         let desired_subjects: HashSet<String> = subjects.iter().cloned().collect();
-        let current_subjects: HashSet<String> = self
-            .available_by_key
-            .iter()
-            .filter(|(_, nodes)| nodes.contains(&node_id))
-            .map(|(subject, _)| subject.clone())
-            .collect();
+        let current_subjects = self
+            .available_subjects_by_node
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default();
 
         if current_subjects == desired_subjects {
             return false;
@@ -356,22 +422,22 @@ impl ClusterService {
 
         let mut changed = false;
 
-        for nodes in self.available_by_key.values_mut() {
-            if nodes.remove(&node_id) {
-                changed = true;
-            }
+        for subject in current_subjects.difference(&desired_subjects) {
+            changed |= Self::remove_subject_membership(
+                &mut self.available_by_key,
+                &mut self.available_subjects_by_node,
+                subject,
+                node_id,
+            );
         }
-        self.available_by_key.retain(|_, nodes| !nodes.is_empty());
 
-        for subject in desired_subjects {
-            if self
-                .available_by_key
-                .entry(subject)
-                .or_default()
-                .insert(node_id)
-            {
-                changed = true;
-            }
+        for subject in desired_subjects.difference(&current_subjects) {
+            changed |= Self::insert_subject_membership(
+                &mut self.available_by_key,
+                &mut self.available_subjects_by_node,
+                subject.clone(),
+                node_id,
+            );
         }
 
         changed
@@ -383,38 +449,60 @@ impl ClusterService {
             .iter()
             .map(|subject| replication_placement_key(subject).to_string())
             .collect();
-        let current_replica_subjects = self.subjects_for_node(node_id);
+        let current_replica_subjects = self
+            .replica_subjects_by_node
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default();
         let mut changed = self.replace_node_available_view(node_id, subjects);
 
         for subject in current_replica_subjects {
             let preserve_historical_version_claim = is_versioned_replication_subject(&subject)
                 && desired_base_keys.contains(replication_placement_key(&subject));
             if !desired_subjects.contains(&subject) && !preserve_historical_version_claim {
-                self.remove_replica(&subject, node_id);
-                changed = true;
+                changed |= Self::remove_subject_membership(
+                    &mut self.replicas_by_key,
+                    &mut self.replica_subjects_by_node,
+                    &subject,
+                    node_id,
+                );
             }
         }
 
         for subject in desired_subjects {
-            if self
-                .replicas_by_key
-                .entry(subject)
-                .or_default()
-                .insert(node_id)
-            {
-                changed = true;
-            }
+            changed |= Self::insert_subject_membership(
+                &mut self.replicas_by_key,
+                &mut self.replica_subjects_by_node,
+                subject,
+                node_id,
+            );
         }
 
         changed
     }
 
     pub fn import_replicas_by_key(&mut self, replicas: HashMap<String, Vec<NodeId>>) {
-        self.replicas_by_key = replicas
-            .into_iter()
-            .map(|(key, nodes)| (key, nodes.into_iter().collect::<HashSet<_>>()))
-            .collect();
-        self.available_by_key = self.replicas_by_key.clone();
+        self.replicas_by_key.clear();
+        self.available_by_key.clear();
+        self.replica_subjects_by_node.clear();
+        self.available_subjects_by_node.clear();
+
+        for (key, nodes) in replicas {
+            for node_id in nodes {
+                Self::insert_subject_membership(
+                    &mut self.replicas_by_key,
+                    &mut self.replica_subjects_by_node,
+                    key.clone(),
+                    node_id,
+                );
+                Self::insert_subject_membership(
+                    &mut self.available_by_key,
+                    &mut self.available_subjects_by_node,
+                    key.clone(),
+                    node_id,
+                );
+            }
+        }
     }
 
     pub fn export_replicas_by_key(&self) -> HashMap<String, Vec<NodeId>> {
@@ -481,10 +569,11 @@ impl ClusterService {
     #[allow(dead_code)]
     pub fn subjects_for_node(&self, node_id: NodeId) -> Vec<String> {
         let mut subjects = self
-            .replicas_by_key
-            .iter()
-            .filter(|(_, replicas)| replicas.contains(&node_id))
-            .map(|(subject, _)| subject.clone())
+            .replica_subjects_by_node
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
             .collect::<Vec<_>>();
         subjects.sort();
         subjects
@@ -492,31 +581,32 @@ impl ClusterService {
 
     pub fn available_subjects_for_node(&self, node_id: NodeId) -> Vec<String> {
         let mut subjects = self
-            .available_by_key
-            .iter()
-            .filter(|(_, nodes)| nodes.contains(&node_id))
-            .map(|(subject, _)| subject.clone())
+            .available_subjects_by_node
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
             .collect::<Vec<_>>();
         subjects.sort();
         subjects
     }
 
     pub fn remove_replica(&mut self, key: &str, node_id: NodeId) {
-        if let Some(nodes) = self.replicas_by_key.get_mut(key) {
-            nodes.remove(&node_id);
-            if nodes.is_empty() {
-                self.replicas_by_key.remove(key);
-            }
-        }
+        Self::remove_subject_membership(
+            &mut self.replicas_by_key,
+            &mut self.replica_subjects_by_node,
+            key,
+            node_id,
+        );
     }
 
     pub fn remove_available(&mut self, key: &str, node_id: NodeId) {
-        if let Some(nodes) = self.available_by_key.get_mut(key) {
-            nodes.remove(&node_id);
-            if nodes.is_empty() {
-                self.available_by_key.remove(key);
-            }
-        }
+        Self::remove_subject_membership(
+            &mut self.available_by_key,
+            &mut self.available_subjects_by_node,
+            key,
+            node_id,
+        );
     }
 
     pub fn placement_for_key(&self, key: &str) -> PlacementDecision {
@@ -1046,6 +1136,35 @@ mod tests {
         let nodes = exported.get("subject-a").unwrap();
         assert!(nodes.contains(&node_a));
         assert!(nodes.contains(&node_b));
+    }
+
+    #[test]
+    fn import_replicas_rebuilds_node_subject_indexes() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+
+        let mut replicas = HashMap::new();
+        replicas.insert("subject-a".to_string(), vec![node_b, node_a]);
+        replicas.insert("subject-b".to_string(), vec![node_a]);
+
+        svc.import_replicas_by_key(replicas);
+
+        assert_eq!(
+            svc.subjects_for_node(node_a),
+            vec!["subject-a".to_string(), "subject-b".to_string()]
+        );
+        assert_eq!(
+            svc.available_subjects_for_node(node_a),
+            vec!["subject-a".to_string(), "subject-b".to_string()]
+        );
+        assert_eq!(svc.subjects_for_node(node_b), vec!["subject-a".to_string()]);
+        assert_eq!(
+            svc.available_subjects_for_node(node_b),
+            vec!["subject-a".to_string()]
+        );
     }
 
     #[test]

@@ -609,6 +609,70 @@ impl MetadataStore for TursoMetadataStore {
         }
     }
 
+    async fn load_cached_media_metadata_many(
+        &self,
+        content_fingerprints: &[String],
+    ) -> Result<HashMap<String, CachedMediaMetadata>> {
+        const TURSO_MEDIA_CACHE_QUERY_BATCH_SIZE: usize = 500;
+
+        let mut metadata_by_content_fingerprint =
+            HashMap::with_capacity(content_fingerprints.len());
+
+        for chunk in content_fingerprints.chunks(TURSO_MEDIA_CACHE_QUERY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT content_fingerprint, metadata_json
+                         FROM media_cache
+                         WHERE content_fingerprint IN ({placeholders})"
+                    ),
+                    params_from_iter(chunk.iter().cloned()),
+                )
+                .await?;
+
+            let mut invalid_rows = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let content_fingerprint = row_string(&row, 0, "media_cache.content_fingerprint")?;
+                let payload = row_blob(&row, 1, "media_cache.metadata_json")?;
+                match self.decode_json::<CachedMediaMetadata>(payload, "media metadata") {
+                    Ok(metadata) => {
+                        metadata_by_content_fingerprint.insert(content_fingerprint, metadata);
+                    }
+                    Err(err) => invalid_rows.push((content_fingerprint, err.to_string())),
+                }
+            }
+
+            for (content_fingerprint, error) in invalid_rows {
+                self.connection
+                    .execute(
+                        "DELETE FROM media_cache WHERE content_fingerprint = ?1",
+                        (content_fingerprint.as_str(),),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to delete invalid media metadata row for {content_fingerprint}"
+                        )
+                    })?;
+                warn!(
+                    content_fingerprint = %content_fingerprint,
+                    error,
+                    "deleted invalid cached media metadata row from Turso"
+                );
+            }
+        }
+
+        Ok(metadata_by_content_fingerprint)
+    }
+
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
         let payload = serde_json::to_vec_pretty(metadata)?;
         self.connection
