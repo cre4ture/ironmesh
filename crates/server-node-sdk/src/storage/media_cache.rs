@@ -365,7 +365,8 @@ impl MediaCacheWorker {
         let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
 
         for chunk in manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+                .map_err(StoreReadError::Internal)?;
             if !fs::try_exists(&chunk_path)
                 .await
                 .map_err(|err| StoreReadError::Internal(err.into()))?
@@ -751,7 +752,7 @@ async fn manifest_chunks_are_locally_complete(
     chunks_dir: &Path,
 ) -> Result<bool> {
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let metadata = match fs::metadata(&chunk_path).await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -778,7 +779,7 @@ async fn read_object_prefix_from_manifest(
             break;
         }
 
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let payload = fs::read(&chunk_path)
             .await
             .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
@@ -812,7 +813,7 @@ async fn collect_local_chunk_paths(
 ) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::with_capacity(manifest.chunks.len());
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let metadata = fs::metadata(&chunk_path)
             .await
             .with_context(|| format!("missing chunk {}", chunk.hash))?;
@@ -829,32 +830,37 @@ async fn collect_local_chunk_paths(
     Ok(paths)
 }
 
-/// Holds the chunk paths and precomputed byte offsets for a virtual video file.
+/// Holds the chunk hashes and precomputed byte offsets for a virtual video file.
+/// Paths are reconstructed from `chunks_dir` + hash at read time rather than
+/// stored, so the read path is always rooted in the trusted chunks directory.
 struct ChunkVideoIndex {
-    paths: Vec<PathBuf>,
+    chunks_dir: PathBuf,
+    hashes: Vec<String>,
     /// Byte offset of each chunk's first byte in the virtual file.
     offsets: Vec<u64>,
     total_size: u64,
 }
 
 impl ChunkVideoIndex {
-    fn new(paths: Vec<PathBuf>, manifest: &ObjectManifest) -> Self {
-        let mut offsets = Vec::with_capacity(paths.len());
+    fn new(chunks_dir: PathBuf, manifest: &ObjectManifest) -> Self {
+        let mut offsets = Vec::with_capacity(manifest.chunks.len());
         let mut offset = 0u64;
         for chunk in &manifest.chunks {
             offsets.push(offset);
             offset += chunk.size_bytes as u64;
         }
+        let hashes = manifest.chunks.iter().map(|c| c.hash.clone()).collect();
         Self {
-            paths,
+            chunks_dir,
+            hashes,
             offsets,
             total_size: offset,
         }
     }
 
     async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
-        let mut result = Vec::with_capacity((end - start + 1) as usize);
-        for i in 0..self.paths.len() {
+        let mut result = Vec::new();
+        for i in 0..self.hashes.len() {
             let chunk_start = self.offsets[i];
             let chunk_size = if i + 1 < self.offsets.len() {
                 self.offsets[i + 1] - chunk_start
@@ -870,7 +876,8 @@ impl ChunkVideoIndex {
             }
             let read_from = start.saturating_sub(chunk_start) as usize;
             let read_to = (end.min(chunk_end) - chunk_start) as usize;
-            let data = fs::read(&self.paths[i]).await?;
+            let path = chunk_path_for_hash(&self.chunks_dir, &self.hashes[i])?;
+            let data = fs::read(&path).await?;
             result.extend_from_slice(&data[read_from..=read_to]);
         }
         Ok(result)
@@ -996,8 +1003,9 @@ async fn derive_video_media_cache(
     include_thumbnail: bool,
 ) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
-    let chunk_paths = collect_local_chunk_paths(manifest, chunks_dir).await?;
-    let chunk_index = Arc::new(ChunkVideoIndex::new(chunk_paths, manifest));
+    // Validate all chunks are present and have the expected size.
+    collect_local_chunk_paths(manifest, chunks_dir).await?;
+    let chunk_index = Arc::new(ChunkVideoIndex::new(chunks_dir.to_path_buf(), manifest));
 
     let temp_dir = std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir)

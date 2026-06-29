@@ -1178,7 +1178,7 @@ impl ChunkIngestor {
             bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
         }
 
-        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
+        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash)?;
         let mut replaced_existing_path = false;
         if fs::try_exists(&chunk_path).await? {
             match fs::read(&chunk_path).await {
@@ -1789,7 +1789,7 @@ impl ReplicationSubjectInspector {
         };
 
         for chunk in &manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)?;
             let metadata = match fs::metadata(&chunk_path).await {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -2184,7 +2184,7 @@ impl PersistentStore {
 
     #[cfg(test)]
     pub fn chunk_path_for_test(&self, chunk_hash: &str) -> PathBuf {
-        chunk_path_for_hash(&self.chunks_dir, chunk_hash)
+        chunk_path_for_hash(&self.chunks_dir, chunk_hash).unwrap()
     }
 
     #[cfg(test)]
@@ -2489,7 +2489,7 @@ impl PersistentStore {
 
         for chunk in payload.chunks(CHUNK_SIZE) {
             let hash = hash_hex(chunk);
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &hash)?;
 
             if fs::try_exists(&chunk_path).await? {
                 dedup_reused_chunks += 1;
@@ -3694,7 +3694,7 @@ impl PersistentStore {
     }
 
     pub async fn read_chunk_payload(&self, hash: &str) -> Result<Option<Bytes>> {
-        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
+        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash)?;
         if !fs::try_exists(&chunk_path).await? {
             return Ok(None);
         }
@@ -3909,7 +3909,7 @@ impl PersistentStore {
         }
 
         for chunk in &manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)?;
             if !fs::try_exists(&chunk_path).await? {
                 bail!("manifest references missing chunk hash={}", chunk.hash);
             }
@@ -4195,7 +4195,7 @@ impl PersistentStore {
             }
 
             for chunk in &manifest.chunks {
-                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)?;
                 if !fs::try_exists(&chunk_path).await? {
                     bail!("manifest references missing chunk hash={}", chunk.hash);
                 }
@@ -4546,7 +4546,8 @@ impl PersistentStore {
         let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
 
         for chunk in manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+                .map_err(StoreReadError::Internal)?;
             if !fs::try_exists(&chunk_path)
                 .await
                 .map_err(|err| StoreReadError::Internal(err.into()))?
@@ -4682,7 +4683,8 @@ impl PersistentStore {
                 break;
             }
 
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+                .map_err(StoreReadError::Internal)?;
             if !fs::try_exists(&chunk_path)
                 .await
                 .map_err(|err| StoreReadError::Internal(err.into()))?
@@ -4775,7 +4777,8 @@ impl PersistentStore {
                 break;
             }
 
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+                .map_err(StoreReadError::Internal)?;
             let metadata = fs::metadata(&chunk_path).await.map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     StoreReadError::Corrupt(format!("missing chunk hash={}", chunk.hash))
@@ -4870,7 +4873,8 @@ impl PersistentStore {
                 break;
             }
 
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+                .map_err(StoreReadError::Internal)?;
             let is_missing = match fs::metadata(&chunk_path).await {
                 Ok(metadata) if metadata.len() == chunk.size_bytes as u64 => !self
                     .local_chunk_matches_ref(&chunk)
@@ -5738,7 +5742,7 @@ impl PersistentStore {
                     continue;
                 }
 
-                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &record.hash);
+                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &record.hash)?;
                 if !fs::try_exists(&chunk_path).await? {
                     self.metadata_store
                         .delete_cached_chunk_record(&record.hash)
@@ -7544,7 +7548,7 @@ async fn validate_local_chunk_integrity(
     hash: &str,
     expected_size_bytes: usize,
 ) -> Result<LocalChunkIntegrity> {
-    let chunk_path = chunk_path_for_hash(chunks_dir, hash);
+    let chunk_path = chunk_path_for_hash(chunks_dir, hash)?;
     let payload = match fs::read(&chunk_path).await {
         Ok(payload) => payload,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -7567,9 +7571,12 @@ async fn validate_local_chunk_integrity(
     Ok(LocalChunkIntegrity::Valid)
 }
 
-pub(super) fn chunk_path_for_hash(chunks_dir: &Path, hash: &str) -> PathBuf {
-    let prefix = &hash[..2.min(hash.len())];
-    chunks_dir.join(prefix).join(hash)
+pub(super) fn chunk_path_for_hash(chunks_dir: &Path, hash: &str) -> anyhow::Result<PathBuf> {
+    if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid chunk hash: {hash}");
+    }
+    let prefix = &hash[..2];
+    Ok(chunks_dir.join(prefix).join(hash))
 }
 
 pub(super) fn hash_hex(data: &[u8]) -> String {

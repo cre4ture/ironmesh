@@ -513,7 +513,17 @@ impl DataScrubber {
         report: &mut DataScrubReport,
     ) -> VerifiedChunkState {
         report.chunks_scanned = report.chunks_scanned.saturating_add(1);
-        let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+        let chunk_path = match chunk_path_for_hash(&self.chunks_dir, &chunk.hash) {
+            Ok(p) => p,
+            Err(err) => {
+                return VerifiedChunkState {
+                    actual_size_bytes: None,
+                    actual_hash: None,
+                    read_error: Some(format!("invalid chunk hash {}: {err}", chunk.hash)),
+                    missing: false,
+                };
+            }
+        };
         match self.read_with_bounded_retry(&chunk_path).await {
             Ok(payload) => {
                 report.bytes_scanned = report.bytes_scanned.saturating_add(payload.len() as u64);
