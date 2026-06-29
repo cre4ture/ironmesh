@@ -365,7 +365,8 @@ impl MediaCacheWorker {
         let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
 
         for chunk in manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+                .map_err(StoreReadError::Internal)?;
             if !fs::try_exists(&chunk_path)
                 .await
                 .map_err(|err| StoreReadError::Internal(err.into()))?
@@ -751,7 +752,7 @@ async fn manifest_chunks_are_locally_complete(
     chunks_dir: &Path,
 ) -> Result<bool> {
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let metadata = match fs::metadata(&chunk_path).await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -778,7 +779,7 @@ async fn read_object_prefix_from_manifest(
             break;
         }
 
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let payload = fs::read(&chunk_path)
             .await
             .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
@@ -812,7 +813,7 @@ async fn collect_local_chunk_paths(
 ) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::with_capacity(manifest.chunks.len());
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let metadata = fs::metadata(&chunk_path)
             .await
             .with_context(|| format!("missing chunk {}", chunk.hash))?;
@@ -875,11 +876,7 @@ impl ChunkVideoIndex {
             }
             let read_from = start.saturating_sub(chunk_start) as usize;
             let read_to = (end.min(chunk_end) - chunk_start) as usize;
-            let hash = &self.hashes[i];
-            if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.is_empty() {
-                bail!("invalid chunk hash: {hash}");
-            }
-            let path = chunk_path_for_hash(&self.chunks_dir, hash);
+            let path = chunk_path_for_hash(&self.chunks_dir, &self.hashes[i])?;
             let data = fs::read(&path).await?;
             result.extend_from_slice(&data[read_from..=read_to]);
         }
