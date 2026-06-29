@@ -1,3 +1,14 @@
+ironmesh (1.0.30-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Fix video thumbnail generation failure on large files by replacing
+    concatf: protocol with a local HTTP Range server, avoiding the OS
+    file-descriptor limit.
+  * Fix CodeQL path-injection findings in ChunkVideoIndex; move chunk hash
+    hex validation into chunk_path_for_hash so every call site is protected.
+  * Roll the workspace release to 1.0.30.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 29 Jun 2026 02:45:00 +0200
+
 ironmesh (1.0.29-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Android server node app with foreground service, Web UI activity, and
