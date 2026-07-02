@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub(super) const FFPROBE_TIMEOUT_SECS: u64 = 30;
-pub(super) const FFMPEG_TIMEOUT_SECS: u64 = 120;
+pub(super) const FFPROBE_TIMEOUT_SECS: u64 = 60;
+pub(super) const FFMPEG_TIMEOUT_SECS: u64 = 160;
 pub(super) const VIDEO_THUMBNAIL_SEEK_FRACTION: f64 = 0.10;
 pub(super) const VIDEO_THUMBNAIL_SEEK_MIN_SECS: f64 = 10.0;
 pub(super) const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 120.0;

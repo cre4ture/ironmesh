@@ -12,6 +12,8 @@ NODE_A_URL="https://127.0.0.1:18481"
 NODE_B_URL="https://127.0.0.1:18482"
 ADMIN_PASSWORD="correct horse battery staple"
 SERVER_NODE_BUILT=0
+SCREEN_STOP_WAIT_ATTEMPTS=50
+SCREEN_STOP_WAIT_INTERVAL_SECONDS=0.1
 
 usage() {
   cat <<EOF
@@ -42,7 +44,7 @@ ensure_server_node_built() {
     return 0
   fi
 
-  (cd "$REPO_ROOT" && cargo build -p server-node)
+  (cd "$REPO_ROOT" && cargo build --release -p server-node)
   SERVER_NODE_BUILT=1
 }
 
@@ -98,6 +100,21 @@ screen_session_exists() {
   screen -list | grep -Eq "[[:space:]]*[0-9]+\\.${session_name}[[:space:]]"
 }
 
+wait_for_screen_session_exit() {
+  local session_name="$1"
+  local attempt
+
+  for ((attempt = 0; attempt < SCREEN_STOP_WAIT_ATTEMPTS; attempt++)); do
+    if ! screen_session_exists "$session_name"; then
+      return 0
+    fi
+
+    sleep "$SCREEN_STOP_WAIT_INTERVAL_SECONDS"
+  done
+
+  return 1
+}
+
 start_node() {
   local node_name="$1"
   local session_name bind_addr url data_dir log_file start_command
@@ -122,7 +139,7 @@ start_node() {
 
   mkdir -p "$data_dir"
   printf -v start_command \
-    'cd %q && export IRONMESH_DATA_DIR=%q IRONMESH_SERVER_BIND=%q && cargo run -p server-node' \
+    'ulimit -n 1024 && cd %q && export IRONMESH_DATA_DIR=%q IRONMESH_SERVER_BIND=%q && cargo run --release -p server-node' \
     "$REPO_ROOT" "$data_dir" "$bind_addr"
 
   screen -L -Logfile "$log_file" -DdmS "$session_name" bash -lc "$start_command"
@@ -149,6 +166,12 @@ stop_node() {
   fi
 
   screen -S "$session_name" -X quit
+
+  if ! wait_for_screen_session_exit "$session_name"; then
+    echo "Timed out waiting for $node_name to stop ($session_name)" >&2
+    return 1
+  fi
+
   echo "Stopped $node_name ($session_name)"
 }
 

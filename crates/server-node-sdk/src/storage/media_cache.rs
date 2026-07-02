@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use axum::Router;
+use axum::extract::State;
 use bytes::{Bytes, BytesMut};
 use exif::{In, Reader as ExifReader, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, GenericImageView, ImageFormat};
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 use tokio::fs;
@@ -364,7 +365,8 @@ impl MediaCacheWorker {
         let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
 
         for chunk in manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+                .map_err(StoreReadError::Internal)?;
             if !fs::try_exists(&chunk_path)
                 .await
                 .map_err(|err| StoreReadError::Internal(err.into()))?
@@ -750,7 +752,7 @@ async fn manifest_chunks_are_locally_complete(
     chunks_dir: &Path,
 ) -> Result<bool> {
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let metadata = match fs::metadata(&chunk_path).await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -777,7 +779,7 @@ async fn read_object_prefix_from_manifest(
             break;
         }
 
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let payload = fs::read(&chunk_path)
             .await
             .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
@@ -811,7 +813,7 @@ async fn collect_local_chunk_paths(
 ) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::with_capacity(manifest.chunks.len());
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
         let metadata = fs::metadata(&chunk_path)
             .await
             .with_context(|| format!("missing chunk {}", chunk.hash))?;
@@ -828,6 +830,169 @@ async fn collect_local_chunk_paths(
     Ok(paths)
 }
 
+/// Holds the chunk hashes and precomputed byte offsets for a virtual video file.
+/// Paths are reconstructed from `chunks_dir` + hash at read time rather than
+/// stored, so the read path is always rooted in the trusted chunks directory.
+struct ChunkVideoIndex {
+    chunks_dir: PathBuf,
+    hashes: Vec<String>,
+    /// Byte offset of each chunk's first byte in the virtual file.
+    offsets: Vec<u64>,
+    total_size: u64,
+}
+
+impl ChunkVideoIndex {
+    fn new(chunks_dir: PathBuf, manifest: &ObjectManifest) -> Self {
+        let mut offsets = Vec::with_capacity(manifest.chunks.len());
+        let mut offset = 0u64;
+        for chunk in &manifest.chunks {
+            offsets.push(offset);
+            offset += chunk.size_bytes as u64;
+        }
+        let hashes = manifest.chunks.iter().map(|c| c.hash.clone()).collect();
+        Self {
+            chunks_dir,
+            hashes,
+            offsets,
+            total_size: offset,
+        }
+    }
+
+    async fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>> {
+        let mut result = Vec::new();
+        for i in 0..self.hashes.len() {
+            let chunk_start = self.offsets[i];
+            let chunk_size = if i + 1 < self.offsets.len() {
+                self.offsets[i + 1] - chunk_start
+            } else {
+                self.total_size - chunk_start
+            };
+            let chunk_end = chunk_start + chunk_size.saturating_sub(1);
+            if chunk_end < start {
+                continue;
+            }
+            if chunk_start > end {
+                break;
+            }
+            let read_from = start.saturating_sub(chunk_start) as usize;
+            let read_to = (end.min(chunk_end) - chunk_start) as usize;
+            let path = chunk_path_for_hash(&self.chunks_dir, &self.hashes[i])?;
+            let data = fs::read(&path).await?;
+            result.extend_from_slice(&data[read_from..=read_to]);
+        }
+        Ok(result)
+    }
+}
+
+async fn serve_video_range(
+    State(index): State<Arc<ChunkVideoIndex>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let total = index.total_size;
+    let (start, end, partial) = match headers.get(header::RANGE) {
+        Some(v) => match parse_http_byte_range(v.to_str().unwrap_or(""), total) {
+            Some((s, e)) => (s, e, true),
+            None => {
+                return (
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [(
+                        header::CONTENT_RANGE,
+                        format!("bytes */{total}")
+                            .parse::<axum::http::HeaderValue>()
+                            .unwrap(),
+                    )],
+                    axum::body::Body::empty(),
+                )
+                    .into_response();
+            }
+        },
+        None => (0, total.saturating_sub(1), false),
+    };
+
+    match index.read_range(start, end).await {
+        Ok(data) => {
+            let len = data.len();
+            let status = if partial {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            let mut builder = axum::response::Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_LENGTH, len);
+            if partial {
+                builder = builder.header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total}"),
+                );
+            }
+            builder
+                .body(axum::body::Body::from(data))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(err) => {
+            warn!(?err, "chunk video server: range read failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn parse_http_byte_range(range: &str, total: u64) -> Option<(u64, u64)> {
+    let s = range.strip_prefix("bytes=")?;
+    if let Some(suffix) = s.strip_prefix('-') {
+        let n: u64 = suffix.trim().parse().ok()?;
+        if n == 0 || total == 0 {
+            return None;
+        }
+        Some((total.saturating_sub(n), total - 1))
+    } else {
+        let (a, b) = s.split_once('-')?;
+        let start: u64 = a.trim().parse().ok()?;
+        let end = if b.trim().is_empty() {
+            total.saturating_sub(1)
+        } else {
+            b.trim().parse::<u64>().ok()?.min(total.saturating_sub(1))
+        };
+        (start <= end && start < total).then_some((start, end))
+    }
+}
+
+/// Starts a local HTTP server on 127.0.0.1 that presents the chunked video
+/// as a single seekable file via Range requests.
+///
+/// A random UUID token is embedded as a literal route segment so that other
+/// local processes cannot reach the endpoint without knowing the token.
+/// The server is torn down (task aborted) as soon as ffprobe/ffmpeg finish.
+async fn start_chunk_video_server(
+    index: Arc<ChunkVideoIndex>,
+    _temp_dir: &Path,
+) -> Result<(tokio::task::JoinHandle<()>, String)> {
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("failed to bind local TCP listener for chunk video server")?;
+    let port = listener.local_addr()?.port();
+    let token = Uuid::new_v4().to_string();
+    let route = format!("/{token}/video");
+
+    let app = Router::new()
+        .route(&route, axum::routing::get(serve_video_range))
+        .with_state(index);
+
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let url = format!("http://127.0.0.1:{port}/{token}/video");
+    Ok((handle, url))
+}
+
 async fn derive_video_media_cache(
     manifest_hash: &str,
     content_fingerprint: &str,
@@ -838,29 +1003,22 @@ async fn derive_video_media_cache(
     include_thumbnail: bool,
 ) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
-    let chunk_paths = collect_local_chunk_paths(manifest, chunks_dir).await?;
-    let concat_temp_dir =
-        std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
-    fs::create_dir_all(&concat_temp_dir)
-        .await
-        .with_context(|| format!("failed to create temp dir {}", concat_temp_dir.display()))?;
-    let concat_file_path = concat_temp_dir.join("chunks.concatf");
+    // Validate all chunks are present and have the expected size.
+    collect_local_chunk_paths(manifest, chunks_dir).await?;
+    let chunk_index = Arc::new(ChunkVideoIndex::new(chunks_dir.to_path_buf(), manifest));
 
-    let concat_payload = chunk_paths
-        .iter()
-        .map(|path| file_url_for_concatf(path.as_path()))
-        .collect::<Result<Vec<_>>>()?
-        .join("\n");
-    fs::write(&concat_file_path, format!("{concat_payload}\n"))
+    let temp_dir = std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir)
         .await
-        .with_context(|| {
-            format!(
-                "failed to write concatf list {}",
-                concat_file_path.display()
-            )
-        })?;
+        .with_context(|| format!("failed to create temp dir {}", temp_dir.display()))?;
 
-    let concat_input = format!("concatf:{}", concat_file_path.display());
+    let (server_task, video_url) = match start_chunk_video_server(chunk_index, &temp_dir).await {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&temp_dir).await;
+            return Err(err);
+        }
+    };
 
     let derived = async {
         let mut ffprobe = Command::new(&media_tools.ffprobe);
@@ -873,7 +1031,7 @@ async fn derive_video_media_cache(
             .arg("stream=width,height,codec_name:format=format_name,duration")
             .arg("-of")
             .arg("json")
-            .arg(&concat_input);
+            .arg(&video_url);
         let probe_output = run_media_tool(&mut ffprobe, FFPROBE_TIMEOUT_SECS, "ffprobe").await?;
         let probe: FfprobeOutput = serde_json::from_slice(&probe_output.stdout)
             .context("failed to parse ffprobe JSON output")?;
@@ -930,7 +1088,7 @@ async fn derive_video_media_cache(
         }
         ffmpeg
             .arg("-i")
-            .arg(&concat_input)
+            .arg(&video_url)
             .arg("-an")
             .arg("-sn")
             .arg("-dn")
@@ -966,14 +1124,9 @@ async fn derive_video_media_cache(
     }
     .await;
 
-    let _ = fs::remove_dir_all(&concat_temp_dir).await;
+    server_task.abort();
+    let _ = fs::remove_dir_all(&temp_dir).await;
     derived
-}
-
-fn file_url_for_concatf(path: &Path) -> Result<String> {
-    Url::from_file_path(path)
-        .map(|url| url.into())
-        .map_err(|_| anyhow::anyhow!("failed to convert path to file URL: {}", path.display()))
 }
 
 async fn run_media_tool(

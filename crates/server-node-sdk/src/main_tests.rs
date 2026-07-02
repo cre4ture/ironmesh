@@ -229,11 +229,10 @@ for arg in "$@"; do
   [ "$arg" != "-nostdin" ]
   input="$arg"
 done
-list="${input#concatf:}"
-[ -f "$list" ]
-line_count=$(wc -l < "$list" | tr -d ' ')
-[ "$line_count" -ge 3 ]
-grep -q '^file:' "$list"
+case "$input" in
+  http+unix://*|http://127.0.0.1:*) ;;
+  *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
+esac
 printf '%s\n' '{"streams":[{"width":1920,"height":1080}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.0"}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
@@ -251,11 +250,10 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
-list="${{input#concatf:}}"
-[ -f "$list" ]
-line_count=$(wc -l < "$list" | tr -d ' ')
-[ "$line_count" -ge 3 ]
-grep -q '^file:' "$list"
+case "$input" in
+  http+unix://*|http://127.0.0.1:*) ;;
+  *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
+esac
 cat '{}'
 "#,
         poster_path.display()
