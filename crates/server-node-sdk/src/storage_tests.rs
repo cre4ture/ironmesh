@@ -334,11 +334,10 @@ for arg in "$@"; do
   [ "$arg" != "-nostdin" ]
   input="$arg"
 done
-list="${input#concatf:}"
-[ -f "$list" ]
-line_count=$(wc -l < "$list" | tr -d ' ')
-[ "$line_count" -ge 3 ]
-grep -q '^file:' "$list"
+case "$input" in
+  http+unix://*|http://127.0.0.1:*) ;;
+  *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
+esac
 printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.0"}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
@@ -356,11 +355,10 @@ for arg in "$@"; do
   fi
   prev="$arg"
 done
-list="${{input#concatf:}}"
-[ -f "$list" ]
-line_count=$(wc -l < "$list" | tr -d ' ')
-[ "$line_count" -ge 3 ]
-grep -q '^file:' "$list"
+case "$input" in
+  http+unix://*|http://127.0.0.1:*) ;;
+  *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
+esac
 cat '{}'
 "#,
         poster_path.display()
@@ -905,7 +903,7 @@ async fn cleanup_unreferenced_dry_run_reports_without_deleting_impl(backend: Sto
 
     let orphan_chunk_payload = b"orphan-chunk";
     let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
-    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash);
+    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash).unwrap();
     fs::create_dir_all(orphan_chunk_path.parent().unwrap())
         .await
         .unwrap();
@@ -960,7 +958,7 @@ async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: St
 
     let orphan_chunk_payload = b"orphan-chunk-delete";
     let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
-    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash);
+    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash).unwrap();
     fs::create_dir_all(orphan_chunk_path.parent().unwrap())
         .await
         .unwrap();
@@ -5287,7 +5285,7 @@ async fn metadata_only_cached_chunks_are_evicted_by_cleanup_impl(backend: Storag
             .is_empty()
     );
 
-    let first_chunk_path = chunk_path_for_hash(&target.chunks_dir, &first_chunk.hash);
+    let first_chunk_path = chunk_path_for_hash(&target.chunks_dir, &first_chunk.hash).unwrap();
     assert!(!fs::try_exists(&first_chunk_path).await.unwrap());
 
     let metadata_subjects = target.list_metadata_subjects().await.unwrap();
@@ -5374,7 +5372,7 @@ async fn put_object_from_chunks_rejects_corrupt_chunk_payload_impl(backend: Stor
         .first()
         .cloned()
         .expect("sample payload should produce at least one chunk");
-    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash);
+    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash).unwrap();
     let mut corrupt_payload = fs::read(&corrupt_path).await.unwrap();
     corrupt_payload[0] ^= 0xff;
     fs::write(&corrupt_path, &corrupt_payload).await.unwrap();
@@ -6273,8 +6271,8 @@ async fn data_scrub_detects_missing_and_corrupt_chunks_impl(backend: StorageTest
 
     let corrupt_chunk = &manifest.chunks[0];
     let missing_chunk = &manifest.chunks[1];
-    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash);
-    let missing_path = chunk_path_for_hash(&store.chunks_dir, &missing_chunk.hash);
+    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash).unwrap();
+    let missing_path = chunk_path_for_hash(&store.chunks_dir, &missing_chunk.hash).unwrap();
 
     fs::write(&corrupt_path, vec![0u8; corrupt_chunk.size_bytes])
         .await
