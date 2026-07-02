@@ -10,7 +10,6 @@ pub use rendezvous_server::{
 
 use crate::failover::{
     DecryptedRendezvousFailoverPackage, load_rendezvous_failover_package, normalize_public_url,
-    validate_failover_package_for_standalone_service,
 };
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -125,9 +124,6 @@ impl RendezvousServiceConfig {
                 )
             })
             .transpose()?;
-        if let Some(package) = failover_package.as_ref() {
-            validate_failover_package_for_standalone_service(package)?;
-        }
 
         let configured_public_url = lookup_env("IRONMESH_RENDEZVOUS_PUBLIC_URL");
         let public_url = match (configured_public_url, failover_package.as_ref()) {
@@ -357,12 +353,12 @@ mod tests {
         let package_path = dir.join("failover.json");
         std::fs::write(
             &package_path,
-            with_standalone_service_target(&build_test_failover_package_json(
+            build_test_failover_package_json(
                 "https://creax.de:44042",
                 "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
                 "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
                 "correct horse battery staple",
-            )),
+            ),
         )
         .expect("test failover package should write");
 
@@ -411,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn from_lookup_rejects_embedded_node_failover_package() {
+    fn from_lookup_accepts_standalone_labeled_failover_package() {
         let dir = std::env::temp_dir().join(format!(
             "ironmesh-rendezvous-config-{}",
             uuid::Uuid::now_v7()
@@ -420,12 +416,12 @@ mod tests {
         let package_path = dir.join("failover.json");
         std::fs::write(
             &package_path,
-            build_test_failover_package_json(
+            with_standalone_service_target(&build_test_failover_package_json(
                 "https://creax.de:44042",
                 "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
                 "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
                 "correct horse battery staple",
-            ),
+            )),
         )
         .expect("test failover package should write");
 
@@ -435,10 +431,14 @@ mod tests {
             failover_passphrase: Some("correct horse battery staple".to_string()),
         };
         let env = HashMap::<String, String>::new();
-        let err = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
-            .expect_err("embedded-node failover package should be rejected");
-        assert!(err.to_string().contains("deployment_target=embedded_node"));
-        assert!(err.to_string().contains("deployment_target=standalone_service"));
+        let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect("standalone-labeled failover package should load");
+
+        assert_eq!(config.public_url, "https://creax.de:44042");
+        assert_eq!(
+            config.relay_public_urls,
+            vec!["https://creax.de:44042".to_string()]
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

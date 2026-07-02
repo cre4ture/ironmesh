@@ -76,22 +76,6 @@ pub(crate) fn load_rendezvous_failover_package(
     decrypt_rendezvous_failover_package(package_path, package, passphrase)
 }
 
-pub(crate) fn validate_failover_package_for_standalone_service(
-    package: &DecryptedRendezvousFailoverPackage,
-) -> Result<()> {
-    if package.package.deployment_target
-        != ManagedRendezvousFailoverDeploymentTarget::StandaloneService
-    {
-        bail!(
-            "managed rendezvous failover package {} has deployment_target={} but ironmesh-rendezvous-service only accepts deployment_target=standalone_service",
-            package.package_path.display(),
-            deployment_target_name(package.package.deployment_target),
-        );
-    }
-
-    Ok(())
-}
-
 fn decrypt_rendezvous_failover_package(
     package_path: &Path,
     package: ManagedRendezvousFailoverPackage,
@@ -161,13 +145,6 @@ fn derive_rendezvous_failover_key(passphrase: &str, salt: &[u8], rounds: u32) ->
 
 pub(crate) fn normalize_public_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_string()
-}
-
-fn deployment_target_name(target: ManagedRendezvousFailoverDeploymentTarget) -> &'static str {
-    match target {
-        ManagedRendezvousFailoverDeploymentTarget::EmbeddedNode => "embedded_node",
-        ManagedRendezvousFailoverDeploymentTarget::StandaloneService => "standalone_service",
-    }
 }
 
 #[cfg(test)]
