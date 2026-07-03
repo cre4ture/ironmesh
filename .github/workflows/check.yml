@@ -438,11 +438,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain with clippy
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Check Windows CFAPI adapter crate
         run: cargo check -p adapter-windows-cfapi --all-targets
+
+      - name: Run Windows workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
