@@ -9439,6 +9439,18 @@ async fn register_node_uses_structured_reachability_payload() {
     assert_eq!(node.capacity_bytes, 100);
     assert_eq!(node.free_bytes, 40);
 
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_register").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    let persisted = persisted_nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("registered node should be persisted");
+    assert_eq!(persisted.public_api_url(), Some("https://public.example"));
+    assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+    assert!(persisted.relay_required());
+
     cleanup_test_state(&state).await;
 }
 
@@ -9469,6 +9481,111 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
     assert_eq!(descriptor.public_api_url(), None);
     assert_eq!(descriptor.peer_api_url(), None);
     assert!(descriptor.relay_capable());
+}
+
+#[tokio::test]
+async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let node_id = NodeId::new_v4();
+    let entry = transport_sdk::PresenceEntry {
+        registration: transport_sdk::PresenceRegistration {
+            cluster_id: state.cluster_id,
+            identity: transport_sdk::PeerIdentity::Node(node_id),
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectHttps,
+                endpoint: "https://internal.example".to_string(),
+                rtt_ms: None,
+            }],
+            labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+            capacity_bytes: Some(100),
+            free_bytes: Some(40),
+            capabilities: vec![transport_sdk::TransportCapability::RelayTunnel],
+            relay_mode: transport_sdk::RelayMode::Fallback,
+            connected_at_unix: 123,
+        },
+        updated_at_unix: 456,
+    };
+
+    let discovered = super::apply_rendezvous_presence_entries(&state, &[entry]).await;
+    assert_eq!(discovered, 1);
+
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_discovery").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    let persisted = persisted_nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("discovered node should be persisted");
+    assert_eq!(persisted.public_api_url(), Some("https://public.example"));
+    assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn remove_node_persists_forget_to_cluster_state() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let node_id = NodeId::new_v4();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        let _ = cluster.register_node(cluster::NodeDescriptor {
+            node_id,
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://public.example".to_string()),
+                peer_api_url: Some("https://internal.example".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 100,
+            free_bytes: 40,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+        cluster.note_replica("subject-a", node_id);
+    }
+    super::persist_cluster_topology_state(&state).await.unwrap();
+
+    let response = axum::response::IntoResponse::into_response(
+        super::remove_node(State(state.clone()), headers, Path(node_id.to_string())).await,
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_remove").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    assert!(
+        persisted_nodes
+            .into_iter()
+            .all(|node| node.node_id != node_id),
+        "removed node should be forgotten from persisted node state"
+    );
+
+    let persisted_replicas = {
+        let store = read_store(&state, "tests.load_cluster_replicas_after_remove").await;
+        store.load_cluster_replicas().await.unwrap()
+    };
+    assert!(
+        persisted_replicas
+            .values()
+            .all(|nodes| !nodes.contains(&node_id)),
+        "removed node should be forgotten from persisted replica state"
+    );
+
+    cleanup_test_state(&state).await;
 }
 
 #[tokio::test]

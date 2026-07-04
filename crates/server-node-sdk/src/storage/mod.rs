@@ -39,6 +39,7 @@ mod turso_impl;
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
 use self::turso_impl::TursoMetadataStore;
+use super::cluster::NodeDescriptor;
 use super::{DataScrubRunRecord, ManualRepairActionRunRecord, RepairRunRecord};
 
 pub use data_scrub::DataScrubReport;
@@ -1007,6 +1008,11 @@ pub(crate) struct ClusterReplicasPersister {
 }
 
 #[derive(Clone)]
+pub(crate) struct ClusterNodesPersister {
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
+#[derive(Clone)]
 pub(crate) struct ReplicationSubjectInspector {
     current_state: CurrentState,
     manifests_dir: PathBuf,
@@ -1067,6 +1073,8 @@ trait MetadataStore: Send + Sync {
     ) -> Result<Vec<DataScrubRunRecord>>;
     async fn persist_data_scrub_run_record(&self, record: &DataScrubRunRecord) -> Result<()>;
     async fn prune_data_scrub_run_history_before(&self, finished_before_unix: u64) -> Result<()>;
+    async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>>;
+    async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()>;
     async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>>;
     async fn persist_cluster_replicas(&self, replicas: &HashMap<String, Vec<NodeId>>)
     -> Result<()>;
@@ -1707,6 +1715,16 @@ impl ClusterReplicasPersister {
     }
 }
 
+impl ClusterNodesPersister {
+    fn new(metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self { metadata_store }
+    }
+
+    pub(crate) async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
+        self.metadata_store.persist_cluster_nodes(nodes).await
+    }
+}
+
 impl ReplicationSubjectInspector {
     fn new(
         current_state: CurrentState,
@@ -2042,6 +2060,10 @@ impl PersistentStore {
         ClusterReplicasPersister::new(self.metadata_store.clone())
     }
 
+    pub(crate) fn cluster_nodes_persister(&self) -> ClusterNodesPersister {
+        ClusterNodesPersister::new(self.metadata_store.clone())
+    }
+
     pub(crate) fn replication_subject_inspector(&self) -> ReplicationSubjectInspector {
         ReplicationSubjectInspector::new(
             self.current_state.clone(),
@@ -2149,6 +2171,15 @@ impl PersistentStore {
 
     pub async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
         self.metadata_store.load_cluster_replicas().await
+    }
+
+    pub async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {
+        self.metadata_store.load_cluster_nodes().await
+    }
+
+    #[cfg(test)]
+    pub async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
+        self.metadata_store.persist_cluster_nodes(nodes).await
     }
 
     #[cfg(test)]

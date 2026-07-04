@@ -4977,26 +4977,6 @@ async fn run_inner(
     };
 
     let mut cluster = ClusterService::new(config.node_id, policy, config.heartbeat_timeout_secs);
-    cluster.register_node(NodeDescriptor {
-        node_id: config.node_id,
-        reachability: NodeReachability {
-            public_api_url: Some(public_url.clone()),
-            peer_api_url: Some(internal_url),
-            relay_required: config.relay_mode == RelayMode::Required,
-        },
-        capabilities: NodeCapabilities {
-            public_api: true,
-            peer_api: true,
-            relay_tunnel: config.rendezvous_registration_enabled
-                && config.relay_mode != RelayMode::Disabled,
-        },
-        labels: config.labels.clone(),
-        capacity_bytes: 0,
-        free_bytes: 0,
-        storage_stats: None,
-        last_heartbeat_unix: 0,
-        status: cluster::NodeStatus::Online,
-    });
 
     let store = new_store_rwlock(
         PersistentStore::init_with_metadata_backend(
@@ -5027,6 +5007,46 @@ async fn run_inner(
         reqwest::Client::new()
     };
 
+    let load_cluster_nodes_phase_started_at =
+        log_server_startup_phase_begin("load_cluster_nodes", startup_phase_anchor);
+    let persisted_cluster_nodes = {
+        let store_guard = store.read("server.init.load_cluster_nodes").await;
+        match store_guard.load_cluster_nodes().await {
+            Ok(nodes) => nodes,
+            Err(err) => {
+                warn!(error = %err, "failed to load cluster node state; starting empty");
+                Vec::new()
+            }
+        }
+    };
+    log_server_startup_phase_end(
+        "load_cluster_nodes",
+        startup_phase_anchor,
+        load_cluster_nodes_phase_started_at,
+    );
+    cluster.import_nodes(persisted_cluster_nodes);
+
+    let _ = cluster.register_node(NodeDescriptor {
+        node_id: config.node_id,
+        reachability: NodeReachability {
+            public_api_url: Some(public_url.clone()),
+            peer_api_url: Some(internal_url),
+            relay_required: config.relay_mode == RelayMode::Required,
+        },
+        capabilities: NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: config.rendezvous_registration_enabled
+                && config.relay_mode != RelayMode::Disabled,
+        },
+        labels: config.labels.clone(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    });
+
     let load_cluster_replicas_phase_started_at =
         log_server_startup_phase_begin("load_cluster_replicas", startup_phase_anchor);
     let persisted_cluster_replicas = {
@@ -5044,7 +5064,22 @@ async fn run_inner(
         startup_phase_anchor,
         load_cluster_replicas_phase_started_at,
     );
-    cluster.import_replicas_by_key(persisted_cluster_replicas);
+    let known_node_ids = cluster
+        .list_nodes()
+        .into_iter()
+        .map(|node| node.node_id)
+        .collect::<HashSet<_>>();
+    let filtered_cluster_replicas = persisted_cluster_replicas
+        .into_iter()
+        .filter_map(|(subject, nodes)| {
+            let nodes = nodes
+                .into_iter()
+                .filter(|node_id| known_node_ids.contains(node_id))
+                .collect::<Vec<_>>();
+            (!nodes.is_empty()).then_some((subject, nodes))
+        })
+        .collect::<HashMap<_, _>>();
+    cluster.import_replicas_by_key(filtered_cluster_replicas);
 
     let load_client_credentials_phase_started_at =
         log_server_startup_phase_begin("load_client_credentials", startup_phase_anchor);
@@ -6435,27 +6470,41 @@ async fn apply_rendezvous_presence_entries(
     state: &ServerState,
     entries: &[transport_sdk::PresenceEntry],
 ) -> usize {
-    let mut discovered = 0usize;
-    let mut cluster = state.cluster.lock().await;
+    let discovered = {
+        let mut discovered = 0usize;
+        let mut cluster = state.cluster.lock().await;
 
-    for entry in entries {
-        let transport_sdk::PeerIdentity::Node(node_id) = &entry.registration.identity else {
-            continue;
-        };
-        if *node_id == state.node_id {
-            continue;
+        for entry in entries {
+            let transport_sdk::PeerIdentity::Node(node_id) = &entry.registration.identity else {
+                continue;
+            };
+            if *node_id == state.node_id {
+                continue;
+            }
+
+            let Some(descriptor) = node_descriptor_from_presence_entry(entry) else {
+                tracing::debug!(
+                    node_id = %node_id,
+                    "skipping rendezvous peer without a usable transport path"
+                );
+                continue;
+            };
+
+            if cluster.register_node(descriptor) {
+                discovered += 1;
+            }
         }
+        discovered
+    };
 
-        let Some(descriptor) = node_descriptor_from_presence_entry(entry) else {
-            tracing::debug!(
-                node_id = %node_id,
-                "skipping rendezvous peer without a usable transport path"
-            );
-            continue;
-        };
-
-        cluster.register_node(descriptor);
-        discovered += 1;
+    if discovered > 0
+        && let Err(err) = persist_cluster_nodes_state(state).await
+    {
+        warn!(
+            error = %err,
+            discovered_nodes = discovered,
+            "failed to persist rendezvous-discovered cluster nodes"
+        );
     }
 
     discovered
@@ -19628,18 +19677,29 @@ async fn register_node(
         relay_tunnel: requested_capabilities.relay_tunnel || reachability.relay_required,
     };
 
-    let mut cluster = state.cluster.lock().await;
-    cluster.register_node(NodeDescriptor {
-        node_id,
-        reachability,
-        capabilities,
-        labels: request.labels,
-        capacity_bytes: request.capacity_bytes.unwrap_or(0),
-        free_bytes: request.free_bytes.unwrap_or(0),
-        storage_stats: request.storage_stats,
-        last_heartbeat_unix: 0,
-        status: cluster::NodeStatus::Online,
-    });
+    let changed = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.register_node(NodeDescriptor {
+            node_id,
+            reachability,
+            capabilities,
+            labels: request.labels,
+            capacity_bytes: request.capacity_bytes.unwrap_or(0),
+            free_bytes: request.free_bytes.unwrap_or(0),
+            storage_stats: request.storage_stats,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        })
+    };
+
+    if changed && let Err(err) = persist_cluster_nodes_state(&state).await {
+        warn!(
+            error = %err,
+            node_id = %node_id,
+            "failed to persist cluster nodes after node registration"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -19680,11 +19740,11 @@ async fn remove_node(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    if let Err(err) = persist_cluster_replicas_state(&state).await {
+    if let Err(err) = persist_cluster_topology_state(&state).await {
         warn!(
             error = %err,
             node_id = %node_id,
-            "failed to persist cluster replicas after node removal"
+            "failed to persist cluster topology after node removal"
         );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -20276,6 +20336,36 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
         store.cluster_replicas_persister()
     };
     persister.persist_cluster_replicas(&replicas).await
+}
+
+async fn persist_cluster_nodes_state(state: &ServerState) -> Result<()> {
+    let nodes = {
+        let cluster = state.cluster.lock().await;
+        cluster.export_nodes()
+    };
+
+    let persister = {
+        let store = read_store(state, "cluster_nodes.clone_persister").await;
+        store.cluster_nodes_persister()
+    };
+    persister.persist_cluster_nodes(&nodes).await
+}
+
+async fn persist_cluster_topology_state(state: &ServerState) -> Result<()> {
+    let (nodes, replicas) = {
+        let cluster = state.cluster.lock().await;
+        (cluster.export_nodes(), cluster.export_replicas_by_key())
+    };
+
+    let (node_persister, replica_persister) = {
+        let store = read_store(state, "cluster_topology.clone_persisters").await;
+        (
+            store.cluster_nodes_persister(),
+            store.cluster_replicas_persister(),
+        )
+    };
+    node_persister.persist_cluster_nodes(&nodes).await?;
+    replica_persister.persist_cluster_replicas(&replicas).await
 }
 
 #[cfg(test)]

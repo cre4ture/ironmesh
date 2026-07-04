@@ -9,6 +9,8 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tracing::warn;
 
+use crate::cluster::NodeDescriptor;
+
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord,
@@ -437,6 +439,52 @@ impl MetadataStore for SqliteMetadataStore {
             params![u64_to_i64(finished_before_unix)?],
         )?;
         Ok(())
+    }
+
+    async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {
+        let db = self.metadata_conn()?;
+        let mut stmt = db.prepare(
+            "SELECT node_id, descriptor_json
+             FROM cluster_nodes
+             ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            let (node_id, payload) = row?;
+            let descriptor =
+                serde_json::from_slice::<NodeDescriptor>(&payload).with_context(|| {
+                    format!("invalid cluster node descriptor in sqlite for {node_id}")
+                })?;
+            if descriptor.node_id.to_string() != node_id {
+                anyhow::bail!(
+                    "cluster node descriptor id mismatch in sqlite: row={node_id} payload={}",
+                    descriptor.node_id
+                );
+            }
+            nodes.push(descriptor);
+        }
+        Ok(nodes)
+    }
+
+    async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
+        self.in_metadata_tx(|db| {
+            db.execute("DELETE FROM cluster_nodes", [])?;
+            let mut stmt = db.prepare(
+                "INSERT INTO cluster_nodes (node_id, descriptor_json)
+                 VALUES (?1, ?2)",
+            )?;
+            for node in nodes {
+                stmt.execute(params![
+                    node.node_id.to_string(),
+                    serde_json::to_vec_pretty(node)?
+                ])?;
+            }
+            Ok(())
+        })
     }
 
     async fn load_cluster_replicas(
@@ -1495,6 +1543,11 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             run_id TEXT PRIMARY KEY,
             finished_at_unix INTEGER NOT NULL,
             record_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS cluster_nodes (
+            node_id TEXT PRIMARY KEY,
+            descriptor_json BLOB NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS cluster_replicas (

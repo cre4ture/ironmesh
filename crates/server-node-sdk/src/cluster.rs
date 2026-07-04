@@ -11,7 +11,7 @@ pub enum NodeStatus {
     Offline,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct NodeReachability {
     #[serde(default)]
     pub public_api_url: Option<String>,
@@ -21,7 +21,7 @@ pub struct NodeReachability {
     pub relay_required: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct NodeCapabilities {
     #[serde(default)]
     pub public_api: bool,
@@ -217,15 +217,38 @@ impl ClusterService {
         changed
     }
 
-    pub fn register_node(&mut self, mut descriptor: NodeDescriptor) {
+    fn node_descriptor_changed_for_persistence(
+        existing: &NodeDescriptor,
+        candidate: &NodeDescriptor,
+    ) -> bool {
+        existing.node_id != candidate.node_id
+            || existing.reachability != candidate.reachability
+            || existing.capabilities != candidate.capabilities
+            || existing.labels != candidate.labels
+    }
+
+    pub fn register_node(&mut self, mut descriptor: NodeDescriptor) -> bool {
         if let Some(existing) = self.nodes.get(&descriptor.node_id)
             && descriptor.storage_stats.is_none()
         {
             descriptor.storage_stats = existing.storage_stats.clone();
         }
+        let changed = self.nodes.get(&descriptor.node_id).is_none_or(|existing| {
+            Self::node_descriptor_changed_for_persistence(existing, &descriptor)
+        });
         descriptor.last_heartbeat_unix = unix_ts();
         descriptor.status = NodeStatus::Online;
         self.nodes.insert(descriptor.node_id, descriptor);
+        changed
+    }
+
+    pub fn import_nodes(&mut self, descriptors: Vec<NodeDescriptor>) {
+        for mut descriptor in descriptors {
+            if descriptor.node_id != self.local_node {
+                descriptor.status = NodeStatus::Offline;
+            }
+            self.nodes.insert(descriptor.node_id, descriptor);
+        }
     }
 
     pub fn remove_node(&mut self, node_id: NodeId) -> bool {
@@ -330,6 +353,10 @@ impl ClusterService {
         let mut nodes: Vec<_> = self.nodes.values().cloned().collect();
         nodes.sort_by_key(|node| node.node_id);
         nodes
+    }
+
+    pub fn export_nodes(&self) -> Vec<NodeDescriptor> {
+        self.list_nodes()
     }
 
     pub fn summary(&self) -> ClusterSummary {
@@ -1165,6 +1192,42 @@ mod tests {
             svc.available_subjects_for_node(node_b),
             vec!["subject-a".to_string()]
         );
+    }
+
+    #[test]
+    fn import_nodes_restores_remote_nodes_as_offline() {
+        let local = NodeId::new_v4();
+        let remote = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        svc.import_nodes(vec![NodeDescriptor {
+            node_id: remote,
+            reachability: NodeReachability {
+                public_api_url: Some("https://remote.example".to_string()),
+                peer_api_url: Some("https://remote-internal.example".to_string()),
+                relay_required: false,
+            },
+            capabilities: NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+            capacity_bytes: 100,
+            free_bytes: 40,
+            storage_stats: None,
+            last_heartbeat_unix: 123,
+            status: NodeStatus::Online,
+        }]);
+
+        let node = svc
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == remote)
+            .expect("remote node should be imported");
+        assert_eq!(node.status, NodeStatus::Offline);
+        assert_eq!(node.last_heartbeat_unix, 123);
+        assert_eq!(node.public_api_url(), Some("https://remote.example"));
     }
 
     #[test]

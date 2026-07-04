@@ -7,6 +7,8 @@ use common::NodeId;
 use tracing::warn;
 use turso::params_from_iter;
 
+use crate::cluster::NodeDescriptor;
+
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord,
@@ -421,6 +423,59 @@ impl MetadataStore for TursoMetadataStore {
             )
             .await?;
         Ok(())
+    }
+
+    async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT node_id, descriptor_json
+                 FROM cluster_nodes
+                 ORDER BY node_id",
+                (),
+            )
+            .await?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let node_id = row_string(&row, 0, "cluster_nodes.node_id")?;
+            let payload = row_blob(&row, 1, "cluster_nodes.descriptor_json")?;
+            let descriptor = self
+                .decode_json::<NodeDescriptor>(payload, "cluster node descriptor")
+                .with_context(|| format!("while reading cluster node {node_id}"))?;
+            if descriptor.node_id.to_string() != node_id {
+                bail!(
+                    "cluster node descriptor id mismatch in turso: row={node_id} payload={}",
+                    descriptor.node_id
+                );
+            }
+            nodes.push(descriptor);
+        }
+        Ok(nodes)
+    }
+
+    async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
+        self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: Result<()> = async {
+            self.connection
+                .execute("DELETE FROM cluster_nodes", ())
+                .await?;
+            for node in nodes {
+                self.connection
+                    .execute(
+                        "INSERT INTO cluster_nodes (node_id, descriptor_json)
+                         VALUES (?1, ?2)",
+                        (node.node_id.to_string(), serde_json::to_vec_pretty(node)?),
+                    )
+                    .await?;
+            }
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
     }
 
     async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
@@ -1635,6 +1690,11 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 run_id TEXT PRIMARY KEY,
                 finished_at_unix INTEGER NOT NULL,
                 record_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cluster_nodes (
+                node_id TEXT PRIMARY KEY,
+                descriptor_json BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS cluster_replicas (

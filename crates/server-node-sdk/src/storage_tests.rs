@@ -3919,6 +3919,21 @@ run_on_all_metadata_backends!(
     load_cluster_replicas_returns_empty_when_file_missing_turso
 );
 
+async fn load_cluster_nodes_returns_empty_when_file_missing_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-nodes-empty").await;
+
+    let nodes = store.load_cluster_nodes().await.unwrap();
+    assert!(nodes.is_empty());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    load_cluster_nodes_returns_empty_when_file_missing_impl,
+    load_cluster_nodes_returns_empty_when_file_missing,
+    load_cluster_nodes_returns_empty_when_file_missing_turso
+);
+
 async fn explicit_version_id_is_idempotent_for_matching_manifest_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("explicit-version-id-idempotent").await;
 
@@ -4034,6 +4049,51 @@ run_on_all_metadata_backends!(
     persist_and_load_cluster_replicas_roundtrip_impl,
     persist_and_load_cluster_replicas_roundtrip,
     persist_and_load_cluster_replicas_roundtrip_turso
+);
+
+async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-nodes-roundtrip").await;
+    let remote_node_id = NodeId::new_v4();
+    let nodes = vec![crate::cluster::NodeDescriptor {
+        node_id: remote_node_id,
+        reachability: crate::cluster::NodeReachability {
+            public_api_url: Some("https://remote.example".to_string()),
+            peer_api_url: Some("https://remote-internal.example".to_string()),
+            relay_required: true,
+        },
+        capabilities: crate::cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
+        labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+        capacity_bytes: 100,
+        free_bytes: 40,
+        storage_stats: None,
+        last_heartbeat_unix: 123,
+        status: crate::cluster::NodeStatus::Offline,
+    }];
+
+    store.persist_cluster_nodes(&nodes).await.unwrap();
+    let loaded = store.load_cluster_nodes().await.unwrap();
+
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].node_id, remote_node_id);
+    assert_eq!(loaded[0].public_api_url(), Some("https://remote.example"));
+    assert_eq!(
+        loaded[0].peer_api_url(),
+        Some("https://remote-internal.example")
+    );
+    assert!(loaded[0].relay_required());
+    assert!(loaded[0].relay_capable());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    persist_and_load_cluster_nodes_roundtrip_impl,
+    persist_and_load_cluster_nodes_roundtrip,
+    persist_and_load_cluster_nodes_roundtrip_turso
 );
 
 async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
