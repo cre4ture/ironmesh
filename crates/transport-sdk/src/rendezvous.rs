@@ -70,6 +70,8 @@ pub struct PresenceEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterPresenceResponse {
     pub accepted: bool,
+    #[serde(default)]
+    pub software_version: Option<String>,
     pub updated_at_unix: u64,
     pub entry: PresenceEntry,
 }

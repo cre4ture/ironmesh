@@ -137,6 +137,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByText("Connections", { exact: true }).click();
   await expect(page.getByRole("columnheader", { name: "Transport" })).toBeVisible();
   await expect(page.getByText("via relay-alpha.local:9443", { exact: true })).toBeVisible();
+  await expect(page.getByText("Rendezvous registration state", { exact: true })).toBeVisible();
+  await expect(page.getByText("Software version: 1.0.31", { exact: true })).toBeVisible();
+  await expect(page.getByText("Software version: 1.0.30", { exact: true })).toBeVisible();
 
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Fingerprint: internal-cert-fingerprint", { exact: true })).toBeVisible();
@@ -751,7 +754,8 @@ async function installServerAdminMocks(
         last_attempt_unix: 1_900_000_000,
         last_success_unix: 1_900_000_000,
         consecutive_failures: 0,
-        last_error: null
+        last_error: null,
+        software_version: "1.0.31"
       },
       {
         url: "https://rendezvous-a.local:9443",
@@ -759,7 +763,8 @@ async function installServerAdminMocks(
         last_attempt_unix: 1_900_000_010,
         last_success_unix: 1_900_000_010,
         consecutive_failures: 0,
-        last_error: null
+        last_error: null,
+        software_version: "1.0.30"
       }
     ],
     mtls_required: true,

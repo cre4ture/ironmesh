@@ -638,6 +638,7 @@ struct RendezvousEndpointRegistrationRuntime {
     last_success_unix: Option<u64>,
     consecutive_failures: u64,
     last_error: Option<String>,
+    software_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -656,6 +657,7 @@ struct RendezvousEndpointRegistrationView {
     last_success_unix: Option<u64>,
     consecutive_failures: u64,
     last_error: Option<String>,
+    software_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3464,7 +3466,11 @@ async fn sync_rendezvous_registration_state(state: &ServerState) {
     }
 }
 
-async fn record_rendezvous_registration_success(state: &ServerState, url: &str) -> bool {
+async fn record_rendezvous_registration_success(
+    state: &ServerState,
+    url: &str,
+    software_version: Option<&str>,
+) -> bool {
     let now = unix_ts();
     let mut registration_state = state.network.rendezvous_registration_state.lock().await;
     let entry = registration_state.entry(url.to_string()).or_default();
@@ -3473,6 +3479,12 @@ async fn record_rendezvous_registration_success(state: &ServerState, url: &str) 
     entry.last_success_unix = Some(now);
     entry.consecutive_failures = 0;
     entry.last_error = None;
+    if let Some(software_version) = software_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        entry.software_version = Some(software_version.to_string());
+    }
     recovered
 }
 
@@ -3530,6 +3542,7 @@ async fn rendezvous_registration_views(
                 last_success_unix: runtime.last_success_unix,
                 consecutive_failures: runtime.consecutive_failures,
                 last_error: runtime.last_error,
+                software_version: runtime.software_version,
             }
         })
         .collect()
@@ -6225,7 +6238,12 @@ fn spawn_rendezvous_presence_heartbeat(
                 };
                 match result {
                     Ok(Ok(response)) => {
-                        let recovered = record_rendezvous_registration_success(&state, &url).await;
+                        let recovered = record_rendezvous_registration_success(
+                            &state,
+                            &url,
+                            response.software_version.as_deref(),
+                        )
+                        .await;
                         if recovered {
                             info!(
                                 node_id = %state.node_id,
@@ -7715,7 +7733,7 @@ fn spawn_rendezvous_relay_multiplex_session_task(
         .await
         {
             Ok(completed_session) => {
-                let _ = record_rendezvous_registration_success(&state, &endpoint_url).await;
+                let _ = record_rendezvous_registration_success(&state, &endpoint_url, None).await;
                 if let Err(err) = serve_relay_multiplex_streams(
                     state,
                     endpoint_url.clone(),

@@ -702,6 +702,7 @@ async fn capture_mtls_presence_register(
     let updated_at_unix = super::unix_ts();
     Json(transport_sdk::RegisterPresenceResponse {
         accepted: true,
+        software_version: None,
         updated_at_unix,
         entry: transport_sdk::PresenceEntry {
             registration,
@@ -786,6 +787,7 @@ async fn https_presence_register(
     let updated_at_unix = super::unix_ts();
     Json(transport_sdk::RegisterPresenceResponse {
         accepted: true,
+        software_version: None,
         updated_at_unix,
         entry: transport_sdk::PresenceEntry {
             registration,
@@ -1525,6 +1527,7 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
             last_success_unix: Some(10),
             consecutive_failures: 0,
             last_error: None,
+            software_version: None,
         },
     )]);
 
@@ -1702,6 +1705,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
                 last_success_unix: Some(10),
                 consecutive_failures: 0,
                 last_error: None,
+                software_version: None,
             },
         ),
         (
@@ -1711,6 +1715,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
                 last_success_unix: Some(11),
                 consecutive_failures: 0,
                 last_error: None,
+                software_version: None,
             },
         ),
     ]);
@@ -1835,6 +1840,7 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
                 last_success_unix: Some(10),
                 consecutive_failures: 2,
                 last_error: Some("unavailable".to_string()),
+                software_version: None,
             },
         ),
         (
@@ -1844,6 +1850,7 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
                 last_success_unix: Some(11),
                 consecutive_failures: 0,
                 last_error: None,
+                software_version: None,
             },
         ),
     ]);
@@ -10841,6 +10848,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                     let updated_at_unix = super::unix_ts();
                     Json(transport_sdk::RegisterPresenceResponse {
                         accepted: true,
+                        software_version: None,
                         updated_at_unix,
                         entry: transport_sdk::PresenceEntry {
                             registration,
@@ -10901,6 +10909,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                     let updated_at_unix = super::unix_ts();
                     Json(transport_sdk::RegisterPresenceResponse {
                         accepted: true,
+                        software_version: None,
                         updated_at_unix,
                         entry: transport_sdk::PresenceEntry {
                             registration,
@@ -10980,6 +10989,7 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
                 last_success_unix: Some(10),
                 consecutive_failures: 0,
                 last_error: None,
+                software_version: Some("1.0.31".to_string()),
             },
         ),
         (
@@ -10989,6 +10999,7 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
                 last_success_unix: Some(8),
                 consecutive_failures: 3,
                 last_error: Some("connection refused".to_string()),
+                software_version: Some("1.0.30".to_string()),
             },
         ),
     ]);
@@ -11006,6 +11017,10 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
         format!("{:?}", view.endpoint_registrations[0].status),
         "Connected"
     );
+    assert_eq!(
+        view.endpoint_registrations[0].software_version.as_deref(),
+        Some("1.0.31")
+    );
     assert_eq!(view.endpoint_registrations[1].url, rendezvous_url_b);
     assert_eq!(
         format!("{:?}", view.endpoint_registrations[1].status),
@@ -11014,6 +11029,10 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
     assert_eq!(
         view.endpoint_registrations[1].last_error.as_deref(),
         Some("connection refused")
+    );
+    assert_eq!(
+        view.endpoint_registrations[1].software_version.as_deref(),
+        Some("1.0.30")
     );
 
     cleanup_test_state(&state).await;

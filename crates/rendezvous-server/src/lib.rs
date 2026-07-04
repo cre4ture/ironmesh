@@ -32,6 +32,8 @@ use crate::auth::{
     ensure_authenticated_peer_identity, require_authenticated_node,
 };
 
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone)]
 pub enum RendezvousServerTlsIdentity {
     Files {
@@ -86,6 +88,7 @@ struct HealthResponse {
     status: &'static str,
     public_url: String,
     registered_endpoints: usize,
+    software_version: &'static str,
 }
 
 pub fn build_router(state: RendezvousAppState) -> Router {
@@ -124,6 +127,7 @@ async fn health(State(state): State<RendezvousAppState>) -> Json<HealthResponse>
         status: "ok",
         public_url: state.config.public_url,
         registered_endpoints: state.presence.len(),
+        software_version: PACKAGE_VERSION,
     })
 }
 
@@ -146,6 +150,7 @@ async fn register_presence(
     let entry = state.presence.register(request);
     Ok(Json(RegisterPresenceResponse {
         accepted: true,
+        software_version: Some(PACKAGE_VERSION.to_string()),
         updated_at_unix: entry.updated_at_unix,
         entry,
     }))

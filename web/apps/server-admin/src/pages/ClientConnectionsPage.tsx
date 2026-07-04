@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   getClientConnections,
+  getRendezvousConfig,
   type ClientConnectionCursor,
   type ClientConnectionEntry,
   type ClientConnectionSummary,
@@ -20,10 +21,12 @@ import {
   Text
 } from "@mantine/core";
 import { useEffect, useState } from "react";
+import { RendezvousRegistrationStateSection } from "../components/RendezvousRegistrationStateSection";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatRelativeUnixTs, formatUnixTs } from "../lib/format";
 
 const CLIENT_CONNECTION_POLL_INTERVAL_MS = 3_000;
+const RENDEZVOUS_REGISTRATION_POLL_INTERVAL_MS = 5_000;
 const RELATIVE_TIME_REFRESH_INTERVAL_MS = 1_000;
 const LIMIT_OPTIONS = ["25", "50", "100", "200"].map((value) => ({
   value,
@@ -88,6 +91,12 @@ export function ClientConnectionsPage() {
     enabled: canInspectConnections,
     refetchInterval: pageIndex === 0 ? CLIENT_CONNECTION_POLL_INTERVAL_MS : false
   });
+  const rendezvousConfigQuery = useQuery({
+    queryKey: ["rendezvous-config", normalizedAdminTokenOverride],
+    queryFn: () => getRendezvousConfig(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectConnections,
+    refetchInterval: RENDEZVOUS_REGISTRATION_POLL_INTERVAL_MS
+  });
 
   const summary = canInspectConnections ? connectionsQuery.data?.summary ?? EMPTY_SUMMARY : EMPTY_SUMMARY;
   const entries = canInspectConnections ? connectionsQuery.data?.entries ?? [] : [];
@@ -133,13 +142,29 @@ export function ClientConnectionsPage() {
             : String(connectionsQuery.error)}
         </Alert>
       ) : null}
+      {rendezvousConfigQuery.error ? (
+        <Alert color="red" title="Rendezvous state unavailable">
+          {rendezvousConfigQuery.error instanceof Error
+            ? rendezvousConfigQuery.error.message
+            : String(rendezvousConfigQuery.error)}
+        </Alert>
+      ) : null}
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={820}>
           Inspect the live device traffic this node is currently handling. HTTP entries cover active
           authenticated client requests, while direct and relay entries represent accepted transport
           sessions that remain open across multiple operations.
         </Text>
-        <Button variant="light" onClick={() => void connectionsQuery.refetch()} loading={connectionsQuery.isFetching}>
+        <Button
+          variant="light"
+          onClick={() => {
+            void Promise.all([
+              connectionsQuery.refetch(),
+              rendezvousConfigQuery.refetch()
+            ]);
+          }}
+          loading={connectionsQuery.isFetching || rendezvousConfigQuery.isFetching}
+        >
           Refresh
         </Button>
       </Group>
@@ -162,6 +187,15 @@ export function ClientConnectionsPage() {
           />
         </Group>
       </Card>
+
+      {rendezvousConfigQuery.data?.registration_enabled ? (
+        <Card withBorder radius="md" padding="lg">
+          <RendezvousRegistrationStateSection
+            rendezvousConfig={rendezvousConfigQuery.data}
+            title="Rendezvous registration state"
+          />
+        </Card>
+      ) : null}
 
       <Card withBorder radius="md" padding="lg">
         <Group justify="space-between" align="center" mb="md">

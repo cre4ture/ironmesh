@@ -69,7 +69,7 @@ import {
   type VersionGraphResponse
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { LogsPage } from "../pages/LogsPage";
@@ -1238,7 +1238,7 @@ function LatencyPage() {
                 Current runtime uses the live embedded client. If bootstrap data is available, the page also probes every configured rendezvous URL individually so relay services can be compared side by side.
               </Text>
               <Table.ScrollContainer minWidth={920}>
-                <Table striped highlightOnHover withTableBorder>
+                <Table highlightOnHover withTableBorder>
                   <Table.Thead>
                     <Table.Tr>
                       <Table.Th>Path</Table.Th>
@@ -1250,50 +1250,70 @@ function LatencyPage() {
                       <Table.Th>Avg overhead</Table.Th>
                       <Table.Th>Session reuse</Table.Th>
                       <Table.Th>Avg throughput</Table.Th>
-                      <Table.Th>Notes</Table.Th>
                     </Table.Tr>
                   </Table.Thead>
                   <Table.Tbody>
-                    {targets.map((target) => (
-                      <Table.Tr key={`${target.path_id}:${target.label}`}>
-                        <Table.Td>
-                          <Stack gap={2}>
-                            <Text size="sm" fw={600}>
-                              {target.label}
-                            </Text>
-                            <Text size="xs" c="dimmed">
-                              {target.target ?? "no explicit target"}
-                            </Text>
-                          </Stack>
-                        </Table.Td>
-                        <Table.Td>
-                          <Badge color={target.transport_mode === "relay" ? "teal" : "blue"} variant="light">
-                            {target.transport_mode}
-                          </Badge>
-                        </Table.Td>
-                        <Table.Td>
-                          <Badge
-                            color={latencyAssessmentColor(target.result?.summary.assessment ?? "warn")}
-                            variant="light"
-                          >
-                            {target.result?.summary.assessment ?? "failed"}
-                          </Badge>
-                        </Table.Td>
-                        <Table.Td>{formatDurationValue(target.result?.summary.avg_total_duration_ms)}</Table.Td>
-                        <Table.Td>{formatDurationValue(target.result?.summary.p95_total_duration_ms)}</Table.Td>
-                        <Table.Td>{formatDurationValue(target.result?.cold_connect_duration_ms)}</Table.Td>
-                        <Table.Td>{formatDurationValue(target.result?.summary.avg_transport_overhead_ms)}</Table.Td>
-                        <Table.Td>{formatLatencySessionReuse(target)}</Table.Td>
-                        <Table.Td>{formatBinaryTransferSpeed(target.result?.summary.avg_throughput_bytes_per_sec)}</Table.Td>
-                        <Table.Td>
-                          <Text size="xs" c={target.error ? "red" : "dimmed"}>
-                            {target.error ??
-                              target.result?.summary.observations.join(" ") ??
-                              "No additional notes."}
-                          </Text>
-                        </Table.Td>
-                      </Table.Tr>
-                    ))}
+                    {targets.map((target) => {
+                      const notes = latencyNotes(target);
+                      const rowKey = `${target.path_id}:${target.label}`;
+
+                      return (
+                        <Fragment key={rowKey}>
+                          <Table.Tr className={notes.length ? "latency-results-main-row" : undefined}>
+                            <Table.Td>
+                              <Stack gap={2}>
+                                <Text size="sm" fw={600}>
+                                  {target.label}
+                                </Text>
+                                <Text size="xs" c="dimmed">
+                                  {target.target ?? "no explicit target"}
+                                </Text>
+                              </Stack>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge color={target.transport_mode === "relay" ? "teal" : "blue"} variant="light">
+                                {target.transport_mode}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge
+                                color={latencyAssessmentColor(target.result?.summary.assessment ?? "warn")}
+                                variant="light"
+                              >
+                                {target.result?.summary.assessment ?? "failed"}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>{formatDurationValue(target.result?.summary.avg_total_duration_ms)}</Table.Td>
+                            <Table.Td>{formatDurationValue(target.result?.summary.p95_total_duration_ms)}</Table.Td>
+                            <Table.Td>{formatDurationValue(target.result?.cold_connect_duration_ms)}</Table.Td>
+                            <Table.Td>{formatDurationValue(target.result?.summary.avg_transport_overhead_ms)}</Table.Td>
+                            <Table.Td>{formatLatencySessionReuse(target)}</Table.Td>
+                            <Table.Td>{formatBinaryTransferSpeed(target.result?.summary.avg_throughput_bytes_per_sec)}</Table.Td>
+                          </Table.Tr>
+                          {notes.length ? (
+                            <Table.Tr className="latency-results-notes-row">
+                              <Table.Td colSpan={9} className="latency-results-notes-cell">
+                                <div className="latency-results-notes-content">
+                                  <span className="latency-results-notes-label">Notes</span>
+                                  <div className="latency-results-notes-list">
+                                    {notes.map((note, noteIndex) => (
+                                      <Text
+                                        key={`${rowKey}:note:${noteIndex}`}
+                                        size="xs"
+                                        c={target.error ? "red" : "dimmed"}
+                                        className="latency-results-notes-text"
+                                      >
+                                        {note}
+                                      </Text>
+                                    ))}
+                                  </div>
+                                </div>
+                              </Table.Td>
+                            </Table.Tr>
+                          ) : null}
+                        </Fragment>
+                      );
+                    })}
                   </Table.Tbody>
                 </Table>
               </Table.ScrollContainer>
@@ -1878,6 +1898,16 @@ function formatLatencySessionReuse(target: ClientLatencyProbeTargetResult | null
     return "n/a";
   }
   return `${stats.connect_count}c / ${stats.reuse_count}r / ${stats.reset_count}x`;
+}
+
+function latencyNotes(target: ClientLatencyProbeTargetResult): string[] {
+  if (target.error) {
+    return [target.error];
+  }
+
+  const observations =
+    target.result?.summary.observations.filter((note) => note.trim().length > 0) ?? [];
+  return observations;
 }
 
 function selectLatencyTargetByAverage(

@@ -673,6 +673,7 @@ export type RendezvousConfigView = {
     last_success_unix: number | null;
     consecutive_failures: number;
     last_error: string | null;
+    software_version: string | null;
   }[];
   mtls_required: boolean;
   persistence_source: "node_enrollment" | "runtime_only";
