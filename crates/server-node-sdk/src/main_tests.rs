@@ -10969,6 +10969,60 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
 }
 
 #[tokio::test]
+async fn rendezvous_registration_success_clears_versionless_heartbeat_but_preserves_relay_version()
+{
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let rendezvous_url = "https://rendezvous-a.example:9443/".to_string();
+    *state.network.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
+    *state.network.rendezvous_registration_state.lock().await = HashMap::from([(
+        rendezvous_url.clone(),
+        super::RendezvousEndpointRegistrationRuntime {
+            last_attempt_unix: Some(10),
+            last_success_unix: Some(10),
+            consecutive_failures: 0,
+            last_error: None,
+            software_version: Some("1.0.31".to_string()),
+        },
+    )]);
+
+    let _ = super::record_rendezvous_registration_success(
+        &state,
+        &rendezvous_url,
+        super::RendezvousRegistrationSuccessVersionUpdate::Sync(None),
+    )
+    .await;
+    {
+        let registration_state = state.network.rendezvous_registration_state.lock().await;
+        let endpoint = registration_state
+            .get(&rendezvous_url)
+            .expect("endpoint state should exist");
+        assert_eq!(endpoint.software_version, None);
+    }
+
+    let _ = super::record_rendezvous_registration_success(
+        &state,
+        &rendezvous_url,
+        super::RendezvousRegistrationSuccessVersionUpdate::Sync(Some("1.0.32")),
+    )
+    .await;
+    let _ = super::record_rendezvous_registration_success(
+        &state,
+        &rendezvous_url,
+        super::RendezvousRegistrationSuccessVersionUpdate::Preserve,
+    )
+    .await;
+    {
+        let registration_state = state.network.rendezvous_registration_state.lock().await;
+        let endpoint = registration_state
+            .get(&rendezvous_url)
+            .expect("endpoint state should exist");
+        assert_eq!(endpoint.software_version.as_deref(), Some("1.0.32"));
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn rendezvous_config_view_includes_endpoint_registration_state() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.network.rendezvous_registration_enabled = true;
