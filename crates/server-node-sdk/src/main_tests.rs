@@ -1304,6 +1304,45 @@ fn s3_signed_request(
     request
 }
 
+fn s3_transport_request(
+    method: Method,
+    external_uri: &str,
+    transport_uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> transport_sdk::BufferedTransportRequest {
+    let request = s3_signed_request(
+        method.clone(),
+        external_uri,
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body.clone(),
+    );
+    let headers = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| transport_sdk::TransportHeader {
+                    name: name.as_str().to_string(),
+                    value: value.to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        method.as_str(),
+        transport_uri,
+        headers,
+        body.to_vec(),
+    )
+}
+
 async fn import_client_credentials_upserts_idempotently_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let source_node_id = NodeId::new_v4();
@@ -2141,6 +2180,123 @@ run_on_main_metadata_backends!(
     s3_listener_supports_bucket_listing_and_object_crud_impl,
     s3_listener_supports_bucket_listing_and_object_crud,
     s3_listener_supports_bucket_listing_and_object_crud_turso
+);
+
+async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-transport-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let scope =
+        super::transport_service::TransportExecutionScope::Internal(super::InternalCaller {
+            node_id: NodeId::new_v4(),
+            cluster_id: state.cluster_id,
+        });
+
+    let list_buckets_request = s3_transport_request(
+        Method::GET,
+        "/",
+        "/s3/",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let list_buckets = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &list_buckets_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(list_buckets.status, StatusCode::OK.as_u16());
+    let list_buckets_xml = String::from_utf8(list_buckets.body).unwrap();
+    assert!(list_buckets_xml.contains("<Name>photos.example</Name>"));
+
+    let payload = Bytes::from_static(b"transported through multiplex");
+    let put_object_request = s3_transport_request(
+        Method::PUT,
+        "/photos.example/docs/transport.txt",
+        "/s3/photos.example/docs/transport.txt",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[("content-type", "text/plain")],
+        payload.clone(),
+    );
+    let put_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &put_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(put_object.status, StatusCode::OK.as_u16());
+
+    let get_object_request = s3_transport_request(
+        Method::GET,
+        "/photos.example/docs/transport.txt",
+        "/s3/photos.example/docs/transport.txt",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let get_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &get_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(get_object.status, StatusCode::OK.as_u16());
+    assert_eq!(get_object.body.as_slice(), payload.as_ref());
+    assert!(get_object.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("x-amz-version-id") && !header.value.is_empty()
+    }));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_transport_executes_listener_requests_impl,
+    s3_transport_executes_listener_requests,
+    s3_transport_executes_listener_requests_turso
 );
 
 #[tokio::test]

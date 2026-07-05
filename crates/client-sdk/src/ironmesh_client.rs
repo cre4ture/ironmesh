@@ -2206,6 +2206,41 @@ impl IronMeshClient {
         runtime.block_on(self.wait_for_store_index_change(since, timeout_ms))
     }
 
+    pub async fn request_relative_path(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RelativePathResponse> {
+        let url = self.relative_url(path)?;
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| RelayHttpHeader { name, value })
+            .collect::<Vec<_>>();
+        let response = self
+            .execute_buffered_request(method, url, headers, body)
+            .await
+            .with_context(|| format!("failed to request {path}"))?;
+        Ok(RelativePathResponse {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
+    }
+
+    pub fn request_relative_path_blocking(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RelativePathResponse> {
+        let path = path.to_string();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.request_relative_path(method, &path, headers, body))
+    }
+
     pub async fn get_json_path(&self, path: &str) -> Result<serde_json::Value> {
         let url = self.relative_url(path)?;
         let response = self

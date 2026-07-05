@@ -1,4 +1,10 @@
 use anyhow::{Context, Result, bail};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::{OriginalUri, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
 use bytes::Bytes;
 use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
@@ -60,6 +66,11 @@ struct LatencyTestSuiteResult {
     targets: Vec<LatencyTestPathResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<LatencyProbeComparison>,
+}
+
+#[derive(Clone)]
+struct S3GatewayState {
+    client: IronMeshClient,
 }
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
@@ -127,6 +138,10 @@ enum Commands {
         max_average_ms: Option<f64>,
         #[arg(long)]
         max_p95_ms: Option<f64>,
+    },
+    ServeS3 {
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        bind: String,
     },
     ServeWeb {
         #[arg(long, default_value = "127.0.0.1:8081")]
@@ -235,6 +250,25 @@ async fn main() -> Result<()> {
             }
             validate_latency_test_thresholds(&suite, *max_average_ms, *max_p95_ms)
         }
+        Commands::ServeS3 { bind } => {
+            let bind_addr: SocketAddr = bind.parse()?;
+            let client = build_authenticated_sdk_from_cli(&cli).await?;
+            log_client_transport_ready("serve_s3", &client);
+            info!(
+                bind_addr = %bind_addr,
+                transport_mode = current_transport_mode(&client),
+                target = describe_current_target(&client).as_deref().unwrap_or("<unknown>"),
+                "starting S3 gateway"
+            );
+
+            let app = Router::new()
+                .route("/", any(s3_gateway_proxy))
+                .route("/{*path}", any(s3_gateway_proxy))
+                .with_state(S3GatewayState { client });
+            let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+            axum::serve(listener, app).await?;
+            Ok(())
+        }
         Commands::ServeWeb { bind } => {
             let bind_addr: SocketAddr = bind.parse()?;
             info!(
@@ -282,6 +316,61 @@ async fn main() -> Result<()> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+    }
+}
+
+async fn s3_gateway_proxy(
+    State(state): State<S3GatewayState>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let transport_path = s3_transport_proxy_path(&uri);
+    let forwarded_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect::<Vec<_>>();
+    let response = match state
+        .client
+        .request_relative_path(
+            method,
+            &transport_path,
+            forwarded_headers,
+            (!body.is_empty()).then(|| body.to_vec()),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("failed forwarding S3 request through Ironmesh transport: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut proxy_response = Response::new(Body::from(response.body));
+    *proxy_response.status_mut() = response.status;
+    *proxy_response.headers_mut() = response.headers;
+    proxy_response
+}
+
+fn s3_transport_proxy_path(uri: &axum::http::Uri) -> String {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    if path_and_query == "/" {
+        "/s3/".to_string()
+    } else {
+        format!("/s3{path_and_query}")
     }
 }
 
@@ -943,6 +1032,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::ReplicationPlan => "replication-plan",
         Commands::CacheList => "cache-list",
         Commands::LatencyTest { .. } => "latency-test",
+        Commands::ServeS3 { .. } => "serve-s3",
         Commands::ServeWeb { .. } => "serve-web",
     }
 }
@@ -1100,5 +1190,33 @@ mod tests {
             Some("http://127.0.0.1:8080")
         );
         assert_eq!(connection_source(&cli), "server_base_url");
+    }
+
+    #[test]
+    fn cli_accepts_serve_s3_subcommand() {
+        let cli = Cli::try_parse_from([
+            "ironmesh",
+            "--server-base-url",
+            "http://127.0.0.1:8080",
+            "serve-s3",
+            "--bind",
+            "127.0.0.1:9001",
+        ])
+        .expect("serve-s3 command should parse");
+
+        assert!(matches!(cli.command, Commands::ServeS3 { .. }));
+        assert_eq!(command_name(&cli.command), "serve-s3");
+    }
+
+    #[test]
+    fn s3_transport_proxy_path_preserves_root_and_query() {
+        let root_uri: axum::http::Uri = "/".parse().unwrap();
+        assert_eq!(s3_transport_proxy_path(&root_uri), "/s3/");
+
+        let object_uri: axum::http::Uri = "/bucket/photos/cat.jpg?versionId=v1".parse().unwrap();
+        assert_eq!(
+            s3_transport_proxy_path(&object_uri),
+            "/s3/bucket/photos/cat.jpg?versionId=v1"
+        );
     }
 }

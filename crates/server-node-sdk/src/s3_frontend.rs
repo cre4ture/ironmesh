@@ -1,16 +1,19 @@
 use super::*;
 use crate::storage::{ObjectVersionMetadataRecord, S3ObjectVersionRecord};
+use axum::body::Body;
 use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{HeaderName, Method, Uri};
+use axum::http::{HeaderName, Method, Request, StatusCode, Uri};
 use axum::routing::get;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
+use tower::ServiceExt;
 
 const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const S3_MAX_LIST_KEYS: usize = 1000;
 const S3_LIST_DEFAULT_MAX_KEYS: usize = 1000;
 const S3_UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+pub(crate) const S3_TRANSPORT_PREFIX: &str = "/s3";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -82,6 +85,76 @@ pub(crate) fn build_listener_app() -> Router<ServerState> {
                 .delete(delete_object)
                 .post(s3_not_implemented_object_post),
         )
+}
+
+pub(crate) fn is_transport_path(path: &str) -> bool {
+    path == S3_TRANSPORT_PREFIX
+        || path == "/s3/"
+        || path.starts_with("/s3/")
+        || path.starts_with("/s3?")
+}
+
+pub(crate) async fn execute_transport_request(
+    state: ServerState,
+    method: Method,
+    raw_path: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(listener_path) = listener_path_from_transport_path(raw_path) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "the specified bucket does not exist",
+            raw_path,
+            &new_s3_request_id(),
+        );
+    };
+    let uri = match listener_path.parse::<Uri>() {
+        Ok(uri) => uri,
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidURI",
+                &format!("failed to parse transport S3 path: {err}"),
+                raw_path,
+                &new_s3_request_id(),
+            );
+        }
+    };
+
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::from(body))
+        .expect("S3 transport requests use valid methods and URIs");
+    *request.headers_mut() = headers;
+
+    match build_listener_app()
+        .with_state(state)
+        .oneshot(request)
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed dispatching S3 transport request: {err}"),
+            raw_path,
+            &new_s3_request_id(),
+        ),
+    }
+}
+
+fn listener_path_from_transport_path(raw_path: &str) -> Option<String> {
+    let trimmed = raw_path.trim();
+    let remainder = trimmed.strip_prefix(S3_TRANSPORT_PREFIX)?;
+    Some(match remainder {
+        "" | "/" => "/".to_string(),
+        value if value.starts_with('/') => value.to_string(),
+        value if value.starts_with('?') => format!("/{value}"),
+        value => format!("/{value}"),
+    })
 }
 
 async fn list_buckets(

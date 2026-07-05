@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, Uri};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use tower::ServiceExt;
@@ -25,7 +26,7 @@ use crate::{
     request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
     require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
     run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
-    start_upload_session, storage_stats_current, storage_stats_history,
+    s3_frontend, start_upload_session, storage_stats_current, storage_stats_history,
     transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
     validate_client_auth_request, wait_for_store_index_change,
 };
@@ -135,6 +136,36 @@ async fn try_execute_direct_transport_request(
                 anyhow::anyhow!("failed parsing latency diagnostic query {raw_path}: {err}")
             })?;
             Some(latency_diagnostic(State(state.clone()), Query(query)).await)
+        }
+        (method @ ("GET" | "HEAD" | "PUT" | "DELETE" | "POST"), path)
+            if s3_frontend::is_transport_path(path) =>
+        {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
+            let method = axum::http::Method::from_bytes(method.as_bytes()).map_err(|err| {
+                anyhow::anyhow!("failed parsing S3 transport method {method}: {err}")
+            })?;
+            Some(
+                s3_frontend::execute_transport_request(
+                    state.clone(),
+                    method,
+                    raw_path,
+                    headers.clone(),
+                    Bytes::from(request.body.clone()),
+                )
+                .await,
+            )
         }
         ("GET", "/store/index") => {
             if let Some(response) = authorize_direct_transport_fast_path(
