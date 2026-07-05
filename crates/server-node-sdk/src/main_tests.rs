@@ -31,11 +31,13 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::extract::{Json, Path, Query, State};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use bytes::Bytes;
 use futures_util::{Sink, Stream};
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 #[cfg(unix)]
@@ -47,6 +49,7 @@ use uuid::Uuid;
 use x509_parser::prelude::FromDer;
 
 const TEST_ADMIN_TOKEN: &str = "system-test-admin";
+type TestHmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Copy)]
 enum MainTestBackend {
@@ -305,6 +308,8 @@ fn test_cluster_config_without_internal_tls(
         metadata_backend: super::storage::MetadataBackendKind::Sqlite,
         bind_addr,
         public_url: Some(format!("http://{bind_addr}")),
+        s3_bind_addr: None,
+        s3_public_url: None,
         labels,
         public_tls: None,
         allow_insecure_public_http: true,
@@ -1180,6 +1185,125 @@ fn sample_s3_access_key_record(
     }
 }
 
+fn s3_test_hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+fn s3_test_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    s3_test_hex_encode(&hasher.finalize())
+}
+
+fn s3_test_hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = TestHmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key sizes");
+    mac.update(data);
+    let bytes = mac.finalize().into_bytes();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&bytes);
+    output
+}
+
+fn s3_test_derive_signing_key(
+    secret_material: &str,
+    date_scope: &str,
+    region: &str,
+    service: &str,
+) -> Vec<u8> {
+    let secret_key = format!("AWS4{secret_material}");
+    let date_key = s3_test_hmac_sha256(secret_key.as_bytes(), date_scope.as_bytes());
+    let region_key = s3_test_hmac_sha256(&date_key, region.as_bytes());
+    let service_key = s3_test_hmac_sha256(&region_key, service.as_bytes());
+    s3_test_hmac_sha256(&service_key, b"aws4_request").to_vec()
+}
+
+fn s3_signed_request(
+    method: Method,
+    uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> Request<Body> {
+    let host = "s3.local";
+    let amz_date = "20260705T120000Z";
+    let date_scope = "20260705";
+    let region = "us-east-1";
+    let service = "s3";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let payload_hash = s3_test_sha256_hex(body.as_ref());
+    let parsed_uri: Uri = uri.parse().unwrap();
+    let canonical_uri = if parsed_uri.path().is_empty() {
+        "/"
+    } else {
+        parsed_uri.path()
+    };
+    let canonical_query = {
+        let mut pairs = parsed_uri
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (name.to_string(), value.to_string())
+            })
+            .collect::<Vec<_>>();
+        pairs.sort();
+        pairs
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    let canonical_request = format!(
+        "{}\n{}\n{}\nhost:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n\n{signed_headers}\n{payload_hash}",
+        method.as_str(),
+        canonical_uri,
+        canonical_query,
+    );
+    let credential_scope = format!("{date_scope}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        s3_test_sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+    let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
+        &signing_key,
+        string_to_sign.as_bytes(),
+    ));
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    let mut request = Request::builder()
+        .method(method)
+        .uri(parsed_uri)
+        .body(Body::from(body))
+        .unwrap();
+    request.headers_mut().insert("host", host.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-amz-date", amz_date.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-amz-content-sha256", payload_hash.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("authorization", authorization.parse().unwrap());
+    for (name, value) in extra_headers {
+        request.headers_mut().insert(
+            name.parse::<axum::http::HeaderName>().unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    request
+}
+
 async fn import_client_credentials_upserts_idempotently_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let source_node_id = NodeId::new_v4();
@@ -1724,6 +1848,299 @@ run_on_main_metadata_backends!(
     s3_control_plane_import_merges_tombstones_and_revocations_impl,
     s3_control_plane_import_merges_tombstones_and_revocations,
     s3_control_plane_import_merges_tombstones_and_revocations_turso
+);
+
+async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-listener-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let list_buckets = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_buckets.status(), StatusCode::OK);
+    let list_buckets_body = to_bytes(list_buckets.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_buckets_xml = String::from_utf8(list_buckets_body.to_vec()).unwrap();
+    assert!(list_buckets_xml.contains("<Name>photos.example</Name>"));
+
+    let head_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/photos.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+
+    let payload = Bytes::from_static(b"hello from the S3 listener");
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[
+                ("content-type", "text/plain"),
+                ("cache-control", "max-age=60"),
+                ("x-amz-meta-color", "blue"),
+            ],
+            payload.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+    let put_etag = put_object
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let put_version_id = put_object
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(put_etag.starts_with('"'));
+    assert!(!put_version_id.is_empty());
+
+    {
+        let store = lock_store(&state, "tests.s3_listener.verify_put_metadata").await;
+        let metadata = store
+            .load_object_version_metadata(&put_version_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(metadata.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(
+            metadata.user_metadata.get("color").map(String::as_str),
+            Some("blue")
+        );
+
+        let version_record = store
+            .load_s3_object_version("photos.example", &put_version_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version_record.ironmesh_key, "tenant/photos/docs/hello.txt");
+
+        let versions = store
+            .list_s3_object_versions_for_key("photos.example", "tenant/photos/docs/hello.txt")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, put_version_id);
+    }
+
+    let list_objects = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    let list_objects_body = to_bytes(list_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_objects_xml = String::from_utf8(list_objects_body.to_vec()).unwrap();
+    assert!(list_objects_xml.contains("<Key>docs/hello.txt</Key>"));
+
+    let get_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    assert_eq!(
+        get_object
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=60")
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get("x-amz-meta-color")
+            .and_then(|value| value.to_str().ok()),
+        Some("blue")
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(put_etag.as_str())
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(put_version_id.as_str())
+    );
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), payload.as_ref());
+
+    let delete_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+    let delete_version_id = delete_object
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_ne!(delete_version_id, put_version_id);
+
+    {
+        let store = lock_store(&state, "tests.s3_listener.verify_delete_metadata").await;
+        let versions = store
+            .list_s3_object_versions_for_key("photos.example", "tenant/photos/docs/hello.txt")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions
+                .iter()
+                .any(|record| record.version_id == put_version_id)
+        );
+        assert!(
+            versions
+                .iter()
+                .any(|record| record.version_id == delete_version_id)
+        );
+    }
+
+    let get_deleted_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+    let get_deleted_current_body = to_bytes(get_deleted_current.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_deleted_current_xml = String::from_utf8(get_deleted_current_body.to_vec()).unwrap();
+    assert!(get_deleted_current_xml.contains("<Code>NoSuchKey</Code>"));
+
+    let get_old_version = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/photos.example/docs/hello.txt?versionId={put_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_old_version.status(), StatusCode::OK);
+    let get_old_version_body = to_bytes(get_old_version.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(get_old_version_body.as_ref(), payload.as_ref());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_bucket_listing_and_object_crud_impl,
+    s3_listener_supports_bucket_listing_and_object_crud,
+    s3_listener_supports_bucket_listing_and_object_crud_turso
 );
 
 #[tokio::test]

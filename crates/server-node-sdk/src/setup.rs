@@ -1828,6 +1828,8 @@ mod tests {
             metadata_backend: storage::MetadataBackendKind::Sqlite,
             bind_addr,
             public_url: Some(format!("http://{bind_addr}")),
+            s3_bind_addr: None,
+            s3_public_url: None,
             labels,
             public_tls: None,
             allow_insecure_public_http: true,

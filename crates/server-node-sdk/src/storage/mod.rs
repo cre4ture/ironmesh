@@ -2543,7 +2543,11 @@ impl PersistentStore {
         read_mode: ObjectReadMode,
     ) -> std::result::Result<String, StoreReadError> {
         let manifest_hash = if let Some(version_id) = version_id {
-            let Some(object_id) = self.object_id_for_key(key) else {
+            let Some(object_id) = self
+                .resolve_object_id_for_key_version(key, version_id)
+                .await
+                .map_err(StoreReadError::Internal)?
+            else {
                 return Err(StoreReadError::NotFound);
             };
             let index = self

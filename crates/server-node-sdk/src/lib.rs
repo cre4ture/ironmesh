@@ -108,6 +108,7 @@ use x509_parser::prelude::FromDer;
 mod cluster;
 mod embedded_rendezvous;
 mod replication;
+mod s3_frontend;
 mod setup;
 mod storage;
 mod transport_service;
@@ -2220,6 +2221,8 @@ pub struct ServerNodeConfig {
     metadata_backend: MetadataBackendKind,
     pub bind_addr: SocketAddr,
     pub public_url: Option<String>,
+    pub s3_bind_addr: Option<SocketAddr>,
+    pub s3_public_url: Option<String>,
     pub labels: HashMap<String, String>,
     pub public_tls: Option<PublicTlsConfig>,
     pub allow_insecure_public_http: bool,
@@ -4083,6 +4086,11 @@ impl ServerNodeConfig {
             )?,
             bind_addr,
             public_url: bootstrap.public_url,
+            s3_bind_addr: std::env::var("IRONMESH_S3_BIND")
+                .ok()
+                .map(|value| value.parse().context("invalid IRONMESH_S3_BIND"))
+                .transpose()?,
+            s3_public_url: std::env::var("IRONMESH_S3_PUBLIC_URL").ok(),
             labels: bootstrap.labels,
             public_tls,
             allow_insecure_public_http,
@@ -4266,6 +4274,13 @@ impl ServerNodeConfig {
             };
             Some(format!("{scheme}://{bind_addr}"))
         });
+        let s3_bind_addr: Option<SocketAddr> = std::env::var("IRONMESH_S3_BIND")
+            .ok()
+            .map(|value| value.parse().context("invalid IRONMESH_S3_BIND"))
+            .transpose()?;
+        let s3_public_url = std::env::var("IRONMESH_S3_PUBLIC_URL").ok().or_else(|| {
+            s3_bind_addr.map(|addr| default_public_url(&addr.to_string(), public_tls.is_some()))
+        });
         let explicit_rendezvous_urls = std::env::var("IRONMESH_RENDEZVOUS_URLS")
             .ok()
             .map(|value| {
@@ -4356,6 +4371,8 @@ impl ServerNodeConfig {
             )?,
             bind_addr,
             public_url,
+            s3_bind_addr,
+            s3_public_url,
             labels,
             public_tls,
             allow_insecure_public_http,
@@ -5342,9 +5359,9 @@ async fn run_inner(
         s3: ServerS3Runtime {
             control_plane: Arc::new(Mutex::new(persisted_s3_control_plane)),
             sync_runtime: Arc::new(StdMutex::new(S3ControlPlaneSyncRuntime::default())),
-            listener_enabled: false,
-            public_url: None,
-            tls_enabled: false,
+            listener_enabled: config.s3_bind_addr.is_some(),
+            public_url: config.s3_public_url.clone(),
+            tls_enabled: config.s3_bind_addr.is_some() && config.public_tls.is_some(),
         },
         network: ServerNetworkRuntime {
             public_ca_pem,
@@ -5441,6 +5458,7 @@ async fn run_inner(
 struct ServerApps {
     public_app: Router,
     internal_app: Router,
+    s3_app: Router,
 }
 
 async fn start_background_runtimes(
@@ -5935,9 +5953,18 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             require_internal_caller,
         ));
 
+    let s3_app = s3_frontend::build_listener_app()
+        .with_state(state.clone())
+        .layer(middleware::from_fn(log_named_client_request))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_inflight_requests,
+        ));
+
     ServerApps {
         public_app,
         internal_app,
+        s3_app,
     }
 }
 
@@ -5949,10 +5976,13 @@ async fn run_server_listeners(
     let ServerApps {
         public_app,
         internal_app,
+        s3_app,
     } = apps;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut internal_server_handle = None;
     let mut internal_server_task = None;
+    let mut s3_server_handle = None;
+    let mut s3_server_task = None;
     let mut embedded_rendezvous_task = None;
 
     if let Some(internal_tls) = config.internal_tls.as_ref() {
@@ -5989,6 +6019,46 @@ async fn run_server_listeners(
             managed_rendezvous,
             shutdown_rx.clone(),
         ));
+    }
+
+    if let Some(s3_bind_addr) = config.s3_bind_addr {
+        info!(
+            bind_addr = %s3_bind_addr,
+            node_id = %config.node_id,
+            tls_enabled = config.public_tls.is_some(),
+            public_url = %config
+                .s3_public_url
+                .clone()
+                .unwrap_or_else(|| default_public_url(&s3_bind_addr.to_string(), config.public_tls.is_some())),
+            "server node S3 listener"
+        );
+
+        if config.public_tls.is_some() {
+            let tls_config = state
+                .network
+                .public_tls_runtime
+                .as_ref()
+                .map(|runtime| runtime.config.clone())
+                .context("public TLS runtime missing for configured S3 listener")?;
+            let handle = Handle::new();
+            s3_server_handle = Some(handle.clone());
+            s3_server_task = Some(tokio::spawn(async move {
+                axum_server::bind_rustls(s3_bind_addr, tls_config)
+                    .handle(handle)
+                    .serve(s3_app.into_make_service())
+                    .await
+                    .context("S3 TLS server listener stopped")
+            }));
+        } else {
+            let shutdown_rx = shutdown_rx.clone();
+            s3_server_task = Some(tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(s3_bind_addr).await?;
+                axum::serve(listener, s3_app)
+                    .with_graceful_shutdown(wait_for_shutdown_trigger(shutdown_rx))
+                    .await
+                    .context("S3 HTTP server listener stopped")
+            }));
+        }
     }
 
     info!(
@@ -6029,12 +6099,28 @@ async fn run_server_listeners(
 
     tokio::select! {
         outcome = &mut public_server_task => {
-            outcome.context("public server task join failure")??;
+            let result = outcome.context("public server task join failure")?;
+            result?;
+        }
+        outcome = async {
+            match s3_server_task.as_mut() {
+                Some(task) => {
+                    let result = task.await.context("S3 server task join failure")?;
+                    result?;
+                    Ok::<(), anyhow::Error>(())
+                }
+                None => std::future::pending::<Result<()>>().await,
+            }
+        } => {
+            outcome?;
         }
         _ = shutdown_signal() => {
             info!(node_id = %state.node_id, "shutdown signal received");
             let _ = shutdown_tx.send(true);
             if let Some(handle) = public_server_handle.as_ref() {
+                handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            }
+            if let Some(handle) = s3_server_handle.as_ref() {
                 handle.graceful_shutdown(Some(Duration::from_secs(5)));
             }
             if let Some(handle) = internal_server_handle.as_ref() {
@@ -6044,6 +6130,9 @@ async fn run_server_listeners(
             public_server_task
                 .await
                 .context("public server task join failure")??;
+            if let Some(task) = s3_server_task.take() {
+                task.await.context("S3 server task join failure")??;
+            }
             if let Some(task) = internal_server_task.take() {
                 task.await.context("internal server task join failure")??;
             }
@@ -6058,8 +6147,14 @@ async fn run_server_listeners(
     }
 
     let _ = shutdown_tx.send(true);
+    if let Some(handle) = s3_server_handle.as_ref() {
+        handle.graceful_shutdown(Some(Duration::from_secs(0)));
+    }
     if let Some(handle) = internal_server_handle.as_ref() {
         handle.graceful_shutdown(Some(Duration::from_secs(0)));
+    }
+    if let Some(task) = s3_server_task {
+        task.await.context("S3 server task join failure")??;
     }
     if let Some(task) = internal_server_task {
         task.await.context("internal server task join failure")??;
