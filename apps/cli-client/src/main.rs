@@ -1206,7 +1206,106 @@ fn unix_ts_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
+    use axum::http::{Uri, header};
     use clap::Parser;
+    use futures_util::stream;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Debug, Clone)]
+    struct ObservedGatewayRequest {
+        method: Method,
+        path_and_query: String,
+        content_type: Option<String>,
+        forwarded_test_header: Option<String>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct GatewayTargetState {
+        requests: Arc<Mutex<Vec<ObservedGatewayRequest>>>,
+    }
+
+    async fn gateway_target_handler(
+        State(state): State<GatewayTargetState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Response {
+        let body = to_bytes(body, usize::MAX)
+            .await
+            .expect("gateway target request body should read");
+        state.requests.lock().await.push(ObservedGatewayRequest {
+            method: method.clone(),
+            path_and_query: uri
+                .path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| uri.path().to_string()),
+            content_type: headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            forwarded_test_header: headers
+                .get("x-forwarded-test")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            body: body.to_vec(),
+        });
+
+        match (method, uri.path()) {
+            (Method::GET, "/s3/files.example/docs/read.txt") => {
+                let body = Body::from_stream(stream::iter([
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"streamed ")),
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"through gateway")),
+                ]));
+                let mut response = Response::new(body);
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/plain"),
+                );
+                response.headers_mut().insert(
+                    header::ETAG,
+                    header::HeaderValue::from_static("\"gateway-etag\""),
+                );
+                response
+            }
+            (Method::PUT, "/s3/files.example/docs/write.txt") => {
+                let mut response = StatusCode::OK.into_response();
+                response.headers_mut().insert(
+                    "x-amz-version-id",
+                    header::HeaderValue::from_static("gateway-version"),
+                );
+                response
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn spawn_gateway_target_server() -> (
+        String,
+        Arc<Mutex<Vec<ObservedGatewayRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gateway target listener should bind");
+        let bind_addr = listener.local_addr().expect("gateway target listener addr");
+        let state = GatewayTargetState::default();
+        let observed_requests = Arc::clone(&state.requests);
+        let app = Router::new()
+            .route("/s3", any(gateway_target_handler))
+            .route("/s3/{*path}", any(gateway_target_handler))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("gateway target test server should serve");
+        });
+        (format!("http://{bind_addr}"), observed_requests, handle)
+    }
 
     #[test]
     fn cli_accepts_server_base_url_flag() {
@@ -1268,5 +1367,109 @@ mod tests {
             s3_transport_proxy_path(&object_uri),
             "/s3/bucket/photos/cat.jpg?versionId=v1"
         );
+    }
+
+    #[tokio::test]
+    async fn s3_gateway_proxy_forwards_direct_get_and_put_requests() {
+        let (target_base_url, observed_requests, target_handle) =
+            spawn_gateway_target_server().await;
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gateway proxy listener should bind");
+        let proxy_bind_addr = proxy_listener
+            .local_addr()
+            .expect("gateway proxy listener addr");
+        let proxy_app = Router::new()
+            .route("/", any(s3_gateway_proxy))
+            .route("/{*path}", any(s3_gateway_proxy))
+            .with_state(S3GatewayState {
+                client: IronMeshClient::from_direct_base_url(target_base_url),
+            });
+        let proxy_handle = tokio::spawn(async move {
+            axum::serve(proxy_listener, proxy_app)
+                .await
+                .expect("gateway proxy test server should serve");
+        });
+        let proxy_base_url = format!("http://{proxy_bind_addr}");
+        let http = reqwest::Client::new();
+
+        let get_response = http
+            .get(format!(
+                "{proxy_base_url}/files.example/docs/read.txt?versionId=v1"
+            ))
+            .header("x-forwarded-test", "read")
+            .send()
+            .await
+            .expect("gateway GET should respond");
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(
+            get_response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            get_response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"gateway-etag\"")
+        );
+        let get_body = get_response
+            .bytes()
+            .await
+            .expect("gateway GET body should read");
+        assert_eq!(get_body.as_ref(), b"streamed through gateway");
+
+        let put_response = http
+            .put(format!("{proxy_base_url}/files.example/docs/write.txt"))
+            .header(header::CONTENT_TYPE.as_str(), "text/plain")
+            .header("x-forwarded-test", "write")
+            .body("gateway body")
+            .send()
+            .await
+            .expect("gateway PUT should respond");
+        assert_eq!(put_response.status(), StatusCode::OK);
+        assert_eq!(
+            put_response
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("gateway-version")
+        );
+
+        let observed_requests = observed_requests.lock().await.clone();
+        assert_eq!(observed_requests.len(), 2);
+        assert_eq!(observed_requests[0].method, Method::GET);
+        assert_eq!(
+            observed_requests[0].path_and_query,
+            "/s3/files.example/docs/read.txt?versionId=v1"
+        );
+        assert_eq!(
+            observed_requests[0].forwarded_test_header.as_deref(),
+            Some("read")
+        );
+        assert!(observed_requests[0].body.is_empty());
+
+        assert_eq!(observed_requests[1].method, Method::PUT);
+        assert_eq!(
+            observed_requests[1].path_and_query,
+            "/s3/files.example/docs/write.txt"
+        );
+        assert_eq!(
+            observed_requests[1].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            observed_requests[1].forwarded_test_header.as_deref(),
+            Some("write")
+        );
+        assert_eq!(observed_requests[1].body, b"gateway body");
+
+        proxy_handle.abort();
+        let _ = proxy_handle.await;
+        target_handle.abort();
+        let _ = target_handle.await;
     }
 }

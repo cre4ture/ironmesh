@@ -1990,6 +1990,236 @@ run_on_main_metadata_backends!(
     s3_control_plane_import_merges_tombstones_and_revocations_turso
 );
 
+async fn s3_control_plane_sync_once_enables_s3_crud_on_peer_impl(backend: MainTestBackend) {
+    let mut source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    source.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(source.clone()),
+        headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(source.clone()),
+        headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("peer-sync-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/inbox/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(source.clone(), &target).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+
+    super::sync_s3_control_plane_once(&target).await;
+
+    wait_for_condition(
+        "s3 control plane sync import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let access_key_id = created_access_key.access_key_id.clone();
+            async move {
+                let control_plane = target.s3.control_plane.lock().await;
+                control_plane.buckets.iter().any(|bucket| {
+                    bucket.bucket_name == "photos.example" && bucket.deleted_at_unix.is_none()
+                }) && control_plane
+                    .access_keys
+                    .iter()
+                    .any(|access_key| access_key.access_key_id == access_key_id)
+            }
+        },
+    )
+    .await;
+
+    let status = super::build_s3_control_plane_status_response(&target).await;
+    assert_eq!(status.bucket_count, 1);
+    assert_eq!(status.access_key_count, 1);
+    assert_eq!(status.last_source_node_id, Some(source.node_id));
+
+    let app = super::s3_frontend::build_listener_app().with_state(target.clone());
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/inbox/peer-sync.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"synced through peer"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let get_object = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example/inbox/peer-sync.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), b"synced through peer");
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_sync_once_enables_s3_crud_on_peer_impl,
+    s3_control_plane_sync_once_enables_s3_crud_on_peer,
+    s3_control_plane_sync_once_enables_s3_crud_on_peer_turso
+);
+
+async fn s3_control_plane_fanout_enables_s3_crud_on_peer_impl(backend: MainTestBackend) {
+    let mut source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    source.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let headers = test_admin_headers();
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(target.clone(), &source).await;
+    register_online_source_node(&source, &target, &peer_base_url).await;
+
+    let create_bucket = super::create_s3_bucket(
+        State(source.clone()),
+        headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "fanout.example".to_string(),
+            root_prefix: Some("tenant/fanout".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(source.clone()),
+        headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("fanout-test".to_string()),
+            bucket_scope: vec!["fanout.example".to_string()],
+            prefix_scope: vec!["tenant/fanout/uploads/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    wait_for_condition(
+        "s3 control plane fanout import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let access_key_id = created_access_key.access_key_id.clone();
+            async move {
+                let control_plane = target.s3.control_plane.lock().await;
+                control_plane.buckets.iter().any(|bucket| {
+                    bucket.bucket_name == "fanout.example" && bucket.deleted_at_unix.is_none()
+                }) && control_plane
+                    .access_keys
+                    .iter()
+                    .any(|access_key| access_key.access_key_id == access_key_id)
+            }
+        },
+    )
+    .await;
+
+    let status = super::build_s3_control_plane_status_response(&target).await;
+    assert_eq!(status.bucket_count, 1);
+    assert_eq!(status.access_key_count, 1);
+    assert_eq!(status.last_source_node_id, Some(source.node_id));
+
+    let app = super::s3_frontend::build_listener_app().with_state(target.clone());
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/fanout.example/uploads/fanout.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"fanout replicated"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let get_object = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/fanout.example/uploads/fanout.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), b"fanout replicated");
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_fanout_enables_s3_crud_on_peer_impl,
+    s3_control_plane_fanout_enables_s3_crud_on_peer,
+    s3_control_plane_fanout_enables_s3_crud_on_peer_turso
+);
+
 async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
@@ -11977,6 +12207,37 @@ async fn spawn_internal_peer_api_server(
         .expect("test peer listener should bind");
     let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
     let app = super::build_internal_peer_api().with_state(state);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("internal peer api should serve in tests");
+    });
+    (peer_base_url, handle)
+}
+
+async fn spawn_internal_peer_api_server_for_caller(
+    state: ServerState,
+    caller: &ServerState,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test peer listener should bind");
+    let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let internal_caller = super::InternalCaller {
+        node_id: caller.node_id,
+        cluster_id: caller.cluster_id,
+    };
+    let app = super::build_internal_peer_api()
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            move |mut request: Request<Body>, next: axum::middleware::Next| {
+                let internal_caller = internal_caller.clone();
+                async move {
+                    request.extensions_mut().insert(internal_caller);
+                    next.run(request).await
+                }
+            },
+        ));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
             .await
