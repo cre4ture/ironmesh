@@ -2477,6 +2477,200 @@ run_on_main_metadata_backends!(
     s3_listener_supports_bucket_create_and_delete_turso
 );
 
+async fn s3_listener_supports_delete_objects_batches_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "batch.example".to_string(),
+            root_prefix: Some("tenant/batch".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-delete-objects-test".to_string()),
+            bucket_scope: vec!["batch.example".to_string()],
+            prefix_scope: vec!["tenant/batch/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let put_v1 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/batch.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version one"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v1.status(), StatusCode::OK);
+    let v1_version_id = put_v1
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let put_v2 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/batch.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version two"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v2.status(), StatusCode::OK);
+
+    let put_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/batch.example/docs/current.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"current payload"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_current.status(), StatusCode::OK);
+
+    let delete_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Object><Key>docs/versioned.txt</Key><VersionId>{v1_version_id}</VersionId></Object>
+  <Object><Key>docs/current.txt</Key></Object>
+  <Object><Key>docs/missing.txt</Key></Object>
+  <Object><Key>docs/versioned.txt</Key><VersionId>missing-version</VersionId></Object>
+</Delete>"#
+    );
+    let delete_objects = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/batch.example?delete=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from(delete_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_objects.status(), StatusCode::OK);
+    let delete_objects_body = to_bytes(delete_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_objects_xml = String::from_utf8(delete_objects_body.to_vec()).unwrap();
+    assert!(delete_objects_xml.contains(&format!(
+        "<Deleted><Key>docs/versioned.txt</Key><VersionId>{v1_version_id}</VersionId>"
+    )));
+    assert!(delete_objects_xml.contains("<Deleted><Key>docs/current.txt</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>"));
+    assert!(delete_objects_xml.contains("<Deleted><Key>docs/missing.txt</Key>"));
+    assert!(delete_objects_xml.contains("<Error><Key>docs/versioned.txt</Key><VersionId>missing-version</VersionId><Code>NoSuchVersion</Code>"));
+
+    let get_deleted_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/batch.example/docs/current.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_deleted_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let get_deleted_old_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/batch.example/docs/versioned.txt?versionId={v1_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_old_version.status(), StatusCode::NOT_FOUND);
+
+    let quiet_delete = app
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/batch.example?delete=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from_static(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Quiet>true</Quiet>
+  <Object><Key>docs/versioned.txt</Key></Object>
+</Delete>"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(quiet_delete.status(), StatusCode::OK);
+    let quiet_delete_body = to_bytes(quiet_delete.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let quiet_delete_xml = String::from_utf8(quiet_delete_body.to_vec()).unwrap();
+    assert!(!quiet_delete_xml.contains("<Deleted>"));
+    assert!(!quiet_delete_xml.contains("<Error>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_delete_objects_batches_impl,
+    s3_listener_supports_delete_objects_batches,
+    s3_listener_supports_delete_objects_batches_turso
+);
+
 async fn s3_listener_supports_presigned_requests_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());

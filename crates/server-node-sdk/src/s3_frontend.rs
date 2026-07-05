@@ -59,6 +59,7 @@ struct S3BucketQuery {
     max_keys: Option<usize>,
     versions: Option<String>,
     versioning: Option<String>,
+    delete: Option<String>,
     #[serde(rename = "key-marker")]
     key_marker: Option<String>,
     #[serde(rename = "version-id-marker")]
@@ -124,6 +125,48 @@ struct CompletedMultipartPart {
     etag: String,
 }
 
+#[derive(Debug, Clone)]
+struct DeleteObjectsRequestItem {
+    key: String,
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteObjectsRequest {
+    objects: Vec<DeleteObjectsRequestItem>,
+    quiet: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteObjectsDeletedEntry {
+    key: String,
+    version_id: Option<String>,
+    delete_marker: bool,
+    delete_marker_version_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteObjectsErrorEntry {
+    key: String,
+    version_id: Option<String>,
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+struct S3DeleteExecutionOutcome {
+    header_version_id: String,
+    batch_version_id: Option<String>,
+    delete_marker: bool,
+    delete_marker_version_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum S3DeleteExecutionError {
+    NoSuchVersion,
+    Internal(String),
+}
+
 pub(crate) fn build_listener_app() -> Router<ServerState> {
     Router::new()
         .route("/", get(list_buckets))
@@ -131,7 +174,7 @@ pub(crate) fn build_listener_app() -> Router<ServerState> {
             "/{bucket}",
             get(list_bucket_objects)
                 .head(head_bucket)
-                .post(s3_not_implemented_bucket_post)
+                .post(post_bucket)
                 .put(put_bucket)
                 .delete(delete_bucket),
         )
@@ -478,6 +521,30 @@ async fn put_bucket(
         response.headers_mut().insert(header::LOCATION, location);
     }
     response
+}
+
+async fn post_bucket(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(bucket_name): Path<String>,
+    Query(query): Query<S3BucketQuery>,
+    payload: Bytes,
+) -> Response {
+    let request = match authenticate_request(&state, &Method::POST, &uri, &headers).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if query.delete.is_some() {
+        return delete_objects_response(&state, &uri, &request, &bucket_name, payload).await;
+    }
+    s3_error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        "bucket POST operations are not implemented yet",
+        uri.path(),
+        &request.request_id,
+    )
 }
 
 async fn delete_bucket(
@@ -2414,51 +2481,31 @@ async fn abort_multipart_upload_response(
     response
 }
 
-async fn delete_object_version_response(
+async fn execute_s3_object_version_delete(
     state: &ServerState,
-    request_path: &str,
     request: &S3RequestContext,
     bucket: &S3BucketRecord,
     full_key: &str,
     version_id: &str,
-) -> Response {
+) -> Result<S3DeleteExecutionOutcome, S3DeleteExecutionError> {
     let actor = s3_actor_context(&request.access_key);
     let mut store = lock_store(state, "s3.delete_object_version.store").await;
-    let outcome = match store
+    let outcome = store
         .delete_object_version_for_key(full_key, version_id)
         .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return s3_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                &format!("failed to delete S3 object version: {err:#}"),
-                request_path,
-                &request.request_id,
-            );
-        }
-    };
+        .map_err(|err| {
+            S3DeleteExecutionError::Internal(format!("failed to delete S3 object version: {err:#}"))
+        })?;
     let Some(outcome) = outcome else {
-        return s3_error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchVersion",
-            "the specified version does not exist",
-            request_path,
-            &request.request_id,
-        );
+        return Err(S3DeleteExecutionError::NoSuchVersion);
     };
     if let Err(err) = store
         .delete_s3_object_version(&bucket.bucket_name, &outcome.version_id)
         .await
     {
-        return s3_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            &format!("failed to delete S3 object version record: {err:#}"),
-            request_path,
-            &request.request_id,
-        );
+        return Err(S3DeleteExecutionError::Internal(format!(
+            "failed to delete S3 object version record: {err:#}"
+        )));
     }
     drop(store);
 
@@ -2498,10 +2545,130 @@ async fn delete_object_version_response(
     )
     .await;
 
+    Ok(S3DeleteExecutionOutcome {
+        header_version_id: outcome.version_id.clone(),
+        batch_version_id: Some(outcome.version_id.clone()),
+        delete_marker: outcome.was_delete_marker,
+        delete_marker_version_id: outcome.was_delete_marker.then_some(outcome.version_id),
+    })
+}
+
+async fn execute_s3_current_object_delete(
+    state: &ServerState,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+) -> Result<S3DeleteExecutionOutcome, S3DeleteExecutionError> {
+    let actor = s3_actor_context(&request.access_key);
+    let mut store = lock_store(state, "s3.delete_object.store").await;
+    let version_id = store
+        .tombstone_object(full_key, PutOptions::default())
+        .await
+        .map_err(|err| {
+            S3DeleteExecutionError::Internal(format!("failed to delete S3 object: {err:#}"))
+        })?;
+    let s3_object_version = S3ObjectVersionRecord {
+        bucket_name: bucket.bucket_name.clone(),
+        ironmesh_key: full_key.to_string(),
+        version_id: version_id.clone(),
+        etag: object_etag(TOMBSTONE_MANIFEST_HASH),
+        multipart_part_count: None,
+        created_at_unix: unix_ts(),
+    };
+    if let Err(err) = store.persist_s3_object_version(&s3_object_version).await {
+        return Err(S3DeleteExecutionError::Internal(format!(
+            "failed to persist S3 tombstone version record: {err:#}"
+        )));
+    }
+    drop(store);
+
+    publish_namespace_change(state);
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(full_key, state.node_id);
+    cluster.note_replica(format!("{}@{}", full_key, version_id), state.node_id);
+    drop(cluster);
+    if let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            key = %full_key,
+            "failed persisting cluster replicas after S3 DELETE"
+        );
+    }
+    if should_trigger_autonomous_post_write_replication(
+        state.autonomous_replication_on_put_enabled,
+        false,
+    ) {
+        enqueue_autonomous_post_write_replication(
+            state,
+            autonomous_post_write_replication_subjects(full_key, &version_id),
+        )
+        .await;
+    }
+    record_data_change_event(
+        state,
+        PendingDataChangeEvent {
+            action: DataChangeAction::Delete,
+            actor: Some(actor),
+            path: full_key.to_string(),
+            from_path: None,
+            to_path: None,
+            recursive: false,
+            affected_path_count: 1,
+            total_size_bytes: None,
+            version_id: Some(version_id.clone()),
+            snapshot_id: None,
+            upload_mode: None,
+        },
+    )
+    .await;
+
+    let expose_delete_marker = bucket.versioning_status == S3BucketVersioningStatus::Enabled;
+    Ok(S3DeleteExecutionOutcome {
+        header_version_id: version_id.clone(),
+        batch_version_id: None,
+        delete_marker: expose_delete_marker,
+        delete_marker_version_id: expose_delete_marker.then_some(version_id),
+    })
+}
+
+async fn delete_object_version_response(
+    state: &ServerState,
+    request_path: &str,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+    version_id: &str,
+) -> Response {
+    let outcome = match execute_s3_object_version_delete(
+        state, request, bucket, full_key, version_id,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(S3DeleteExecutionError::NoSuchVersion) => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "the specified version does not exist",
+                request_path,
+                &request.request_id,
+            );
+        }
+        Err(S3DeleteExecutionError::Internal(message)) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &message,
+                request_path,
+                &request.request_id,
+            );
+        }
+    };
+
     let mut response = StatusCode::NO_CONTENT.into_response();
     append_request_id_header(&mut response, &request.request_id);
-    append_version_id_header(&mut response, Some(&outcome.version_id));
-    if outcome.was_delete_marker {
+    append_version_id_header(&mut response, Some(&outcome.header_version_id));
+    if outcome.delete_marker {
         append_delete_marker_header(&mut response);
     }
     response
@@ -2584,88 +2751,165 @@ async fn delete_object(
         .await;
     }
 
-    let actor = s3_actor_context(&request.access_key);
-    let mut store = lock_store(&state, "s3.delete_object.store").await;
-    let version_id = match store
-        .tombstone_object(&full_key, PutOptions::default())
-        .await
+    let outcome = match execute_s3_current_object_delete(&state, &request, &bucket, &full_key).await
     {
-        Ok(version_id) => version_id,
-        Err(err) => {
+        Ok(outcome) => outcome,
+        Err(S3DeleteExecutionError::Internal(message)) => {
             return s3_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
-                &format!("failed to delete S3 object: {err:#}"),
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        Err(S3DeleteExecutionError::NoSuchVersion) => {
+            unreachable!("current deletes do not resolve version IDs")
+        }
+    };
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    append_request_id_header(&mut response, &request.request_id);
+    append_version_id_header(&mut response, Some(&outcome.header_version_id));
+    if outcome.delete_marker {
+        append_delete_marker_header(&mut response);
+    }
+    response
+}
+
+async fn delete_objects_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket_name: &str,
+    payload: Bytes,
+) -> Response {
+    if !request.access_key.allow_delete {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to delete objects",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    let bucket = match resolve_bucket(state, bucket_name).await {
+        Some(bucket) => bucket,
+        None => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
                 uri.path(),
                 &request.request_id,
             );
         }
     };
-    let s3_object_version = S3ObjectVersionRecord {
-        bucket_name: bucket.bucket_name.clone(),
-        ironmesh_key: full_key.clone(),
-        version_id: version_id.clone(),
-        etag: object_etag(TOMBSTONE_MANIFEST_HASH),
-        multipart_part_count: None,
-        created_at_unix: unix_ts(),
-    };
-    if let Err(err) = store.persist_s3_object_version(&s3_object_version).await {
+    if bucket.read_only {
         return s3_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            &format!("failed to persist S3 tombstone version record: {err:#}"),
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the bucket mapping is read-only",
             uri.path(),
             &request.request_id,
         );
     }
-    drop(store);
-
-    publish_namespace_change(&state);
-    let mut cluster = state.cluster.lock().await;
-    cluster.note_replica(&full_key, state.node_id);
-    cluster.note_replica(format!("{}@{}", full_key, version_id), state.node_id);
-    drop(cluster);
-    if let Err(err) = persist_cluster_replicas_state(&state).await {
-        warn!(
-            error = %err,
-            key = %full_key,
-            "failed persisting cluster replicas after S3 DELETE"
+    if !access_key_allows_bucket(&request.access_key, &bucket) {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to access this bucket",
+            uri.path(),
+            &request.request_id,
         );
     }
-    if should_trigger_autonomous_post_write_replication(
-        state.autonomous_replication_on_put_enabled,
-        false,
-    ) {
-        enqueue_autonomous_post_write_replication(
-            &state,
-            autonomous_post_write_replication_subjects(&full_key, &version_id),
-        )
-        .await;
-    }
-    record_data_change_event(
-        &state,
-        PendingDataChangeEvent {
-            action: DataChangeAction::Delete,
-            actor: Some(actor),
-            path: full_key,
-            from_path: None,
-            to_path: None,
-            recursive: false,
-            affected_path_count: 1,
-            total_size_bytes: None,
-            version_id: Some(version_id.clone()),
-            snapshot_id: None,
-            upload_mode: None,
-        },
-    )
-    .await;
 
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    append_request_id_header(&mut response, &request.request_id);
-    append_version_id_header(&mut response, Some(&version_id));
-    if bucket.versioning_status == S3BucketVersioningStatus::Enabled {
-        append_delete_marker_header(&mut response);
+    let delete_request = match parse_delete_objects_request(payload.as_ref()) {
+        Ok(request) => request,
+        Err(message) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for object in delete_request.objects {
+        let full_key = format!(
+            "{}{}",
+            bucket.root_prefix,
+            object.key.trim_start_matches('/')
+        );
+        if !access_key_allows_object(&request.access_key, &bucket, &full_key) {
+            errors.push(DeleteObjectsErrorEntry {
+                key: object.key,
+                version_id: object.version_id,
+                code: "AccessDenied",
+                message: "the access key is not allowed to delete this object path".to_string(),
+            });
+            continue;
+        }
+
+        let outcome = if let Some(version_id) = object.version_id.as_deref() {
+            match execute_s3_object_version_delete(state, request, &bucket, &full_key, version_id)
+                .await
+            {
+                Ok(outcome) => Some(outcome),
+                Err(S3DeleteExecutionError::NoSuchVersion) => {
+                    errors.push(DeleteObjectsErrorEntry {
+                        key: object.key.clone(),
+                        version_id: object.version_id.clone(),
+                        code: "NoSuchVersion",
+                        message: "the specified version does not exist".to_string(),
+                    });
+                    None
+                }
+                Err(S3DeleteExecutionError::Internal(message)) => {
+                    errors.push(DeleteObjectsErrorEntry {
+                        key: object.key.clone(),
+                        version_id: object.version_id.clone(),
+                        code: "InternalError",
+                        message,
+                    });
+                    None
+                }
+            }
+        } else {
+            match execute_s3_current_object_delete(state, request, &bucket, &full_key).await {
+                Ok(outcome) => Some(outcome),
+                Err(S3DeleteExecutionError::Internal(message)) => {
+                    errors.push(DeleteObjectsErrorEntry {
+                        key: object.key.clone(),
+                        version_id: None,
+                        code: "InternalError",
+                        message,
+                    });
+                    None
+                }
+                Err(S3DeleteExecutionError::NoSuchVersion) => None,
+            }
+        };
+        if let Some(outcome) = outcome {
+            deleted.push(DeleteObjectsDeletedEntry {
+                key: object.key,
+                version_id: outcome.batch_version_id,
+                delete_marker: outcome.delete_marker,
+                delete_marker_version_id: outcome.delete_marker_version_id,
+            });
+        }
     }
+
+    let mut response = xml_response(
+        StatusCode::OK,
+        render_delete_objects_result(delete_request.quiet, &deleted, &errors),
+        &request.request_id,
+    );
+    append_request_id_header(&mut response, &request.request_id);
     response
 }
 
@@ -2907,24 +3151,6 @@ async fn get_or_head_object_response(
         append_etag_header(&mut response, &version.etag);
     }
     response
-}
-
-async fn s3_not_implemented_bucket_post(
-    State(state): State<ServerState>,
-    OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
-) -> Response {
-    let request = match authenticate_request(&state, &Method::POST, &uri, &headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    s3_error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        "bucket POST operations are not implemented yet",
-        uri.path(),
-        &request.request_id,
-    )
 }
 
 async fn authenticate_request(
@@ -3830,13 +4056,24 @@ fn parse_complete_multipart_upload_parts(xml: &str) -> Result<Vec<CompletedMulti
 }
 
 fn xml_tag_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
-    let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut blocks = Vec::new();
     let mut offset = 0usize;
 
-    while let Some(start_rel) = xml[offset..].find(&open) {
-        let start = offset + start_rel + open.len();
+    while let Some(start_rel) = xml[offset..].find(&format!("<{tag}")) {
+        let open_start = offset + start_rel;
+        let open_tag_end = open_start + tag.len() + 1;
+        let Some(next_char) = xml[open_tag_end..].chars().next() else {
+            break;
+        };
+        if next_char != '>' && next_char != '/' && !next_char.is_ascii_whitespace() {
+            offset = open_tag_end;
+            continue;
+        }
+        let Some(open_end_rel) = xml[open_start..].find('>') else {
+            break;
+        };
+        let start = open_start + open_end_rel + 1;
         let Some(end_rel) = xml[start..].find(&close) else {
             break;
         };
@@ -3850,6 +4087,44 @@ fn xml_tag_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
 
 fn xml_tag_contents<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     xml_tag_blocks(xml, tag).into_iter().next()
+}
+
+fn parse_delete_objects_request(payload: &[u8]) -> Result<DeleteObjectsRequest, String> {
+    if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("DeleteObjects requires a non-empty XML request body".to_string());
+    }
+    let xml = std::str::from_utf8(payload)
+        .map_err(|_| "DeleteObjects request bodies must be valid UTF-8 XML".to_string())?;
+    let Some(delete_xml) = xml_tag_contents(xml, "Delete") else {
+        return Err("DeleteObjects request bodies must include a Delete element".to_string());
+    };
+    let object_blocks = xml_tag_blocks(delete_xml, "Object");
+    if object_blocks.is_empty() {
+        return Err("DeleteObjects must include at least one Object element".to_string());
+    }
+    if object_blocks.len() > 1000 {
+        return Err("DeleteObjects may not include more than 1000 Object elements".to_string());
+    }
+
+    let mut objects = Vec::with_capacity(object_blocks.len());
+    for object_xml in object_blocks {
+        let Some(key) = xml_tag_contents(object_xml, "Key") else {
+            return Err("DeleteObjects Object elements must include a Key".to_string());
+        };
+        let version_id = xml_tag_contents(object_xml, "VersionId")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        objects.push(DeleteObjectsRequestItem {
+            key: key.to_string(),
+            version_id,
+        });
+    }
+
+    let quiet = xml_tag_contents(delete_xml, "Quiet")
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    Ok(DeleteObjectsRequest { objects, quiet })
 }
 
 fn object_metadata_from_headers(headers: &HeaderMap) -> ObjectVersionMetadataRecord {
@@ -4095,6 +4370,55 @@ fn render_bucket_versioning_result(bucket: &S3BucketRecord) -> String {
         xml.push_str("<Status>Enabled</Status>");
     }
     xml.push_str("</VersioningConfiguration>");
+    xml
+}
+
+fn render_delete_objects_result(
+    quiet: bool,
+    deleted: &[DeleteObjectsDeletedEntry],
+    errors: &[DeleteObjectsErrorEntry],
+) -> String {
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns=""#);
+    xml.push('"');
+    xml.push_str(S3_XML_NAMESPACE);
+    xml.push_str(r#"">"#);
+    if !quiet {
+        for entry in deleted {
+            xml.push_str("<Deleted><Key>");
+            xml.push_str(&xml_escape(&entry.key));
+            xml.push_str("</Key>");
+            if let Some(version_id) = entry.version_id.as_deref() {
+                xml.push_str("<VersionId>");
+                xml.push_str(&xml_escape(version_id));
+                xml.push_str("</VersionId>");
+            }
+            if entry.delete_marker {
+                xml.push_str("<DeleteMarker>true</DeleteMarker>");
+            }
+            if let Some(version_id) = entry.delete_marker_version_id.as_deref() {
+                xml.push_str("<DeleteMarkerVersionId>");
+                xml.push_str(&xml_escape(version_id));
+                xml.push_str("</DeleteMarkerVersionId>");
+            }
+            xml.push_str("</Deleted>");
+        }
+    }
+    for entry in errors {
+        xml.push_str("<Error><Key>");
+        xml.push_str(&xml_escape(&entry.key));
+        xml.push_str("</Key>");
+        if let Some(version_id) = entry.version_id.as_deref() {
+            xml.push_str("<VersionId>");
+            xml.push_str(&xml_escape(version_id));
+            xml.push_str("</VersionId>");
+        }
+        xml.push_str("<Code>");
+        xml.push_str(entry.code);
+        xml.push_str("</Code><Message>");
+        xml.push_str(&xml_escape(&entry.message));
+        xml.push_str("</Message></Error>");
+    }
+    xml.push_str("</DeleteResult>");
     xml
 }
 
