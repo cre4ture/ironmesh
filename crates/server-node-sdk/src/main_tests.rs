@@ -1134,6 +1134,52 @@ fn sample_replicated_client_credential(
     }
 }
 
+fn test_admin_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
+    headers
+}
+
+fn sample_s3_bucket_record(
+    bucket_name: &str,
+    root_prefix: &str,
+    created_at_unix: u64,
+) -> super::S3BucketRecord {
+    super::S3BucketRecord {
+        bucket_name: bucket_name.to_string(),
+        root_prefix: root_prefix.to_string(),
+        versioning_status: super::S3BucketVersioningStatus::Enabled,
+        read_only: false,
+        created_at_unix,
+        updated_at_unix: created_at_unix,
+        created_by: Some("replication-test".to_string()),
+        deleted_at_unix: None,
+    }
+}
+
+fn sample_s3_access_key_record(
+    access_key_id: &str,
+    secret_material: &str,
+    bucket_scope: Vec<String>,
+    created_at_unix: u64,
+) -> super::S3AccessKeyRecord {
+    super::S3AccessKeyRecord {
+        access_key_id: access_key_id.to_string(),
+        secret_material: secret_material.to_string(),
+        description: Some("replication-test".to_string()),
+        bucket_scope,
+        prefix_scope: Vec::new(),
+        allow_list: true,
+        allow_read: true,
+        allow_write: true,
+        allow_delete: true,
+        created_at_unix,
+        updated_at_unix: created_at_unix,
+        last_used_at_unix: None,
+        revoked_at_unix: None,
+    }
+}
+
 async fn import_client_credentials_upserts_idempotently_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let source_node_id = NodeId::new_v4();
@@ -1312,6 +1358,372 @@ run_on_main_metadata_backends!(
     export_client_credentials_omits_issued_credential_pem_impl,
     export_client_credentials_omits_issued_credential_pem,
     export_client_credentials_omits_issued_credential_pem_turso
+);
+
+async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+    let create_bucket_body = to_bytes(create_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_bucket: super::S3BucketView = serde_json::from_slice(&create_bucket_body).unwrap();
+    assert_eq!(created_bucket.bucket_name, "photos.example");
+    assert_eq!(created_bucket.root_prefix, "tenant/photos/");
+    assert_eq!(
+        created_bucket.versioning_status,
+        super::S3BucketVersioningStatus::Enabled
+    );
+    assert!(created_bucket.deleted_at_unix.is_none());
+
+    let status_response = super::get_s3_control_plane_status(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let status_body = to_bytes(status_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: super::S3ControlPlaneStatusResponse = serde_json::from_slice(&status_body).unwrap();
+    assert_eq!(status.bucket_count, 1);
+    assert_eq!(status.access_key_count, 0);
+    assert!(status.local_generation >= 1);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        headers.clone(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("photos-writer".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/inbox/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+    assert!(created_access_key.access_key_id.starts_with("IM"));
+    assert!(!created_access_key.secret_access_key.is_empty());
+    assert_eq!(
+        created_access_key.view.secret_fingerprint,
+        super::text_fingerprint(&created_access_key.secret_access_key)
+    );
+    assert_eq!(
+        created_access_key.view.bucket_scope,
+        vec!["photos.example".to_string()]
+    );
+    assert_eq!(
+        created_access_key.view.prefix_scope,
+        vec!["tenant/photos/inbox/".to_string()]
+    );
+    assert!(created_access_key.view.revoked_at_unix.is_none());
+
+    let listed_buckets = super::list_s3_buckets(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(listed_buckets.status(), StatusCode::OK);
+    let listed_buckets_body = to_bytes(listed_buckets.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_buckets: Vec<super::S3BucketView> =
+        serde_json::from_slice(&listed_buckets_body).unwrap();
+    assert_eq!(listed_buckets.len(), 1);
+    assert_eq!(listed_buckets[0].root_prefix, "tenant/photos/");
+
+    let listed_access_keys = super::list_s3_access_keys(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(listed_access_keys.status(), StatusCode::OK);
+    let listed_access_keys_body = to_bytes(listed_access_keys.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_access_keys: Vec<super::S3AccessKeyView> =
+        serde_json::from_slice(&listed_access_keys_body).unwrap();
+    assert_eq!(listed_access_keys.len(), 1);
+    assert_eq!(
+        listed_access_keys[0].access_key_id,
+        created_access_key.access_key_id
+    );
+
+    {
+        let mut store = lock_store(&state, "tests.s3_control_plane.seed_bucket_object").await;
+        store
+            .put_object_versioned(
+                "tenant/photos/hello.txt",
+                Bytes::from_static(b"hello"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let non_empty_delete = super::delete_s3_bucket(
+        State(state.clone()),
+        headers.clone(),
+        Path("photos.example".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(non_empty_delete.status(), StatusCode::CONFLICT);
+
+    {
+        let mut store = lock_store(&state, "tests.s3_control_plane.tombstone_bucket_object").await;
+        store
+            .tombstone_object("tenant/photos/hello.txt", PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    let revoke_access_key = super::revoke_s3_access_key(
+        State(state.clone()),
+        headers.clone(),
+        Path(created_access_key.access_key_id.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(revoke_access_key.status(), StatusCode::NO_CONTENT);
+
+    let delete_bucket = super::delete_s3_bucket(
+        State(state.clone()),
+        headers.clone(),
+        Path("photos.example".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
+
+    let listed_buckets_after = super::list_s3_buckets(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(listed_buckets_after.status(), StatusCode::OK);
+    let listed_buckets_after_body = to_bytes(listed_buckets_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_buckets_after: Vec<super::S3BucketView> =
+        serde_json::from_slice(&listed_buckets_after_body).unwrap();
+    assert!(listed_buckets_after.is_empty());
+
+    let listed_access_keys_after =
+        super::list_s3_access_keys(State(state.clone()), headers.clone())
+            .await
+            .into_response();
+    assert_eq!(listed_access_keys_after.status(), StatusCode::OK);
+    let listed_access_keys_after_body = to_bytes(listed_access_keys_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_access_keys_after: Vec<super::S3AccessKeyView> =
+        serde_json::from_slice(&listed_access_keys_after_body).unwrap();
+    assert_eq!(listed_access_keys_after.len(), 1);
+    assert_eq!(
+        listed_access_keys_after[0].access_key_id,
+        created_access_key.access_key_id
+    );
+    assert!(listed_access_keys_after[0].revoked_at_unix.is_some());
+
+    let status_after = super::get_s3_control_plane_status(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(status_after.status(), StatusCode::OK);
+    let status_after_body = to_bytes(status_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_after: super::S3ControlPlaneStatusResponse =
+        serde_json::from_slice(&status_after_body).unwrap();
+    assert_eq!(status_after.bucket_count, 0);
+    assert_eq!(status_after.access_key_count, 1);
+    assert!(status_after.local_generation >= 4);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_admin_lifecycle_impl,
+    s3_control_plane_admin_lifecycle,
+    s3_control_plane_admin_lifecycle_turso
+);
+
+async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_node_id = NodeId::new_v4();
+    let initial_bucket = sample_s3_bucket_record("archive.example", "s3/archive.example/", 10);
+    let initial_access_key = sample_s3_access_key_record(
+        "IMSYNC123456789012",
+        "replicated-secret-v1",
+        vec!["archive.example".to_string()],
+        10,
+    );
+
+    let initial_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 1,
+            state: super::S3ControlPlaneState {
+                buckets: vec![initial_bucket.clone()],
+                access_keys: vec![initial_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(initial_import.status(), StatusCode::OK);
+    let initial_import_body = to_bytes(initial_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let initial_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&initial_import_body).unwrap();
+    assert!(initial_report.changed);
+    assert_eq!(initial_report.bucket_count, 1);
+    assert_eq!(initial_report.access_key_count, 1);
+
+    let idempotent_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 1,
+            state: super::S3ControlPlaneState {
+                buckets: vec![initial_bucket.clone()],
+                access_keys: vec![initial_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(idempotent_import.status(), StatusCode::OK);
+    let idempotent_import_body = to_bytes(idempotent_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let idempotent_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&idempotent_import_body).unwrap();
+    assert!(!idempotent_report.changed);
+    assert_eq!(idempotent_report.bucket_count, 1);
+    assert_eq!(idempotent_report.access_key_count, 1);
+
+    let mut deleted_bucket = initial_bucket.clone();
+    deleted_bucket.updated_at_unix = 20;
+    deleted_bucket.deleted_at_unix = Some(21);
+
+    let mut revoked_access_key = initial_access_key.clone();
+    revoked_access_key.updated_at_unix = 22;
+    revoked_access_key.last_used_at_unix = Some(21);
+    revoked_access_key.revoked_at_unix = Some(22);
+
+    let tombstone_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 2,
+            state: super::S3ControlPlaneState {
+                buckets: vec![deleted_bucket.clone()],
+                access_keys: vec![revoked_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(tombstone_import.status(), StatusCode::OK);
+    let tombstone_import_body = to_bytes(tombstone_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tombstone_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&tombstone_import_body).unwrap();
+    assert!(tombstone_report.changed);
+    assert_eq!(tombstone_report.bucket_count, 0);
+    assert_eq!(tombstone_report.access_key_count, 1);
+
+    let stale_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 1,
+            state: super::S3ControlPlaneState {
+                buckets: vec![initial_bucket.clone()],
+                access_keys: vec![initial_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(stale_import.status(), StatusCode::OK);
+    let stale_import_body = to_bytes(stale_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stale_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&stale_import_body).unwrap();
+    assert!(!stale_report.changed);
+    assert_eq!(stale_report.bucket_count, 0);
+    assert_eq!(stale_report.access_key_count, 1);
+
+    let control_plane = state.s3.control_plane.lock().await.clone();
+    assert_eq!(control_plane.buckets.len(), 1);
+    assert_eq!(
+        control_plane.buckets[0].deleted_at_unix,
+        deleted_bucket.deleted_at_unix
+    );
+    assert_eq!(control_plane.access_keys.len(), 1);
+    assert_eq!(
+        control_plane.access_keys[0].revoked_at_unix,
+        revoked_access_key.revoked_at_unix
+    );
+    drop(control_plane);
+
+    let persisted = {
+        let store = lock_store(&state, "tests.s3_control_plane.load_persisted").await;
+        store.load_s3_control_plane_state().await.unwrap()
+    };
+    assert_eq!(persisted.buckets.len(), 1);
+    assert_eq!(persisted.buckets[0].deleted_at_unix, Some(21));
+    assert_eq!(persisted.access_keys.len(), 1);
+    assert_eq!(persisted.access_keys[0].revoked_at_unix, Some(22));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_import_merges_tombstones_and_revocations_impl,
+    s3_control_plane_import_merges_tombstones_and_revocations,
+    s3_control_plane_import_merges_tombstones_and_revocations_turso
 );
 
 #[tokio::test]
@@ -8330,6 +8742,15 @@ async fn build_test_state(
             admin_sessions: Arc::new(Mutex::new(super::AdminSessionStore::default())),
             client_auth_control: super::ClientAuthControl::default(),
             client_auth_replay_cache: Arc::new(Mutex::new(super::ClientAuthReplayCache::default())),
+        },
+        s3: super::ServerS3Runtime {
+            control_plane: Arc::new(Mutex::new(super::S3ControlPlaneState::default())),
+            sync_runtime: Arc::new(std::sync::Mutex::new(
+                super::S3ControlPlaneSyncRuntime::default(),
+            )),
+            listener_enabled: false,
+            public_url: None,
+            tls_enabled: false,
         },
         network: super::ServerNetworkRuntime {
             public_ca_pem: None,

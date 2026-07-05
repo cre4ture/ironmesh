@@ -648,12 +648,14 @@ pub struct S3BucketRecord {
     pub updated_at_unix: u64,
     #[serde(default)]
     pub created_by: Option<String>,
+    #[serde(default)]
+    pub deleted_at_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct S3AccessKeyRecord {
     pub access_key_id: String,
-    pub secret_hash: String,
+    pub secret_material: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -665,6 +667,7 @@ pub struct S3AccessKeyRecord {
     pub allow_write: bool,
     pub allow_delete: bool,
     pub created_at_unix: u64,
+    pub updated_at_unix: u64,
     #[serde(default)]
     pub last_used_at_unix: Option<u64>,
     #[serde(default)]
@@ -987,16 +990,18 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
             "root_prefix",
             "versioning_status",
             "created_by",
+            "deleted_at_unix",
         ],
     },
     MetadataDbLogicalTableSpec {
         table: "s3_access_keys",
         tracked_columns: &[
             "access_key_id",
-            "secret_hash",
+            "secret_material",
             "description",
             "bucket_scope_json",
             "prefix_scope_json",
+            "updated_at_unix",
         ],
     },
     MetadataDbLogicalTableSpec {

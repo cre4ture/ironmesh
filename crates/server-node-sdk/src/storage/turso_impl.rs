@@ -509,7 +509,7 @@ impl MetadataStore for TursoMetadataStore {
             .connection
             .query(
                 "SELECT bucket_name, root_prefix, versioning_status, read_only,
-                        created_at_unix, updated_at_unix, created_by
+                        created_at_unix, updated_at_unix, created_by, deleted_at_unix
                  FROM s3_buckets
                  ORDER BY bucket_name",
                 (),
@@ -532,15 +532,17 @@ impl MetadataStore for TursoMetadataStore {
                 created_at_unix: row_u64(&row, 4, "s3_buckets.created_at_unix")?,
                 updated_at_unix: row_u64(&row, 5, "s3_buckets.updated_at_unix")?,
                 created_by: row_opt_string(&row, 6, "s3_buckets.created_by")?,
+                deleted_at_unix: row_opt_u64(&row, 7, "s3_buckets.deleted_at_unix")?,
             });
         }
 
         let mut access_key_rows = self
             .connection
             .query(
-                "SELECT access_key_id, secret_hash, description, bucket_scope_json,
+                "SELECT access_key_id, secret_material, description, bucket_scope_json,
                         prefix_scope_json, allow_list, allow_read, allow_write,
-                        allow_delete, created_at_unix, last_used_at_unix, revoked_at_unix
+                        allow_delete, created_at_unix, updated_at_unix,
+                        last_used_at_unix, revoked_at_unix
                  FROM s3_access_keys
                  ORDER BY access_key_id",
                 (),
@@ -552,7 +554,7 @@ impl MetadataStore for TursoMetadataStore {
             let prefix_scope_json = row_blob(&row, 4, "s3_access_keys.prefix_scope_json")?;
             access_keys.push(S3AccessKeyRecord {
                 access_key_id: row_string(&row, 0, "s3_access_keys.access_key_id")?,
-                secret_hash: row_string(&row, 1, "s3_access_keys.secret_hash")?,
+                secret_material: row_string(&row, 1, "s3_access_keys.secret_material")?,
                 description: row_opt_string(&row, 2, "s3_access_keys.description")?,
                 bucket_scope: self.decode_json(bucket_scope_json, "s3 access key bucket scope")?,
                 prefix_scope: self.decode_json(prefix_scope_json, "s3 access key prefix scope")?,
@@ -561,8 +563,9 @@ impl MetadataStore for TursoMetadataStore {
                 allow_write: row_bool(&row, 7, "s3_access_keys.allow_write")?,
                 allow_delete: row_bool(&row, 8, "s3_access_keys.allow_delete")?,
                 created_at_unix: row_u64(&row, 9, "s3_access_keys.created_at_unix")?,
-                last_used_at_unix: row_opt_u64(&row, 10, "s3_access_keys.last_used_at_unix")?,
-                revoked_at_unix: row_opt_u64(&row, 11, "s3_access_keys.revoked_at_unix")?,
+                updated_at_unix: row_u64(&row, 10, "s3_access_keys.updated_at_unix")?,
+                last_used_at_unix: row_opt_u64(&row, 11, "s3_access_keys.last_used_at_unix")?,
+                revoked_at_unix: row_opt_u64(&row, 12, "s3_access_keys.revoked_at_unix")?,
             });
         }
 
@@ -592,8 +595,9 @@ impl MetadataStore for TursoMetadataStore {
                              read_only,
                              created_at_unix,
                              updated_at_unix,
-                             created_by
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                             created_by,
+                             deleted_at_unix
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         (
                             bucket.bucket_name.as_str(),
                             bucket.root_prefix.as_str(),
@@ -604,6 +608,11 @@ impl MetadataStore for TursoMetadataStore {
                             i64::try_from(bucket.updated_at_unix)
                                 .context("s3 bucket updated_at_unix overflow")?,
                             bucket.created_by.clone(),
+                            bucket
+                                .deleted_at_unix
+                                .map(i64::try_from)
+                                .transpose()
+                                .context("s3 bucket deleted_at_unix overflow")?,
                         ),
                     )
                     .await?;
@@ -614,7 +623,7 @@ impl MetadataStore for TursoMetadataStore {
                     .execute(
                         "INSERT INTO s3_access_keys (
                              access_key_id,
-                             secret_hash,
+                             secret_material,
                              description,
                              bucket_scope_json,
                              prefix_scope_json,
@@ -623,12 +632,13 @@ impl MetadataStore for TursoMetadataStore {
                              allow_write,
                              allow_delete,
                              created_at_unix,
+                             updated_at_unix,
                              last_used_at_unix,
                              revoked_at_unix
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                         (
                             access_key.access_key_id.as_str(),
-                            access_key.secret_hash.as_str(),
+                            access_key.secret_material.as_str(),
                             access_key.description.clone(),
                             serde_json::to_vec(&access_key.bucket_scope)?,
                             serde_json::to_vec(&access_key.prefix_scope)?,
@@ -642,6 +652,8 @@ impl MetadataStore for TursoMetadataStore {
                             },
                             i64::try_from(access_key.created_at_unix)
                                 .context("s3 access key created_at_unix overflow")?,
+                            i64::try_from(access_key.updated_at_unix)
+                                .context("s3 access key updated_at_unix overflow")?,
                             access_key
                                 .last_used_at_unix
                                 .map(i64::try_from)
@@ -2016,12 +2028,13 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 read_only INTEGER NOT NULL,
                 created_at_unix INTEGER NOT NULL,
                 updated_at_unix INTEGER NOT NULL,
-                created_by TEXT
+                created_by TEXT,
+                deleted_at_unix INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS s3_access_keys (
                 access_key_id TEXT PRIMARY KEY,
-                secret_hash TEXT NOT NULL,
+                secret_material TEXT NOT NULL,
                 description TEXT,
                 bucket_scope_json BLOB NOT NULL,
                 prefix_scope_json BLOB NOT NULL,
@@ -2030,6 +2043,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 allow_write INTEGER NOT NULL,
                 allow_delete INTEGER NOT NULL,
                 created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
                 last_used_at_unix INTEGER,
                 revoked_at_unix INTEGER
             );

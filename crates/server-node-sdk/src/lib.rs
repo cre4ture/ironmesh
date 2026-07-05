@@ -30,7 +30,9 @@ use axum_server::Handle;
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{
+    STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+};
 use bytes::Bytes;
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
@@ -42,6 +44,7 @@ use futures_util::io::{
 use futures_util::{Sink, Stream};
 use http_body_util::BodyExt;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use rand::RngCore;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     SanType,
@@ -169,6 +172,8 @@ const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
 const CLIENT_CREDENTIAL_IMPORT_PATH: &str = "/cluster/client-credentials/import";
+const S3_CONTROL_PLANE_EXPORT_PATH: &str = "/cluster/s3/control-plane/export";
+const S3_CONTROL_PLANE_IMPORT_PATH: &str = "/cluster/s3/control-plane/import";
 const PEER_MEDIA_ARTIFACT_ROUTE: &str = "/cluster/media/artifact";
 
 use cluster::{
@@ -192,10 +197,11 @@ use storage::{
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
     PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
-    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
-    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
+    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
+    S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
+    StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
+    VersionConsistencyState, media_cache_retry_due, metadata_db_logical_table_count,
+    promote_cached_media_metadata_to_incomplete,
 };
 
 tokio::task_local! {
@@ -213,6 +219,7 @@ struct ServerState {
     cluster: Arc<Mutex<ClusterService>>,
     storage: ServerStorageRuntime,
     access: ServerAccessRuntime,
+    s3: ServerS3Runtime,
     network: ServerNetworkRuntime,
     maintenance: ServerMaintenanceRuntime,
     metadata_commit_mode: MetadataCommitMode,
@@ -248,6 +255,23 @@ struct ServerAccessRuntime {
     admin_sessions: Arc<Mutex<AdminSessionStore>>,
     client_auth_control: ClientAuthControl,
     client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
+}
+
+#[derive(Clone)]
+struct ServerS3Runtime {
+    control_plane: Arc<Mutex<S3ControlPlaneState>>,
+    sync_runtime: Arc<StdMutex<S3ControlPlaneSyncRuntime>>,
+    listener_enabled: bool,
+    public_url: Option<String>,
+    tls_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct S3ControlPlaneSyncRuntime {
+    generation: u64,
+    last_applied_at_unix: Option<u64>,
+    last_source_node_id: Option<NodeId>,
+    last_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -5073,6 +5097,27 @@ async fn run_inner(
         load_client_credentials_phase_started_at,
     );
 
+    let load_s3_control_plane_phase_started_at =
+        log_server_startup_phase_begin("load_s3_control_plane", startup_phase_anchor);
+    let persisted_s3_control_plane = {
+        let store_guard = store.read("server.init.load_s3_control_plane").await;
+        match store_guard.load_s3_control_plane_state().await {
+            Ok(state) => state,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to load S3 control-plane state; starting empty"
+                );
+                S3ControlPlaneState::default()
+            }
+        }
+    };
+    log_server_startup_phase_end(
+        "load_s3_control_plane",
+        startup_phase_anchor,
+        load_s3_control_plane_phase_started_at,
+    );
+
     let load_trust_and_rendezvous_phase_started_at =
         log_server_startup_phase_begin("load_trust_and_rendezvous", startup_phase_anchor);
     let embedded_trust_roots =
@@ -5293,6 +5338,13 @@ async fn run_inner(
             admin_sessions: Arc::new(Mutex::new(AdminSessionStore::default())),
             client_auth_control,
             client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
+        },
+        s3: ServerS3Runtime {
+            control_plane: Arc::new(Mutex::new(persisted_s3_control_plane)),
+            sync_runtime: Arc::new(StdMutex::new(S3ControlPlaneSyncRuntime::default())),
+            listener_enabled: false,
+            public_url: None,
+            tls_enabled: false,
         },
         network: ServerNetworkRuntime {
             public_ca_pem,
@@ -5603,6 +5655,23 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route(
             "/auth/rendezvous-config",
             get(get_rendezvous_config).put(update_rendezvous_config),
+        )
+        .route("/auth/s3/status", get(get_s3_control_plane_status))
+        .route(
+            "/auth/s3/buckets",
+            get(list_s3_buckets).post(create_s3_bucket),
+        )
+        .route(
+            "/auth/s3/buckets/{bucket_name}",
+            axum::routing::delete(delete_s3_bucket),
+        )
+        .route(
+            "/auth/s3/access-keys",
+            get(list_s3_access_keys).post(create_s3_access_key),
+        )
+        .route(
+            "/auth/s3/access-keys/{access_key_id}/revoke",
+            post(revoke_s3_access_key),
         )
         .route("/auth/client-credentials", get(list_client_credentials))
         .route(
@@ -6657,6 +6726,8 @@ pub(crate) fn build_internal_peer_api() -> Router<ServerState> {
             CLIENT_CREDENTIAL_IMPORT_PATH,
             post(import_client_credentials),
         )
+        .route(S3_CONTROL_PLANE_EXPORT_PATH, get(export_s3_control_plane))
+        .route(S3_CONTROL_PLANE_IMPORT_PATH, post(import_s3_control_plane))
         .route(
             "/cluster/node-enrollments/renew",
             post(renew_node_enrollment_authenticated),
@@ -8257,6 +8328,7 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
             ticker.tick().await;
             sync_remote_availability_views_once(&state).await;
             sync_cluster_metadata_once(&state).await;
+            sync_s3_control_plane_once(&state).await;
             sync_client_credentials_once(&state).await;
         }
     });
@@ -13836,6 +13908,114 @@ impl ClientCredentialImportResponse {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3ControlPlaneExportResponse {
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    generation: u64,
+    state: S3ControlPlaneState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3ControlPlaneImportRequest {
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    generation: u64,
+    state: S3ControlPlaneState,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct S3ControlPlaneImportResponse {
+    changed: bool,
+    bucket_count: usize,
+    access_key_count: usize,
+}
+
+impl S3ControlPlaneImportResponse {
+    fn changed(&self) -> bool {
+        self.changed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3BucketView {
+    bucket_name: String,
+    root_prefix: String,
+    versioning_status: S3BucketVersioningStatus,
+    read_only: bool,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    created_by: Option<String>,
+    deleted_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3AccessKeyView {
+    access_key_id: String,
+    description: Option<String>,
+    bucket_scope: Vec<String>,
+    prefix_scope: Vec<String>,
+    allow_list: bool,
+    allow_read: bool,
+    allow_write: bool,
+    allow_delete: bool,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    last_used_at_unix: Option<u64>,
+    revoked_at_unix: Option<u64>,
+    secret_fingerprint: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct S3ControlPlaneStatusResponse {
+    listener_enabled: bool,
+    public_url: Option<String>,
+    tls_enabled: bool,
+    local_generation: u64,
+    last_applied_at_unix: Option<u64>,
+    last_source_node_id: Option<NodeId>,
+    last_error: Option<String>,
+    bucket_count: usize,
+    access_key_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateS3BucketRequest {
+    bucket_name: String,
+    root_prefix: Option<String>,
+    versioning_status: Option<S3BucketVersioningStatus>,
+    #[serde(default)]
+    read_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateS3AccessKeyRequest {
+    description: Option<String>,
+    #[serde(default)]
+    bucket_scope: Vec<String>,
+    #[serde(default)]
+    prefix_scope: Vec<String>,
+    #[serde(default)]
+    allow_list: bool,
+    #[serde(default = "default_s3_access_allow_read")]
+    allow_read: bool,
+    #[serde(default)]
+    allow_write: bool,
+    #[serde(default)]
+    allow_delete: bool,
+}
+
+fn default_s3_access_allow_read() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CreateS3AccessKeyResponse {
+    access_key_id: String,
+    secret_access_key: String,
+    view: S3AccessKeyView,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ClientBootstrapClaimStatus {
@@ -13922,6 +14102,292 @@ async fn persist_client_credential_state(state: &ServerState) -> Result<()> {
     };
     let store = lock_store(state, "client_credentials.persist").await;
     store.persist_client_credential_state(&snapshot).await
+}
+
+async fn persist_s3_control_plane_state(
+    state: &ServerState,
+    source_node_id: Option<NodeId>,
+) -> Result<()> {
+    let snapshot = {
+        let control_plane = state.s3.control_plane.lock().await;
+        control_plane.clone()
+    };
+    let store = lock_store(state, "s3_control_plane.persist").await;
+    store.persist_s3_control_plane_state(&snapshot).await?;
+    let now = unix_ts();
+    let mut runtime = match state.s3.sync_runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    runtime.generation = runtime.generation.saturating_add(1);
+    runtime.last_applied_at_unix = Some(now);
+    runtime.last_source_node_id = source_node_id;
+    runtime.last_error = None;
+    Ok(())
+}
+
+fn normalize_optional_s3_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_s3_scope_values(values: Vec<String>) -> Vec<String> {
+    let mut values = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn normalize_s3_control_plane_state(mut state: S3ControlPlaneState) -> S3ControlPlaneState {
+    for bucket in &mut state.buckets {
+        bucket.bucket_name = bucket.bucket_name.trim().to_string();
+        bucket.root_prefix = bucket.root_prefix.trim().to_string();
+        bucket.created_by = normalize_optional_s3_text(bucket.created_by.take());
+    }
+    state
+        .buckets
+        .sort_by(|left, right| left.bucket_name.cmp(&right.bucket_name));
+    state
+        .buckets
+        .dedup_by(|left, right| left.bucket_name == right.bucket_name);
+
+    for access_key in &mut state.access_keys {
+        access_key.access_key_id = access_key.access_key_id.trim().to_string();
+        access_key.secret_material = access_key.secret_material.trim().to_string();
+        access_key.description = normalize_optional_s3_text(access_key.description.take());
+        access_key.bucket_scope =
+            normalize_s3_scope_values(std::mem::take(&mut access_key.bucket_scope));
+        access_key.prefix_scope =
+            normalize_s3_scope_values(std::mem::take(&mut access_key.prefix_scope));
+    }
+    state
+        .access_keys
+        .sort_by(|left, right| left.access_key_id.cmp(&right.access_key_id));
+    state
+        .access_keys
+        .dedup_by(|left, right| left.access_key_id == right.access_key_id);
+
+    state
+}
+
+fn s3_bucket_effective_unix(record: &S3BucketRecord) -> u64 {
+    record
+        .deleted_at_unix
+        .unwrap_or(0)
+        .max(record.updated_at_unix)
+        .max(record.created_at_unix)
+}
+
+fn s3_access_key_effective_unix(record: &S3AccessKeyRecord) -> u64 {
+    record
+        .revoked_at_unix
+        .unwrap_or(0)
+        .max(record.last_used_at_unix.unwrap_or(0))
+        .max(record.updated_at_unix)
+        .max(record.created_at_unix)
+}
+
+fn merge_s3_bucket_record(existing: &mut S3BucketRecord, incoming: S3BucketRecord) -> bool {
+    let incoming_effective = s3_bucket_effective_unix(&incoming);
+    let existing_effective = s3_bucket_effective_unix(existing);
+    if incoming_effective > existing_effective
+        || (incoming_effective == existing_effective
+            && incoming.deleted_at_unix.is_some()
+            && existing.deleted_at_unix.is_none())
+        || (incoming_effective == existing_effective && incoming != *existing)
+    {
+        *existing = incoming;
+        true
+    } else {
+        false
+    }
+}
+
+fn merge_s3_access_key_record(
+    existing: &mut S3AccessKeyRecord,
+    incoming: S3AccessKeyRecord,
+) -> bool {
+    let incoming_effective = s3_access_key_effective_unix(&incoming);
+    let existing_effective = s3_access_key_effective_unix(existing);
+    if incoming_effective > existing_effective
+        || (incoming_effective == existing_effective
+            && incoming.revoked_at_unix.is_some()
+            && existing.revoked_at_unix.is_none())
+        || (incoming_effective == existing_effective && incoming != *existing)
+    {
+        *existing = incoming;
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_s3_control_plane_import_state(
+    control_plane: &mut S3ControlPlaneState,
+    imported: S3ControlPlaneState,
+) -> S3ControlPlaneImportResponse {
+    let imported = normalize_s3_control_plane_state(imported);
+    let mut changed = false;
+
+    for bucket in imported.buckets {
+        match control_plane
+            .buckets
+            .iter_mut()
+            .find(|existing| existing.bucket_name == bucket.bucket_name)
+        {
+            Some(existing) => {
+                changed |= merge_s3_bucket_record(existing, bucket);
+            }
+            None => {
+                control_plane.buckets.push(bucket);
+                changed = true;
+            }
+        }
+    }
+
+    for access_key in imported.access_keys {
+        match control_plane
+            .access_keys
+            .iter_mut()
+            .find(|existing| existing.access_key_id == access_key.access_key_id)
+        {
+            Some(existing) => {
+                changed |= merge_s3_access_key_record(existing, access_key);
+            }
+            None => {
+                control_plane.access_keys.push(access_key);
+                changed = true;
+            }
+        }
+    }
+
+    *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+
+    S3ControlPlaneImportResponse {
+        changed,
+        bucket_count: control_plane
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.deleted_at_unix.is_none())
+            .count(),
+        access_key_count: control_plane.access_keys.len(),
+    }
+}
+
+fn s3_bucket_view(record: &S3BucketRecord) -> S3BucketView {
+    S3BucketView {
+        bucket_name: record.bucket_name.clone(),
+        root_prefix: record.root_prefix.clone(),
+        versioning_status: record.versioning_status,
+        read_only: record.read_only,
+        created_at_unix: record.created_at_unix,
+        updated_at_unix: record.updated_at_unix,
+        created_by: record.created_by.clone(),
+        deleted_at_unix: record.deleted_at_unix,
+    }
+}
+
+fn s3_access_key_view(record: &S3AccessKeyRecord) -> S3AccessKeyView {
+    S3AccessKeyView {
+        access_key_id: record.access_key_id.clone(),
+        description: record.description.clone(),
+        bucket_scope: record.bucket_scope.clone(),
+        prefix_scope: record.prefix_scope.clone(),
+        allow_list: record.allow_list,
+        allow_read: record.allow_read,
+        allow_write: record.allow_write,
+        allow_delete: record.allow_delete,
+        created_at_unix: record.created_at_unix,
+        updated_at_unix: record.updated_at_unix,
+        last_used_at_unix: record.last_used_at_unix,
+        revoked_at_unix: record.revoked_at_unix,
+        secret_fingerprint: text_fingerprint(&record.secret_material),
+    }
+}
+
+async fn build_s3_control_plane_status_response(
+    state: &ServerState,
+) -> S3ControlPlaneStatusResponse {
+    let control_plane = {
+        let control_plane = state.s3.control_plane.lock().await;
+        control_plane.clone()
+    };
+    let runtime = match state.s3.sync_runtime.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    S3ControlPlaneStatusResponse {
+        listener_enabled: state.s3.listener_enabled,
+        public_url: state.s3.public_url.clone(),
+        tls_enabled: state.s3.tls_enabled,
+        local_generation: runtime.generation,
+        last_applied_at_unix: runtime.last_applied_at_unix,
+        last_source_node_id: runtime.last_source_node_id,
+        last_error: runtime.last_error,
+        bucket_count: control_plane
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.deleted_at_unix.is_none())
+            .count(),
+        access_key_count: control_plane.access_keys.len(),
+    }
+}
+
+fn normalize_s3_bucket_name(bucket_name: &str) -> Result<String> {
+    let normalized = bucket_name.trim().to_ascii_lowercase();
+    if normalized.len() < 3 || normalized.len() > 63 {
+        bail!("bucket_name must be between 3 and 63 characters");
+    }
+    if normalized.starts_with('-')
+        || normalized.ends_with('-')
+        || normalized.starts_with('.')
+        || normalized.ends_with('.')
+    {
+        bail!("bucket_name must start and end with a letter or digit");
+    }
+    if normalized.contains("..") {
+        bail!("bucket_name must not contain adjacent dots");
+    }
+    if !normalized.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
+    }) {
+        bail!("bucket_name may only contain lowercase letters, digits, dots, and hyphens");
+    }
+    Ok(normalized)
+}
+
+fn normalize_s3_root_prefix(bucket_name: &str, root_prefix: Option<&str>) -> String {
+    let raw = root_prefix
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("s3/{bucket_name}/"));
+    let trimmed = raw.trim_matches('/').to_string();
+    if trimmed.is_empty() {
+        format!("s3/{bucket_name}/")
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+fn s3_root_prefixes_overlap(left: &str, right: &str) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn generate_s3_access_key_id() -> String {
+    let raw = Uuid::now_v7().simple().to_string().to_ascii_uppercase();
+    format!("IM{}", &raw[..18])
+}
+
+fn generate_s3_secret_access_key() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn normalize_optional_replication_text(value: Option<String>) -> Option<String> {
@@ -14304,6 +14770,175 @@ async fn fanout_client_credentials_once(
                     error = %err,
                     "client credential fan-out failed"
                 );
+            }
+        }
+    }
+}
+
+fn spawn_s3_control_plane_fanout(state: ServerState) {
+    tokio::spawn(async move {
+        fanout_s3_control_plane_once(&state).await;
+    });
+}
+
+async fn fanout_s3_control_plane_once(state: &ServerState) {
+    let peers = online_peer_nodes(state).await;
+    if peers.is_empty() {
+        return;
+    }
+
+    let (generation, control_plane) = {
+        let control_plane = state.s3.control_plane.lock().await.clone();
+        let generation = match state.s3.sync_runtime.lock() {
+            Ok(guard) => guard.generation,
+            Err(poisoned) => poisoned.into_inner().generation,
+        };
+        (generation, control_plane)
+    };
+    let request = S3ControlPlaneImportRequest {
+        cluster_id: state.cluster_id,
+        source_node_id: state.node_id,
+        generation,
+        state: control_plane,
+    };
+    let body = match serde_json::to_vec(&request) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(error = %err, "failed to serialize S3 control-plane fan-out payload");
+            return;
+        }
+    };
+
+    for peer in peers {
+        match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::POST,
+            S3_CONTROL_PLANE_IMPORT_PATH,
+            peer_json_headers(),
+            body.clone(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => {
+                if let Err(err) = response.json::<S3ControlPlaneImportResponse>() {
+                    tracing::debug!(
+                        peer_node_id = %peer.node_id,
+                        error = %err,
+                        "failed decoding S3 control-plane fan-out response"
+                    );
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    status = response.status,
+                    "S3 control-plane fan-out rejected by peer"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "S3 control-plane fan-out failed"
+                );
+            }
+        }
+    }
+}
+
+async fn import_s3_control_plane_state_from_peer(
+    state: &ServerState,
+    source_node_id: NodeId,
+    control_plane: S3ControlPlaneState,
+) -> Result<S3ControlPlaneImportResponse> {
+    let response = {
+        let mut local_control_plane = state.s3.control_plane.lock().await;
+        apply_s3_control_plane_import_state(&mut local_control_plane, control_plane)
+    };
+
+    if response.changed() {
+        persist_s3_control_plane_state(state, Some(source_node_id)).await?;
+    }
+
+    Ok(response)
+}
+
+async fn sync_s3_control_plane_once(state: &ServerState) {
+    let peers = online_peer_nodes(state).await;
+
+    for peer in peers {
+        let response = match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::GET,
+            S3_CONTROL_PLANE_EXPORT_PATH,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => response,
+            Ok(response) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    status = response.status,
+                    "S3 control-plane export rejected by peer"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "S3 control-plane export failed"
+                );
+                continue;
+            }
+        };
+
+        let payload = match response.json::<S3ControlPlaneExportResponse>() {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "failed decoding S3 control-plane export response"
+                );
+                continue;
+            }
+        };
+        if payload.cluster_id != state.cluster_id || payload.source_node_id != peer.node_id {
+            warn!(
+                peer_node_id = %peer.node_id,
+                payload_cluster_id = %payload.cluster_id,
+                payload_source_node_id = %payload.source_node_id,
+                "S3 control-plane export identity mismatch"
+            );
+            continue;
+        }
+
+        match import_s3_control_plane_state_from_peer(state, payload.source_node_id, payload.state)
+            .await
+        {
+            Ok(report) if report.changed() => {
+                info!(
+                    peer_node_id = %peer.node_id,
+                    bucket_count = report.bucket_count,
+                    access_key_count = report.access_key_count,
+                    "S3 control-plane sync applied peer snapshot"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    error = %err,
+                    "failed importing S3 control-plane peer snapshot"
+                );
+                if let Ok(mut runtime) = state.s3.sync_runtime.lock() {
+                    runtime.last_error = Some(err.to_string());
+                }
             }
         }
     }
@@ -17383,6 +18018,35 @@ async fn export_client_credentials(
         .into_response()
 }
 
+async fn export_s3_control_plane(
+    State(state): State<ServerState>,
+    caller: InternalCaller,
+) -> impl IntoResponse {
+    if caller.cluster_id != state.cluster_id {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let control_plane = {
+        let control_plane = state.s3.control_plane.lock().await;
+        control_plane.clone()
+    };
+    let generation = match state.s3.sync_runtime.lock() {
+        Ok(guard) => guard.generation,
+        Err(poisoned) => poisoned.into_inner().generation,
+    };
+
+    (
+        StatusCode::OK,
+        Json(S3ControlPlaneExportResponse {
+            cluster_id: state.cluster_id,
+            source_node_id: state.node_id,
+            generation,
+            state: control_plane,
+        }),
+    )
+        .into_response()
+}
+
 async fn import_client_credentials(
     State(state): State<ServerState>,
     caller: InternalCaller,
@@ -17408,6 +18072,33 @@ async fn import_client_credentials(
                 error = %err,
                 source_node_id = %request.source_node_id,
                 "failed importing replicated client credentials"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn import_s3_control_plane(
+    State(state): State<ServerState>,
+    caller: InternalCaller,
+    Json(request): Json<S3ControlPlaneImportRequest>,
+) -> impl IntoResponse {
+    if caller.cluster_id != state.cluster_id || request.cluster_id != state.cluster_id {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.source_node_id != caller.node_id {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    match import_s3_control_plane_state_from_peer(&state, request.source_node_id, request.state)
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                source_node_id = %request.source_node_id,
+                "failed importing replicated S3 control-plane state"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -18152,6 +18843,556 @@ async fn update_rendezvous_config(
     .await;
 
     (StatusCode::OK, Json(view)).into_response()
+}
+
+async fn get_s3_control_plane_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/s3/status/get";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let response = build_s3_control_plane_status_response(&state).await;
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "listener_enabled": response.listener_enabled,
+            "bucket_count": response.bucket_count,
+            "access_key_count": response.access_key_count,
+            "local_generation": response.local_generation,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn list_s3_buckets(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/s3/buckets/list";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let buckets = {
+        let control_plane = state.s3.control_plane.lock().await;
+        control_plane
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.deleted_at_unix.is_none())
+            .map(s3_bucket_view)
+            .collect::<Vec<_>>()
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({ "bucket_count": buckets.len() }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(buckets)).into_response()
+}
+
+async fn create_s3_bucket(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateS3BucketRequest>,
+) -> impl IntoResponse {
+    let bucket_name = match normalize_s3_bucket_name(&request.bucket_name) {
+        Ok(bucket_name) => bucket_name,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let root_prefix = normalize_s3_root_prefix(&bucket_name, request.root_prefix.as_deref());
+    let versioning_status = request.versioning_status.unwrap_or_default();
+
+    let action = "auth/s3/buckets/create";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        true,
+        json!({
+            "bucket_name": bucket_name,
+            "root_prefix": root_prefix,
+            "versioning_status": versioning_status,
+            "read_only": request.read_only,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let now = unix_ts();
+    let created_by = authz.actor.clone();
+    let bucket = match {
+        let mut control_plane = state.s3.control_plane.lock().await;
+        if control_plane
+            .buckets
+            .iter()
+            .filter(|existing| {
+                existing.bucket_name != bucket_name && existing.deleted_at_unix.is_none()
+            })
+            .any(|existing| s3_root_prefixes_overlap(&existing.root_prefix, &root_prefix))
+        {
+            None
+        } else {
+            Some(
+                match control_plane
+                    .buckets
+                    .iter_mut()
+                    .find(|existing| existing.bucket_name == bucket_name)
+                {
+                    Some(existing) => {
+                        existing.root_prefix = root_prefix.clone();
+                        existing.versioning_status = versioning_status;
+                        existing.read_only = request.read_only;
+                        existing.updated_at_unix = now;
+                        existing.created_by = created_by.clone();
+                        existing.deleted_at_unix = None;
+                        existing.clone()
+                    }
+                    None => {
+                        let bucket = S3BucketRecord {
+                            bucket_name: bucket_name.clone(),
+                            root_prefix: root_prefix.clone(),
+                            versioning_status,
+                            read_only: request.read_only,
+                            created_at_unix: now,
+                            updated_at_unix: now,
+                            created_by: created_by.clone(),
+                            deleted_at_unix: None,
+                        };
+                        control_plane.buckets.push(bucket.clone());
+                        *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+                        bucket
+                    }
+                },
+            )
+        }
+    } {
+        Some(bucket) => bucket,
+        None => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "error",
+                json!({
+                    "bucket_name": bucket_name,
+                    "root_prefix": root_prefix,
+                    "error": "bucket root_prefix overlaps an existing bucket mapping",
+                }),
+            )
+            .await;
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "bucket root_prefix overlaps an existing bucket mapping" })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(err) = persist_s3_control_plane_state(&state, None).await {
+        warn!(error = %err, "failed to persist S3 bucket change");
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            false,
+            true,
+            "error",
+            json!({
+                "bucket_name": bucket.bucket_name,
+                "error": err.to_string(),
+            }),
+        )
+        .await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    spawn_s3_control_plane_fanout(state.clone());
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        false,
+        true,
+        "success",
+        json!({
+            "bucket_name": bucket.bucket_name,
+            "root_prefix": bucket.root_prefix,
+            "versioning_status": bucket.versioning_status,
+            "read_only": bucket.read_only,
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(s3_bucket_view(&bucket))).into_response()
+}
+
+async fn delete_s3_bucket(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(bucket_name): Path<String>,
+) -> impl IntoResponse {
+    let bucket_name = match normalize_s3_bucket_name(&bucket_name) {
+        Ok(bucket_name) => bucket_name,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let action = "auth/s3/buckets/delete";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        true,
+        json!({ "bucket_name": bucket_name }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let root_prefix =
+        {
+            let control_plane = state.s3.control_plane.lock().await;
+            let Some(bucket) = control_plane.buckets.iter().find(|bucket| {
+                bucket.bucket_name == bucket_name && bucket.deleted_at_unix.is_none()
+            }) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            bucket.root_prefix.clone()
+        };
+
+    let bucket_not_empty = {
+        let store = read_store(&state, "s3_bucket_delete.inspect").await;
+        let inspector = store.store_index_inspector();
+        inspector
+            .current_object_hashes()
+            .into_iter()
+            .any(|(key, manifest_hash)| {
+                key.starts_with(&root_prefix) && manifest_hash != TOMBSTONE_MANIFEST_HASH
+            })
+    };
+    if bucket_not_empty {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            false,
+            true,
+            "error",
+            json!({
+                "bucket_name": bucket_name,
+                "error": "bucket is not empty",
+            }),
+        )
+        .await;
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "bucket is not empty" })),
+        )
+            .into_response();
+    }
+
+    let now = unix_ts();
+    {
+        let mut control_plane = state.s3.control_plane.lock().await;
+        let Some(bucket) = control_plane
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.bucket_name == bucket_name && bucket.deleted_at_unix.is_none())
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        bucket.updated_at_unix = now;
+        bucket.deleted_at_unix = Some(now);
+        *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+    }
+
+    if let Err(err) = persist_s3_control_plane_state(&state, None).await {
+        warn!(error = %err, "failed to persist S3 bucket deletion");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    spawn_s3_control_plane_fanout(state.clone());
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        false,
+        true,
+        "success",
+        json!({ "bucket_name": bucket_name }),
+    )
+    .await;
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn list_s3_access_keys(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/s3/access-keys/list";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let access_keys = {
+        let control_plane = state.s3.control_plane.lock().await;
+        control_plane
+            .access_keys
+            .iter()
+            .map(s3_access_key_view)
+            .collect::<Vec<_>>()
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({ "access_key_count": access_keys.len() }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(access_keys)).into_response()
+}
+
+async fn create_s3_access_key(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateS3AccessKeyRequest>,
+) -> impl IntoResponse {
+    if !request.allow_list && !request.allow_read && !request.allow_write && !request.allow_delete {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "at least one S3 permission must be enabled" })),
+        )
+            .into_response();
+    }
+
+    let description = normalize_optional_s3_text(request.description);
+    let bucket_scope = normalize_s3_scope_values(request.bucket_scope);
+    let prefix_scope = normalize_s3_scope_values(request.prefix_scope);
+
+    let action = "auth/s3/access-keys/create";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        true,
+        json!({
+            "description": description,
+            "bucket_scope": bucket_scope,
+            "prefix_scope": prefix_scope,
+            "allow_list": request.allow_list,
+            "allow_read": request.allow_read,
+            "allow_write": request.allow_write,
+            "allow_delete": request.allow_delete,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let unknown_bucket = {
+        let control_plane = state.s3.control_plane.lock().await;
+        bucket_scope.iter().find_map(|bucket| {
+            (!control_plane.buckets.iter().any(|existing| {
+                existing.bucket_name == *bucket && existing.deleted_at_unix.is_none()
+            }))
+            .then(|| bucket.clone())
+        })
+    };
+    if let Some(bucket) = unknown_bucket {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            false,
+            true,
+            "error",
+            json!({
+                "bucket_scope": bucket_scope,
+                "error": format!("unknown bucket in bucket_scope: {bucket}"),
+            }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown bucket in bucket_scope: {bucket}") })),
+        )
+            .into_response();
+    }
+
+    let now = unix_ts();
+    let access_key_id = generate_s3_access_key_id();
+    let secret_access_key = generate_s3_secret_access_key();
+    let access_key = {
+        let mut control_plane = state.s3.control_plane.lock().await;
+        let access_key = S3AccessKeyRecord {
+            access_key_id: access_key_id.clone(),
+            secret_material: secret_access_key.clone(),
+            description,
+            bucket_scope,
+            prefix_scope,
+            allow_list: request.allow_list,
+            allow_read: request.allow_read,
+            allow_write: request.allow_write,
+            allow_delete: request.allow_delete,
+            created_at_unix: now,
+            updated_at_unix: now,
+            last_used_at_unix: None,
+            revoked_at_unix: None,
+        };
+        control_plane.access_keys.push(access_key.clone());
+        *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+        access_key
+    };
+
+    if let Err(err) = persist_s3_control_plane_state(&state, None).await {
+        warn!(error = %err, "failed to persist S3 access key");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    spawn_s3_control_plane_fanout(state.clone());
+
+    let view = s3_access_key_view(&access_key);
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        false,
+        true,
+        "success",
+        json!({
+            "access_key_id": access_key_id,
+            "secret_fingerprint": view.secret_fingerprint,
+            "bucket_scope": view.bucket_scope,
+            "prefix_scope": view.prefix_scope,
+        }),
+    )
+    .await;
+
+    (
+        StatusCode::CREATED,
+        Json(CreateS3AccessKeyResponse {
+            access_key_id,
+            secret_access_key,
+            view,
+        }),
+    )
+        .into_response()
+}
+
+async fn revoke_s3_access_key(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(access_key_id): Path<String>,
+) -> impl IntoResponse {
+    let access_key_id = access_key_id.trim().to_string();
+    if access_key_id.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let action = "auth/s3/access-keys/revoke";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        true,
+        json!({ "access_key_id": access_key_id }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let now = unix_ts();
+    {
+        let mut control_plane = state.s3.control_plane.lock().await;
+        let Some(access_key) = control_plane
+            .access_keys
+            .iter_mut()
+            .find(|access_key| access_key.access_key_id == access_key_id)
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        access_key.revoked_at_unix = Some(now);
+        access_key.updated_at_unix = now;
+        *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+    }
+
+    if let Err(err) = persist_s3_control_plane_state(&state, None).await {
+        warn!(error = %err, "failed to persist S3 access key revocation");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    spawn_s3_control_plane_fanout(state.clone());
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        false,
+        true,
+        "success",
+        json!({ "access_key_id": access_key_id }),
+    )
+    .await;
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn revoke_client_credential(

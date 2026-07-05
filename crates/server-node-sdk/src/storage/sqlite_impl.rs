@@ -519,7 +519,7 @@ impl MetadataStore for SqliteMetadataStore {
 
         let mut bucket_stmt = db.prepare(
             "SELECT bucket_name, root_prefix, versioning_status, read_only,
-                    created_at_unix, updated_at_unix, created_by
+                    created_at_unix, updated_at_unix, created_by, deleted_at_unix
              FROM s3_buckets
              ORDER BY bucket_name",
         )?;
@@ -532,6 +532,7 @@ impl MetadataStore for SqliteMetadataStore {
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
             ))
         })?;
 
@@ -545,6 +546,7 @@ impl MetadataStore for SqliteMetadataStore {
                 created_at_unix,
                 updated_at_unix,
                 created_by,
+                deleted_at_unix,
             ) = row?;
             buckets.push(S3BucketRecord {
                 bucket_name,
@@ -561,13 +563,19 @@ impl MetadataStore for SqliteMetadataStore {
                 updated_at_unix: u64::try_from(updated_at_unix)
                     .context("negative s3 bucket updated_at_unix in sqlite")?,
                 created_by,
+                deleted_at_unix: deleted_at_unix
+                    .map(|value| {
+                        u64::try_from(value).context("negative s3 bucket deleted_at_unix in sqlite")
+                    })
+                    .transpose()?,
             });
         }
 
         let mut access_key_stmt = db.prepare(
-            "SELECT access_key_id, secret_hash, description, bucket_scope_json,
+            "SELECT access_key_id, secret_material, description, bucket_scope_json,
                     prefix_scope_json, allow_list, allow_read, allow_write,
-                    allow_delete, created_at_unix, last_used_at_unix, revoked_at_unix
+                    allow_delete, created_at_unix, updated_at_unix,
+                    last_used_at_unix, revoked_at_unix
              FROM s3_access_keys
              ORDER BY access_key_id",
         )?;
@@ -583,8 +591,9 @@ impl MetadataStore for SqliteMetadataStore {
                 row.get::<_, bool>(7)?,
                 row.get::<_, bool>(8)?,
                 row.get::<_, i64>(9)?,
-                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, i64>(10)?,
                 row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<i64>>(12)?,
             ))
         })?;
 
@@ -592,7 +601,7 @@ impl MetadataStore for SqliteMetadataStore {
         for row in access_key_rows {
             let (
                 access_key_id,
-                secret_hash,
+                secret_material,
                 description,
                 bucket_scope_json,
                 prefix_scope_json,
@@ -601,12 +610,13 @@ impl MetadataStore for SqliteMetadataStore {
                 allow_write,
                 allow_delete,
                 created_at_unix,
+                updated_at_unix,
                 last_used_at_unix,
                 revoked_at_unix,
             ) = row?;
             access_keys.push(S3AccessKeyRecord {
                 access_key_id,
-                secret_hash,
+                secret_material,
                 description,
                 bucket_scope: serde_json::from_slice(&bucket_scope_json)
                     .context("invalid s3 access key bucket_scope_json in sqlite")?,
@@ -618,6 +628,8 @@ impl MetadataStore for SqliteMetadataStore {
                 allow_delete,
                 created_at_unix: u64::try_from(created_at_unix)
                     .context("negative s3 access key created_at_unix in sqlite")?,
+                updated_at_unix: u64::try_from(updated_at_unix)
+                    .context("negative s3 access key updated_at_unix in sqlite")?,
                 last_used_at_unix: last_used_at_unix
                     .map(|value| {
                         u64::try_from(value)
@@ -652,25 +664,27 @@ impl MetadataStore for SqliteMetadataStore {
                      read_only,
                      created_at_unix,
                      updated_at_unix,
-                     created_by
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     created_by,
+                     deleted_at_unix
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for bucket in &state.buckets {
                 bucket_stmt.execute(params![
-                    bucket.bucket_name,
-                    bucket.root_prefix,
+                    bucket.bucket_name.as_str(),
+                    bucket.root_prefix.as_str(),
                     bucket.versioning_status.as_str(),
                     bucket.read_only,
                     u64_to_i64(bucket.created_at_unix)?,
                     u64_to_i64(bucket.updated_at_unix)?,
-                    bucket.created_by,
+                    bucket.created_by.clone(),
+                    bucket.deleted_at_unix.map(u64_to_i64).transpose()?,
                 ])?;
             }
 
             let mut access_key_stmt = db.prepare(
                 "INSERT INTO s3_access_keys (
                      access_key_id,
-                     secret_hash,
+                     secret_material,
                      description,
                      bucket_scope_json,
                      prefix_scope_json,
@@ -679,15 +693,16 @@ impl MetadataStore for SqliteMetadataStore {
                      allow_write,
                      allow_delete,
                      created_at_unix,
+                     updated_at_unix,
                      last_used_at_unix,
                      revoked_at_unix
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for access_key in &state.access_keys {
                 access_key_stmt.execute(params![
-                    access_key.access_key_id,
-                    access_key.secret_hash,
-                    access_key.description,
+                    access_key.access_key_id.as_str(),
+                    access_key.secret_material.as_str(),
+                    access_key.description.clone(),
                     serde_json::to_vec(&access_key.bucket_scope)?,
                     serde_json::to_vec(&access_key.prefix_scope)?,
                     access_key.allow_list,
@@ -695,6 +710,7 @@ impl MetadataStore for SqliteMetadataStore {
                     access_key.allow_write,
                     access_key.allow_delete,
                     u64_to_i64(access_key.created_at_unix)?,
+                    u64_to_i64(access_key.updated_at_unix)?,
                     access_key.last_used_at_unix.map(u64_to_i64).transpose()?,
                     access_key.revoked_at_unix.map(u64_to_i64).transpose()?,
                 ])?;
@@ -1942,12 +1958,13 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             read_only INTEGER NOT NULL,
             created_at_unix INTEGER NOT NULL,
             updated_at_unix INTEGER NOT NULL,
-            created_by TEXT
+            created_by TEXT,
+            deleted_at_unix INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS s3_access_keys (
             access_key_id TEXT PRIMARY KEY,
-            secret_hash TEXT NOT NULL,
+            secret_material TEXT NOT NULL,
             description TEXT,
             bucket_scope_json BLOB NOT NULL,
             prefix_scope_json BLOB NOT NULL,
@@ -1956,6 +1973,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             allow_write INTEGER NOT NULL,
             allow_delete INTEGER NOT NULL,
             created_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL,
             last_used_at_unix INTEGER,
             revoked_at_unix INTEGER
         );
