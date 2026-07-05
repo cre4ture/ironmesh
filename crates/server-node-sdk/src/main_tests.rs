@@ -3241,6 +3241,7 @@ async fn s3_versioning_surface_lists_versions_and_delete_markers_impl(backend: M
     assert_eq!(copy_old_version.status(), StatusCode::OK);
 
     let get_copied_old_version = app
+        .clone()
         .oneshot(s3_signed_request(
             Method::GET,
             "/versions.example/docs/copied-from-v1.txt",
@@ -3256,6 +3257,146 @@ async fn s3_versioning_surface_lists_versions_and_delete_markers_impl(backend: M
         .await
         .unwrap();
     assert_eq!(get_copied_old_version_body.as_ref(), b"version one");
+
+    let delete_delete_marker = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/versions.example/docs/versioned.txt?versionId={delete_marker_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_delete_marker.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_delete_marker
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(delete_marker_version_id.as_str())
+    );
+    assert_eq!(
+        delete_delete_marker
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let get_restored_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_restored_current.status(), StatusCode::OK);
+    let get_restored_current_body = to_bytes(get_restored_current.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(get_restored_current_body.as_ref(), b"version two");
+
+    let delete_v1_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/versions.example/docs/versioned.txt?versionId={v1_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_v1_version.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_v1_version
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(v1_version_id.as_str())
+    );
+    assert!(
+        delete_v1_version
+            .headers()
+            .get("x-amz-delete-marker")
+            .is_none()
+    );
+
+    let get_deleted_v1_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/versions.example/docs/versioned.txt?versionId={v1_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_v1_version.status(), StatusCode::NOT_FOUND);
+    let get_deleted_v1_version_body = to_bytes(get_deleted_v1_version.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_deleted_v1_version_xml =
+        String::from_utf8(get_deleted_v1_version_body.to_vec()).unwrap();
+    assert!(get_deleted_v1_version_xml.contains("<Code>NoSuchVersion</Code>"));
+
+    let delete_v2_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/versions.example/docs/versioned.txt?versionId={v2_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_v2_version.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_v2_version
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(v2_version_id.as_str())
+    );
+    assert!(
+        delete_v2_version
+            .headers()
+            .get("x-amz-delete-marker")
+            .is_none()
+    );
+
+    let get_missing_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_missing_current.status(), StatusCode::NOT_FOUND);
+    assert!(
+        get_missing_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .is_none()
+    );
 
     cleanup_test_state(&state).await;
 }

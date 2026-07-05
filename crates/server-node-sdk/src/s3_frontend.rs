@@ -2180,6 +2180,99 @@ async fn abort_multipart_upload_response(
     response
 }
 
+async fn delete_object_version_response(
+    state: &ServerState,
+    request_path: &str,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+    version_id: &str,
+) -> Response {
+    let actor = s3_actor_context(&request.access_key);
+    let mut store = lock_store(state, "s3.delete_object_version.store").await;
+    let outcome = match store
+        .delete_object_version_for_key(full_key, version_id)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to delete S3 object version: {err:#}"),
+                request_path,
+                &request.request_id,
+            );
+        }
+    };
+    let Some(outcome) = outcome else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchVersion",
+            "the specified version does not exist",
+            request_path,
+            &request.request_id,
+        );
+    };
+    if let Err(err) = store
+        .delete_s3_object_version(&bucket.bucket_name, &outcome.version_id)
+        .await
+    {
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed to delete S3 object version record: {err:#}"),
+            request_path,
+            &request.request_id,
+        );
+    }
+    drop(store);
+
+    publish_namespace_change(state);
+    let version_subject = format!("{full_key}@{}", outcome.version_id);
+    let mut cluster = state.cluster.lock().await;
+    cluster.remove_replica(&version_subject, state.node_id);
+    cluster.remove_available(&version_subject, state.node_id);
+    if !outcome.current_object_exists {
+        cluster.remove_replica(full_key, state.node_id);
+        cluster.remove_available(full_key, state.node_id);
+    }
+    drop(cluster);
+    if let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            key = %full_key,
+            version_id = %outcome.version_id,
+            "failed persisting cluster replicas after S3 version delete"
+        );
+    }
+    record_data_change_event(
+        state,
+        PendingDataChangeEvent {
+            action: DataChangeAction::Delete,
+            actor: Some(actor),
+            path: full_key.to_string(),
+            from_path: None,
+            to_path: None,
+            recursive: false,
+            affected_path_count: 1,
+            total_size_bytes: None,
+            version_id: Some(outcome.version_id.clone()),
+            snapshot_id: None,
+            upload_mode: None,
+        },
+    )
+    .await;
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    append_request_id_header(&mut response, &request.request_id);
+    append_version_id_header(&mut response, Some(&outcome.version_id));
+    if outcome.was_delete_marker {
+        append_delete_marker_header(&mut response);
+    }
+    response
+}
+
 async fn delete_object(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
@@ -2244,6 +2337,17 @@ async fn delete_object(
             uri.path(),
             &request.request_id,
         );
+    }
+    if let Some(version_id) = query.version_id.as_deref() {
+        return delete_object_version_response(
+            &state,
+            uri.path(),
+            &request,
+            &bucket,
+            &full_key,
+            version_id,
+        )
+        .await;
     }
 
     let actor = s3_actor_context(&request.access_key);
@@ -3026,10 +3130,22 @@ async fn resolve_requested_version_id(
             }
         };
         let Some(version) = version else {
-            return Ok(None);
+            return Err(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "the specified version does not exist",
+                request_path,
+                request_id,
+            ));
         };
         if version.ironmesh_key != full_key {
-            return Ok(None);
+            return Err(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "the specified version does not exist",
+                request_path,
+                request_id,
+            ));
         }
         return Ok(Some(version.version_id));
     }

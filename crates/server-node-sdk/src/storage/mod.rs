@@ -724,6 +724,13 @@ pub struct ObjectVersionInspection {
     pub is_delete_marker: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteObjectVersionOutcome {
+    pub version_id: String,
+    pub was_delete_marker: bool,
+    pub current_object_exists: bool,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -2469,6 +2476,62 @@ impl PersistentStore {
             created_at_unix: record.created_at_unix,
             total_size_bytes: Some(manifest.total_size_bytes as u64),
             is_delete_marker: false,
+        }))
+    }
+
+    pub async fn delete_object_version_for_key(
+        &mut self,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<DeleteObjectVersionOutcome>> {
+        let Some(object_id) = self
+            .resolve_object_id_for_key_version(key, version_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(mut index) = self.load_version_index_by_object_id(&object_id).await? else {
+            return Ok(None);
+        };
+        let Some(record) = index.versions.get(version_id).cloned() else {
+            return Ok(None);
+        };
+
+        let touched_paths = BTreeSet::from([key.to_string()]);
+        let before_manifest = self.current_state.objects.get(key).cloned();
+        let before_object_id = self.current_state.object_ids.get(key).cloned();
+        self.maybe_rotate_snapshot_batch(&touched_paths).await?;
+
+        index.versions.remove(version_id);
+        if index.versions.is_empty() {
+            self.delete_version_index_by_object_id(&object_id).await?;
+            if self.current_state.object_ids.get(key) == Some(&object_id) {
+                self.current_state.objects.remove(key);
+                self.current_state.object_ids.remove(key);
+            }
+        } else {
+            index.head_version_ids = recompute_head_version_ids(&index);
+            index.preferred_head_version_id = choose_preferred_head(&index);
+            self.persist_version_index_by_object_id(&object_id, &index)
+                .await?;
+            self.sync_current_state_for_key_from_index(key, &index)?;
+        }
+
+        self.delete_object_version_metadata(version_id).await?;
+        let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
+            || self.current_state.object_ids.get(key).cloned() != before_object_id
+        {
+            touched_paths
+        } else {
+            BTreeSet::new()
+        };
+        self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
+            .await?;
+
+        Ok(Some(DeleteObjectVersionOutcome {
+            version_id: version_id.to_string(),
+            was_delete_marker: record.manifest_hash == TOMBSTONE_MANIFEST_HASH,
+            current_object_exists: self.current_state.objects.contains_key(key),
         }))
     }
 
