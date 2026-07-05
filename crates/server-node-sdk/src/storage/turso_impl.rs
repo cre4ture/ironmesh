@@ -541,7 +541,7 @@ impl MetadataStore for TursoMetadataStore {
             .query(
                 "SELECT access_key_id, secret_material, description, bucket_scope_json,
                         prefix_scope_json, allow_list, allow_read, allow_write,
-                        allow_delete, created_at_unix, updated_at_unix,
+                        allow_delete, allow_manage, created_at_unix, updated_at_unix,
                         last_used_at_unix, revoked_at_unix
                  FROM s3_access_keys
                  ORDER BY access_key_id",
@@ -562,10 +562,11 @@ impl MetadataStore for TursoMetadataStore {
                 allow_read: row_bool(&row, 6, "s3_access_keys.allow_read")?,
                 allow_write: row_bool(&row, 7, "s3_access_keys.allow_write")?,
                 allow_delete: row_bool(&row, 8, "s3_access_keys.allow_delete")?,
-                created_at_unix: row_u64(&row, 9, "s3_access_keys.created_at_unix")?,
-                updated_at_unix: row_u64(&row, 10, "s3_access_keys.updated_at_unix")?,
-                last_used_at_unix: row_opt_u64(&row, 11, "s3_access_keys.last_used_at_unix")?,
-                revoked_at_unix: row_opt_u64(&row, 12, "s3_access_keys.revoked_at_unix")?,
+                allow_manage: row_bool(&row, 9, "s3_access_keys.allow_manage")?,
+                created_at_unix: row_u64(&row, 10, "s3_access_keys.created_at_unix")?,
+                updated_at_unix: row_u64(&row, 11, "s3_access_keys.updated_at_unix")?,
+                last_used_at_unix: row_opt_u64(&row, 12, "s3_access_keys.last_used_at_unix")?,
+                revoked_at_unix: row_opt_u64(&row, 13, "s3_access_keys.revoked_at_unix")?,
             });
         }
 
@@ -631,11 +632,12 @@ impl MetadataStore for TursoMetadataStore {
                              allow_read,
                              allow_write,
                              allow_delete,
+                             allow_manage,
                              created_at_unix,
                              updated_at_unix,
                              last_used_at_unix,
                              revoked_at_unix
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                         (
                             access_key.access_key_id.as_str(),
                             access_key.secret_material.as_str(),
@@ -646,6 +648,11 @@ impl MetadataStore for TursoMetadataStore {
                             if access_key.allow_read { 1_i64 } else { 0_i64 },
                             if access_key.allow_write { 1_i64 } else { 0_i64 },
                             if access_key.allow_delete {
+                                1_i64
+                            } else {
+                                0_i64
+                            },
+                            if access_key.allow_manage {
                                 1_i64
                             } else {
                                 0_i64
@@ -2088,6 +2095,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 allow_read INTEGER NOT NULL,
                 allow_write INTEGER NOT NULL,
                 allow_delete INTEGER NOT NULL,
+                allow_manage INTEGER NOT NULL DEFAULT 0,
                 created_at_unix INTEGER NOT NULL,
                 updated_at_unix INTEGER NOT NULL,
                 last_used_at_unix INTEGER,
@@ -2196,6 +2204,20 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             ",
         )
         .await?;
+    if let Err(err) = connection
+        .execute(
+            "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+    {
+        let duplicate_column = err
+            .to_string()
+            .contains("duplicate column name: allow_manage");
+        if !duplicate_column {
+            return Err(err).context("failed to migrate turso s3_access_keys.allow_manage");
+        }
+    }
     Ok(())
 }
 

@@ -14503,6 +14503,7 @@ struct S3AccessKeyView {
     allow_read: bool,
     allow_write: bool,
     allow_delete: bool,
+    allow_manage: bool,
     created_at_unix: u64,
     updated_at_unix: u64,
     last_used_at_unix: Option<u64>,
@@ -14548,6 +14549,8 @@ struct CreateS3AccessKeyRequest {
     allow_write: bool,
     #[serde(default)]
     allow_delete: bool,
+    #[serde(default)]
+    allow_manage: bool,
 }
 
 fn default_s3_access_allow_read() -> bool {
@@ -14847,6 +14850,7 @@ fn s3_access_key_view(record: &S3AccessKeyRecord) -> S3AccessKeyView {
         allow_read: record.allow_read,
         allow_write: record.allow_write,
         allow_delete: record.allow_delete,
+        allow_manage: record.allow_manage,
         created_at_unix: record.created_at_unix,
         updated_at_unix: record.updated_at_unix,
         last_used_at_unix: record.last_used_at_unix,
@@ -19756,7 +19760,12 @@ async fn create_s3_access_key(
     headers: HeaderMap,
     Json(request): Json<CreateS3AccessKeyRequest>,
 ) -> impl IntoResponse {
-    if !request.allow_list && !request.allow_read && !request.allow_write && !request.allow_delete {
+    if !request.allow_list
+        && !request.allow_read
+        && !request.allow_write
+        && !request.allow_delete
+        && !request.allow_manage
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "at least one S3 permission must be enabled" })),
@@ -19783,6 +19792,7 @@ async fn create_s3_access_key(
             "allow_read": request.allow_read,
             "allow_write": request.allow_write,
             "allow_delete": request.allow_delete,
+            "allow_manage": request.allow_manage,
         }),
     )
     .await
@@ -19794,9 +19804,10 @@ async fn create_s3_access_key(
     let unknown_bucket = {
         let control_plane = state.s3.control_plane.lock().await;
         bucket_scope.iter().find_map(|bucket| {
-            (!control_plane.buckets.iter().any(|existing| {
-                existing.bucket_name == *bucket && existing.deleted_at_unix.is_none()
-            }))
+            (!request.allow_manage
+                && !control_plane.buckets.iter().any(|existing| {
+                    existing.bucket_name == *bucket && existing.deleted_at_unix.is_none()
+                }))
             .then(|| bucket.clone())
         })
     };
@@ -19837,6 +19848,7 @@ async fn create_s3_access_key(
             allow_read: request.allow_read,
             allow_write: request.allow_write,
             allow_delete: request.allow_delete,
+            allow_manage: request.allow_manage,
             created_at_unix: now,
             updated_at_unix: now,
             last_used_at_unix: None,

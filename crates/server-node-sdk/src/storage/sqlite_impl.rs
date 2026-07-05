@@ -574,10 +574,10 @@ impl MetadataStore for SqliteMetadataStore {
         let mut access_key_stmt = db.prepare(
             "SELECT access_key_id, secret_material, description, bucket_scope_json,
                     prefix_scope_json, allow_list, allow_read, allow_write,
-                    allow_delete, created_at_unix, updated_at_unix,
+                    allow_delete, allow_manage, created_at_unix, updated_at_unix,
                     last_used_at_unix, revoked_at_unix
-             FROM s3_access_keys
-             ORDER BY access_key_id",
+                 FROM s3_access_keys
+                 ORDER BY access_key_id",
         )?;
         let access_key_rows = access_key_stmt.query_map([], |row| {
             Ok((
@@ -590,10 +590,11 @@ impl MetadataStore for SqliteMetadataStore {
                 row.get::<_, bool>(6)?,
                 row.get::<_, bool>(7)?,
                 row.get::<_, bool>(8)?,
-                row.get::<_, i64>(9)?,
+                row.get::<_, bool>(9)?,
                 row.get::<_, i64>(10)?,
-                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, i64>(11)?,
                 row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
             ))
         })?;
 
@@ -609,6 +610,7 @@ impl MetadataStore for SqliteMetadataStore {
                 allow_read,
                 allow_write,
                 allow_delete,
+                allow_manage,
                 created_at_unix,
                 updated_at_unix,
                 last_used_at_unix,
@@ -626,6 +628,7 @@ impl MetadataStore for SqliteMetadataStore {
                 allow_read,
                 allow_write,
                 allow_delete,
+                allow_manage,
                 created_at_unix: u64::try_from(created_at_unix)
                     .context("negative s3 access key created_at_unix in sqlite")?,
                 updated_at_unix: u64::try_from(updated_at_unix)
@@ -692,11 +695,12 @@ impl MetadataStore for SqliteMetadataStore {
                      allow_read,
                      allow_write,
                      allow_delete,
+                     allow_manage,
                      created_at_unix,
                      updated_at_unix,
                      last_used_at_unix,
                      revoked_at_unix
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for access_key in &state.access_keys {
                 access_key_stmt.execute(params![
@@ -709,6 +713,7 @@ impl MetadataStore for SqliteMetadataStore {
                     access_key.allow_read,
                     access_key.allow_write,
                     access_key.allow_delete,
+                    access_key.allow_manage,
                     u64_to_i64(access_key.created_at_unix)?,
                     u64_to_i64(access_key.updated_at_unix)?,
                     access_key.last_used_at_unix.map(u64_to_i64).transpose()?,
@@ -2052,6 +2057,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             allow_read INTEGER NOT NULL,
             allow_write INTEGER NOT NULL,
             allow_delete INTEGER NOT NULL,
+            allow_manage INTEGER NOT NULL DEFAULT 0,
             created_at_unix INTEGER NOT NULL,
             updated_at_unix INTEGER NOT NULL,
             last_used_at_unix INTEGER,
@@ -2159,6 +2165,17 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
         ",
     )?;
+    if let Err(err) = db.execute(
+        "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
+        [],
+    ) {
+        let duplicate_column = err
+            .to_string()
+            .contains("duplicate column name: allow_manage");
+        if !duplicate_column {
+            return Err(err).context("failed to migrate sqlite s3_access_keys.allow_manage");
+        }
+    }
 
     let stored_version = db
         .query_row(

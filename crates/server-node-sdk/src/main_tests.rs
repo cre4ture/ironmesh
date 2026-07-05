@@ -1179,6 +1179,7 @@ fn sample_s3_access_key_record(
         allow_read: true,
         allow_write: true,
         allow_delete: true,
+        allow_manage: false,
         created_at_unix,
         updated_at_unix: created_at_unix,
         last_used_at_unix: None,
@@ -1675,6 +1676,7 @@ async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
             allow_read: true,
             allow_write: true,
             allow_delete: false,
+            allow_manage: false,
         }),
     )
     .await
@@ -2018,6 +2020,7 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -2281,6 +2284,156 @@ run_on_main_metadata_backends!(
     s3_listener_supports_bucket_listing_and_object_crud_turso
 );
 
+async fn s3_listener_supports_bucket_create_and_delete_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-bucket-manage-test".to_string()),
+            bucket_scope: vec!["managed.example".to_string()],
+            prefix_scope: vec![],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+    assert!(created_access_key.view.allow_manage);
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let create_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_bucket.status(), StatusCode::OK);
+    assert_eq!(
+        create_bucket
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/managed.example")
+    );
+
+    let head_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/managed.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"hello"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let delete_nonempty_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_nonempty_bucket.status(), StatusCode::CONFLICT);
+    let delete_nonempty_bucket_body = to_bytes(delete_nonempty_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_nonempty_bucket_xml =
+        String::from_utf8(delete_nonempty_bucket_body.to_vec()).unwrap();
+    assert!(delete_nonempty_bucket_xml.contains("<Code>BucketNotEmpty</Code>"));
+
+    let delete_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/managed.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+    let delete_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
+
+    let head_deleted_bucket = app
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_deleted_bucket.status(), StatusCode::NOT_FOUND);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_bucket_create_and_delete_impl,
+    s3_listener_supports_bucket_create_and_delete,
+    s3_listener_supports_bucket_create_and_delete_turso
+);
+
 async fn s3_listener_supports_presigned_requests_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
@@ -2311,6 +2464,7 @@ async fn s3_listener_supports_presigned_requests_impl(backend: MainTestBackend) 
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -2462,6 +2616,7 @@ async fn s3_listener_lists_folder_marker_objects_and_common_prefixes_impl(
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -2548,6 +2703,7 @@ async fn s3_listener_continuation_tokens_page_listings_impl(backend: MainTestBac
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -2663,6 +2819,7 @@ async fn s3_copy_object_overwrites_targets_and_replaces_metadata_impl(backend: M
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -2880,6 +3037,7 @@ async fn s3_multipart_uploads_complete_and_abort_impl(backend: MainTestBackend) 
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -3223,6 +3381,7 @@ async fn s3_versioning_surface_lists_versions_and_delete_markers_impl(backend: M
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -3678,6 +3837,7 @@ async fn s3_version_listing_supports_delimiter_impl(backend: MainTestBackend) {
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await
@@ -3858,6 +4018,7 @@ async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) 
             allow_read: true,
             allow_write: true,
             allow_delete: true,
+            allow_manage: false,
         }),
     )
     .await

@@ -133,7 +133,7 @@ pub(crate) fn build_listener_app() -> Router<ServerState> {
                 .head(head_bucket)
                 .post(s3_not_implemented_bucket_post)
                 .put(put_bucket)
-                .delete(s3_bucket_mutation_not_supported),
+                .delete(delete_bucket),
         )
         .route(
             "/{bucket}/{*key}",
@@ -379,13 +379,205 @@ async fn put_bucket(
     if query.versioning.is_some() {
         return put_bucket_versioning_response(&state, &uri, &request, &bucket_name, payload).await;
     }
-    s3_error_response(
-        StatusCode::FORBIDDEN,
-        "AccessDenied",
-        "bucket creation and deletion are managed through the Ironmesh admin control plane",
-        uri.path(),
-        &request.request_id,
-    )
+    if !request.access_key.allow_manage {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to create buckets",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let bucket_name = match normalize_s3_bucket_name(&bucket_name) {
+        Ok(bucket_name) => bucket_name,
+        Err(_) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidBucketName",
+                "the specified bucket is not valid",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    if !access_key_can_manage_bucket_name(&request.access_key, &bucket_name) {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to create this bucket",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    if !payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return s3_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "CreateBucket request bodies are not implemented yet",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let now = unix_ts();
+    let created = {
+        let mut control_plane = state.s3.control_plane.lock().await;
+        if let Some(bucket) = control_plane
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.bucket_name == bucket_name)
+        {
+            if bucket.deleted_at_unix.is_none() {
+                return s3_error_response(
+                    StatusCode::CONFLICT,
+                    "BucketAlreadyOwnedByYou",
+                    "the requested bucket already exists",
+                    uri.path(),
+                    &request.request_id,
+                );
+            }
+            bucket.deleted_at_unix = None;
+            bucket.updated_at_unix = now;
+        } else {
+            control_plane.buckets.push(S3BucketRecord {
+                bucket_name: bucket_name.clone(),
+                root_prefix: default_s3_bucket_root_prefix(&bucket_name),
+                versioning_status: S3BucketVersioningStatus::Disabled,
+                read_only: false,
+                created_at_unix: now,
+                updated_at_unix: now,
+                created_by: Some(request.access_key.access_key_id.clone()),
+                deleted_at_unix: None,
+            });
+        }
+        *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+        control_plane
+            .buckets
+            .iter()
+            .find(|bucket| bucket.bucket_name == bucket_name && bucket.deleted_at_unix.is_none())
+            .cloned()
+            .expect("bucket was just created or restored")
+    };
+
+    if let Err(err) = persist_s3_control_plane_state(&state, None).await {
+        warn!(error = %err, bucket_name = %bucket_name, "failed to persist S3 bucket");
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "failed to persist bucket metadata",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    spawn_s3_control_plane_fanout(state.clone());
+
+    let mut response = StatusCode::OK.into_response();
+    append_request_id_header(&mut response, &request.request_id);
+    if let Ok(location) = HeaderValue::from_str(&format!("/{}", created.bucket_name)) {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+    response
+}
+
+async fn delete_bucket(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(bucket_name): Path<String>,
+) -> Response {
+    let request = match authenticate_request(&state, &Method::DELETE, &uri, &headers).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if !request.access_key.allow_manage {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to delete buckets",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let bucket = match resolve_bucket(&state, &bucket_name).await {
+        Some(bucket) => bucket,
+        None => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    if !access_key_allows_bucket(&request.access_key, &bucket) {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to delete this bucket",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let bucket_has_objects = {
+        let store = read_store(&state, "s3.delete_bucket.inspect_objects").await;
+        let inspector = store.store_index_inspector();
+        inspector
+            .current_object_hashes()
+            .iter()
+            .any(|(key, manifest_hash)| {
+                manifest_hash.as_str() != TOMBSTONE_MANIFEST_HASH
+                    && key.starts_with(&bucket.root_prefix)
+            })
+    };
+    if bucket_has_objects {
+        return s3_error_response(
+            StatusCode::CONFLICT,
+            "BucketNotEmpty",
+            "the bucket you tried to delete is not empty",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    {
+        let mut control_plane = state.s3.control_plane.lock().await;
+        let Some(bucket) = control_plane
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.bucket_name == bucket_name && bucket.deleted_at_unix.is_none())
+        else {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        };
+        bucket.deleted_at_unix = Some(unix_ts());
+        bucket.updated_at_unix = unix_ts();
+        *control_plane = normalize_s3_control_plane_state(control_plane.clone());
+    }
+
+    if let Err(err) = persist_s3_control_plane_state(&state, None).await {
+        warn!(error = %err, bucket_name = %bucket_name, "failed to persist S3 bucket deletion");
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "failed to persist bucket metadata",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    spawn_s3_control_plane_fanout(state.clone());
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    append_request_id_header(&mut response, &request.request_id);
+    response
 }
 
 async fn list_objects_v2_response(
@@ -2717,29 +2909,6 @@ async fn get_or_head_object_response(
     response
 }
 
-async fn s3_bucket_mutation_not_supported(
-    State(state): State<ServerState>,
-    OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
-) -> Response {
-    let method = headers
-        .get("x-http-method-override")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Method::from_bytes(value.as_bytes()).ok())
-        .unwrap_or(Method::PUT);
-    let request = match authenticate_request(&state, &method, &uri, &headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    s3_error_response(
-        StatusCode::FORBIDDEN,
-        "AccessDenied",
-        "bucket creation and deletion are managed through the Ironmesh admin control plane",
-        uri.path(),
-        &request.request_id,
-    )
-}
-
 async fn s3_not_implemented_bucket_post(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
@@ -3205,6 +3374,10 @@ fn normalize_header_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn default_s3_bucket_root_prefix(bucket_name: &str) -> String {
+    format!("s3/{bucket_name}/")
+}
+
 fn derive_signing_key(secret_material: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let secret_key = format!("AWS4{secret_material}");
     let date_key = hmac_sha256(secret_key.as_bytes(), date.as_bytes());
@@ -3271,6 +3444,14 @@ async fn visible_buckets(
         .filter(|bucket| access_key_allows_bucket(access_key, bucket))
         .cloned()
         .collect()
+}
+
+fn access_key_can_manage_bucket_name(access_key: &S3AccessKeyRecord, bucket_name: &str) -> bool {
+    access_key.bucket_scope.is_empty()
+        || access_key
+            .bucket_scope
+            .iter()
+            .any(|scope| scope == bucket_name)
 }
 
 fn access_key_allows_bucket(access_key: &S3AccessKeyRecord, bucket: &S3BucketRecord) -> bool {

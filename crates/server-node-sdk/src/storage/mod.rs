@@ -666,6 +666,8 @@ pub struct S3AccessKeyRecord {
     pub allow_read: bool,
     pub allow_write: bool,
     pub allow_delete: bool,
+    #[serde(default)]
+    pub allow_manage: bool,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
     #[serde(default)]
