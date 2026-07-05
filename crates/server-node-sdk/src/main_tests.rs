@@ -3648,6 +3648,186 @@ run_on_main_metadata_backends!(
     s3_versioning_surface_lists_versions_and_delete_markers_turso
 );
 
+async fn s3_version_listing_supports_delimiter_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "versions.example".to_string(),
+            root_prefix: Some("tenant/versions".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-version-delimiter-test".to_string()),
+            bucket_scope: vec!["versions.example".to_string()],
+            prefix_scope: vec!["tenant/versions/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    for (path, body) in [
+        (
+            "/versions.example/root.txt",
+            Bytes::from_static(b"root version"),
+        ),
+        (
+            "/versions.example/docs/a.txt",
+            Bytes::from_static(b"docs a version"),
+        ),
+        (
+            "/versions.example/docs/sub/b.txt",
+            Bytes::from_static(b"docs sub b version"),
+        ),
+    ] {
+        let put_object = app
+            .clone()
+            .oneshot(s3_signed_request(
+                Method::PUT,
+                path,
+                &created_access_key.access_key_id,
+                &created_access_key.secret_access_key,
+                &[("content-type", "text/plain")],
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_object.status(), StatusCode::OK);
+    }
+
+    let root_versions = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(root_versions.status(), StatusCode::OK);
+    let root_versions_body = to_bytes(root_versions.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let root_versions_xml = String::from_utf8(root_versions_body.to_vec()).unwrap();
+    assert!(root_versions_xml.contains("<Delimiter>/</Delimiter>"));
+    assert!(root_versions_xml.contains("<Key>root.txt</Key>"));
+    assert!(root_versions_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>"));
+    assert!(!root_versions_xml.contains("<Key>docs/a.txt</Key>"));
+    assert!(!root_versions_xml.contains("<Key>docs/sub/b.txt</Key>"));
+
+    let first_root_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&delimiter=/&max-keys=1",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_root_page.status(), StatusCode::OK);
+    let first_root_page_body = to_bytes(first_root_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_root_page_xml = String::from_utf8(first_root_page_body.to_vec()).unwrap();
+    assert!(first_root_page_xml.contains("<IsTruncated>true</IsTruncated>"));
+    assert!(
+        first_root_page_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+    );
+    assert_eq!(
+        xml_tag_text(&first_root_page_xml, "NextKeyMarker").as_deref(),
+        Some("root.txt")
+    );
+    assert!(xml_tag_text(&first_root_page_xml, "NextVersionIdMarker").is_some());
+
+    let root_version_id =
+        xml_tag_text(&first_root_page_xml, "NextVersionIdMarker").expect("next version marker");
+    let second_root_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!(
+                "/versions.example?versions=&delimiter=/&max-keys=1&key-marker=root.txt&version-id-marker={root_version_id}"
+            ),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_root_page.status(), StatusCode::OK);
+    let second_root_page_body = to_bytes(second_root_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_root_page_xml = String::from_utf8(second_root_page_body.to_vec()).unwrap();
+    assert!(second_root_page_xml.contains("<Key>root.txt</Key>"));
+    assert!(
+        !second_root_page_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+    );
+
+    let docs_versions = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&prefix=docs/&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(docs_versions.status(), StatusCode::OK);
+    let docs_versions_body = to_bytes(docs_versions.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let docs_versions_xml = String::from_utf8(docs_versions_body.to_vec()).unwrap();
+    assert!(docs_versions_xml.contains("<Key>docs/a.txt</Key>"));
+    assert!(
+        docs_versions_xml.contains("<CommonPrefixes><Prefix>docs/sub/</Prefix></CommonPrefixes>")
+    );
+    assert!(!docs_versions_xml.contains("<Key>docs/sub/b.txt</Key>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_version_listing_supports_delimiter_impl,
+    s3_version_listing_supports_delimiter,
+    s3_version_listing_supports_delimiter_turso
+);
+
 async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());

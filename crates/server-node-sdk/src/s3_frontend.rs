@@ -113,6 +113,12 @@ struct S3ListVersionEntry {
 }
 
 #[derive(Debug, Clone)]
+enum S3ListVersionItem {
+    Version(S3ListVersionEntry),
+    CommonPrefix(String),
+}
+
+#[derive(Debug, Clone)]
 struct CompletedMultipartPart {
     part_number: u32,
     etag: String,
@@ -667,21 +673,8 @@ async fn list_object_versions_response(
     bucket: &S3BucketRecord,
     query: &S3BucketQuery,
 ) -> Response {
-    if query
-        .delimiter
-        .as_deref()
-        .is_some_and(|value| !value.is_empty())
-    {
-        return s3_error_response(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "delimiter is not supported for ListObjectVersions yet",
-            uri.path(),
-            &request.request_id,
-        );
-    }
-
     let prefix = query.prefix.clone().unwrap_or_default();
+    let delimiter = query.delimiter.as_deref().filter(|value| !value.is_empty());
     let max_keys = query
         .max_keys
         .unwrap_or(S3_LIST_DEFAULT_MAX_KEYS)
@@ -692,12 +685,14 @@ async fn list_object_versions_response(
             render_list_object_versions_result(
                 bucket,
                 &prefix,
+                delimiter,
                 query.key_marker.as_deref(),
                 query.version_id_marker.as_deref(),
                 max_keys,
                 false,
                 None,
                 None,
+                &[],
                 &[],
             ),
             &request.request_id,
@@ -796,24 +791,51 @@ async fn list_object_versions_response(
     }
     drop(store);
 
-    let mut collected = Vec::<S3ListVersionEntry>::new();
+    let all_items = if let Some(delimiter) = delimiter {
+        let mut items = Vec::<S3ListVersionItem>::new();
+        let mut emitted_common_prefixes = HashSet::<String>::new();
+        for entry in all_entries {
+            let Some(relative_suffix) = entry.key.strip_prefix(&prefix) else {
+                items.push(S3ListVersionItem::Version(entry));
+                continue;
+            };
+            let Some(index) = relative_suffix.find(delimiter) else {
+                items.push(S3ListVersionItem::Version(entry));
+                continue;
+            };
+            let common_prefix = format!("{}{delimiter}", &entry.key[..prefix.len() + index]);
+            if emitted_common_prefixes.insert(common_prefix.clone()) {
+                items.push(S3ListVersionItem::CommonPrefix(common_prefix));
+            }
+        }
+        items
+    } else {
+        all_entries
+            .into_iter()
+            .map(S3ListVersionItem::Version)
+            .collect::<Vec<_>>()
+    };
+
+    let mut collected_entries = Vec::<S3ListVersionEntry>::new();
+    let mut collected_common_prefixes = Vec::<String>::new();
     let mut next_key_marker = None::<String>;
     let mut next_version_id_marker = None::<String>;
     let mut started = query.key_marker.is_none();
     let requested_key_marker = query.key_marker.as_deref();
     let requested_version_id_marker = query.version_id_marker.as_deref();
 
-    for entry in all_entries {
+    for item in all_items {
+        let item_key = match &item {
+            S3ListVersionItem::Version(entry) => entry.key.as_str(),
+            S3ListVersionItem::CommonPrefix(prefix) => prefix.as_str(),
+        };
         if !started {
-            match entry
-                .key
-                .as_str()
-                .cmp(requested_key_marker.unwrap_or_default())
-            {
+            match item_key.cmp(requested_key_marker.unwrap_or_default()) {
                 std::cmp::Ordering::Less => continue,
                 std::cmp::Ordering::Greater => started = true,
                 std::cmp::Ordering::Equal => {
-                    if let Some(version_id_marker) = requested_version_id_marker
+                    if let S3ListVersionItem::Version(entry) = &item
+                        && let Some(version_id_marker) = requested_version_id_marker
                         && entry.version_id != version_id_marker
                     {
                         continue;
@@ -823,24 +845,37 @@ async fn list_object_versions_response(
             }
         }
 
-        if collected.len() >= max_keys {
-            next_key_marker = Some(entry.key.clone());
-            next_version_id_marker = Some(entry.version_id.clone());
+        if collected_entries.len() + collected_common_prefixes.len() >= max_keys {
+            match &item {
+                S3ListVersionItem::Version(entry) => {
+                    next_key_marker = Some(entry.key.clone());
+                    next_version_id_marker = Some(entry.version_id.clone());
+                }
+                S3ListVersionItem::CommonPrefix(prefix) => {
+                    next_key_marker = Some(prefix.clone());
+                    next_version_id_marker = None;
+                }
+            }
             break;
         }
-        collected.push(entry);
+        match item {
+            S3ListVersionItem::Version(entry) => collected_entries.push(entry),
+            S3ListVersionItem::CommonPrefix(prefix) => collected_common_prefixes.push(prefix),
+        }
     }
 
     let xml = render_list_object_versions_result(
         bucket,
         &prefix,
+        delimiter,
         query.key_marker.as_deref(),
         query.version_id_marker.as_deref(),
         max_keys,
         next_key_marker.is_some(),
         next_key_marker.as_deref(),
         next_version_id_marker.as_deref(),
-        &collected,
+        &collected_entries,
+        &collected_common_prefixes,
     );
     xml_response(StatusCode::OK, xml, &request.request_id)
 }
@@ -3885,6 +3920,7 @@ fn render_bucket_versioning_result(bucket: &S3BucketRecord) -> String {
 fn render_list_object_versions_result(
     bucket: &S3BucketRecord,
     prefix: &str,
+    delimiter: Option<&str>,
     key_marker: Option<&str>,
     version_id_marker: Option<&str>,
     max_keys: usize,
@@ -3892,6 +3928,7 @@ fn render_list_object_versions_result(
     next_key_marker: Option<&str>,
     next_version_id_marker: Option<&str>,
     entries: &[S3ListVersionEntry],
+    common_prefixes: &[String],
 ) -> String {
     let mut xml =
         String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns=""#);
@@ -3907,7 +3944,13 @@ fn render_list_object_versions_result(
     xml.push_str(&xml_escape(version_id_marker.unwrap_or("")));
     xml.push_str("</VersionIdMarker><MaxKeys>");
     xml.push_str(&max_keys.to_string());
-    xml.push_str("</MaxKeys><IsTruncated>");
+    xml.push_str("</MaxKeys>");
+    if let Some(delimiter) = delimiter {
+        xml.push_str("<Delimiter>");
+        xml.push_str(&xml_escape(delimiter));
+        xml.push_str("</Delimiter>");
+    }
+    xml.push_str("<IsTruncated>");
     xml.push_str(if is_truncated { "true" } else { "false" });
     xml.push_str("</IsTruncated>");
     if let Some(marker) = next_key_marker {
@@ -3946,6 +3989,11 @@ fn render_list_object_versions_result(
             xml.push_str(&entry.size_bytes.unwrap_or(0).to_string());
             xml.push_str("</Size><StorageClass>STANDARD</StorageClass></Version>");
         }
+    }
+    for prefix in common_prefixes {
+        xml.push_str("<CommonPrefixes><Prefix>");
+        xml.push_str(&xml_escape(prefix));
+        xml.push_str("</Prefix></CommonPrefixes>");
     }
     xml.push_str("</ListVersionsResult>");
     xml
