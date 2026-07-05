@@ -2182,6 +2182,204 @@ run_on_main_metadata_backends!(
     s3_listener_supports_bucket_listing_and_object_crud_turso
 );
 
+async fn s3_listener_lists_folder_marker_objects_and_common_prefixes_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-folder-marker-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    for path in ["/photos.example/docs/", "/photos.example/docs/hello.txt"] {
+        let put_response = app
+            .clone()
+            .oneshot(s3_signed_request(
+                Method::PUT,
+                path,
+                &created_access_key.access_key_id,
+                &created_access_key.secret_access_key,
+                &[],
+                Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_response.status(), StatusCode::OK);
+    }
+
+    let list_response = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_body = to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_xml = String::from_utf8(list_body.to_vec()).unwrap();
+    assert!(list_xml.contains("<Key>docs/</Key>"));
+    assert!(list_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_lists_folder_marker_objects_and_common_prefixes_impl,
+    s3_listener_lists_folder_marker_objects_and_common_prefixes,
+    s3_listener_lists_folder_marker_objects_and_common_prefixes_turso
+);
+
+async fn s3_listener_continuation_tokens_page_listings_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-continuation-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    for path in ["/photos.example/docs/a.txt", "/photos.example/docs/b.txt"] {
+        let put_response = app
+            .clone()
+            .oneshot(s3_signed_request(
+                Method::PUT,
+                path,
+                &created_access_key.access_key_id,
+                &created_access_key.secret_access_key,
+                &[],
+                Bytes::from_static(b"payload"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_response.status(), StatusCode::OK);
+    }
+
+    let first_response = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2&max-keys=1",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_xml = String::from_utf8(first_body.to_vec()).unwrap();
+    assert!(first_xml.contains("<Key>docs/a.txt</Key>"));
+    let next_token = first_xml
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|value| value.split("</NextContinuationToken>").next())
+        .expect("paginated S3 listing should expose a next continuation token");
+
+    let second_response = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/photos.example?list-type=2&max-keys=1&continuation-token={next_token}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_xml = String::from_utf8(second_body.to_vec()).unwrap();
+    assert!(second_xml.contains("<Key>docs/b.txt</Key>"));
+    assert!(!second_xml.contains("<NextContinuationToken>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_continuation_tokens_page_listings_impl,
+    s3_listener_continuation_tokens_page_listings,
+    s3_listener_continuation_tokens_page_listings_turso
+);
+
 async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
@@ -6614,6 +6812,53 @@ fn store_index_prefix_respects_path_boundaries() {
 }
 
 #[test]
+fn key_listing_cursor_keeps_folder_marker_objects_distinct_from_common_prefixes() {
+    let keys = vec![
+        "docs/".to_string(),
+        "docs/file.txt".to_string(),
+        "notes.txt".to_string(),
+    ];
+
+    let first_page = super::listing::paginate_sorted_keys(
+        &keys,
+        "test-scope",
+        super::listing::KeyListingPrefixMode::ExactStartsWith,
+        "",
+        Some("/"),
+        Some(1),
+        None,
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(first_page.entries.len(), 1);
+    assert_eq!(first_page.entries[0].path, "docs/");
+    assert_eq!(
+        first_page.entries[0].kind,
+        super::listing::KeyListingEntryKind::Object
+    );
+
+    let second_page = super::listing::paginate_sorted_keys(
+        &keys,
+        "test-scope",
+        super::listing::KeyListingPrefixMode::ExactStartsWith,
+        "",
+        Some("/"),
+        Some(1),
+        first_page.next_cursor.as_deref(),
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(second_page.entries[0].path, "docs/");
+    assert_eq!(
+        second_page.entries[0].kind,
+        super::listing::KeyListingEntryKind::CommonPrefix
+    );
+}
+
+#[test]
 fn store_index_entry_plan_limits_visible_files_to_requested_depth() {
     let keys = vec![
         "docs/readme.md".to_string(),
@@ -7382,6 +7627,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7460,6 +7707,8 @@ async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7531,6 +7780,8 @@ async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7598,6 +7849,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7670,6 +7923,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7738,6 +7993,8 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7806,6 +8063,8 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7870,6 +8129,8 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
                 depth: Some(1),
                 snapshot: None,
                 view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7912,6 +8173,98 @@ run_on_main_metadata_backends!(
     list_store_index_sets_timing_headers_impl,
     list_store_index_sets_timing_headers,
     list_store_index_sets_timing_headers_turso
+);
+
+async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "docs/a.txt",
+                bytes::Bytes::from_static(b"a"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        locked
+            .put_object_versioned(
+                "docs/folder/b.txt",
+                bytes::Bytes::from_static(b"b"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("docs".to_string()),
+                depth: Some(1),
+                snapshot: None,
+                view: None,
+                cursor: None,
+                page_size: Some(1),
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+    let first_body = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_payload["total_entry_count"], 2);
+    assert_eq!(first_payload["entries"][0]["path"], "docs/a.txt");
+    assert_eq!(first_payload["entries"][0]["entry_type"], "key");
+    let next_cursor = first_payload["next_cursor"]
+        .as_str()
+        .expect("cursor mode should return a continuation token")
+        .to_string();
+
+    let second_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("docs".to_string()),
+                depth: Some(1),
+                snapshot: None,
+                view: None,
+                cursor: Some(next_cursor),
+                page_size: Some(1),
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+    let second_body = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(second_payload["entries"][0]["path"], "docs/folder/");
+    assert_eq!(second_payload["entries"][0]["entry_type"], "prefix");
+    assert_eq!(second_payload["has_more"], false);
+    assert!(second_payload["next_cursor"].is_null());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_cursor_mode_pages_raw_entries_impl,
+    list_store_index_cursor_mode_pages_raw_entries,
+    list_store_index_cursor_mode_pages_raw_entries_turso
 );
 
 #[test]
@@ -8078,6 +8431,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -8517,6 +8872,8 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,

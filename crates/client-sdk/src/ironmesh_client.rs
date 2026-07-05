@@ -1124,6 +1124,8 @@ pub struct StoreIndexResponse {
     #[serde(default)]
     pub has_more: bool,
     #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
     pub media_summary: StoreIndexMediaSummary,
     #[serde(default)]
     pub entries: Vec<StoreIndexEntry>,
@@ -1236,6 +1238,8 @@ pub struct StoreIndexMediaSummary {
 #[derive(Debug, Clone)]
 pub struct StoreIndexRequestOptions {
     pub view: Option<StoreIndexView>,
+    pub cursor: Option<String>,
+    pub page_size: Option<usize>,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
     pub sort: Option<StoreIndexSortOrder>,
@@ -1247,6 +1251,8 @@ impl Default for StoreIndexRequestOptions {
     fn default() -> Self {
         Self {
             view: None,
+            cursor: None,
+            page_size: None,
             offset: None,
             limit: None,
             sort: None,
@@ -2087,6 +2093,13 @@ impl IronMeshClient {
         if let Some(view) = options.view {
             url.query_pairs_mut()
                 .append_pair("view", view.as_query_value());
+        }
+        if let Some(cursor) = options.cursor.as_deref() {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        if let Some(page_size) = options.page_size {
+            url.query_pairs_mut()
+                .append_pair("page_size", &page_size.max(1).to_string());
         }
         if let Some(offset) = options.offset {
             url.query_pairs_mut()

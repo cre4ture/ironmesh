@@ -295,33 +295,8 @@ async fn list_bucket_objects(
         );
     }
 
-    let prefix = query.prefix.unwrap_or_default();
-    let delimiter = query
-        .delimiter
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
-    let continuation_marker = match query
-        .continuation_token
-        .as_deref()
-        .or(query.start_after.as_deref())
-    {
-        Some(value) if query.continuation_token.is_some() => match decode_continuation_token(value)
-        {
-            Ok(value) => Some(value),
-            Err(()) => {
-                return s3_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidArgument",
-                    "the continuation token could not be decoded",
-                    uri.path(),
-                    &request.request_id,
-                );
-            }
-        },
-        Some(value) => Some(value.to_string()),
-        None => None,
-    };
+    let prefix = query.prefix.clone().unwrap_or_default();
+    let delimiter = query.delimiter.as_deref().filter(|value| !value.is_empty());
     let max_keys = query
         .max_keys
         .unwrap_or(S3_LIST_DEFAULT_MAX_KEYS)
@@ -334,7 +309,7 @@ async fn list_bucket_objects(
     let object_hashes = inspector.current_object_hashes();
     let object_ids = inspector.current_object_ids();
 
-    let mut relative_keys = object_hashes
+    let relative_keys_by_object_key = object_hashes
         .iter()
         .filter(|(key, manifest_hash)| {
             manifest_hash.as_str() != TOMBSTONE_MANIFEST_HASH
@@ -344,66 +319,62 @@ async fn list_bucket_objects(
         .filter_map(|(key, _)| {
             full_key_to_object_key(&bucket, key).map(|object_key| (object_key, key.clone()))
         })
-        .filter(|(object_key, _)| object_key.starts_with(&prefix))
+        .collect::<HashMap<_, _>>();
+    let mut relative_keys = relative_keys_by_object_key
+        .keys()
+        .cloned()
         .collect::<Vec<_>>();
-    relative_keys.sort_by(|left, right| left.0.cmp(&right.0));
+    relative_keys.sort();
+
+    let listing_scope = format!("s3:{}", bucket.bucket_name);
+    let page = match crate::listing::paginate_sorted_keys(
+        &relative_keys,
+        &listing_scope,
+        crate::listing::KeyListingPrefixMode::ExactStartsWith,
+        &prefix,
+        delimiter,
+        delimiter.map(|_| 1usize),
+        query.continuation_token.as_deref(),
+        query.start_after.as_deref(),
+        max_keys,
+    ) {
+        Ok(page) => page,
+        Err(message) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
 
     let mut contents = Vec::new();
     let mut common_prefixes = Vec::new();
     let mut selected_hashes = HashMap::new();
     let mut selected_object_ids = HashMap::new();
-    let mut results_count = 0usize;
-    let mut last_processed_key = None::<String>;
-    let mut index = 0usize;
-
-    while index < relative_keys.len() && results_count < max_keys {
-        let (object_key, full_key) = &relative_keys[index];
-        if continuation_marker
-            .as_deref()
-            .is_some_and(|marker| object_key.as_str() <= marker)
-        {
-            index += 1;
-            continue;
-        }
-
-        let remainder = object_key
-            .strip_prefix(&prefix)
-            .unwrap_or(object_key.as_str());
-        if !delimiter.is_empty() && !remainder.is_empty() {
-            if let Some(separator_index) = remainder.find(delimiter) {
-                let common_prefix = format!(
-                    "{prefix}{}",
-                    &remainder[..separator_index + delimiter.len()]
-                );
-                common_prefixes.push(common_prefix.clone());
-                results_count += 1;
-                while index < relative_keys.len()
-                    && relative_keys[index].0.starts_with(&common_prefix)
-                {
-                    last_processed_key = Some(relative_keys[index].0.clone());
-                    index += 1;
+    for entry in &page.entries {
+        match entry.kind {
+            crate::listing::KeyListingEntryKind::Object => {
+                let Some(full_key) = relative_keys_by_object_key.get(&entry.path) else {
+                    continue;
+                };
+                let manifest_hash = object_hashes.get(full_key).cloned().unwrap_or_default();
+                selected_hashes.insert(full_key.clone(), manifest_hash);
+                if let Some(object_id) = object_ids.get(full_key).cloned() {
+                    selected_object_ids.insert(full_key.clone(), object_id);
                 }
-                continue;
+                contents.push((entry.path.clone(), full_key.clone()));
+            }
+            crate::listing::KeyListingEntryKind::CommonPrefix => {
+                common_prefixes.push(entry.path.clone());
             }
         }
-
-        let manifest_hash = object_hashes.get(full_key).cloned().unwrap_or_default();
-        selected_hashes.insert(full_key.clone(), manifest_hash);
-        if let Some(object_id) = object_ids.get(full_key).cloned() {
-            selected_object_ids.insert(full_key.clone(), object_id);
-        }
-        contents.push((object_key.clone(), full_key.clone()));
-        last_processed_key = Some(object_key.clone());
-        results_count += 1;
-        index += 1;
     }
 
-    let is_truncated = index < relative_keys.len();
-    let next_continuation_token = if is_truncated {
-        last_processed_key.as_deref().map(encode_continuation_token)
-    } else {
-        None
-    };
+    let is_truncated = page.has_more;
+    let next_continuation_token = page.next_cursor;
 
     let (sizes, _) = match inspector
         .object_sizes_and_content_fingerprints_by_key(&selected_hashes)
@@ -455,9 +426,9 @@ async fn list_bucket_objects(
     let xml = render_list_objects_v2_result(
         &bucket,
         &prefix,
-        delimiter,
+        delimiter.unwrap_or(""),
         max_keys,
-        continuation_marker.as_deref(),
+        query.continuation_token.as_deref(),
         next_continuation_token.as_deref(),
         is_truncated,
         key_count,
@@ -1645,17 +1616,6 @@ fn render_list_objects_v2_result(
     }
     xml.push_str("</ListBucketResult>");
     xml
-}
-
-fn encode_continuation_token(value: &str) -> String {
-    BASE64_URL_SAFE_NO_PAD.encode(value.as_bytes())
-}
-
-fn decode_continuation_token(value: &str) -> Result<String, ()> {
-    let decoded = BASE64_URL_SAFE_NO_PAD
-        .decode(value.as_bytes())
-        .map_err(|_| ())?;
-    String::from_utf8(decoded).map_err(|_| ())
 }
 
 fn new_s3_request_id() -> String {

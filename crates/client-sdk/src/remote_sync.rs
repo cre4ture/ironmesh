@@ -723,6 +723,7 @@ mod tests {
                 offset: 0,
                 limit: None,
                 has_more: false,
+                next_cursor: None,
                 media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: Vec::new(),
             })
@@ -783,6 +784,7 @@ mod tests {
                 offset: 0,
                 limit: None,
                 has_more: false,
+                next_cursor: None,
                 media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
                 entries: vec![crate::ironmesh_client::StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),
