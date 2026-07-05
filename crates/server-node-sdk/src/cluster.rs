@@ -670,8 +670,19 @@ impl ClusterService {
                 .collect();
 
             let raw_extra_nodes = if current_set.len() > target_replica_count {
-                let mut extra_nodes: Vec<_> =
-                    current_set.difference(&desired_set).copied().collect();
+                let mut extra_nodes: Vec<_> = current_set
+                    .difference(&desired_set)
+                    .copied()
+                    .filter(|node_id| {
+                        // Remembered offline peers should not trigger cleanup pressure.
+                        // Once they are online again, or explicitly forgotten, planning
+                        // will naturally reconsider them.
+                        self.nodes
+                            .get(node_id)
+                            .map(|node| node.status == NodeStatus::Online)
+                            .unwrap_or(true)
+                    })
+                    .collect();
                 extra_nodes.sort_by_key(|node_id| {
                     self.nodes
                         .get(node_id)
@@ -1513,6 +1524,93 @@ mod tests {
         assert_eq!(item.current_nodes, vec![node_a]);
         assert_eq!(item.missing_nodes.len(), 2);
         assert!(item.extra_nodes.is_empty());
+    }
+
+    #[test]
+    fn replication_plan_ignores_offline_replicas_for_over_replication() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 2,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+
+        svc.note_replica("subject-a", node_a);
+        svc.note_replica("subject-a", node_b);
+        svc.note_replica("subject-a", node_c);
+
+        let desired = svc.placement_for_key("subject-a").selected_nodes;
+        let offline_node = [node_a, node_b, node_c]
+            .into_iter()
+            .find(|node_id| !desired.contains(node_id))
+            .expect("expected one replica holder outside desired set");
+        svc.nodes.get_mut(&offline_node).unwrap().status = NodeStatus::Offline;
+
+        let plan = svc.replication_plan(&["subject-a".to_string()]);
+
+        assert!(
+            plan.items.iter().all(|item| item.key != "subject-a"),
+            "offline remembered replica should not trigger over-replication: {:?}",
+            plan.items
+        );
+        assert_eq!(plan.over_replicated, 0);
+    }
+
+    #[test]
+    fn replication_plan_still_flags_online_extras_when_offline_replicas_exist() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 2,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        let node_d = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+        svc.register_node(mk_node(node_d, "dc-d", "rack-4", 600));
+
+        let key = (0..10_000)
+            .map(|idx| format!("subject-{idx}"))
+            .find(|candidate| {
+                let desired = svc.placement_for_key(candidate).selected_nodes;
+                !desired.contains(&node_c) && !desired.contains(&node_d)
+            })
+            .expect("failed to find key where desired nodes exclude node_c and node_d");
+
+        svc.note_replica(&key, node_a);
+        svc.note_replica(&key, node_b);
+        svc.note_replica(&key, node_c);
+        svc.note_replica(&key, node_d);
+        svc.nodes.get_mut(&node_d).unwrap().status = NodeStatus::Offline;
+
+        let plan = svc.replication_plan(std::slice::from_ref(&key));
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.key == key)
+            .expect("expected over-replicated item");
+
+        assert!(item.missing_nodes.is_empty());
+        assert_eq!(item.extra_nodes, vec![node_c]);
+        assert_eq!(plan.over_replicated, 1);
     }
 
     #[test]
