@@ -461,6 +461,45 @@ fn new_store_rwlock(store: PersistentStore) -> Arc<TracedRwLock<PersistentStore>
     ))
 }
 
+fn placeholder_cluster_node_descriptor(node_id: NodeId) -> NodeDescriptor {
+    NodeDescriptor {
+        node_id,
+        reachability: NodeReachability::default(),
+        capabilities: NodeCapabilities::default(),
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Offline,
+    }
+}
+
+fn backfill_cluster_nodes_from_replica_rows(
+    mut persisted_cluster_nodes: Vec<NodeDescriptor>,
+    persisted_cluster_replicas: &HashMap<String, Vec<NodeId>>,
+) -> Vec<NodeDescriptor> {
+    let known_node_ids = persisted_cluster_nodes
+        .iter()
+        .map(|node| node.node_id)
+        .collect::<HashSet<_>>();
+    let mut missing_node_ids = persisted_cluster_replicas
+        .values()
+        .flat_map(|nodes| nodes.iter().copied())
+        .filter(|node_id| !known_node_ids.contains(node_id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    missing_node_ids.sort();
+
+    for node_id in missing_node_ids {
+        persisted_cluster_nodes.push(placeholder_cluster_node_descriptor(node_id));
+    }
+
+    persisted_cluster_nodes.sort_by_key(|node| node.node_id);
+    persisted_cluster_nodes
+}
+
 async fn lock_store<'a>(
     state: &'a ServerState,
     operation: &'static str,
@@ -5030,6 +5069,28 @@ async fn run_inner(
         startup_phase_anchor,
         load_cluster_nodes_phase_started_at,
     );
+
+    let load_cluster_replicas_phase_started_at =
+        log_server_startup_phase_begin("load_cluster_replicas", startup_phase_anchor);
+    let persisted_cluster_replicas = {
+        let store_guard = store.read("server.init.load_cluster_replicas").await;
+        match store_guard.load_cluster_replicas().await {
+            Ok(replicas) => replicas,
+            Err(err) => {
+                warn!(error = %err, "failed to load cluster replica state; starting empty");
+                HashMap::new()
+            }
+        }
+    };
+    log_server_startup_phase_end(
+        "load_cluster_replicas",
+        startup_phase_anchor,
+        load_cluster_replicas_phase_started_at,
+    );
+    let persisted_cluster_nodes = backfill_cluster_nodes_from_replica_rows(
+        persisted_cluster_nodes,
+        &persisted_cluster_replicas,
+    );
     cluster.import_nodes(persisted_cluster_nodes);
 
     let _ = cluster.register_node(NodeDescriptor {
@@ -5053,23 +5114,6 @@ async fn run_inner(
         status: cluster::NodeStatus::Online,
     });
 
-    let load_cluster_replicas_phase_started_at =
-        log_server_startup_phase_begin("load_cluster_replicas", startup_phase_anchor);
-    let persisted_cluster_replicas = {
-        let store_guard = store.read("server.init.load_cluster_replicas").await;
-        match store_guard.load_cluster_replicas().await {
-            Ok(replicas) => replicas,
-            Err(err) => {
-                warn!(error = %err, "failed to load cluster replica state; starting empty");
-                HashMap::new()
-            }
-        }
-    };
-    log_server_startup_phase_end(
-        "load_cluster_replicas",
-        startup_phase_anchor,
-        load_cluster_replicas_phase_started_at,
-    );
     let known_node_ids = cluster
         .list_nodes()
         .into_iter()

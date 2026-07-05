@@ -9389,6 +9389,72 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
 }
 
 #[tokio::test]
+async fn backfill_cluster_nodes_from_replica_rows_adds_placeholders_for_legacy_replicas() {
+    let remote_a = NodeId::new_v4();
+    let remote_b = NodeId::new_v4();
+    let replicas = HashMap::from([("subject-a".to_string(), vec![remote_b, remote_a])]);
+
+    let nodes = super::backfill_cluster_nodes_from_replica_rows(Vec::new(), &replicas);
+
+    assert_eq!(nodes.len(), 2);
+    assert!(nodes.iter().any(|node| node.node_id == remote_a));
+    assert!(nodes.iter().any(|node| node.node_id == remote_b));
+    for node in nodes {
+        assert_eq!(node.status, cluster::NodeStatus::Offline);
+        assert_eq!(node.public_api_url(), None);
+        assert_eq!(node.peer_api_url(), None);
+        assert!(!node.relay_required());
+        assert!(!node.relay_capable());
+    }
+}
+
+#[tokio::test]
+async fn backfill_cluster_nodes_from_replica_rows_preserves_existing_descriptors() {
+    let remote_a = NodeId::new_v4();
+    let remote_b = NodeId::new_v4();
+    let existing = cluster::NodeDescriptor {
+        node_id: remote_a,
+        reachability: cluster::NodeReachability {
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            relay_required: true,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
+        labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+        capacity_bytes: 100,
+        free_bytes: 40,
+        storage_stats: None,
+        last_heartbeat_unix: 123,
+        status: cluster::NodeStatus::Offline,
+    };
+    let replicas = HashMap::from([("subject-a".to_string(), vec![remote_a, remote_b])]);
+
+    let nodes = super::backfill_cluster_nodes_from_replica_rows(vec![existing.clone()], &replicas);
+
+    assert_eq!(nodes.len(), 2);
+    let preserved = nodes
+        .iter()
+        .find(|node| node.node_id == remote_a)
+        .expect("existing node descriptor should remain");
+    assert_eq!(preserved.public_api_url(), Some("https://public.example"));
+    assert_eq!(preserved.peer_api_url(), Some("https://internal.example"));
+    assert!(preserved.relay_required());
+    assert!(preserved.relay_capable());
+
+    let placeholder = nodes
+        .iter()
+        .find(|node| node.node_id == remote_b)
+        .expect("missing replica owner should be backfilled");
+    assert_eq!(placeholder.public_api_url(), None);
+    assert_eq!(placeholder.peer_api_url(), None);
+    assert_eq!(placeholder.status, cluster::NodeStatus::Offline);
+}
+
+#[tokio::test]
 async fn register_node_uses_structured_reachability_payload() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
