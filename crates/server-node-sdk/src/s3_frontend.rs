@@ -2961,17 +2961,12 @@ async fn get_or_head_object_response(
         );
     }
     if query.upload_id.is_some() {
+        let response =
+            list_multipart_parts_response(state, &uri, &request, &bucket, &full_key, &query).await;
         if head_only {
-            return s3_error_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                "HEAD with multipart upload state is not implemented",
-                uri.path(),
-                &request.request_id,
-            );
+            return head_response_without_body(response);
         }
-        return list_multipart_parts_response(state, &uri, &request, &bucket, &full_key, &query)
-            .await;
+        return response;
     }
     if query.part_number.is_some() {
         return s3_error_response(
@@ -4665,6 +4660,11 @@ fn build_delete_marker_version_response(
     append_version_id_header(&mut response, Some(version_id));
     append_last_modified_header(&mut response, modified_at_unix);
     response
+}
+
+fn head_response_without_body(response: Response) -> Response {
+    let (parts, _) = response.into_parts();
+    Response::from_parts(parts, Body::empty())
 }
 
 fn xml_response(status: StatusCode, body: String, request_id: &str) -> Response {

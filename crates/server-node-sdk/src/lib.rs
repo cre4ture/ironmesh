@@ -7643,11 +7643,15 @@ where
         .map(|(path, _)| path)
         .unwrap_or(raw_path);
     let path_only = transport_service::strip_public_api_v1_prefix(path_only);
-    if !path_only.starts_with("/store/") {
+    let supports_s3_streaming =
+        path_only == "/s3" || path_only == "/s3/" || path_only.starts_with("/s3/");
+    if !path_only.starts_with("/store/") && !supports_s3_streaming {
         let response = buffered_transport_error_response(
             request_head.request_id,
             400,
-            format!("object read streams only support /store/* paths, received {path_only}"),
+            format!(
+                "object read streams only support /store/* or /s3/* paths, received {path_only}"
+            ),
         );
         return write_buffered_transport_response(stream, &response)
             .await
@@ -7668,34 +7672,49 @@ where
                 .context("failed writing object read header error");
         }
     };
-    let query = match transport_service::parse_query::<ObjectGetQuery>(&normalized_raw_path) {
-        Ok(query) => query,
-        Err(err) => {
-            let response = buffered_transport_error_response(
-                request_head.request_id,
-                400,
-                format!("invalid object read query: {err:#}"),
-            );
-            return write_buffered_transport_response(stream, &response)
-                .await
-                .context("failed writing object read query error");
-        }
-    };
-    let key = match transport_service::decode_route_tail(path_only, "/store/") {
-        Ok(key) => key,
-        Err(err) => {
-            let response = buffered_transport_error_response(
-                request_head.request_id,
-                400,
-                format!("invalid object read path: {err:#}"),
-            );
-            return write_buffered_transport_response(stream, &response)
-                .await
-                .context("failed writing object read key error");
-        }
-    };
+    let response = if path_only.starts_with("/store/") {
+        let query = match transport_service::parse_query::<ObjectGetQuery>(&normalized_raw_path) {
+            Ok(query) => query,
+            Err(err) => {
+                let response = buffered_transport_error_response(
+                    request_head.request_id,
+                    400,
+                    format!("invalid object read query: {err:#}"),
+                );
+                return write_buffered_transport_response(stream, &response)
+                    .await
+                    .context("failed writing object read query error");
+            }
+        };
+        let key = match transport_service::decode_route_tail(path_only, "/store/") {
+            Ok(key) => key,
+            Err(err) => {
+                let response = buffered_transport_error_response(
+                    request_head.request_id,
+                    400,
+                    format!("invalid object read path: {err:#}"),
+                );
+                return write_buffered_transport_response(stream, &response)
+                    .await
+                    .context("failed writing object read key error");
+            }
+        };
 
-    let response = get_object_response(state, &key, query, &headers, false).await;
+        get_object_response(state, &key, query, &headers, false).await
+    } else {
+        let method = request_head
+            .method
+            .parse::<axum::http::Method>()
+            .map_err(|err| anyhow::anyhow!("failed parsing streamed S3 transport method: {err}"))?;
+        s3_frontend::execute_transport_request(
+            state.clone(),
+            method,
+            raw_path,
+            headers.clone(),
+            Bytes::new(),
+        )
+        .await
+    };
     write_transport_response_from_axum(stream, request_head.request_id, response).await
 }
 

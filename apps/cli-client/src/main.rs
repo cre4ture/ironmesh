@@ -337,6 +337,28 @@ async fn s3_gateway_proxy(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect::<Vec<_>>();
+    if method == Method::GET {
+        let response = state
+            .client
+            .request_relative_path_streaming_response(method, &transport_path, forwarded_headers)
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed forwarding S3 request through Ironmesh transport: {err:#}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut proxy_response = Response::new(Body::from_stream(response.body));
+        *proxy_response.status_mut() = response.status;
+        *proxy_response.headers_mut() = response.headers;
+        return proxy_response;
+    }
+
     let response = if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
         let body_stream = TryStreamExt::map_err(body.into_data_stream(), |err| {
             std::io::Error::other(format!(

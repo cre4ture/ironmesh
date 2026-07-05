@@ -10,7 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use futures_util::{Sink, Stream};
+use futures_util::{Sink, Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::{
     Arc, Barrier,
@@ -1037,6 +1037,47 @@ async fn direct_mixed_workload_ws(
                             .close()
                             .await
                             .expect("mixed workload object-read stream should close");
+                    }
+                    (
+                        TransportStreamKind::ObjectRead,
+                        "GET",
+                        "/s3/photos.example/docs/streamed.txt",
+                    ) => {
+                        write_transport_response_head(
+                            &mut stream,
+                            &TransportResponseHead {
+                                request_id: request.request_id,
+                                status: StatusCode::OK.as_u16(),
+                                headers: vec![
+                                    TransportHeader {
+                                        name: CONTENT_LENGTH.as_str().to_string(),
+                                        value: payload.len().to_string(),
+                                    },
+                                    TransportHeader {
+                                        name: ETAG.as_str().to_string(),
+                                        value: "\"s3-streamed-etag\"".to_string(),
+                                    },
+                                    TransportHeader {
+                                        name: "content-type".to_string(),
+                                        value: "application/octet-stream".to_string(),
+                                    },
+                                ],
+                            },
+                        )
+                        .await
+                        .expect("mixed workload S3 object-read head should write");
+
+                        for chunk in payload.chunks(16 * 1024) {
+                            stream
+                                .write_all(chunk)
+                                .await
+                                .expect("mixed workload S3 object-read body should write");
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        stream
+                            .close()
+                            .await
+                            .expect("mixed workload S3 object-read stream should close");
                     }
                     (TransportStreamKind::Rpc, "GET", "/api/v1/cluster/status") => {
                         write_buffered_transport_response(
@@ -2316,6 +2357,70 @@ async fn direct_transport_keeps_small_rpcs_responsive_during_streamed_downloads(
     let snapshot = client.transport_session_pool_snapshot();
     assert_eq!(snapshot.connect_count, 1);
     assert!(snapshot.reuse_count >= 2);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn direct_transport_streams_relative_s3_reads_without_blocking_small_rpcs() {
+    let payload = Arc::new(vec![0x7B; 1024 * 1024]);
+    let payload_len = payload.len();
+    let (base_url, server) = spawn_direct_mixed_workload_test_server(Arc::clone(&payload)).await;
+
+    let mut identity = ClientIdentityMaterial::generate(
+        uuid::Uuid::now_v7(),
+        None,
+        Some("direct-stream-relative-s3-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let client = IronMeshClient::from_direct_base_url(base_url).with_client_identity(identity);
+
+    let download_client = client.clone();
+    let download_future = async move {
+        let mut response = download_client
+            .request_relative_path_streaming_response(
+                Method::GET,
+                "/s3/photos.example/docs/streamed.txt",
+                Vec::new(),
+            )
+            .await
+            .expect("streamed relative S3 read should succeed");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"s3-streamed-etag\"")
+        );
+
+        let mut output = Vec::new();
+        while let Some(chunk) = response.body.next().await {
+            let chunk = chunk.expect("streamed relative S3 body chunk should succeed");
+            output.extend_from_slice(chunk.as_ref());
+        }
+        output
+    };
+    let rpc_future = async {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.get_json_path("/cluster/status"),
+        )
+        .await
+        .expect("small RPC should not be blocked behind streamed relative S3 read")
+        .expect("small RPC should succeed")
+    };
+    let (output, rpc_response) = tokio::join!(download_future, rpc_future);
+
+    assert_eq!(rpc_response["status"], "ok");
+    assert_eq!(output.len(), payload_len);
+    assert_eq!(output, payload.as_ref().to_vec());
+    let snapshot = client.transport_session_pool_snapshot();
+    assert_eq!(snapshot.connect_count, 1);
+    assert!(snapshot.reuse_count >= 1);
 
     server.abort();
     let _ = server.await;

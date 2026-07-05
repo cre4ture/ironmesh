@@ -3354,6 +3354,24 @@ async fn s3_multipart_uploads_complete_and_abort_impl(backend: MainTestBackend) 
         .unwrap()
         .to_string();
 
+    let head_upload_parts = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            &format!("/media.example/archive/movie.bin?uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_upload_parts.status(), StatusCode::OK);
+    let head_upload_parts_body = to_bytes(head_upload_parts.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(head_upload_parts_body.is_empty());
+
     let list_first_page = app
         .clone()
         .oneshot(s3_signed_request(
