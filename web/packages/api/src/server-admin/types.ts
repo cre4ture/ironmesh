@@ -652,6 +652,7 @@ export type S3AccessKeyView = {
   allow_read: boolean;
   allow_write: boolean;
   allow_delete: boolean;
+  allow_manage: boolean;
   created_at_unix: number;
   updated_at_unix: number;
   last_used_at_unix: number | null;
@@ -687,6 +688,7 @@ export type CreateS3AccessKeyRequest = {
   allow_read?: boolean;
   allow_write?: boolean;
   allow_delete?: boolean;
+  allow_manage?: boolean;
 };
 
 export type CreateS3AccessKeyResponse = {

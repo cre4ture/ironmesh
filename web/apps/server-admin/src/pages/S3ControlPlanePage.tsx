@@ -78,6 +78,7 @@ export function S3ControlPlanePage() {
   const [allowRead, setAllowRead] = useState(true);
   const [allowWrite, setAllowWrite] = useState(false);
   const [allowDelete, setAllowDelete] = useState(false);
+  const [allowManage, setAllowManage] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [latestCreatedAccessKey, setLatestCreatedAccessKey] =
     useState<CreateS3AccessKeyResponse | null>(null);
@@ -154,7 +155,8 @@ export function S3ControlPlanePage() {
         allow_list: allowList,
         allow_read: allowRead,
         allow_write: allowWrite,
-        allow_delete: allowDelete
+        allow_delete: allowDelete,
+        allow_manage: allowManage
       },
       adminCredential
     ),
@@ -167,6 +169,7 @@ export function S3ControlPlanePage() {
       setAllowRead(true);
       setAllowWrite(false);
       setAllowDelete(false);
+      setAllowManage(false);
       await refreshAll();
     }
   });
@@ -201,7 +204,8 @@ export function S3ControlPlanePage() {
       latestCreatedAccessKey.view.allow_list ? "list" : null,
       latestCreatedAccessKey.view.allow_read ? "read" : null,
       latestCreatedAccessKey.view.allow_write ? "write" : null,
-      latestCreatedAccessKey.view.allow_delete ? "delete" : null
+      latestCreatedAccessKey.view.allow_delete ? "delete" : null,
+      latestCreatedAccessKey.view.allow_manage ? "manage" : null
     ].filter((value): value is string => value != null);
     return labels.join(", ");
   }, [latestCreatedAccessKey]);
@@ -471,7 +475,9 @@ export function S3ControlPlanePage() {
                   </Group>
                   <Text c="dimmed">
                     Scope fields accept one value per line or comma-separated values. Leave them
-                    blank to avoid narrowing the key to specific buckets or prefixes.
+                    blank to avoid narrowing the key to specific buckets or prefixes. Enable{" "}
+                    <Code>manage</Code> when this key should create buckets or change bucket
+                    versioning through the S3 API.
                   </Text>
                   <TextInput
                     label="Description"
@@ -528,6 +534,14 @@ export function S3ControlPlanePage() {
                         label="Delete"
                         checked={allowDelete}
                         onChange={(event) => setAllowDelete(event.currentTarget.checked)}
+                        disabled={!canInspectS3}
+                      />
+                    </Grid.Col>
+                    <Grid.Col span={6}>
+                      <Checkbox
+                        label="Manage"
+                        checked={allowManage}
+                        onChange={(event) => setAllowManage(event.currentTarget.checked)}
                         disabled={!canInspectS3}
                       />
                     </Grid.Col>
@@ -668,7 +682,8 @@ export function S3ControlPlanePage() {
                           accessKey.allow_list ? "list" : null,
                           accessKey.allow_read ? "read" : null,
                           accessKey.allow_write ? "write" : null,
-                          accessKey.allow_delete ? "delete" : null
+                          accessKey.allow_delete ? "delete" : null,
+                          accessKey.allow_manage ? "manage" : null
                         ]
                           .filter((value): value is string => value != null)
                           .join(", ")}
