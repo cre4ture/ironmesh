@@ -1623,6 +1623,333 @@ run_on_main_metadata_backends!(
     export_client_credentials_omits_issued_credential_pem_turso
 );
 
+async fn client_credential_sync_enables_remote_client_auth_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    target.access.client_auth_control.require_client_auth = true;
+
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(source.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        source.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
+    {
+        let mut auth = source.access.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
+            device_id: identity.device_id.to_string(),
+            label: Some("Synced Laptop".to_string()),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
+            issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
+            created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+    }
+
+    let app = Router::new()
+        .route("/store/index", get(|| async { StatusCode::OK }))
+        .with_state(target.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            target.clone(),
+            super::require_client_auth,
+        ));
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("sync-nonce-a".to_string()),
+    )
+    .unwrap();
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(source.clone(), &target).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+    super::sync_client_credentials_once(&target).await;
+
+    wait_for_condition(
+        "client credential sync import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let device_id = identity.device_id.to_string();
+            async move {
+                let auth = target.access.client_credentials.lock().await;
+                auth.credentials
+                    .iter()
+                    .any(|record| record.device_id == device_id)
+            }
+        },
+    )
+    .await;
+
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("sync-nonce-b".to_string()),
+    )
+    .unwrap();
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    client_credential_sync_enables_remote_client_auth_impl,
+    client_credential_sync_enables_remote_client_auth,
+    client_credential_sync_enables_remote_client_auth_turso
+);
+
+async fn client_credential_fanout_after_enrollment_enables_remote_client_auth_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    target.access.client_auth_control.require_client_auth = true;
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(target.clone(), &source).await;
+    register_online_source_node(&source, &target, &peer_base_url).await;
+
+    let now = super::unix_ts();
+    {
+        let mut auth = source.access.client_credentials.lock().await;
+        auth.pairing_authorizations
+            .push(super::PairingAuthorizationRecord {
+                token_id: "pair-fanout-1".to_string(),
+                pairing_secret_hash: super::hash_token("pair-secret-fanout"),
+                label: Some("Fanout Laptop".to_string()),
+                created_at_unix: now,
+                expires_at_unix: now + 300,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
+    }
+
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(source.cluster_id, None, None).unwrap();
+    let enrolled = super::enroll_client_device_impl(
+        &source,
+        super::ClientEnrollmentRequest {
+            cluster_id: source.cluster_id,
+            pairing_token: "pair-secret-fanout".to_string(),
+            device_id: Some(identity.device_id),
+            label: None,
+            public_key_pem: identity.public_key_pem.clone(),
+        },
+    )
+    .await
+    .expect("client enrollment should succeed");
+    identity.credential_pem = Some(enrolled.credential_pem.clone());
+
+    let app = Router::new()
+        .route("/store/index", get(|| async { StatusCode::OK }))
+        .with_state(target.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            target.clone(),
+            super::require_client_auth,
+        ));
+
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("fanout-nonce-a".to_string()),
+    )
+    .unwrap();
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    wait_for_condition(
+        "client credential fanout import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let device_id = identity.device_id.to_string();
+            async move {
+                let auth = target.access.client_credentials.lock().await;
+                auth.credentials
+                    .iter()
+                    .any(|record| record.device_id == device_id)
+            }
+        },
+    )
+    .await;
+
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("fanout-nonce-b".to_string()),
+    )
+    .unwrap();
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    client_credential_fanout_after_enrollment_enables_remote_client_auth_impl,
+    client_credential_fanout_after_enrollment_enables_remote_client_auth,
+    client_credential_fanout_after_enrollment_enables_remote_client_auth_turso
+);
+
 async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
@@ -4754,6 +5081,80 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     );
     assert_eq!(bootstrap.device_label.as_deref(), Some("tablet"));
     assert!(bootstrap.pairing_token.is_some());
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn issue_bootstrap_bundle_keeps_cluster_endpoints_when_client_auth_is_required() {
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.client_auth_control.require_client_auth = true;
+    state.network.public_ca_pem = Some("public-ca".to_string());
+    state.network.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.network.internal_ca_key_pem = Some("cluster-key".to_string());
+    state.network.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
+
+    let remote_node_id = {
+        let cluster = state.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != state.node_id)
+            .map(|node| node.node_id)
+            .expect("expected seeded remote placeholder node")
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_bootstrap_bundle(
+        State(state.clone()),
+        headers,
+        Json(super::PairingTokenIssueRequest {
+            label: Some("tablet".to_string()),
+            expires_in_secs: Some(600),
+            preferred_rendezvous_url: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let bootstrap: transport_sdk::ClientBootstrap = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(bootstrap.direct_endpoints.len(), 2);
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| endpoint.node_id == Some(state.node_id))
+    );
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| endpoint.node_id == Some(remote_node_id))
+    );
+    assert_eq!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .map(|endpoint| endpoint.url.as_str())
+            .collect::<Vec<_>>(),
+        vec!["http://127.0.0.1:39080", "http://127.0.0.1:9"]
+    );
 
     cleanup_test_state(&state).await;
 }

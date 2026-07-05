@@ -160,6 +160,16 @@ Those bridges can be added incrementally without changing the workspace topology
 - Persistent storage strategy and requirements are documented in [persistent-storage-strategy.md](persistent-storage-strategy.md).
 - S3 compatibility-front-end design is documented in [s3-compatible-front-end-design.md](s3-compatible-front-end-design.md).
 
+### Recent S3 milestone notes
+
+- 2026-07-06: relay-backed `serve-s3` gateway coverage now exercises both direct and rendezvous/relay forwarding paths, including streamed `GET` bodies and streamed request-body `PUT` forwarding through the `/s3/*` transport contract.
+- 2026-07-06: bootstrap bundles no longer collapse client direct endpoints to the local node when client auth is enabled.
+  Client-credential replication is now treated as part of the working multi-node access model, and bootstrap responses can advertise cluster-wide direct endpoints again.
+- 2026-07-06: cross-node client auth now has explicit regression coverage for both:
+  - snapshot-style credential sync from a peer, and
+  - normal post-enrollment credential fanout.
+  Those tests prove a client credential issued on one node can authenticate against another node after replication, which is the prerequisite for cluster-wide bootstrap endpoint advertisement.
+
 ## Multi-node strategy
 
 - Multi-node requirements, replication strategy, and rollout plan are documented in [multi-node-strategy.md](multi-node-strategy.md).
