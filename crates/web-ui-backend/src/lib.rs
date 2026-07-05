@@ -2173,6 +2173,8 @@ async fn web_store_list(
             query.snapshot.as_deref(),
             StoreIndexRequestOptions {
                 view,
+                cursor: None,
+                page_size: None,
                 offset: query.offset,
                 limit: query.limit,
                 sort,

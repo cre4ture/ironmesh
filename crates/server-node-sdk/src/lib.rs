@@ -7707,12 +7707,12 @@ async fn handle_streamed_object_write_request<S>(
 where
     S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
 {
-    if request_head.method != "PUT" {
+    if !matches!(request_head.method.as_str(), "PUT" | "POST" | "DELETE") {
         let response = buffered_transport_error_response(
             request_head.request_id,
             405,
             format!(
-                "object write streams only support PUT, received {}",
+                "object write streams only support PUT, POST, or DELETE, received {}",
                 request_head.method
             ),
         );
@@ -7727,39 +7727,6 @@ where
         .map(|(path, _)| path)
         .unwrap_or(raw_path);
     let path_only = transport_service::strip_public_api_v1_prefix(path_only);
-    let Some(path_tail) = path_only.strip_prefix("/store/uploads/") else {
-        let response = buffered_transport_error_response(
-            request_head.request_id,
-            400,
-            format!("object write streams only support /store/uploads/*, received {path_only}"),
-        );
-        return write_buffered_transport_response(stream, &response)
-            .await
-            .context("failed writing object write path error");
-    };
-    let Some((upload_id, index_raw)) = path_tail.split_once("/chunk/") else {
-        let response = buffered_transport_error_response(
-            request_head.request_id,
-            400,
-            format!("object write streams only support upload chunk paths, received {path_only}"),
-        );
-        return write_buffered_transport_response(stream, &response)
-            .await
-            .context("failed writing object write chunk-path error");
-    };
-    let index = match index_raw.parse::<usize>() {
-        Ok(index) => index,
-        Err(err) => {
-            let response = buffered_transport_error_response(
-                request_head.request_id,
-                400,
-                format!("invalid upload chunk index {index_raw}: {err}"),
-            );
-            return write_buffered_transport_response(stream, &response)
-                .await
-                .context("failed writing object write chunk-index error");
-        }
-    };
     let headers = match transport_service::header_map_from_transport_headers(&request_head.headers)
     {
         Ok(headers) => headers,
@@ -7780,8 +7747,60 @@ where
         .await
         .context("failed reading object write request body")?;
 
-    let response =
-        upload_session_chunk_response(state, &headers, upload_id, index, Bytes::from(body)).await;
+    let response = if let Some(path_tail) = path_only.strip_prefix("/store/uploads/") {
+        let Some((upload_id, index_raw)) = path_tail.split_once("/chunk/") else {
+            let response = buffered_transport_error_response(
+                request_head.request_id,
+                400,
+                format!(
+                    "object write streams only support upload chunk paths, received {path_only}"
+                ),
+            );
+            return write_buffered_transport_response(stream, &response)
+                .await
+                .context("failed writing object write chunk-path error");
+        };
+        let index = match index_raw.parse::<usize>() {
+            Ok(index) => index,
+            Err(err) => {
+                let response = buffered_transport_error_response(
+                    request_head.request_id,
+                    400,
+                    format!("invalid upload chunk index {index_raw}: {err}"),
+                );
+                return write_buffered_transport_response(stream, &response)
+                    .await
+                    .context("failed writing object write chunk-index error");
+            }
+        };
+        upload_session_chunk_response(state, &headers, upload_id, index, Bytes::from(body)).await
+    } else if transport_service::strip_public_api_v1_prefix(path_only)
+        .starts_with(s3_frontend::S3_TRANSPORT_PREFIX)
+    {
+        let method = request_head
+            .method
+            .parse::<axum::http::Method>()
+            .map_err(|err| anyhow::anyhow!("failed parsing streamed S3 transport method: {err}"))?;
+        s3_frontend::execute_transport_request(
+            state.clone(),
+            method,
+            raw_path,
+            headers.clone(),
+            Bytes::from(body),
+        )
+        .await
+    } else {
+        let response = buffered_transport_error_response(
+            request_head.request_id,
+            400,
+            format!(
+                "object write streams only support /store/uploads/* or /s3/* paths, received {path_only}"
+            ),
+        );
+        return write_buffered_transport_response(stream, &response)
+            .await
+            .context("failed writing object write path error");
+    };
     write_transport_response_from_axum(stream, request_head.request_id, response).await
 }
 

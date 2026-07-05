@@ -4,6 +4,7 @@ use common::{NodeId, StorageObjectMeta};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
 };
+use futures_util::stream::{Stream, StreamExt};
 use reqwest::Client as HttpClient;
 use reqwest::Method;
 use reqwest::RequestBuilder;
@@ -20,6 +21,7 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -874,6 +876,84 @@ async fn execute_streaming_object_write_request_for_transport(
     }
 }
 
+async fn execute_streaming_write_request_for_transport(
+    transport: &ClientTransport,
+    auth: &ClientRequestAuth,
+    connection_name: Option<&str>,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body_stream: RequestBodyStream,
+) -> Result<BufferedTransportResponse> {
+    match transport {
+        ClientTransport::Direct {
+            http,
+            server_base_url,
+            session_pool,
+            ..
+        } => {
+            if let ClientRequestAuth::SignedIdentity(identity) = auth {
+                let direct = DirectMultiplexSessionContext {
+                    server_base_url,
+                    session_pool,
+                    identity,
+                    connection_name,
+                };
+                return execute_direct_multiplex_streaming_write_request(
+                    direct,
+                    method,
+                    url,
+                    headers,
+                    body_stream,
+                )
+                .await
+                .with_context(|| format!("failed to execute streamed {} {}", method, url));
+            }
+
+            let mut payload = Vec::new();
+            let mut body_stream = body_stream;
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.context("failed reading streamed request body chunk")?;
+                payload.extend_from_slice(chunk.as_ref());
+            }
+            let request =
+                apply_headers_to_request(http.request(method.clone(), url.clone()), headers)
+                    .body(payload);
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("failed to execute streamed {} {}", method, url))?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.bytes().await.with_context(|| {
+                format!(
+                    "failed to read streamed response body for {} {}",
+                    method, url
+                )
+            })?;
+            Ok(BufferedTransportResponse {
+                status,
+                headers,
+                body,
+            })
+        }
+        ClientTransport::Relay(relay) => {
+            let source = relay_source_identity_for_auth(auth)?;
+            execute_relay_multiplex_streaming_write_request(
+                relay,
+                source,
+                connection_name,
+                method,
+                url,
+                headers,
+                body_stream,
+            )
+            .await
+            .with_context(|| format!("failed to relay streamed {} {}", method, url))
+        }
+    }
+}
+
 async fn probe_endpoint_background_quality(
     endpoint: &ClientEndpoint,
     auth: &ClientRequestAuth,
@@ -940,6 +1020,9 @@ pub struct RelativePathResponse {
     pub headers: HeaderMap,
     pub body: Bytes,
 }
+
+type RequestBodyStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UploadMode {
@@ -2240,6 +2323,88 @@ impl IronMeshClient {
             headers: response.headers,
             body: response.body,
         })
+    }
+
+    pub async fn request_relative_path_streaming_body<S>(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body_stream: S,
+    ) -> Result<RelativePathResponse>
+    where
+        S: Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + 'static,
+    {
+        self.maybe_spawn_background_quality_refresh();
+
+        let url = self.relative_url(path)?;
+        let mut headers = headers
+            .into_iter()
+            .map(|(name, value)| RelayHttpHeader { name, value })
+            .collect::<Vec<_>>();
+        let mut auth_headers = self.request_auth_headers(&method, &url)?;
+        auth_headers.append(&mut headers);
+        let mut last_error = None;
+        let mut body_stream = Some(Box::pin(body_stream) as RequestBodyStream);
+
+        for index in self.transport_router.rank_indices() {
+            let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
+                continue;
+            };
+            let endpoint_url = endpoint
+                .rewrite_url(&url)
+                .with_context(|| format!("failed to rewrite streamed {} {}", method, url));
+            let endpoint_url = match endpoint_url {
+                Ok(endpoint_url) => endpoint_url,
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(index, &error.to_string());
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let started_at = std::time::Instant::now();
+            let Some(request_body_stream) = body_stream.take() else {
+                bail!("streamed relative-path request body was already consumed");
+            };
+            match execute_streaming_write_request_for_transport(
+                &endpoint.transport,
+                &self.auth,
+                self.connection_name.as_deref(),
+                &method,
+                &endpoint_url,
+                &auth_headers,
+                request_body_stream,
+            )
+            .await
+            {
+                Ok(response) => {
+                    self.transport_router.record_success(
+                        index,
+                        started_at.elapsed().as_secs_f64() * 1000.0,
+                        response.body.len(),
+                    );
+                    return Ok(RelativePathResponse {
+                        status: response.status,
+                        headers: response.headers,
+                        body: response.body,
+                    });
+                }
+                Err(error) => {
+                    self.transport_router
+                        .record_failure(index, &error.to_string());
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!(
+                "no client transport endpoints are available for streamed {} {}",
+                method,
+                url
+            )
+        }))
     }
 
     pub fn request_relative_path_blocking(
@@ -3895,6 +4060,50 @@ async fn execute_multiplex_streaming_object_write_request(
     buffered_response_from_multiplex(response)
 }
 
+async fn execute_multiplex_streaming_write_request(
+    session: &transport_sdk::MultiplexedSession,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    mut body_stream: RequestBodyStream,
+) -> Result<BufferedTransportResponse> {
+    let request_path = path_and_query(url);
+    let mut stream = session
+        .open_stream()
+        .await
+        .context("failed opening streamed transport request stream")?;
+    write_transport_request_head(
+        &mut stream,
+        &TransportRequestHead {
+            request_id: Uuid::now_v7().to_string(),
+            kind: TransportStreamKind::ObjectWrite,
+            method: method.as_str().to_string(),
+            path: request_path,
+            headers: transport_headers_from_relay_headers(headers),
+            end_of_stream: false,
+        },
+    )
+    .await
+    .context("failed writing streamed transport request head")?;
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk.context("failed reading streamed request body chunk")?;
+        if !chunk.is_empty() {
+            stream
+                .write_all(chunk.as_ref())
+                .await
+                .context("failed writing streamed transport request body chunk")?;
+        }
+    }
+    stream
+        .close()
+        .await
+        .context("failed closing streamed transport request body")?;
+    let response = read_buffered_transport_response(&mut stream)
+        .await
+        .context("failed reading streamed transport response")?;
+    buffered_response_from_multiplex(response)
+}
+
 async fn execute_direct_http_streaming_object_read_request(
     http: &HttpClient,
     url: &Url,
@@ -4118,6 +4327,45 @@ async fn execute_relay_multiplex_streaming_object_write_request(
         "streamed relay object write retried without producing a response for target node {}",
         relay.target_node_id
     )
+}
+
+async fn execute_direct_multiplex_streaming_write_request(
+    direct: DirectMultiplexSessionContext<'_>,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body_stream: RequestBodyStream,
+) -> Result<BufferedTransportResponse> {
+    let session = direct
+        .session_pool
+        .ensure_direct_session(direct.identity, direct.connection_name)
+        .await
+        .context("failed ensuring direct multiplex session")?;
+    execute_multiplex_streaming_write_request(session.as_ref(), method, url, headers, body_stream)
+        .await
+}
+
+async fn execute_relay_multiplex_streaming_write_request(
+    relay: &ClientRelayTransport,
+    source: PeerIdentity,
+    connection_name: Option<&str>,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body_stream: RequestBodyStream,
+) -> Result<BufferedTransportResponse> {
+    let session = relay
+        .session_pool
+        .ensure_relay_session(source, connection_name)
+        .await
+        .with_context(|| {
+            format!(
+                "failed ensuring streamed relay session for target node {}",
+                relay.target_node_id
+            )
+        })?;
+    execute_multiplex_streaming_write_request(session.as_ref(), method, url, headers, body_stream)
+        .await
 }
 
 async fn execute_direct_multiplex_buffered_request(

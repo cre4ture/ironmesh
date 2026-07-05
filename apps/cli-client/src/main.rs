@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -14,6 +14,7 @@ use client_sdk::{
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     enroll_connection_input_blocking, normalize_server_base_url,
 };
+use futures_util::TryStreamExt;
 use serde::Serialize;
 use std::fs;
 use std::net::SocketAddr;
@@ -324,7 +325,7 @@ async fn s3_gateway_proxy(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let transport_path = s3_transport_proxy_path(&uri);
     let forwarded_headers = headers
@@ -336,16 +337,43 @@ async fn s3_gateway_proxy(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect::<Vec<_>>();
-    let response = match state
-        .client
-        .request_relative_path(
-            method,
-            &transport_path,
-            forwarded_headers,
-            (!body.is_empty()).then(|| body.to_vec()),
-        )
-        .await
-    {
+    let response = if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
+        let body_stream = TryStreamExt::map_err(body.into_data_stream(), |err| {
+            std::io::Error::other(format!(
+                "failed reading incoming S3 gateway request body: {err}"
+            ))
+        });
+        state
+            .client
+            .request_relative_path_streaming_body(
+                method,
+                &transport_path,
+                forwarded_headers,
+                body_stream,
+            )
+            .await
+    } else {
+        let body = match to_bytes(body, usize::MAX).await {
+            Ok(body) => body,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("failed reading incoming S3 request body: {err:#}"),
+                )
+                    .into_response();
+            }
+        };
+        state
+            .client
+            .request_relative_path(
+                method,
+                &transport_path,
+                forwarded_headers,
+                (!body.is_empty()).then(|| body.to_vec()),
+            )
+            .await
+    };
+    let response = match response {
         Ok(response) => response,
         Err(err) => {
             return (

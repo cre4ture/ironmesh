@@ -19,7 +19,9 @@ bytes.workspace = true
 clap.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
 common = { path = "../../crates/common" }
+futures-util = "0.3"
 git-version.workspace = true
+http-body-util = "0.1"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
