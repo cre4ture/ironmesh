@@ -38,6 +38,13 @@ struct ParsedS3Authorization {
     service: String,
 }
 
+#[derive(Debug, Clone)]
+struct ParsedS3QueryAuthorization {
+    parsed: ParsedS3Authorization,
+    amz_date: String,
+    payload_hash: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct S3BucketQuery {
     #[serde(rename = "list-type")]
@@ -2722,21 +2729,81 @@ async fn authenticate_request(
     uri: &Uri,
     headers: &HeaderMap,
 ) -> Result<S3RequestContext, Response> {
+    let request_id = new_s3_request_id();
     if uri
         .query()
         .is_some_and(|query| query.contains("X-Amz-Signature="))
     {
-        let request_id = new_s3_request_id();
-        return Err(s3_error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "presigned S3 requests are not implemented yet",
-            uri.path(),
-            &request_id,
-        ));
+        let parsed = match parse_presigned_authorization(uri) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                return Err(s3_error_response(
+                    StatusCode::FORBIDDEN,
+                    "AuthorizationQueryParametersError",
+                    &message,
+                    uri.path(),
+                    &request_id,
+                ));
+            }
+        };
+        if parsed.parsed.service != "s3" {
+            return Err(s3_error_response(
+                StatusCode::FORBIDDEN,
+                "AuthorizationQueryParametersError",
+                "the presigned credential scope must target the s3 service",
+                uri.path(),
+                &request_id,
+            ));
+        }
+
+        let Some(access_key) = resolve_s3_access_key(state, &parsed.parsed.access_key_id).await
+        else {
+            return Err(s3_error_response(
+                StatusCode::FORBIDDEN,
+                "InvalidAccessKeyId",
+                "the provided access key is not recognized",
+                uri.path(),
+                &request_id,
+            ));
+        };
+
+        let expected_signature = match build_expected_presigned_signature(
+            method,
+            uri,
+            headers,
+            &parsed,
+            &access_key.secret_material,
+        ) {
+            Ok(signature) => signature,
+            Err(message) => {
+                return Err(s3_error_response(
+                    StatusCode::FORBIDDEN,
+                    "SignatureDoesNotMatch",
+                    &message,
+                    uri.path(),
+                    &request_id,
+                ));
+            }
+        };
+        if !constant_time_eq(
+            expected_signature.as_bytes(),
+            parsed.parsed.signature_hex.as_bytes(),
+        ) {
+            return Err(s3_error_response(
+                StatusCode::FORBIDDEN,
+                "SignatureDoesNotMatch",
+                "the request signature we calculated does not match the provided signature",
+                uri.path(),
+                &request_id,
+            ));
+        }
+
+        return Ok(S3RequestContext {
+            request_id,
+            access_key,
+        });
     }
 
-    let request_id = new_s3_request_id();
     let authorization = match headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -2774,18 +2841,7 @@ async fn authenticate_request(
         ));
     }
 
-    let access_key = {
-        let control_plane = state.s3.control_plane.lock().await;
-        control_plane
-            .access_keys
-            .iter()
-            .find(|access_key| {
-                access_key.access_key_id == parsed.access_key_id
-                    && access_key.revoked_at_unix.is_none()
-            })
-            .cloned()
-    };
-    let Some(access_key) = access_key else {
+    let Some(access_key) = resolve_s3_access_key(state, &parsed.access_key_id).await else {
         return Err(s3_error_response(
             StatusCode::FORBIDDEN,
             "InvalidAccessKeyId",
@@ -2865,6 +2921,51 @@ fn parse_authorization_header(value: &str) -> Result<ParsedS3Authorization, Stri
     let credential = credential.ok_or_else(|| "Credential is missing".to_string())?;
     let signed_headers = signed_headers.ok_or_else(|| "SignedHeaders is missing".to_string())?;
     let signature_hex = signature_hex.ok_or_else(|| "Signature is missing".to_string())?;
+    parse_credential_scope(&credential, signed_headers, signature_hex)
+}
+
+fn parse_presigned_authorization(uri: &Uri) -> Result<ParsedS3QueryAuthorization, String> {
+    let algorithm = query_parameter_value(uri, "X-Amz-Algorithm")?
+        .ok_or_else(|| "X-Amz-Algorithm is missing".to_string())?;
+    if algorithm != "AWS4-HMAC-SHA256" {
+        return Err("only AWS4-HMAC-SHA256 presigned requests are supported".to_string());
+    }
+
+    let credential = query_parameter_value(uri, "X-Amz-Credential")?
+        .ok_or_else(|| "X-Amz-Credential is missing".to_string())?;
+    let amz_date = query_parameter_value(uri, "X-Amz-Date")?
+        .ok_or_else(|| "X-Amz-Date is missing".to_string())?;
+    let expires = query_parameter_value(uri, "X-Amz-Expires")?
+        .ok_or_else(|| "X-Amz-Expires is missing".to_string())?;
+    let expires = expires
+        .parse::<u64>()
+        .map_err(|_| "X-Amz-Expires must be an integer".to_string())?;
+    if !(1..=604_800).contains(&expires) {
+        return Err("X-Amz-Expires must be between 1 and 604800 seconds".to_string());
+    }
+
+    let signed_headers = query_parameter_value(uri, "X-Amz-SignedHeaders")?
+        .ok_or_else(|| "X-Amz-SignedHeaders is missing".to_string())?
+        .split(';')
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    let signature_hex = query_parameter_value(uri, "X-Amz-Signature")?
+        .ok_or_else(|| "X-Amz-Signature is missing".to_string())?
+        .to_ascii_lowercase();
+    let parsed = parse_credential_scope(&credential, signed_headers, signature_hex)?;
+    Ok(ParsedS3QueryAuthorization {
+        parsed,
+        amz_date,
+        payload_hash: S3_UNSIGNED_PAYLOAD.to_string(),
+    })
+}
+
+fn parse_credential_scope(
+    credential: &str,
+    signed_headers: Vec<String>,
+    signature_hex: String,
+) -> Result<ParsedS3Authorization, String> {
     let credential_parts = credential.split('/').collect::<Vec<_>>();
     if credential_parts.len() != 5 {
         return Err(
@@ -2885,6 +2986,25 @@ fn parse_authorization_header(value: &str) -> Result<ParsedS3Authorization, Stri
         region: credential_parts[2].to_string(),
         service: credential_parts[3].to_string(),
     })
+}
+
+fn query_parameter_value(uri: &Uri, parameter_name: &str) -> Result<Option<String>, String> {
+    for pair in uri.query().unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name != parameter_name {
+            continue;
+        }
+        let decoded = percent_encoding::percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| {
+                format!("query parameter {parameter_name} contains invalid percent-encoding")
+            })?;
+        return Ok(Some(decoded.to_string()));
+    }
+    Ok(None)
 }
 
 fn build_expected_signature(
@@ -2912,8 +3032,14 @@ fn build_expected_signature(
         payload_hash
     };
 
-    let canonical_request =
-        build_canonical_request(method, uri, headers, &parsed.signed_headers, payload_hash)?;
+    let canonical_request = build_canonical_request(
+        method,
+        uri,
+        headers,
+        &parsed.signed_headers,
+        payload_hash,
+        &canonical_query_string(uri),
+    )?;
     let canonical_request_hash = hex_sha256(canonical_request.as_bytes());
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{}\n{canonical_request_hash}",
@@ -2931,19 +3057,51 @@ fn build_expected_signature(
     )))
 }
 
+fn build_expected_presigned_signature(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    parsed: &ParsedS3QueryAuthorization,
+    secret_material: &str,
+) -> Result<String, String> {
+    let canonical_request = build_canonical_request(
+        method,
+        uri,
+        headers,
+        &parsed.parsed.signed_headers,
+        &parsed.payload_hash,
+        &canonical_query_string_excluding(uri, "X-Amz-Signature"),
+    )?;
+    let canonical_request_hash = hex_sha256(canonical_request.as_bytes());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{canonical_request_hash}",
+        parsed.amz_date, parsed.parsed.credential_scope
+    );
+    let signing_key = derive_signing_key(
+        secret_material,
+        &parsed.parsed.date_scope,
+        &parsed.parsed.region,
+        &parsed.parsed.service,
+    );
+    Ok(hex_encode(&hmac_sha256(
+        &signing_key,
+        string_to_sign.as_bytes(),
+    )))
+}
+
 fn build_canonical_request(
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     signed_headers: &[String],
     payload_hash: &str,
+    canonical_query: &str,
 ) -> Result<String, String> {
     let canonical_uri = if uri.path().is_empty() {
         "/"
     } else {
         uri.path()
     };
-    let canonical_query = canonical_query_string(uri);
     let canonical_headers = canonical_headers(headers, signed_headers)?;
     let signed_headers_value = signed_headers.join(";");
     Ok(format!(
@@ -2958,6 +3116,10 @@ fn build_canonical_request(
 }
 
 fn canonical_query_string(uri: &Uri) -> String {
+    canonical_query_string_excluding(uri, "")
+}
+
+fn canonical_query_string_excluding(uri: &Uri, excluded_name: &str) -> String {
     let mut pairs = uri
         .query()
         .unwrap_or_default()
@@ -2967,6 +3129,7 @@ fn canonical_query_string(uri: &Uri) -> String {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             (name.to_string(), value.to_string())
         })
+        .filter(|(name, _)| excluded_name.is_empty() || name != excluded_name)
         .collect::<Vec<_>>();
     pairs.sort();
     pairs
@@ -3036,6 +3199,20 @@ fn hex_encode(bytes: &[u8]) -> String {
         result.push_str(&format!("{byte:02x}"));
     }
     result
+}
+
+async fn resolve_s3_access_key(
+    state: &ServerState,
+    access_key_id: &str,
+) -> Option<S3AccessKeyRecord> {
+    let control_plane = state.s3.control_plane.lock().await;
+    control_plane
+        .access_keys
+        .iter()
+        .find(|access_key| {
+            access_key.access_key_id == access_key_id && access_key.revoked_at_unix.is_none()
+        })
+        .cloned()
 }
 
 async fn resolve_bucket(state: &ServerState, bucket_name: &str) -> Option<S3BucketRecord> {

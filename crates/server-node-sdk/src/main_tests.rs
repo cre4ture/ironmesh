@@ -37,6 +37,7 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use futures_util::{Sink, Stream};
 use hmac::{Hmac, Mac};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -1304,6 +1305,96 @@ fn s3_signed_request(
     request
 }
 
+fn s3_presigned_request(
+    method: Method,
+    uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> Request<Body> {
+    let host = "s3.local";
+    let amz_date = "20260705T120000Z";
+    let date_scope = "20260705";
+    let region = "us-east-1";
+    let service = "s3";
+    let expires = "900";
+    let signed_headers = "host";
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let parsed_uri: Uri = uri.parse().unwrap();
+    let canonical_uri = if parsed_uri.path().is_empty() {
+        "/"
+    } else {
+        parsed_uri.path()
+    };
+    let credential_scope = format!("{date_scope}/{region}/{service}/aws4_request");
+    let credential_value = utf8_percent_encode(
+        &format!("{access_key_id}/{credential_scope}"),
+        NON_ALPHANUMERIC,
+    )
+    .to_string();
+
+    let mut pairs = parsed_uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (name.to_string(), value.to_string())
+        })
+        .collect::<Vec<_>>();
+    pairs.push((
+        "X-Amz-Algorithm".to_string(),
+        "AWS4-HMAC-SHA256".to_string(),
+    ));
+    pairs.push(("X-Amz-Credential".to_string(), credential_value));
+    pairs.push(("X-Amz-Date".to_string(), amz_date.to_string()));
+    pairs.push(("X-Amz-Expires".to_string(), expires.to_string()));
+    pairs.push((
+        "X-Amz-SignedHeaders".to_string(),
+        signed_headers.to_string(),
+    ));
+    pairs.sort();
+
+    let canonical_query = pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_request = format!(
+        "{}\n{}\n{}\nhost:{host}\n\n{signed_headers}\n{payload_hash}",
+        method.as_str(),
+        canonical_uri,
+        canonical_query,
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        s3_test_sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+    let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
+        &signing_key,
+        string_to_sign.as_bytes(),
+    ));
+    let full_query = format!("{canonical_query}&X-Amz-Signature={signature}");
+    let full_uri = format!("{canonical_uri}?{full_query}");
+
+    let mut request = Request::builder()
+        .method(method)
+        .uri(full_uri)
+        .body(Body::from(body))
+        .unwrap();
+    request.headers_mut().insert("host", host.parse().unwrap());
+    for (name, value) in extra_headers {
+        request.headers_mut().insert(
+            name.parse::<axum::http::HeaderName>().unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    request
+}
+
 fn s3_transport_request(
     method: Method,
     external_uri: &str,
@@ -2188,6 +2279,156 @@ run_on_main_metadata_backends!(
     s3_listener_supports_bucket_listing_and_object_crud_impl,
     s3_listener_supports_bucket_listing_and_object_crud,
     s3_listener_supports_bucket_listing_and_object_crud_turso
+);
+
+async fn s3_listener_supports_presigned_requests_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-presigned-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let put_object = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::PUT,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"presigned body"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let list_objects = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::GET,
+            "/photos.example?list-type=2&prefix=docs/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    let list_objects_body = to_bytes(list_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_objects_xml = String::from_utf8(list_objects_body.to_vec()).unwrap();
+    assert!(list_objects_xml.contains("<Key>docs/presigned.txt</Key>"));
+
+    let get_object = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::GET,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), b"presigned body");
+
+    let mut tampered_get_object = s3_presigned_request(
+        Method::GET,
+        "/photos.example/docs/presigned.txt",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let tampered_uri = tampered_get_object.uri().to_string();
+    let (tampered_prefix, tampered_last) = tampered_uri.split_at(tampered_uri.len() - 1);
+    let tampered_replacement = if tampered_last == "0" { "1" } else { "0" };
+    *tampered_get_object.uri_mut() = format!("{tampered_prefix}{tampered_replacement}")
+        .parse()
+        .unwrap();
+    let tampered_get_object = app.clone().oneshot(tampered_get_object).await.unwrap();
+    assert_eq!(tampered_get_object.status(), StatusCode::FORBIDDEN);
+    let tampered_get_object_body = to_bytes(tampered_get_object.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tampered_get_object_xml = String::from_utf8(tampered_get_object_body.to_vec()).unwrap();
+    assert!(tampered_get_object_xml.contains("<Code>SignatureDoesNotMatch</Code>"));
+
+    let delete_object = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::DELETE,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+    let get_missing_object = app
+        .oneshot(s3_presigned_request(
+            Method::GET,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_missing_object.status(), StatusCode::NOT_FOUND);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_presigned_requests_impl,
+    s3_listener_supports_presigned_requests,
+    s3_listener_supports_presigned_requests_turso
 );
 
 async fn s3_listener_lists_folder_marker_objects_and_common_prefixes_impl(
