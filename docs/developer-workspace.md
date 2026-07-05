@@ -158,6 +158,7 @@ Those bridges can be added incrementally without changing the workspace topology
 ## Storage design
 
 - Persistent storage strategy and requirements are documented in [persistent-storage-strategy.md](persistent-storage-strategy.md).
+- S3 compatibility-front-end design is documented in [s3-compatible-front-end-design.md](s3-compatible-front-end-design.md).
 
 ## Multi-node strategy
 
