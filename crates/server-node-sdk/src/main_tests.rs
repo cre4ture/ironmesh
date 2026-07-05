@@ -1343,6 +1343,14 @@ fn s3_transport_request(
     )
 }
 
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = xml.find(&start_tag)? + start_tag.len();
+    let end = start + xml[start..].find(&end_tag)?;
+    Some(xml[start..end].to_string())
+}
+
 async fn import_client_credentials_upserts_idempotently_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let source_node_id = NodeId::new_v4();
@@ -2600,6 +2608,349 @@ run_on_main_metadata_backends!(
     s3_copy_object_overwrites_targets_and_replaces_metadata_impl,
     s3_copy_object_overwrites_targets_and_replaces_metadata,
     s3_copy_object_overwrites_targets_and_replaces_metadata_turso
+);
+
+async fn s3_multipart_uploads_complete_and_abort_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "media.example".to_string(),
+            root_prefix: Some("tenant/media".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Disabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-multipart-test".to_string()),
+            bucket_scope: vec!["media.example".to_string()],
+            prefix_scope: vec!["tenant/media/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let create_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/media.example/archive/movie.bin?uploads=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[
+                ("content-type", "application/octet-stream"),
+                ("x-amz-meta-origin", "camera"),
+            ],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_upload.status(), StatusCode::OK);
+    let create_upload_body = to_bytes(create_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let create_upload_xml = String::from_utf8(create_upload_body.to_vec()).unwrap();
+    let upload_id = xml_tag_text(&create_upload_xml, "UploadId")
+        .expect("multipart upload initiation should return an UploadId");
+
+    let part1_payload = vec![b'a'; 5 * 1024 * 1024];
+    let part2_payload = b"tail".to_vec();
+
+    let upload_part1 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            &format!("/media.example/archive/movie.bin?partNumber=1&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::from(part1_payload.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload_part1.status(), StatusCode::OK);
+    let part1_etag = upload_part1
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let upload_part2 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            &format!("/media.example/archive/movie.bin?partNumber=2&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::from(part2_payload.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload_part2.status(), StatusCode::OK);
+    let part2_etag = upload_part2
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let list_first_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/media.example/archive/movie.bin?max-parts=1&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_first_page.status(), StatusCode::OK);
+    let list_first_page_body = to_bytes(list_first_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_first_page_xml = String::from_utf8(list_first_page_body.to_vec()).unwrap();
+    assert!(list_first_page_xml.contains("<PartNumber>1</PartNumber>"));
+    assert!(!list_first_page_xml.contains("<PartNumber>2</PartNumber>"));
+    assert!(list_first_page_xml.contains("<NextPartNumberMarker>1</NextPartNumberMarker>"));
+
+    let list_second_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/media.example/archive/movie.bin?part-number-marker=1&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_second_page.status(), StatusCode::OK);
+    let list_second_page_body = to_bytes(list_second_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_second_page_xml = String::from_utf8(list_second_page_body.to_vec()).unwrap();
+    assert!(list_second_page_xml.contains("<PartNumber>2</PartNumber>"));
+    assert!(!list_second_page_xml.contains("<NextPartNumberMarker>"));
+
+    let complete_payload = Bytes::from(format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<CompleteMultipartUpload>",
+            "<Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>",
+            "<Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part>",
+            "</CompleteMultipartUpload>"
+        ),
+        part1_etag, part2_etag
+    ));
+    let complete_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            &format!("/media.example/archive/movie.bin?uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            complete_payload,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete_upload.status(), StatusCode::OK);
+    let complete_etag = complete_upload
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(complete_etag.ends_with("-2\""));
+    let complete_upload_body = to_bytes(complete_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let complete_upload_xml = String::from_utf8(complete_upload_body.to_vec()).unwrap();
+    assert_eq!(
+        xml_tag_text(&complete_upload_xml, "ETag").as_deref(),
+        Some(complete_etag.as_str())
+    );
+
+    let get_completed_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/media.example/archive/movie.bin",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_completed_object.status(), StatusCode::OK);
+    assert_eq!(
+        get_completed_object
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(complete_etag.as_str())
+    );
+    assert_eq!(
+        get_completed_object
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        get_completed_object
+            .headers()
+            .get("x-amz-meta-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("camera")
+    );
+    assert!(
+        get_completed_object
+            .headers()
+            .get("x-amz-version-id")
+            .is_none()
+    );
+    let get_completed_object_body = to_bytes(get_completed_object.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut expected_payload = part1_payload.clone();
+    expected_payload.extend_from_slice(&part2_payload);
+    assert_eq!(
+        get_completed_object_body.as_ref(),
+        expected_payload.as_slice()
+    );
+
+    {
+        let store = lock_store(&state, "tests.s3_multipart.verify_complete").await;
+        let versions = store
+            .list_s3_object_versions_for_key("media.example", "tenant/media/archive/movie.bin")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].etag, complete_etag);
+        assert_eq!(versions[0].multipart_part_count, Some(2));
+
+        let metadata = store
+            .load_object_version_metadata(&versions[0].version_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metadata.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            metadata.user_metadata.get("origin").map(String::as_str),
+            Some("camera")
+        );
+    }
+
+    let create_abort_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/media.example/archive/abort.bin?uploads=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_abort_upload.status(), StatusCode::OK);
+    let create_abort_upload_body = to_bytes(create_abort_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let create_abort_upload_xml = String::from_utf8(create_abort_upload_body.to_vec()).unwrap();
+    let abort_upload_id = xml_tag_text(&create_abort_upload_xml, "UploadId")
+        .expect("abort test multipart initiation should return an UploadId");
+
+    let upload_abort_part = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            &format!("/media.example/archive/abort.bin?partNumber=1&uploadId={abort_upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::from_static(b"abort-me"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload_abort_part.status(), StatusCode::OK);
+
+    let abort_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/media.example/archive/abort.bin?uploadId={abort_upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(abort_upload.status(), StatusCode::NO_CONTENT);
+
+    {
+        let sessions = super::read_upload_sessions(&state, "tests.s3_multipart.assert_abort").await;
+        assert!(!sessions.sessions.contains_key(&abort_upload_id));
+    }
+
+    let list_aborted_parts = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/media.example/archive/abort.bin?uploadId={abort_upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_aborted_parts.status(), StatusCode::NOT_FOUND);
+    let list_aborted_parts_body = to_bytes(list_aborted_parts.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_aborted_parts_xml = String::from_utf8(list_aborted_parts_body.to_vec()).unwrap();
+    assert!(list_aborted_parts_xml.contains("<Code>NoSuchUpload</Code>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_multipart_uploads_complete_and_abort_impl,
+    s3_multipart_uploads_complete_and_abort,
+    s3_multipart_uploads_complete_and_abort_turso
 );
 
 async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
@@ -6940,7 +7291,12 @@ async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: 
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
+                multipart_parts: std::collections::BTreeMap::new(),
+                multipart_bucket_name: None,
+                multipart_object_metadata: None,
+                multipart_completed_result: None,
                 created_at_unix: now,
                 updated_at_unix: now,
                 expires_at_unix: now + 300,
@@ -10025,7 +10381,12 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
+                multipart_parts: std::collections::BTreeMap::new(),
+                multipart_bucket_name: None,
+                multipart_object_metadata: None,
+                multipart_completed_result: None,
                 created_at_unix: now,
                 updated_at_unix: now,
                 expires_at_unix: now + 300,

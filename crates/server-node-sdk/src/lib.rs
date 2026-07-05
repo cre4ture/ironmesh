@@ -198,13 +198,13 @@ use storage::{
     DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
-    S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
-    StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
-    VersionConsistencyState, media_cache_retry_due, metadata_db_logical_table_count,
-    promote_cached_media_metadata_to_incomplete,
+    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
+    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
+    ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
 };
 
 tokio::task_local! {
@@ -752,7 +752,18 @@ struct UploadSessionRecord {
     state: VersionConsistencyState,
     parent_version_ids: Vec<String>,
     explicit_version_id: Option<String>,
+    #[serde(default)]
+    assembly_mode: UploadAssemblyMode,
+    #[serde(default)]
     received_chunks: Vec<Option<UploadChunkRef>>,
+    #[serde(default)]
+    multipart_parts: BTreeMap<u32, StagedUploadPart>,
+    #[serde(default)]
+    multipart_bucket_name: Option<String>,
+    #[serde(default)]
+    multipart_object_metadata: Option<ObjectVersionMetadataRecord>,
+    #[serde(default)]
+    multipart_completed_result: Option<MultipartUploadCompleteResult>,
     created_at_unix: u64,
     updated_at_unix: u64,
     expires_at_unix: u64,
@@ -772,6 +783,36 @@ struct UploadSessionFile {
 struct UploadSessionStore {
     path: PathBuf,
     sessions: HashMap<String, UploadSessionRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum UploadAssemblyMode {
+    #[default]
+    FixedSequence,
+    Multipart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StagedUploadPart {
+    part_number: u32,
+    size_bytes: u64,
+    #[serde(default)]
+    chunk_refs: Vec<UploadChunkRef>,
+    #[serde(default)]
+    client_etag: Option<String>,
+    #[serde(default)]
+    checksum_sha256: Option<String>,
+    created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MultipartUploadCompleteResult {
+    version_id: String,
+    etag: String,
+    modified_at_unix: u64,
+    total_size_bytes: u64,
+    part_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -968,6 +1009,25 @@ fn upload_session_view(session: &UploadSessionRecord) -> UploadSessionView {
         completed: session.completed,
         completed_result: session.completed_result.clone(),
     }
+}
+
+async fn ingest_payload_to_chunk_refs(
+    state: &ServerState,
+    payload: &[u8],
+) -> Result<Vec<UploadChunkRef>> {
+    let mut chunk_refs = Vec::new();
+    for chunk in payload.chunks(1024 * 1024) {
+        let (hash, _) = state
+            .storage
+            .upload_chunk_ingestor
+            .ingest_chunk_auto(chunk)
+            .await?;
+        chunk_refs.push(UploadChunkRef {
+            hash,
+            size_bytes: chunk.len(),
+        });
+    }
+    Ok(chunk_refs)
 }
 
 fn expected_upload_chunk_size(
@@ -10646,7 +10706,12 @@ async fn start_upload_session(
         state: version_state,
         parent_version_ids: request.parent,
         explicit_version_id: request.version_id,
+        assembly_mode: UploadAssemblyMode::FixedSequence,
         received_chunks: vec![None; chunk_count],
+        multipart_parts: BTreeMap::new(),
+        multipart_bucket_name: None,
+        multipart_object_metadata: None,
+        multipart_completed_result: None,
         created_at_unix: now,
         updated_at_unix: now,
         expires_at_unix: now.saturating_add(UPLOAD_SESSION_TTL_SECS),
@@ -10754,6 +10819,9 @@ async fn upload_session_chunk_response(
         if session.completed || session.finalizing {
             return StatusCode::CONFLICT.into_response();
         }
+        if session.assembly_mode != UploadAssemblyMode::FixedSequence {
+            return StatusCode::CONFLICT.into_response();
+        }
 
         (
             session.total_size_bytes,
@@ -10815,6 +10883,9 @@ async fn upload_session_chunk_response(
         return StatusCode::FORBIDDEN.into_response();
     }
     if session.completed || session.finalizing {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if session.assembly_mode != UploadAssemblyMode::FixedSequence {
         return StatusCode::CONFLICT.into_response();
     }
 
@@ -10891,6 +10962,9 @@ async fn complete_upload_session_route(
             return (StatusCode::OK, Json(result)).into_response();
         }
         if session.finalizing || session.received_chunks.iter().any(|entry| entry.is_none()) {
+            return StatusCode::CONFLICT.into_response();
+        }
+        if session.assembly_mode != UploadAssemblyMode::FixedSequence {
             return StatusCode::CONFLICT.into_response();
         }
 

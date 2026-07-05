@@ -1,10 +1,11 @@
 use super::*;
 use crate::storage::{ObjectVersionMetadataRecord, S3ObjectVersionRecord};
 use axum::body::Body;
-use axum::extract::{OriginalUri, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
 use axum::http::{HeaderName, Method, Request, StatusCode, Uri};
 use axum::routing::get;
 use hmac::{Hmac, Mac};
+use md5::Md5;
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use tower::ServiceExt;
@@ -12,6 +13,9 @@ use tower::ServiceExt;
 const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const S3_MAX_LIST_KEYS: usize = 1000;
 const S3_LIST_DEFAULT_MAX_KEYS: usize = 1000;
+const S3_MULTIPART_MIN_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+const S3_MULTIPART_MAX_PARTS: u32 = 10_000;
+const S3_LIST_DEFAULT_MAX_PARTS: usize = 1000;
 const S3_UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 pub(crate) const S3_TRANSPORT_PREFIX: &str = "/s3";
 
@@ -56,6 +60,11 @@ struct S3ObjectQuery {
     upload_id: Option<String>,
     #[serde(rename = "partNumber")]
     part_number: Option<u32>,
+    #[serde(rename = "part-number-marker")]
+    part_number_marker: Option<u32>,
+    #[serde(rename = "max-parts")]
+    max_parts: Option<usize>,
+    uploads: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +88,12 @@ struct S3ListContentEntry {
     modified_at_unix: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CompletedMultipartPart {
+    part_number: u32,
+    etag: String,
+}
+
 pub(crate) fn build_listener_app() -> Router<ServerState> {
     Router::new()
         .route("/", get(list_buckets))
@@ -96,8 +111,9 @@ pub(crate) fn build_listener_app() -> Router<ServerState> {
                 .head(head_object)
                 .put(put_object)
                 .delete(delete_object)
-                .post(s3_not_implemented_object_post),
+                .post(post_object),
         )
+        .layer(DefaultBodyLimit::disable())
 }
 
 pub(crate) fn is_transport_path(path: &str) -> bool {
@@ -492,7 +508,7 @@ async fn head_object(
     .await
 }
 
-async fn put_object(
+async fn post_object(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
@@ -500,19 +516,10 @@ async fn put_object(
     Query(query): Query<S3ObjectQuery>,
     payload: Bytes,
 ) -> Response {
-    let request = match authenticate_request(&state, &Method::PUT, &uri, &headers).await {
+    let request = match authenticate_request(&state, &Method::POST, &uri, &headers).await {
         Ok(request) => request,
         Err(response) => return response,
     };
-    if query.upload_id.is_some() || query.part_number.is_some() {
-        return s3_error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "multipart upload operations are not implemented yet",
-            uri.path(),
-            &request.request_id,
-        );
-    }
     if !request.access_key.allow_write {
         return s3_error_response(
             StatusCode::FORBIDDEN,
@@ -555,6 +562,90 @@ async fn put_object(
             uri.path(),
             &request.request_id,
         );
+    }
+
+    if query.uploads.is_some() {
+        return create_multipart_upload_response(
+            &state, &uri, &headers, &request, &bucket, &full_key,
+        )
+        .await;
+    }
+    if query.upload_id.is_some() {
+        return complete_multipart_upload_response(
+            &state, &uri, &request, &bucket, &full_key, &query, payload,
+        )
+        .await;
+    }
+
+    s3_error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        "object POST operations are not implemented yet",
+        uri.path(),
+        &request.request_id,
+    )
+}
+
+async fn put_object(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path((bucket_name, raw_key)): Path<(String, String)>,
+    Query(query): Query<S3ObjectQuery>,
+    payload: Bytes,
+) -> Response {
+    let request = match authenticate_request(&state, &Method::PUT, &uri, &headers).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if !request.access_key.allow_write {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to write objects",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let bucket = match resolve_bucket(&state, &bucket_name).await {
+        Some(bucket) => bucket,
+        None => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    if bucket.read_only {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the bucket mapping is read-only",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let object_key = raw_key.trim_start_matches('/').to_string();
+    let full_key = format!("{}{}", bucket.root_prefix, object_key);
+    if !access_key_allows_object(&request.access_key, &bucket, &full_key) {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to write this object path",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    if query.upload_id.is_some() || query.part_number.is_some() {
+        return upload_multipart_part_response(
+            &state, &uri, &headers, &request, &bucket, &full_key, &query, payload,
+        )
+        .await;
     }
     if header_value_name(&headers, "x-amz-copy-source").is_some() {
         return copy_object_response(&state, &uri, &headers, &request, &bucket, &full_key).await;
@@ -1010,6 +1101,715 @@ async fn copy_object_response(
     response
 }
 
+async fn create_multipart_upload_response(
+    state: &ServerState,
+    _uri: &Uri,
+    headers: &HeaderMap,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+) -> Response {
+    let now = unix_ts();
+    let session = UploadSessionRecord {
+        upload_id: Uuid::now_v7().to_string(),
+        owner_device_id: None,
+        key: full_key.to_string(),
+        total_size_bytes: 0,
+        chunk_size_bytes: 0,
+        chunk_count: 0,
+        state: VersionConsistencyState::Confirmed,
+        parent_version_ids: Vec::new(),
+        explicit_version_id: None,
+        assembly_mode: UploadAssemblyMode::Multipart,
+        received_chunks: Vec::new(),
+        multipart_parts: BTreeMap::new(),
+        multipart_bucket_name: Some(bucket.bucket_name.clone()),
+        multipart_object_metadata: Some(object_metadata_from_headers(headers)),
+        multipart_completed_result: None,
+        created_at_unix: now,
+        updated_at_unix: now,
+        expires_at_unix: now.saturating_add(UPLOAD_SESSION_TTL_SECS),
+        finalizing: false,
+        completed: false,
+        completed_result: None,
+    };
+
+    let mut sessions = write_upload_sessions(state, "s3.multipart.create").await;
+    prune_expired_upload_sessions(&mut sessions, now);
+    sessions
+        .sessions
+        .insert(session.upload_id.clone(), session.clone());
+    drop(sessions);
+    persist_upload_session_store_after_mutation(state, "s3_create_multipart_upload").await;
+
+    xml_response(
+        StatusCode::OK,
+        render_create_multipart_upload_result(
+            &bucket.bucket_name,
+            full_key_to_object_key(bucket, full_key)
+                .unwrap_or_default()
+                .as_str(),
+            &session.upload_id,
+        ),
+        &request.request_id,
+    )
+}
+
+async fn upload_multipart_part_response(
+    state: &ServerState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+    query: &S3ObjectQuery,
+    payload: Bytes,
+) -> Response {
+    let Some(upload_id) = query.upload_id.as_deref() else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "uploadId is required for UploadPart",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    let Some(part_number) = query.part_number else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "partNumber is required for UploadPart",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    if !(1..=S3_MULTIPART_MAX_PARTS).contains(&part_number) {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "partNumber must be between 1 and 10000",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let now = unix_ts();
+    {
+        let mut sessions = write_upload_sessions(state, "s3.multipart.upload_part.preflight").await;
+        prune_expired_upload_sessions(&mut sessions, now);
+        let Some(session) = sessions.sessions.get(upload_id) else {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "the specified multipart upload does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        };
+        if !multipart_upload_session_matches(session, &bucket.bucket_name, full_key)
+            || session.completed
+            || session.finalizing
+        {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "the specified multipart upload does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    }
+
+    let chunk_refs = match ingest_payload_to_chunk_refs(state, payload.as_ref()).await {
+        Ok(chunk_refs) => chunk_refs,
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to ingest multipart upload part: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    let etag = part_etag(payload.as_ref());
+
+    let mut sessions = write_upload_sessions(state, "s3.multipart.upload_part.commit").await;
+    prune_expired_upload_sessions(&mut sessions, unix_ts());
+    let Some(session) = sessions.sessions.get_mut(upload_id) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    if !multipart_upload_session_matches(session, &bucket.bucket_name, full_key)
+        || session.completed
+        || session.finalizing
+    {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    session.multipart_parts.insert(
+        part_number,
+        StagedUploadPart {
+            part_number,
+            size_bytes: payload.len() as u64,
+            chunk_refs,
+            client_etag: Some(etag.clone()),
+            checksum_sha256: header_value_name(headers, "x-amz-checksum-sha256"),
+            created_at_unix: unix_ts(),
+        },
+    );
+    session.updated_at_unix = unix_ts();
+    session.expires_at_unix = session
+        .updated_at_unix
+        .saturating_add(UPLOAD_SESSION_TTL_SECS);
+    drop(sessions);
+    persist_upload_session_store_after_mutation(state, "s3_upload_multipart_part").await;
+
+    let mut response = StatusCode::OK.into_response();
+    append_request_id_header(&mut response, &request.request_id);
+    append_etag_header(&mut response, &etag);
+    response
+}
+
+async fn list_multipart_parts_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+    query: &S3ObjectQuery,
+) -> Response {
+    if !request.access_key.allow_write {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to inspect multipart uploads",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    let Some(upload_id) = query.upload_id.as_deref() else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "uploadId is required for multipart part listings",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+
+    let now = unix_ts();
+    let mut sessions = write_upload_sessions(state, "s3.multipart.list_parts").await;
+    prune_expired_upload_sessions(&mut sessions, now);
+    let Some(session) = sessions.sessions.get(upload_id) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    if !multipart_upload_session_matches(session, &bucket.bucket_name, full_key)
+        || session.completed
+    {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let max_parts = query
+        .max_parts
+        .unwrap_or(S3_LIST_DEFAULT_MAX_PARTS)
+        .max(1)
+        .min(S3_LIST_DEFAULT_MAX_PARTS);
+    let part_number_marker = query.part_number_marker.unwrap_or(0);
+    let all_parts = session
+        .multipart_parts
+        .values()
+        .filter(|part| part.part_number > part_number_marker)
+        .cloned()
+        .collect::<Vec<_>>();
+    let is_truncated = all_parts.len() > max_parts;
+    let parts = all_parts.into_iter().take(max_parts).collect::<Vec<_>>();
+    let next_part_number_marker = if is_truncated {
+        parts.last().map(|part| part.part_number)
+    } else {
+        None
+    };
+
+    xml_response(
+        StatusCode::OK,
+        render_list_parts_result(
+            &bucket.bucket_name,
+            full_key_to_object_key(bucket, full_key)
+                .unwrap_or_default()
+                .as_str(),
+            upload_id,
+            part_number_marker,
+            max_parts,
+            is_truncated,
+            next_part_number_marker,
+            &parts,
+        ),
+        &request.request_id,
+    )
+}
+
+async fn complete_multipart_upload_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket: &S3BucketRecord,
+    full_key: &str,
+    query: &S3ObjectQuery,
+    payload: Bytes,
+) -> Response {
+    let Some(upload_id) = query.upload_id.as_deref() else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "uploadId is required for CompleteMultipartUpload",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    let requested_parts = match parse_complete_multipart_upload_parts(
+        std::str::from_utf8(payload.as_ref()).unwrap_or_default(),
+    ) {
+        Ok(parts) => parts,
+        Err(message) => {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+
+    let (multipart_metadata, selected_parts, existing_completed) = {
+        let now = unix_ts();
+        let mut sessions = write_upload_sessions(state, "s3.multipart.complete.prepare").await;
+        prune_expired_upload_sessions(&mut sessions, now);
+        let Some(session) = sessions.sessions.get_mut(upload_id) else {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "the specified multipart upload does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        };
+        if !multipart_upload_session_matches(session, &bucket.bucket_name, full_key) {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "the specified multipart upload does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        if session.completed {
+            if let Some(result) = session.multipart_completed_result.clone() {
+                let mut response = xml_response(
+                    StatusCode::OK,
+                    render_complete_multipart_upload_result(
+                        &bucket.bucket_name,
+                        full_key_to_object_key(bucket, full_key)
+                            .unwrap_or_default()
+                            .as_str(),
+                        &result,
+                    ),
+                    &request.request_id,
+                );
+                append_request_id_header(&mut response, &request.request_id);
+                append_etag_header(&mut response, &result.etag);
+                append_version_id_header(&mut response, Some(&result.version_id));
+                return response;
+            }
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "the specified multipart upload does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        if session.finalizing {
+            return s3_error_response(
+                StatusCode::CONFLICT,
+                "InvalidRequest",
+                "the multipart upload is already being finalized",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+
+        let mut selected_parts = Vec::with_capacity(requested_parts.len());
+        let mut previous_part_number = 0u32;
+        for requested_part in &requested_parts {
+            if requested_part.part_number <= previous_part_number {
+                return s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidPartOrder",
+                    "multipart upload parts must be completed in strictly increasing part-number order",
+                    uri.path(),
+                    &request.request_id,
+                );
+            }
+            previous_part_number = requested_part.part_number;
+
+            let Some(staged_part) = session.multipart_parts.get(&requested_part.part_number) else {
+                return s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidPart",
+                    "one or more multipart upload parts are missing",
+                    uri.path(),
+                    &request.request_id,
+                );
+            };
+            if normalize_etag(staged_part.client_etag.as_deref().unwrap_or_default())
+                != normalize_etag(&requested_part.etag)
+            {
+                return s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidPart",
+                    "one or more multipart upload part ETags did not match",
+                    uri.path(),
+                    &request.request_id,
+                );
+            }
+            selected_parts.push(staged_part.clone());
+        }
+        for staged_part in selected_parts
+            .iter()
+            .take(selected_parts.len().saturating_sub(1))
+        {
+            if staged_part.size_bytes < S3_MULTIPART_MIN_PART_SIZE_BYTES {
+                return s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "EntityTooSmall",
+                    "all multipart upload parts except the final part must be at least 5 MiB",
+                    uri.path(),
+                    &request.request_id,
+                );
+            }
+        }
+
+        session.finalizing = true;
+        session.updated_at_unix = now;
+        session.expires_at_unix = now.saturating_add(UPLOAD_SESSION_TTL_SECS);
+        (
+            session
+                .multipart_object_metadata
+                .clone()
+                .unwrap_or_default(),
+            selected_parts,
+            session.multipart_completed_result.clone(),
+        )
+    };
+    if let Some(result) = existing_completed {
+        let mut response = xml_response(
+            StatusCode::OK,
+            render_complete_multipart_upload_result(
+                &bucket.bucket_name,
+                full_key_to_object_key(bucket, full_key)
+                    .unwrap_or_default()
+                    .as_str(),
+                &result,
+            ),
+            &request.request_id,
+        );
+        append_etag_header(&mut response, &result.etag);
+        append_version_id_header(&mut response, Some(&result.version_id));
+        return response;
+    }
+
+    let mut chunk_refs = Vec::new();
+    let mut total_size_bytes = 0u64;
+    let mut part_etags = Vec::with_capacity(selected_parts.len());
+    for part in &selected_parts {
+        total_size_bytes = total_size_bytes.saturating_add(part.size_bytes);
+        part_etags.push(part.client_etag.clone().unwrap_or_default());
+        chunk_refs.extend(part.chunk_refs.clone());
+    }
+    let multipart_etag = match complete_multipart_etag(&part_etags) {
+        Ok(etag) => etag,
+        Err(message) => {
+            let mut sessions =
+                write_upload_sessions(state, "s3.multipart.complete.rollback.etag").await;
+            if let Some(session) = sessions.sessions.get_mut(upload_id) {
+                session.finalizing = false;
+                session.updated_at_unix = unix_ts();
+                session.expires_at_unix = session
+                    .updated_at_unix
+                    .saturating_add(UPLOAD_SESSION_TTL_SECS);
+            }
+            drop(sessions);
+            persist_upload_session_store_after_mutation(state, "s3_complete_multipart_etag_error")
+                .await;
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &message,
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+
+    let mut store = lock_store(state, "s3.multipart.complete.put_object_from_chunks").await;
+    let outcome = match store
+        .put_object_from_chunks(
+            full_key,
+            total_size_bytes as usize,
+            &chunk_refs,
+            PutOptions::default(),
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            drop(store);
+            let mut sessions = write_upload_sessions(state, "s3.multipart.complete.rollback").await;
+            if let Some(session) = sessions.sessions.get_mut(upload_id) {
+                session.finalizing = false;
+                session.updated_at_unix = unix_ts();
+                session.expires_at_unix = session
+                    .updated_at_unix
+                    .saturating_add(UPLOAD_SESSION_TTL_SECS);
+            }
+            drop(sessions);
+            persist_upload_session_store_after_mutation(state, "s3_complete_multipart_error").await;
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to finalize multipart upload: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    let mut object_metadata = multipart_metadata;
+    object_metadata.version_id = outcome.version_id.clone();
+    object_metadata.updated_at_unix = unix_ts();
+    if let Err(err) = store
+        .persist_object_version_metadata(&object_metadata)
+        .await
+    {
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed to persist multipart object metadata: {err:#}"),
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    if let Err(err) = store
+        .persist_s3_object_version(&S3ObjectVersionRecord {
+            bucket_name: bucket.bucket_name.clone(),
+            ironmesh_key: full_key.to_string(),
+            version_id: outcome.version_id.clone(),
+            etag: multipart_etag.clone(),
+            multipart_part_count: Some(selected_parts.len() as u32),
+            created_at_unix: unix_ts(),
+        })
+        .await
+    {
+        return s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed to persist multipart S3 version metadata: {err:#}"),
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    drop(store);
+
+    publish_namespace_change(state);
+    spawn_media_metadata_warmup(
+        state.clone(),
+        full_key.to_string(),
+        outcome.manifest_hash.clone(),
+    );
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(full_key, state.node_id);
+    cluster.note_replica(
+        format!("{}@{}", full_key, outcome.version_id),
+        state.node_id,
+    );
+    drop(cluster);
+    if let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            key = %full_key,
+            "failed persisting cluster replicas after multipart completion"
+        );
+    }
+    if should_trigger_autonomous_post_write_replication(
+        state.autonomous_replication_on_put_enabled,
+        false,
+    ) {
+        enqueue_autonomous_post_write_replication(
+            state,
+            autonomous_post_write_replication_subjects(full_key, &outcome.version_id),
+        )
+        .await;
+    }
+    record_data_change_event(
+        state,
+        PendingDataChangeEvent {
+            action: DataChangeAction::Upload,
+            actor: Some(s3_actor_context(&request.access_key)),
+            path: full_key.to_string(),
+            from_path: None,
+            to_path: None,
+            recursive: false,
+            affected_path_count: 1,
+            total_size_bytes: Some(total_size_bytes),
+            version_id: Some(outcome.version_id.clone()),
+            snapshot_id: Some(outcome.snapshot_id.clone()),
+            upload_mode: Some(DataChangeUploadMode::Chunked),
+        },
+    )
+    .await;
+
+    let completed_result = MultipartUploadCompleteResult {
+        version_id: outcome.version_id.clone(),
+        etag: multipart_etag.clone(),
+        modified_at_unix: unix_ts(),
+        total_size_bytes,
+        part_count: selected_parts.len() as u32,
+    };
+    let mut sessions = write_upload_sessions(state, "s3.multipart.complete.finish").await;
+    if let Some(session) = sessions.sessions.get_mut(upload_id) {
+        session.completed = true;
+        session.finalizing = false;
+        session.total_size_bytes = total_size_bytes;
+        session.multipart_completed_result = Some(completed_result.clone());
+        session.multipart_parts.clear();
+        session.updated_at_unix = unix_ts();
+        session.expires_at_unix = session
+            .updated_at_unix
+            .saturating_add(UPLOAD_SESSION_TTL_SECS);
+    }
+    drop(sessions);
+    persist_upload_session_store_after_mutation(state, "s3_complete_multipart_finish").await;
+
+    let mut response = xml_response(
+        StatusCode::OK,
+        render_complete_multipart_upload_result(
+            &bucket.bucket_name,
+            full_key_to_object_key(bucket, full_key)
+                .unwrap_or_default()
+                .as_str(),
+            &completed_result,
+        ),
+        &request.request_id,
+    );
+    append_etag_header(&mut response, &completed_result.etag);
+    append_version_id_header(&mut response, Some(&completed_result.version_id));
+    response
+}
+
+async fn abort_multipart_upload_response(
+    state: &ServerState,
+    uri: &Uri,
+    request: &S3RequestContext,
+    bucket_name: &str,
+    raw_key: &str,
+    query: &S3ObjectQuery,
+) -> Response {
+    if !request.access_key.allow_write {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to abort multipart uploads",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    let Some(upload_id) = query.upload_id.as_deref() else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "uploadId is required to abort a multipart upload",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+
+    let bucket = match resolve_bucket(state, bucket_name).await {
+        Some(bucket) => bucket,
+        None => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+    };
+    let object_key = raw_key.trim_start_matches('/').to_string();
+    let full_key = format!("{}{}", bucket.root_prefix, object_key);
+    if !access_key_allows_object(&request.access_key, &bucket, &full_key) {
+        return s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "the access key is not allowed to write this object path",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+
+    let now = unix_ts();
+    let mut sessions = write_upload_sessions(state, "s3.multipart.abort").await;
+    prune_expired_upload_sessions(&mut sessions, now);
+    let Some(session) = sessions.sessions.get(upload_id) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
+            uri.path(),
+            &request.request_id,
+        );
+    };
+    if !multipart_upload_session_matches(session, &bucket.bucket_name, &full_key) {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
+            uri.path(),
+            &request.request_id,
+        );
+    }
+    sessions.sessions.remove(upload_id);
+    drop(sessions);
+    persist_upload_session_store_after_mutation(state, "s3_abort_multipart_upload").await;
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    append_request_id_header(&mut response, &request.request_id);
+    response
+}
+
 async fn delete_object(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
@@ -1021,14 +1821,16 @@ async fn delete_object(
         Ok(request) => request,
         Err(response) => return response,
     };
-    if query.upload_id.is_some() || query.part_number.is_some() {
-        return s3_error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "multipart upload operations are not implemented yet",
-            uri.path(),
-            &request.request_id,
-        );
+    if query.upload_id.is_some() {
+        return abort_multipart_upload_response(
+            &state,
+            &uri,
+            &request,
+            &bucket_name,
+            &raw_key,
+            &query,
+        )
+        .await;
     }
     if !request.access_key.allow_delete {
         return s3_error_response(
@@ -1179,15 +1981,6 @@ async fn get_or_head_object_response(
             &request.request_id,
         );
     }
-    if query.upload_id.is_some() || query.part_number.is_some() {
-        return s3_error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "multipart upload operations are not implemented yet",
-            uri.path(),
-            &request.request_id,
-        );
-    }
 
     let bucket = match resolve_bucket(state, &bucket_name).await {
         Some(bucket) => bucket,
@@ -1212,7 +2005,28 @@ async fn get_or_head_object_response(
             &request.request_id,
         );
     }
-
+    if query.upload_id.is_some() {
+        if head_only {
+            return s3_error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "HEAD with multipart upload state is not implemented",
+                uri.path(),
+                &request.request_id,
+            );
+        }
+        return list_multipart_parts_response(state, &uri, &request, &bucket, &full_key, &query)
+            .await;
+    }
+    if query.part_number.is_some() {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "partNumber requires uploadId for multipart upload operations",
+            uri.path(),
+            &request.request_id,
+        );
+    }
     let resolved_version_id = match resolve_requested_version_id(
         state,
         &bucket,
@@ -1225,6 +2039,17 @@ async fn get_or_head_object_response(
     {
         Ok(version_id) => version_id,
         Err(response) => return response,
+    };
+    let effective_version_id = match resolved_version_id.as_deref() {
+        Some(version_id) => Some(version_id.to_string()),
+        None => {
+            match resolve_current_head_version_id(state, &full_key, uri.path(), &request.request_id)
+                .await
+            {
+                Ok(version_id) => version_id,
+                Err(response) => return response,
+            }
+        }
     };
     let object_response = super::get_object_response(
         state,
@@ -1270,7 +2095,7 @@ async fn get_or_head_object_response(
         };
     }
 
-    let metadata = match resolved_version_id.as_deref() {
+    let metadata = match effective_version_id.as_deref() {
         Some(version_id) => {
             let store = read_store(state, "s3.get_object.load_metadata").await;
             match store.load_object_version_metadata(version_id).await {
@@ -1288,11 +2113,35 @@ async fn get_or_head_object_response(
         }
         None => None,
     };
+    let s3_object_version = match effective_version_id.as_deref() {
+        Some(version_id) => {
+            let store = read_store(state, "s3.get_object.load_s3_version").await;
+            match store
+                .load_s3_object_version(&bucket.bucket_name, version_id)
+                .await
+            {
+                Ok(record) => record,
+                Err(err) => {
+                    return s3_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        &format!("failed to load S3 object version record: {err:#}"),
+                        uri.path(),
+                        &request.request_id,
+                    );
+                }
+            }
+        }
+        None => None,
+    };
 
     let mut response = object_response;
     append_request_id_header(&mut response, &request.request_id);
     append_version_id_header(&mut response, resolved_version_id.as_deref());
     append_object_metadata_headers(&mut response, metadata.as_ref());
+    if let Some(version) = s3_object_version.as_ref() {
+        append_etag_header(&mut response, &version.etag);
+    }
     response
 }
 
@@ -1332,24 +2181,6 @@ async fn s3_not_implemented_bucket_post(
         StatusCode::NOT_IMPLEMENTED,
         "NotImplemented",
         "bucket POST operations are not implemented yet",
-        uri.path(),
-        &request.request_id,
-    )
-}
-
-async fn s3_not_implemented_object_post(
-    State(state): State<ServerState>,
-    OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
-) -> Response {
-    let request = match authenticate_request(&state, &Method::POST, &uri, &headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    s3_error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        "multipart upload operations are not implemented yet",
         uri.path(),
         &request.request_id,
     )
@@ -1733,6 +2564,16 @@ fn full_key_to_object_key(bucket: &S3BucketRecord, full_key: &str) -> Option<Str
         .map(ToString::to_string)
 }
 
+fn multipart_upload_session_matches(
+    session: &UploadSessionRecord,
+    bucket_name: &str,
+    full_key: &str,
+) -> bool {
+    session.assembly_mode == UploadAssemblyMode::Multipart
+        && session.key == full_key
+        && session.multipart_bucket_name.as_deref() == Some(bucket_name)
+}
+
 async fn resolve_requested_version_id(
     state: &ServerState,
     bucket: &S3BucketRecord,
@@ -1787,6 +2628,28 @@ async fn resolve_requested_version_id(
             None
         },
     )
+}
+
+async fn resolve_current_head_version_id(
+    state: &ServerState,
+    full_key: &str,
+    request_path: &str,
+    request_id: &str,
+) -> Result<Option<String>, Response> {
+    let store = read_store(state, "s3.get_object.current_head_version").await;
+    let versions = match store.list_versions(full_key).await {
+        Ok(versions) => versions,
+        Err(err) => {
+            return Err(s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to inspect object versions: {err:#}"),
+                request_path,
+                request_id,
+            ));
+        }
+    };
+    Ok(versions.and_then(|graph| graph.preferred_head_version_id))
 }
 
 async fn resolve_copy_source_version(
@@ -1918,6 +2781,120 @@ fn parse_metadata_directive(headers: &HeaderMap) -> Result<S3MetadataDirective, 
         Some(value) if value == "REPLACE" => Ok(S3MetadataDirective::Replace),
         Some(_) => Err("x-amz-metadata-directive must be either COPY or REPLACE".to_string()),
     }
+}
+
+fn normalize_etag(value: &str) -> String {
+    value.trim().trim_matches('"').to_ascii_lowercase()
+}
+
+fn part_etag(payload: &[u8]) -> String {
+    let digest = Md5::digest(payload);
+    format!("\"{}\"", hex_encode(digest.as_slice()))
+}
+
+fn complete_multipart_etag(part_etags: &[String]) -> Result<String, String> {
+    if part_etags.is_empty() {
+        return Err("multipart uploads must include at least one part".to_string());
+    }
+
+    let mut digests = Vec::with_capacity(part_etags.len() * 16);
+    for etag in part_etags {
+        let normalized = normalize_etag(etag);
+        if normalized.len() != 32 {
+            return Err("multipart part ETag must be a 32-character MD5 digest".to_string());
+        }
+        digests.extend(hex_decode(&normalized)?);
+    }
+
+    let digest = Md5::digest(&digests);
+    Ok(format!(
+        "\"{}-{}\"",
+        hex_encode(digest.as_slice()),
+        part_etags.len()
+    ))
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+    fn decode_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    if value.len() % 2 != 0 {
+        return Err("hex-encoded values must have an even number of digits".to_string());
+    }
+
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = decode_nibble(pair[0])
+            .ok_or_else(|| "hex-encoded values must only contain hexadecimal digits".to_string())?;
+        let low = decode_nibble(pair[1])
+            .ok_or_else(|| "hex-encoded values must only contain hexadecimal digits".to_string())?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn parse_complete_multipart_upload_parts(xml: &str) -> Result<Vec<CompletedMultipartPart>, String> {
+    let parts_xml = xml_tag_blocks(xml, "Part");
+    if parts_xml.is_empty() {
+        return Err("CompleteMultipartUpload must include at least one Part element".to_string());
+    }
+
+    let mut parts = Vec::with_capacity(parts_xml.len());
+    for part_xml in parts_xml {
+        let Some(part_number_raw) = xml_tag_contents(part_xml, "PartNumber") else {
+            return Err("each multipart Part must include a PartNumber".to_string());
+        };
+        let part_number = part_number_raw
+            .parse::<u32>()
+            .map_err(|_| "each multipart PartNumber must be a positive integer".to_string())?;
+        if !(1..=S3_MULTIPART_MAX_PARTS).contains(&part_number) {
+            return Err("each multipart PartNumber must be between 1 and 10000".to_string());
+        }
+
+        let Some(etag) = xml_tag_contents(part_xml, "ETag") else {
+            return Err("each multipart Part must include an ETag".to_string());
+        };
+        let etag = etag.trim();
+        if etag.is_empty() {
+            return Err("multipart Part ETag values must not be empty".to_string());
+        }
+
+        parts.push(CompletedMultipartPart {
+            part_number,
+            etag: etag.to_string(),
+        });
+    }
+
+    Ok(parts)
+}
+
+fn xml_tag_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut blocks = Vec::new();
+    let mut offset = 0usize;
+
+    while let Some(start_rel) = xml[offset..].find(&open) {
+        let start = offset + start_rel + open.len();
+        let Some(end_rel) = xml[start..].find(&close) else {
+            break;
+        };
+        let end = start + end_rel;
+        blocks.push(xml[start..end].trim());
+        offset = end + close.len();
+    }
+
+    blocks
+}
+
+fn xml_tag_contents<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    xml_tag_blocks(xml, tag).into_iter().next()
 }
 
 fn object_metadata_from_headers(headers: &HeaderMap) -> ObjectVersionMetadataRecord {
@@ -2109,6 +3086,96 @@ fn render_copy_object_result(etag: &str, modified_at_unix: u64) -> String {
     xml
 }
 
+fn render_create_multipart_upload_result(
+    bucket_name: &str,
+    object_key: &str,
+    upload_id: &str,
+) -> String {
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult xmlns=""#,
+    );
+    xml.push('"');
+    xml.push_str(S3_XML_NAMESPACE);
+    xml.push_str(r#""><Bucket>"#);
+    xml.push_str(&xml_escape(bucket_name));
+    xml.push_str("</Bucket><Key>");
+    xml.push_str(&xml_escape(object_key));
+    xml.push_str("</Key><UploadId>");
+    xml.push_str(&xml_escape(upload_id));
+    xml.push_str("</UploadId></InitiateMultipartUploadResult>");
+    xml
+}
+
+fn render_list_parts_result(
+    bucket_name: &str,
+    object_key: &str,
+    upload_id: &str,
+    part_number_marker: u32,
+    max_parts: usize,
+    is_truncated: bool,
+    next_part_number_marker: Option<u32>,
+    parts: &[StagedUploadPart],
+) -> String {
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListPartsResult xmlns=""#);
+    xml.push('"');
+    xml.push_str(S3_XML_NAMESPACE);
+    xml.push_str(r#""><Bucket>"#);
+    xml.push_str(&xml_escape(bucket_name));
+    xml.push_str("</Bucket><Key>");
+    xml.push_str(&xml_escape(object_key));
+    xml.push_str("</Key><UploadId>");
+    xml.push_str(&xml_escape(upload_id));
+    xml.push_str("</UploadId><PartNumberMarker>");
+    xml.push_str(&part_number_marker.to_string());
+    xml.push_str("</PartNumberMarker><MaxParts>");
+    xml.push_str(&max_parts.to_string());
+    xml.push_str("</MaxParts><IsTruncated>");
+    xml.push_str(if is_truncated { "true" } else { "false" });
+    xml.push_str("</IsTruncated>");
+    if let Some(marker) = next_part_number_marker {
+        xml.push_str("<NextPartNumberMarker>");
+        xml.push_str(&marker.to_string());
+        xml.push_str("</NextPartNumberMarker>");
+    }
+    for part in parts {
+        xml.push_str("<Part><PartNumber>");
+        xml.push_str(&part.part_number.to_string());
+        xml.push_str("</PartNumber><LastModified>");
+        xml.push_str(&xml_escape(&s3_timestamp(part.created_at_unix)));
+        xml.push_str("</LastModified><ETag>");
+        xml.push_str(&xml_escape(part.client_etag.as_deref().unwrap_or_default()));
+        xml.push_str("</ETag><Size>");
+        xml.push_str(&part.size_bytes.to_string());
+        xml.push_str("</Size></Part>");
+    }
+    xml.push_str("</ListPartsResult>");
+    xml
+}
+
+fn render_complete_multipart_upload_result(
+    bucket_name: &str,
+    object_key: &str,
+    result: &MultipartUploadCompleteResult,
+) -> String {
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult xmlns=""#,
+    );
+    xml.push('"');
+    xml.push_str(S3_XML_NAMESPACE);
+    xml.push_str(r#""><Location>/"#);
+    xml.push_str(&xml_escape(bucket_name));
+    xml.push('/');
+    xml.push_str(&xml_escape(object_key));
+    xml.push_str("</Location><Bucket>");
+    xml.push_str(&xml_escape(bucket_name));
+    xml.push_str("</Bucket><Key>");
+    xml.push_str(&xml_escape(object_key));
+    xml.push_str("</Key><ETag>");
+    xml.push_str(&xml_escape(&result.etag));
+    xml.push_str("</ETag></CompleteMultipartUploadResult>");
+    xml
+}
+
 fn new_s3_request_id() -> String {
     Uuid::now_v7().simple().to_string().to_ascii_uppercase()
 }
@@ -2166,8 +3233,6 @@ fn xml_escape(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn s3_timestamp(unix_ts: u64) -> String {
