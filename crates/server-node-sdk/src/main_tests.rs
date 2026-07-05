@@ -2294,7 +2294,10 @@ async fn s3_listener_supports_bucket_create_and_delete_impl(backend: MainTestBac
         admin_headers,
         Json(super::CreateS3AccessKeyRequest {
             description: Some("s3-bucket-manage-test".to_string()),
-            bucket_scope: vec!["managed.example".to_string()],
+            bucket_scope: vec![
+                "managed.example".to_string(),
+                "managed-body.example".to_string(),
+            ],
             prefix_scope: vec![],
             allow_list: true,
             allow_read: true,
@@ -2413,6 +2416,7 @@ async fn s3_listener_supports_bucket_create_and_delete_impl(backend: MainTestBac
     assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
 
     let head_deleted_bucket = app
+        .clone()
         .oneshot(s3_signed_request(
             Method::HEAD,
             "/managed.example",
@@ -2424,6 +2428,45 @@ async fn s3_listener_supports_bucket_create_and_delete_impl(backend: MainTestBac
         .await
         .unwrap();
     assert_eq!(head_deleted_bucket.status(), StatusCode::NOT_FOUND);
+
+    let create_bucket_with_body = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/managed-body.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from_static(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <LocationConstraint>eu-central-1</LocationConstraint>
+</CreateBucketConfiguration>"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_bucket_with_body.status(), StatusCode::OK);
+    assert_eq!(
+        create_bucket_with_body
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/managed-body.example")
+    );
+
+    let head_bucket_with_body = app
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/managed-body.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket_with_body.status(), StatusCode::OK);
 
     cleanup_test_state(&state).await;
 }

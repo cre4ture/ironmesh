@@ -410,11 +410,11 @@ async fn put_bucket(
             &request.request_id,
         );
     }
-    if !payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+    if let Err(message) = parse_create_bucket_location_constraint(payload.as_ref()) {
         return s3_error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "CreateBucket request bodies are not implemented yet",
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            &message,
             uri.path(),
             &request.request_id,
         );
@@ -4386,6 +4386,25 @@ fn parse_bucket_versioning_status(xml: &str) -> Result<S3BucketVersioningStatus,
         "Suspended" | "Disabled" => Ok(S3BucketVersioningStatus::Disabled),
         _ => Err("VersioningConfiguration Status must be Enabled or Suspended".to_string()),
     }
+}
+
+fn parse_create_bucket_location_constraint(payload: &[u8]) -> Result<Option<String>, String> {
+    if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    let xml = std::str::from_utf8(payload)
+        .map_err(|_| "CreateBucket request bodies must be valid UTF-8 XML".to_string())?;
+    let Some(location_constraint) = xml_tag_contents(xml, "LocationConstraint") else {
+        return Err(
+            "CreateBucket request bodies must include a LocationConstraint element when non-empty"
+                .to_string(),
+        );
+    };
+    let location_constraint = location_constraint.trim();
+    if location_constraint.is_empty() {
+        return Err("CreateBucket LocationConstraint must not be empty".to_string());
+    }
+    Ok(Some(location_constraint.to_string()))
 }
 
 fn s3_timestamp(unix_ts: u64) -> String {
