@@ -35,6 +35,8 @@ import type {
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
+  ProcessStatsCurrentResponse,
+  ProcessStatsSample,
   RepairActivityStatusResponse,
   RepairHistoryResponse,
   RendezvousConfigView,
@@ -685,6 +687,30 @@ export async function getStorageStatsHistory(
 
   return fetchAdminJson<StorageStatsSample[]>(
     `${apiV1("/storage/stats/history")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
+}
+
+export async function getProcessStatsCurrent(
+  adminTokenOverride?: string
+): Promise<ProcessStatsCurrentResponse> {
+  return fetchAdminJson<ProcessStatsCurrentResponse>(apiV1("/process/stats/current"), {
+    adminTokenOverride
+  });
+}
+
+export async function getProcessStatsHistory(
+  limit?: number,
+  adminTokenOverride?: string
+): Promise<ProcessStatsSample[]> {
+  const query = new URLSearchParams();
+  if (typeof limit === "number" && Number.isFinite(limit)) {
+    query.set("limit", String(Math.max(1, Math.trunc(limit))));
+  }
+  const suffix = query.toString();
+
+  return fetchAdminJson<ProcessStatsSample[]>(
+    `${apiV1("/process/stats/history")}${suffix ? `?${suffix}` : ""}`,
     { adminTokenOverride }
   );
 }

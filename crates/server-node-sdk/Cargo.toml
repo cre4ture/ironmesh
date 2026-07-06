@@ -43,6 +43,7 @@ serde_json.workspace = true
 zstd = "0.13"
 sha2 = "0.10"
 sqlite-vfs = "0.2.0"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 tokio.workspace = true
 tokio-rustls = "0.26"
 time = "0.3"

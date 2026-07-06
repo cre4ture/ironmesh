@@ -484,6 +484,34 @@ export type StorageStatsCurrentResponse = {
   last_error?: string | null;
 };
 
+export type ChildProcessStat = {
+  pid: number;
+  name: string;
+  cpu_percent: number;
+  memory_bytes: number;
+  disk_read_bytes_per_sec: number;
+  disk_write_bytes_per_sec: number;
+};
+
+export type ProcessStatsSample = {
+  collected_at_unix: number;
+  main_cpu_percent: number;
+  main_memory_bytes: number;
+  main_disk_read_bytes_per_sec: number;
+  main_disk_write_bytes_per_sec: number;
+  children_cpu_percent: number;
+  children_memory_bytes: number;
+  children_disk_read_bytes_per_sec: number;
+  children_disk_write_bytes_per_sec: number;
+  children_count: number;
+};
+
+export type ProcessStatsCurrentResponse = {
+  sample?: ProcessStatsSample | null;
+  children: ChildProcessStat[];
+  logical_cpu_count: number;
+};
+
 export type MetadataDbBackendKind = "sqlite" | "turso";
 
 export type MetadataDbTableLogicalBreakdown = {

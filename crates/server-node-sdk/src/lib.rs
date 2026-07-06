@@ -98,6 +98,8 @@ const BUILD_REVISION: &str = git_version::git_version!(
 );
 const STORAGE_STATS_REFRESH_INTERVAL_SECS: u64 = 300;
 const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
+const PROCESS_STATS_SAMPLE_INTERVAL_SECS: u64 = 2;
+const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
@@ -221,6 +223,7 @@ struct ServerState {
     repair_config: RepairConfig,
     log_buffer: Arc<LogBuffer>,
     runtime_log_control: RuntimeLogControl,
+    process_stats_runtime: Arc<StdMutex<ProcessStatsRuntime>>,
 }
 
 #[derive(Clone)]
@@ -1886,6 +1889,54 @@ impl LogBuffer {
         let keep = limit.max(1);
         let skip = entries.len().saturating_sub(keep);
         entries.iter().skip(skip).cloned().collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChildProcessStat {
+    pid: u32,
+    name: String,
+    cpu_percent: f32,
+    memory_bytes: u64,
+    disk_read_bytes_per_sec: u64,
+    disk_write_bytes_per_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProcessStatsSample {
+    collected_at_unix: u64,
+    main_cpu_percent: f32,
+    main_memory_bytes: u64,
+    main_disk_read_bytes_per_sec: u64,
+    main_disk_write_bytes_per_sec: u64,
+    children_cpu_percent: f32,
+    children_memory_bytes: u64,
+    children_disk_read_bytes_per_sec: u64,
+    children_disk_write_bytes_per_sec: u64,
+    children_count: u32,
+}
+
+#[derive(Default)]
+struct ProcessStatsRuntime {
+    history: VecDeque<ProcessStatsSample>,
+    latest_children: Vec<ChildProcessStat>,
+    logical_cpu_count: usize,
+}
+
+impl ProcessStatsRuntime {
+    fn push(&mut self, sample: ProcessStatsSample, children: Vec<ChildProcessStat>, logical_cpu_count: usize) {
+        self.history.push_back(sample);
+        while self.history.len() > PROCESS_STATS_HISTORY_MAX_SAMPLES {
+            self.history.pop_front();
+        }
+        self.latest_children = children;
+        self.logical_cpu_count = logical_cpu_count;
+    }
+
+    fn recent(&self, limit: usize) -> Vec<ProcessStatsSample> {
+        let keep = limit.max(1);
+        let skip = self.history.len().saturating_sub(keep);
+        self.history.iter().skip(skip).cloned().collect()
     }
 }
 
@@ -5438,6 +5489,7 @@ async fn run_inner(
         repair_config,
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
         runtime_log_control,
+        process_stats_runtime: Arc::new(StdMutex::new(ProcessStatsRuntime::default())),
     };
 
     let internal_peer_url = config
@@ -5493,6 +5545,7 @@ async fn start_background_runtimes(
     );
     spawn_local_availability_refresher(state.clone(), startup_phase_anchor);
     spawn_storage_stats_refresher(state.clone());
+    spawn_process_stats_sampler(state.clone());
     spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
 
@@ -5750,6 +5803,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5816,6 +5871,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5898,6 +5955,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/cluster/scrub/run", post(trigger_data_scrub_peer))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
@@ -6226,6 +6285,80 @@ fn spawn_storage_stats_refresher(state: ServerState) {
                     refresh_storage_stats_once(&state).await;
                 }
             }
+        }
+    });
+}
+
+fn spawn_process_stats_sampler(state: ServerState) {
+    tokio::spawn(async move {
+        let mut system = sysinfo::System::new();
+        let main_pid = sysinfo::Pid::from_u32(std::process::id());
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(PROCESS_STATS_SAMPLE_INTERVAL_SECS));
+
+        loop {
+            ticker.tick().await;
+            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+            let main_process = system.process(main_pid);
+            let main_cpu_percent = main_process.map(|p| p.cpu_usage()).unwrap_or(0.0);
+            let main_memory_bytes = main_process.map(|p| p.memory()).unwrap_or(0);
+            let main_disk_usage = main_process.map(|p| p.disk_usage()).unwrap_or_default();
+
+            let mut children = Vec::new();
+            for (pid, process) in system.processes() {
+                if *pid == main_pid
+                    || process.parent() != Some(main_pid)
+                    || process.thread_kind().is_some()
+                {
+                    // Linux exposes OS threads (e.g. tokio workers) as entries with the
+                    // same parent pid; thread_kind() distinguishes them from real children.
+                    continue;
+                }
+                let disk_usage = process.disk_usage();
+                children.push(ChildProcessStat {
+                    pid: pid.as_u32(),
+                    name: process.name().to_string_lossy().into_owned(),
+                    cpu_percent: process.cpu_usage(),
+                    memory_bytes: process.memory(),
+                    disk_read_bytes_per_sec: disk_usage.read_bytes
+                        / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                    disk_write_bytes_per_sec: disk_usage.written_bytes
+                        / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                });
+            }
+
+            let children_cpu_percent = children.iter().map(|child| child.cpu_percent).sum();
+            let children_memory_bytes = children.iter().map(|child| child.memory_bytes).sum();
+            let children_disk_read_bytes_per_sec =
+                children.iter().map(|child| child.disk_read_bytes_per_sec).sum();
+            let children_disk_write_bytes_per_sec = children
+                .iter()
+                .map(|child| child.disk_write_bytes_per_sec)
+                .sum();
+            let children_count = children.len() as u32;
+
+            let sample = ProcessStatsSample {
+                collected_at_unix: unix_ts(),
+                main_cpu_percent,
+                main_memory_bytes,
+                main_disk_read_bytes_per_sec: main_disk_usage.read_bytes
+                    / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                main_disk_write_bytes_per_sec: main_disk_usage.written_bytes
+                    / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                children_cpu_percent,
+                children_memory_bytes,
+                children_disk_read_bytes_per_sec,
+                children_disk_write_bytes_per_sec,
+                children_count,
+            };
+
+            let logical_cpu_count = system.cpus().len();
+            let mut runtime = match state.process_stats_runtime.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            runtime.push(sample, children, logical_cpu_count);
         }
     });
 }
@@ -18439,6 +18572,81 @@ async fn storage_stats_history(
     };
 
     let samples = downsample_storage_stats_samples(samples, max_points);
+
+    (StatusCode::OK, Json(samples)).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessStatsCurrentResponse {
+    sample: Option<ProcessStatsSample>,
+    children: Vec<ChildProcessStat>,
+    logical_cpu_count: usize,
+}
+
+async fn process_stats_current(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "process_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let runtime = match state.process_stats_runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let response = ProcessStatsCurrentResponse {
+        sample: runtime.history.back().cloned(),
+        children: runtime.latest_children.clone(),
+        logical_cpu_count: runtime.logical_cpu_count,
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessStatsHistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn process_stats_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ProcessStatsHistoryQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "process_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let limit = query
+        .limit
+        .map(|limit| limit.clamp(1, PROCESS_STATS_HISTORY_MAX_SAMPLES))
+        .unwrap_or(PROCESS_STATS_HISTORY_MAX_SAMPLES);
+    let samples = {
+        let runtime = match state.process_stats_runtime.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        runtime.recent(limit)
+    };
 
     (StatusCode::OK, Json(samples)).into_response()
 }
