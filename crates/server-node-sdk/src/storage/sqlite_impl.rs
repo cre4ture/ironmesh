@@ -14,12 +14,11 @@ use crate::cluster::NodeDescriptor;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord,
-    FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    DataScrubRunRecord, FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo,
+    SnapshotManifest, StorageStatsSample, StorageStatsState, compress_snapshot_json,
+    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
@@ -115,7 +114,8 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn count_current_objects(&self) -> Result<usize> {
         let db = self.metadata_conn()?;
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM current_objects", [], |row| row.get(0))?;
+        let count: i64 =
+            db.query_row("SELECT COUNT(*) FROM current_objects", [], |row| row.get(0))?;
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
