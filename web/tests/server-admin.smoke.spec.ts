@@ -134,6 +134,36 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Revoke credential" }).click();
   await expect(page.getByText("manual smoke revocation")).toBeVisible();
 
+  await page.getByText("S3", { exact: true }).click();
+  await expect(page.getByText("Listener and replication status", { exact: true })).toBeVisible();
+  await expect(page.getByText("Bucket mappings", { exact: true })).toBeVisible();
+  await expect(page.getByText("Access keys", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Gateway command")).toHaveValue(
+    /serve-s3 --bind 127\.0\.0\.1:9000/
+  );
+  await expect(page.getByText("media.example", { exact: true })).toBeVisible();
+  await page.getByLabel("Bucket name").fill("archive.example");
+  await page.getByLabel("Root prefix").fill("s3/archive.example/");
+  await page.getByRole("button", { name: "Create bucket" }).click();
+  await expect(page.getByText("archive.example", { exact: true })).toBeVisible();
+  await page.getByLabel("Description").fill("build pipeline writer");
+  await page.getByLabel("Bucket scope").fill("archive.example");
+  await page.getByLabel("Prefix scope").fill("tenant/media/inbox/");
+  await page.getByLabel("Write").check();
+  await page.getByRole("button", { name: "Create access key" }).click();
+  await expect(page.getByText("New S3 access key issued", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Access key ID")).toHaveValue("IMS3TEST0002");
+  await expect(page.getByLabel("Secret access key")).toHaveValue("im_secret_2");
+  await page.getByRole("button", { name: "Hide secret" }).click();
+  const newAccessKeyRow = page.getByRole("row", { name: /IMS3TEST0002/ });
+  await expect(newAccessKeyRow).toContainText("build pipeline writer");
+  await expect(newAccessKeyRow).toContainText("write");
+  page.once("dialog", (dialog) => {
+    void dialog.accept();
+  });
+  await newAccessKeyRow.getByRole("button", { name: "Revoke" }).click();
+  await expect(newAccessKeyRow).toContainText("revoked");
+
   await page.getByText("Connections", { exact: true }).click();
   await expect(page.getByRole("columnheader", { name: "Transport" })).toBeVisible();
   await expect(page.getByText("via relay-alpha.local:9443", { exact: true })).toBeVisible();
@@ -278,7 +308,10 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
       apiV1("/storage/stats/current"),
       apiV1("/auth/bootstrap-claims/issue"),
       apiV1("/auth/rendezvous-config"),
-      apiV1("/auth/client-connections")
+      apiV1("/auth/client-connections"),
+      apiV1("/auth/s3/status"),
+      apiV1("/auth/s3/buckets"),
+      apiV1("/auth/s3/access-keys")
     ])
   );
   expect(
@@ -724,6 +757,38 @@ async function installServerAdminMocks(
   let remainingPostLoginUnauthenticatedSessionResponses =
     options?.postLoginUnauthenticatedSessionResponses ?? 0;
   const revokedDeviceIds = new Set<string>();
+  let s3LocalGeneration = 7;
+  const s3Buckets = [
+    {
+      bucket_name: "media.example",
+      root_prefix: "s3/media.example/",
+      versioning_status: "enabled",
+      read_only: false,
+      created_at_unix: 1_900_000_020,
+      updated_at_unix: 1_900_000_040,
+      created_by: "admin-user",
+      deleted_at_unix: null
+    }
+  ];
+  const s3AccessKeys = [
+    {
+      access_key_id: "IMS3TEST0001",
+      description: "gallery reader",
+      bucket_scope: ["media.example"],
+      prefix_scope: ["gallery/"],
+      allow_list: true,
+      allow_read: true,
+      allow_write: false,
+      allow_delete: false,
+      allow_manage: false,
+      created_at_unix: 1_900_000_050,
+      updated_at_unix: 1_900_000_060,
+      last_used_at_unix: 1_900_000_180,
+      revoked_at_unix: null,
+      secret_fingerprint: "fp-gallery-reader"
+    }
+  ];
+  let nextS3AccessKeySuffix = 2;
   const bootstrapBundle = {
     cluster_id: "cluster-alpha",
     relay_mode: "relay-preferred",
@@ -837,6 +902,22 @@ async function installServerAdminMocks(
     ]
   };
   let metadataDbLogicalDistributionPhase: "idle" | "running" | "ready" = "idle";
+
+  function buildS3Status() {
+    return {
+      listener_enabled: true,
+      public_url: "https://node-alpha.local:9443",
+      tls_enabled: true,
+      gateway_command_hint:
+        "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000",
+      local_generation: s3LocalGeneration,
+      last_applied_at_unix: 1_900_000_210,
+      last_source_node_id: "node-beta",
+      last_error: null,
+      bucket_count: s3Buckets.length,
+      access_key_count: s3AccessKeys.length
+    };
+  }
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -1732,6 +1813,108 @@ async function installServerAdminMocks(
 
     if (pathname === apiV1("/auth/bootstrap-claims") && method === "GET") {
       return json(route, buildBootstrapClaimList());
+    }
+
+    if (pathname === apiV1("/auth/s3/status") && method === "GET") {
+      return json(route, buildS3Status());
+    }
+
+    if (pathname === apiV1("/auth/s3/buckets") && method === "GET") {
+      return json(route, s3Buckets);
+    }
+
+    if (pathname === apiV1("/auth/s3/buckets") && method === "POST") {
+      const body = route.request().postDataJSON() as {
+        bucket_name: string;
+        root_prefix?: string | null;
+        versioning_status?: "disabled" | "enabled" | null;
+        read_only?: boolean;
+      };
+      const bucket = {
+        bucket_name: body.bucket_name,
+        root_prefix: body.root_prefix?.trim() || `s3/${body.bucket_name}/`,
+        versioning_status: body.versioning_status ?? "disabled",
+        read_only: body.read_only === true,
+        created_at_unix: 1_900_000_220,
+        updated_at_unix: 1_900_000_220,
+        created_by: "admin-user",
+        deleted_at_unix: null
+      };
+      s3Buckets.push(bucket);
+      s3LocalGeneration += 1;
+      return json(route, bucket);
+    }
+
+    if (pathname.startsWith(`${apiV1("/auth/s3/buckets")}/`) && method === "DELETE") {
+      const bucketName = decodeURIComponent(pathname.split("/").pop() ?? "");
+      const bucketIndex = s3Buckets.findIndex((bucket) => bucket.bucket_name === bucketName);
+      if (bucketIndex >= 0) {
+        s3Buckets.splice(bucketIndex, 1);
+        s3LocalGeneration += 1;
+      }
+      return json(route, { status: "deleted" });
+    }
+
+    if (pathname === apiV1("/auth/s3/access-keys") && method === "GET") {
+      return json(route, s3AccessKeys);
+    }
+
+    if (pathname === apiV1("/auth/s3/access-keys") && method === "POST") {
+      const body = route.request().postDataJSON() as {
+        description?: string | null;
+        bucket_scope?: string[];
+        prefix_scope?: string[];
+        allow_list?: boolean;
+        allow_read?: boolean;
+        allow_write?: boolean;
+        allow_delete?: boolean;
+        allow_manage?: boolean;
+      };
+      const accessKeyId = `IMS3TEST${String(nextS3AccessKeySuffix).padStart(4, "0")}`;
+      const secretAccessKey = `im_secret_${nextS3AccessKeySuffix}`;
+      nextS3AccessKeySuffix += 1;
+      const view = {
+        access_key_id: accessKeyId,
+        description: body.description?.trim() || null,
+        bucket_scope: body.bucket_scope ?? [],
+        prefix_scope: body.prefix_scope ?? [],
+        allow_list: body.allow_list !== false,
+        allow_read: body.allow_read !== false,
+        allow_write: body.allow_write === true,
+        allow_delete: body.allow_delete === true,
+        allow_manage: body.allow_manage === true,
+        created_at_unix: 1_900_000_230,
+        updated_at_unix: 1_900_000_230,
+        last_used_at_unix: null,
+        revoked_at_unix: null,
+        secret_fingerprint: `fp-${accessKeyId.toLowerCase()}`
+      };
+      s3AccessKeys.push(view);
+      s3LocalGeneration += 1;
+      return json(route, {
+        access_key_id: accessKeyId,
+        secret_access_key: secretAccessKey,
+        view
+      });
+    }
+
+    if (
+      pathname.startsWith(`${apiV1("/auth/s3/access-keys")}/`) &&
+      pathname.endsWith("/revoke") &&
+      method === "POST"
+    ) {
+      const accessKeyId = decodeURIComponent(
+        pathname
+          .slice(`${apiV1("/auth/s3/access-keys")}/`.length)
+          .replace(/\/revoke$/, "")
+      );
+      const accessKey = s3AccessKeys.find((entry) => entry.access_key_id === accessKeyId);
+      if (accessKey) {
+        accessKey.revoked_at_unix = 1_900_000_240;
+        accessKey.updated_at_unix = 1_900_000_240;
+        s3LocalGeneration += 1;
+      }
+      return json(route, { status: "revoked" });
     }
 
     if (pathname === apiV1("/auth/rendezvous-config") && method === "GET") {

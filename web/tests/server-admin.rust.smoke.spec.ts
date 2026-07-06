@@ -72,6 +72,11 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText(/No (image|media) objects in view/)).toBeVisible();
 
+  await page.getByText("S3", { exact: true }).click();
+  await expect(page.getByText("Listener and replication status", { exact: true })).toBeVisible();
+  await expect(page.getByText("Bucket mappings", { exact: true })).toBeVisible();
+  await expect(page.getByText("Access keys", { exact: true })).toBeVisible();
+
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Configured on this node").first()).toBeVisible();
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();

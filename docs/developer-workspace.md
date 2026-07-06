@@ -169,6 +169,10 @@ Those bridges can be added incrementally without changing the workspace topology
   - snapshot-style credential sync from a peer, and
   - normal post-enrollment credential fanout.
   Those tests prove a client credential issued on one node can authenticate against another node after replication, which is the prerequisite for cluster-wide bootstrap endpoint advertisement.
+- 2026-07-06: bootstrap coverage now goes one step further than metadata inspection.
+  A server-node integration test now issues a real bootstrap bundle, enrolls a client from it, syncs the issued credential to a second node, builds a `client-sdk` client from the bootstrap JSON, and successfully reaches the remote node through the production public transport surface (`/transport/ws` plus authenticated public API routes).
+- 2026-07-06: the mandatory S3 admin UI path now has smoke coverage.
+  The browser suite exercises the S3 page in both the mocked server-admin flow and a real `server-node` runtime, including bucket creation, access-key issuance, one-time secret display, and key revocation in the mocked path.
 
 ## Multi-node strategy
 

@@ -5160,6 +5160,171 @@ async fn issue_bootstrap_bundle_keeps_cluster_endpoints_when_client_auth_is_requ
 }
 
 #[tokio::test]
+async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node() {
+    let mut source = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut target = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    target.cluster_id = source.cluster_id;
+    target.access.client_auth_control.require_client_auth = true;
+
+    let bind_addr = free_bind_addr();
+    let public_url = format!("https://127.0.0.1:{}", bind_addr.port());
+    let (public_ca_pem, _, server_cert_pem, server_key_pem) =
+        generate_test_https_ca_and_server_material(bind_addr, "bootstrap-remote-client-auth");
+    source.network.public_ca_pem = Some(public_ca_pem.clone());
+
+    {
+        let mut cluster = source.cluster.lock().await;
+        cluster.register_node(cluster::NodeDescriptor {
+            node_id: source.node_id,
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://127.0.0.1:9".to_string()),
+                peer_api_url: Some("https://127.0.0.1:49080".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 900_000,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+        cluster.register_node(cluster::NodeDescriptor {
+            node_id: target.node_id,
+            reachability: cluster::NodeReachability {
+                public_api_url: Some(public_url.clone()),
+                peer_api_url: Some("https://127.0.0.1:10009".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 800_000,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+    }
+
+    let tls_root = fresh_test_dir("bootstrap-remote-client-auth");
+    let cert_path = tls_root.join("public.pem");
+    let key_path = tls_root.join("public.key");
+    std::fs::write(&cert_path, server_cert_pem).unwrap();
+    std::fs::write(&key_path, server_key_pem).unwrap();
+
+    let app = super::build_server_apps(&target).public_app;
+    let server_handle = tokio::spawn(async move {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .unwrap();
+        axum_server::bind_rustls(bind_addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let probe_http = super::build_http_client_from_optional_pem(Some(&public_ca_pem)).unwrap();
+    wait_for_http_status(
+        &probe_http,
+        &format!("{public_url}/api/v1/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let (bootstrap, _) = super::issue_client_bootstrap_impl(
+        &source,
+        super::PairingTokenIssueRequest {
+            label: Some("Bootstrap Laptop".to_string()),
+            expires_in_secs: Some(600),
+            preferred_rendezvous_url: None,
+        },
+    )
+    .await
+    .expect("bootstrap issuance should succeed");
+    let bootstrap_json = serde_json::to_string(&bootstrap).unwrap();
+    let bootstrap = client_sdk::ConnectionBootstrap::from_json_str(&bootstrap_json).unwrap();
+
+    assert_eq!(bootstrap.direct_endpoints.len(), 2);
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| endpoint.node_id == Some(source.node_id))
+    );
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| {
+                endpoint.node_id == Some(target.node_id) && endpoint.url == public_url
+            })
+    );
+
+    let mut identity = transport_sdk::ClientIdentityMaterial::generate(
+        source.cluster_id,
+        None,
+        Some("Bootstrap Laptop".to_string()),
+    )
+    .unwrap();
+    let enrolled = super::enroll_client_device_impl(
+        &source,
+        super::ClientEnrollmentRequest {
+            cluster_id: source.cluster_id,
+            pairing_token: bootstrap.pairing_token.clone().unwrap(),
+            device_id: Some(identity.device_id),
+            label: identity.label.clone(),
+            public_key_pem: identity.public_key_pem.clone(),
+        },
+    )
+    .await
+    .expect("client enrollment should succeed");
+    identity.credential_pem = Some(enrolled.credential_pem.clone());
+
+    let (peer_base_url, sync_handle) =
+        spawn_internal_peer_api_server_for_caller(source.clone(), &target).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+    super::sync_client_credentials_once(&target).await;
+
+    wait_for_condition(
+        "bootstrap-issued credential sync import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let device_id = identity.device_id.to_string();
+            async move {
+                let auth = target.access.client_credentials.lock().await;
+                auth.credentials
+                    .iter()
+                    .any(|record| record.device_id == device_id)
+            }
+        },
+    )
+    .await;
+
+    let client = bootstrap.build_client_with_identity(&identity).unwrap();
+    let response = client.get_json_path("/cluster/status").await.unwrap();
+    assert_eq!(
+        response.get("local_node_id").and_then(|value| value.as_str()),
+        Some(target.node_id.to_string().as_str())
+    );
+
+    sync_handle.abort();
+    server_handle.abort();
+    cleanup_test_state(&target).await;
+    cleanup_test_state(&source).await;
+    let _ = std::fs::remove_dir_all(&tls_root);
+}
+
+#[tokio::test]
 async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_node() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
