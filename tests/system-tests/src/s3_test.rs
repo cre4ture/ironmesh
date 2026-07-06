@@ -2986,6 +2986,39 @@ mod tests {
                     b"transported through relay"
                 );
 
+                let large_payload = (0..((2 * 1024 * 1024) + 257))
+                    .map(|index| (index % 251) as u8)
+                    .collect::<Vec<_>>();
+                let put_large_object = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::PUT,
+                    "/relay-gateway.example/docs/large.bin",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[("content-type", "application/octet-stream")],
+                    large_payload.clone(),
+                )
+                .await?;
+                assert_eq!(put_large_object.status(), StatusCode::OK);
+
+                let get_large_object = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::GET,
+                    "/relay-gateway.example/docs/large.bin",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[],
+                    Vec::new(),
+                )
+                .await?;
+                assert_eq!(get_large_object.status(), StatusCode::OK);
+                assert_eq!(
+                    get_large_object.bytes().await?.as_ref(),
+                    large_payload.as_slice()
+                );
+
                 Ok(())
             }
             .await;
