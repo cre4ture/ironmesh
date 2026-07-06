@@ -131,12 +131,29 @@ is gone. In its place:
   resolves correctly and `object_count()`/`current_keys()` report the true total. Full
   existing suite (298 tests, 437 with `--features turso-metadata`) passes unmodified.
 
-## Slice 3: Bound GC scan memory
+## Slice 3: Bound GC scan memory — implemented (2026-07-06)
 
-- Change `load_all_manifests` from "collect every manifest into one `HashMap` up front" to
-  a batched/streaming scan that accumulates only the reference-count state GC actually
-  needs, processing manifests in bounded-size batches.
-- Peak GC memory becomes bounded by batch size, not total manifest count.
+`load_all_manifests` (the transient `HashMap<String, ObjectManifest>` covering every
+manifest in the store) is gone. `PersistentStore::cleanup_unreferenced`
+(`crates/server-node-sdk/src/storage/mod.rs`) now:
+
+- Lists manifest hashes via `list_manifest_hashes`, a directory scan that reads file
+  names only — no manifest JSON is parsed to find orphan candidates, only to inspect
+  content that's actually retained.
+- Determines the retained set (referenced manifests, plus any orphan still inside the
+  retention window) without ever holding manifest content for the full store.
+- Loads manifest content for the retained set only, one bounded batch at a time
+  (`GC_MANIFEST_LOAD_BATCH_SIZE = 500`, overridable per-instance in tests via
+  `set_gc_manifest_load_batch_size_for_test`), accumulating only `protected_chunks` and
+  `protected_media_fingerprints` — the reference-count state GC actually needs — rather
+  than materializing every manifest at once.
+- Peak GC memory is now bounded by batch size and the size of the retained set, not by
+  total manifest count on disk.
+- Verified: `cleanup_unreferenced_processes_retained_manifests_across_batches` (new test,
+  both metadata backends) forces the batch size down to 2 with 5 live objects and asserts
+  every object's manifest and chunks survive cleanup and remain readable — a regression
+  test for a batching bug that only processed the first batch. Full existing suite
+  (300 tests) passes unmodified.
 
 ## Implementation Order
 
@@ -145,9 +162,10 @@ is gone. In its place:
 3. ~~Slice 2 (compact `CurrentState` values)~~ — superseded by Slice 2b below, which
    replaces the resident map entirely rather than just shrinking its entries.
 4. Slice 1b (FUSE disk-backed staging for large files).
-5. Slice 3 (GC batched scan).
+5. ~~Slice 3 (GC batched scan)~~ — done, see status below.
 6. Slice 1c — only if Slice 0 telemetry from real usage shows it's needed.
-7. **Slice 2b — done** (see status below). Landed ahead of Slices 0/1/3 per direct request;
+7. **Slice 2b — done** (see status below). Landed ahead of Slices 0/1 per direct request.
+8. **Slice 3 — done** (see status below). Landed ahead of Slices 0/1 per direct request;
    those remain open.
 
 ## Test Plan
@@ -165,8 +183,12 @@ is gone. In its place:
   `storage_tests.rs` — seeds keys past a small forced cache capacity and asserts every key
   still resolves correctly via the sqlite fallback, and that `object_count()`/`current_keys()`
   report the true total regardless of cache size. Runs against both metadata backends.
-- **GC batching**: large synthetic manifest count fixture; assert peak RSS during a GC pass
-  stays roughly constant as manifest count grows, instead of scaling linearly.
+- **GC batching (done)**: `cleanup_unreferenced_processes_retained_manifests_across_batches`
+  in `storage_tests.rs` — forces `GC_MANIFEST_LOAD_BATCH_SIZE` down to 2 with 5 live objects
+  (more than two batches' worth) and asserts every object's manifest/chunks survive cleanup
+  and stay readable. Runs against both metadata backends. No dedicated large-scale RSS
+  benchmark was run; the structural fix (no full-store `HashMap<String, ObjectManifest>`,
+  bounded per-batch loads) removes the scaling factor by construction.
 - Existing FUSE and server-node system tests must keep passing unmodified — none of these
   slices are meant to change client-visible read/write semantics.
 
@@ -198,6 +220,9 @@ is gone. In its place:
   bounded by cache capacity (default 100k entries) regardless of file count, not just
   "reduced." Slice 0's gauge would still be useful to confirm this in production but is no
   longer required to validate the fix.
-- GC pass peak RSS no longer scales with total manifest count.
+- ~~GC pass peak RSS no longer scales with total manifest count~~ — done: `cleanup_unreferenced`
+  no longer builds a full-store manifest map; retained-manifest content is loaded in
+  bounded batches (default 500), so peak resident manifest data no longer scales with
+  total manifest count on disk.
 - The admin dashboard shows per-structure memory attribution next to the existing
   whole-process RSS graph, so operators can explain a node's memory use without guessing.

@@ -1005,6 +1005,50 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_deletes_orphan_manifest_and_chunk_turso
 );
 
+async fn cleanup_unreferenced_processes_retained_manifests_across_batches_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("cleanup-gc-batching").await;
+    // Force a batch size far smaller than the number of live objects below so the
+    // retained-manifest loop in cleanup_unreferenced must span multiple batches;
+    // a bug that only processed the first batch would wrongly treat later objects'
+    // chunks as unreferenced and delete them.
+    store.set_gc_manifest_load_batch_size_for_test(2);
+
+    let keys: Vec<String> = (0..5).map(|i| format!("docs/live-{i}.txt")).collect();
+    for key in &keys {
+        store
+            .put_object_versioned(
+                key,
+                Bytes::from(format!("payload-{key}")),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let report = store.cleanup_unreferenced(0, false).await.unwrap();
+    assert_eq!(report.deleted_manifests, 0);
+    assert_eq!(report.deleted_chunks, 0);
+    assert_eq!(report.protected_manifests, keys.len());
+
+    for key in &keys {
+        let payload = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(payload.as_ref(), format!("payload-{key}").as_bytes());
+    }
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_processes_retained_manifests_across_batches_impl,
+    cleanup_unreferenced_processes_retained_manifests_across_batches,
+    cleanup_unreferenced_processes_retained_manifests_across_batches_turso
+);
+
 async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index_impl(
     backend: StorageTestBackend,
 ) {

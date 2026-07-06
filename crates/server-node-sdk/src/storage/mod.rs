@@ -80,6 +80,10 @@ const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
 const DELETE_RECREATE_LOOP_REPAIR_SAMPLE_LIMIT: usize = 64;
 const SNAPSHOT_HISTORY_COMPACTION_SAMPLE_LIMIT: usize = 64;
 const SNAPSHOT_HISTORY_COMPACTION_CHANGED_PATH_SAMPLE_LIMIT: usize = 8;
+/// Bounds how many retained manifests `cleanup_unreferenced` loads into memory at once
+/// while computing protected chunks/media fingerprints, so GC peak memory stays flat
+/// as total manifest count grows.
+const GC_MANIFEST_LOAD_BATCH_SIZE: usize = 500;
 const SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS: u64 = 2 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -978,6 +982,7 @@ pub struct PersistentStore {
     media_thumbnails_dir: PathBuf,
     media_cache_build_permits: Arc<Semaphore>,
     current_objects_cache: std::sync::Mutex<RangeChunkCache<String, CurrentObjectEntry>>,
+    gc_manifest_load_batch_size: usize,
     snapshot_batch: Option<ActiveSnapshotBatch>,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
@@ -1985,6 +1990,7 @@ impl PersistentStore {
             media_thumbnails_dir,
             media_cache_build_permits,
             current_objects_cache,
+            gc_manifest_load_batch_size: GC_MANIFEST_LOAD_BATCH_SIZE,
             snapshot_batch,
             metadata_store,
             storage_stats_lock,
@@ -2034,6 +2040,11 @@ impl PersistentStore {
     #[cfg(test)]
     pub fn set_current_objects_cache_capacity_for_test(&mut self, capacity: usize) {
         self.current_objects_cache = std::sync::Mutex::new(RangeChunkCache::new(capacity));
+    }
+
+    #[cfg(test)]
+    pub fn set_gc_manifest_load_batch_size_for_test(&mut self, batch_size: usize) {
+        self.gc_manifest_load_batch_size = batch_size;
     }
 
     pub(crate) async fn store_index_inspector(&self) -> Result<StoreIndexInspector> {
@@ -5674,7 +5685,7 @@ impl PersistentStore {
         let now = unix_ts();
         let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
         let owned_referenced_manifests = self.collect_owned_referenced_manifest_hashes().await?;
-        let all_manifests = self.load_all_manifests().await?;
+        let manifest_hashes = self.list_manifest_hashes().await?;
         let cached_chunk_records = self.metadata_store.list_cached_chunk_records().await?;
         let tracked_cached_chunks = cached_chunk_records.len();
         let cached_chunk_hashes = cached_chunk_records
@@ -5686,7 +5697,7 @@ impl PersistentStore {
         let mut skipped_recent_manifests = 0usize;
         let mut deleted_manifests = 0usize;
 
-        for manifest_hash in all_manifests.keys() {
+        for manifest_hash in &manifest_hashes {
             if referenced_manifests.contains(manifest_hash) {
                 continue;
             }
@@ -5720,12 +5731,20 @@ impl PersistentStore {
             }
         }
 
+        // Only the retained set (referenced, or too-recent-to-reap) ever needs its
+        // content inspected, and even that is read one bounded batch at a time so peak
+        // resident manifest data stays flat as the store grows instead of scaling with
+        // total manifest count (see docs/node-memory-footprint-reduction-plan.md Slice 3).
         let mut protected_chunks = HashSet::<String>::new();
         let mut protected_media_fingerprints = HashSet::<String>::new();
-        for manifest_hash in &retained_manifests {
-            if let Some(manifest) = all_manifests.get(manifest_hash) {
-                protected_media_fingerprints.insert(content_fingerprint_from_manifest(manifest));
-                if owned_referenced_manifests.contains(manifest_hash) {
+        let retained_manifest_hashes: Vec<&String> = retained_manifests.iter().collect();
+        for batch in retained_manifest_hashes.chunks(self.gc_manifest_load_batch_size.max(1)) {
+            for manifest_hash in batch {
+                let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+                    continue;
+                };
+                protected_media_fingerprints.insert(content_fingerprint_from_manifest(&manifest));
+                if owned_referenced_manifests.contains(*manifest_hash) {
                     for chunk in &manifest.chunks {
                         protected_chunks.insert(chunk.hash.clone());
                     }
@@ -7139,8 +7158,11 @@ impl PersistentStore {
         Ok(referenced)
     }
 
-    async fn load_all_manifests(&self) -> Result<HashMap<String, ObjectManifest>> {
-        let mut manifests = HashMap::<String, ObjectManifest>::new();
+    /// Lists manifest hashes present in the manifest store without parsing their
+    /// content, so GC's orphan scan doesn't have to hold every manifest's bytes in
+    /// memory just to enumerate hashes.
+    async fn list_manifest_hashes(&self) -> Result<Vec<String>> {
+        let mut hashes = Vec::<String>::new();
         let mut entries = fs::read_dir(&self.manifests_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
@@ -7153,13 +7175,10 @@ impl PersistentStore {
                 continue;
             };
 
-            let payload = fs::read(&path).await?;
-            let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
-                .with_context(|| format!("invalid manifest {}", path.display()))?;
-            manifests.insert(file_stem.to_string(), manifest);
+            hashes.push(file_stem.to_string());
         }
 
-        Ok(manifests)
+        Ok(hashes)
     }
 
     async fn collect_chunk_file_paths(&self) -> Result<Vec<PathBuf>> {
