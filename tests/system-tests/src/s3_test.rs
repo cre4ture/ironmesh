@@ -5,8 +5,8 @@ mod tests {
     use crate::framework::{
         ChildGuard, TEST_ADMIN_TOKEN, binary_path, default_client_identity_path, fresh_data_dir,
         issue_bootstrap_bundle_and_enroll_client, lock_test_resources, register_node,
-        start_authenticated_server_with_env_options, stop_server, tcp_resource_key,
-        wait_for_online_nodes,
+        start_authenticated_server_with_env_options, start_rendezvous_service, stop_server,
+        tcp_resource_key, wait_for_online_nodes, wait_for_rendezvous_registered_endpoints,
     };
     use anyhow::{Context, Result, bail};
     use hmac::{Hmac, Mac};
@@ -2673,6 +2673,183 @@ mod tests {
         .await;
 
         stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serve_s3_gateway_transports_signed_s3_requests_over_relay() -> Result<()> {
+        let server_bind = "127.0.0.1:19584";
+        let rendezvous_bind = "127.0.0.1:19585";
+        let gateway_bind = "127.0.0.1:19586";
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let data_dir = fresh_data_dir("s3-gateway-relay-server");
+        let client_dir = fresh_data_dir("s3-gateway-relay-client");
+        let node_env = [
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut server = start_authenticated_server_with_env_options(
+            server_bind,
+            &data_dir,
+            "s3-gateway-relay-node",
+            1,
+            None,
+            None,
+            &node_env,
+        )
+        .await?;
+
+        let http = reqwest::Client::new();
+        let base_url = format!("http://{server_bind}");
+        let gateway_base = format!("http://{gateway_bind}");
+
+        let result: Result<()> = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let create_bucket_response = http
+                .post(format!("{base_url}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "relay-gateway.example",
+                    "root_prefix": "tenant/relay-gateway",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{base_url}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-gateway-relay",
+                    "bucket_scope": ["relay-gateway.example"],
+                    "prefix_scope": ["tenant/relay-gateway/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_url,
+                TEST_ADMIN_TOKEN,
+                &client_dir,
+                "s3-gateway-relay.bootstrap.json",
+                Some("s3-gateway-relay"),
+                Some(3600),
+            )
+            .await?;
+            let identity_path = default_client_identity_path(&enrolled.bootstrap_path);
+
+            let mut relay_bootstrap = enrolled.bootstrap.clone();
+            for endpoint in &mut relay_bootstrap.direct_endpoints {
+                if endpoint.usage == Some(client_sdk::BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+            let relay_bootstrap_path = client_dir.join("s3-gateway-relay-forced.bootstrap.json");
+            relay_bootstrap.write_to_path(&relay_bootstrap_path)?;
+
+            let bootstrap_arg = relay_bootstrap_path.to_string_lossy().into_owned();
+            let identity_arg = identity_path.to_string_lossy().into_owned();
+            let cli_args = [
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "--client-identity-file",
+                identity_arg.as_str(),
+            ];
+            let mut gateway = start_cli_s3_gateway(gateway_bind, &cli_args).await?;
+
+            let gateway_result: Result<()> = async {
+                wait_for_signed_s3_status(
+                    &http,
+                    &gateway_base,
+                    Method::GET,
+                    "/",
+                    &access_key_id,
+                    &secret_access_key,
+                    StatusCode::OK,
+                )
+                .await?;
+
+                let list_buckets = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::GET,
+                    "/",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[],
+                    Vec::new(),
+                )
+                .await?;
+                assert_eq!(list_buckets.status(), StatusCode::OK);
+                let list_buckets_xml = list_buckets.text().await?;
+                assert!(list_buckets_xml.contains("<Name>relay-gateway.example</Name>"));
+
+                let put_object = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::PUT,
+                    "/relay-gateway.example/docs/relay.txt",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[("content-type", "text/plain")],
+                    b"transported through relay".to_vec(),
+                )
+                .await?;
+                assert_eq!(put_object.status(), StatusCode::OK);
+
+                let get_object = send_signed_s3_request(
+                    &http,
+                    &gateway_base,
+                    Method::GET,
+                    "/relay-gateway.example/docs/relay.txt",
+                    &access_key_id,
+                    &secret_access_key,
+                    &[],
+                    Vec::new(),
+                )
+                .await?;
+                assert_eq!(get_object.status(), StatusCode::OK);
+                assert!(
+                    get_object
+                        .headers()
+                        .get("x-amz-version-id")
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| !value.is_empty())
+                );
+                assert_eq!(
+                    get_object.bytes().await?.as_ref(),
+                    b"transported through relay"
+                );
+
+                Ok(())
+            }
+            .await;
+
+            stop_server(&mut gateway).await;
+            gateway_result
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        stop_server(&mut rendezvous).await;
         result?;
         Ok(())
     }
