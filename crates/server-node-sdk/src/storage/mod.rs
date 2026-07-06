@@ -3,6 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
+
+fn current_objects_cache_capacity() -> usize {
+    std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY)
+}
+
 pub(super) fn compress_snapshot_json(data: &[u8]) -> Result<Vec<u8>> {
     zstd::encode_all(data, 3).context("failed to compress snapshot json")
 }
@@ -21,6 +30,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use common::content_fingerprint::content_fingerprint_from_chunk_refs;
+use common::range_chunk_cache::RangeChunkCache;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -123,6 +133,12 @@ pub(super) struct CurrentState {
     pub(super) objects: HashMap<String, String>,
     #[serde(default)]
     pub(super) object_ids: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CurrentObjectEntry {
+    pub(super) manifest_hash: String,
+    pub(super) object_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -961,7 +977,7 @@ pub struct PersistentStore {
     metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
     media_cache_build_permits: Arc<Semaphore>,
-    current_state: CurrentState,
+    current_objects_cache: std::sync::Mutex<RangeChunkCache<String, CurrentObjectEntry>>,
     snapshot_batch: Option<ActiveSnapshotBatch>,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
@@ -1041,6 +1057,13 @@ struct ArchivedTombstoneIndexRecord {
 #[async_trait]
 trait MetadataStore: Send + Sync {
     async fn load_current_state(&self) -> Result<CurrentState>;
+    async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
+    async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
+    async fn remove_current_object(&self, key: &str) -> Result<()>;
+    #[cfg(test)]
+    async fn count_current_objects(&self) -> Result<usize>;
+    async fn list_current_object_keys(&self) -> Result<Vec<String>>;
+    async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>>;
     async fn persist_repair_attempts(
         &self,
@@ -1119,7 +1142,6 @@ trait MetadataStore: Send + Sync {
         object_id: &str,
         index: &FileVersionIndex,
     ) -> Result<()>;
-    async fn persist_current_state(&self, current_state: &CurrentState) -> Result<()>;
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
@@ -1943,7 +1965,8 @@ impl PersistentStore {
                 )
             }
         };
-        let current_state = metadata_store.load_current_state().await?;
+        let current_objects_cache =
+            std::sync::Mutex::new(RangeChunkCache::new(current_objects_cache_capacity()));
         let snapshot_batch = metadata_store.load_snapshot_batch_state().await?;
         let storage_stats_lock = Arc::new(AsyncMutex::new(()));
         let media_cache_build_permits = Arc::new(Semaphore::new(MEDIA_CACHE_BUILD_MAX_CONCURRENCY));
@@ -1961,7 +1984,7 @@ impl PersistentStore {
             metadata_db_path,
             media_thumbnails_dir,
             media_cache_build_permits,
-            current_state,
+            current_objects_cache,
             snapshot_batch,
             metadata_store,
             storage_stats_lock,
@@ -2008,12 +2031,17 @@ impl PersistentStore {
         self.data_scrub_run_test_hook = hook;
     }
 
-    pub(crate) fn store_index_inspector(&self) -> StoreIndexInspector {
-        StoreIndexInspector::new(
-            self.current_state.clone(),
+    #[cfg(test)]
+    pub fn set_current_objects_cache_capacity_for_test(&mut self, capacity: usize) {
+        self.current_objects_cache = std::sync::Mutex::new(RangeChunkCache::new(capacity));
+    }
+
+    pub(crate) async fn store_index_inspector(&self) -> Result<StoreIndexInspector> {
+        Ok(StoreIndexInspector::new(
+            self.metadata_store.load_current_state().await?,
             self.manifests_dir.clone(),
             self.metadata_store.clone(),
-        )
+        ))
     }
 
     pub(crate) fn storage_stats_collector(&self) -> StorageStatsCollector {
@@ -2044,16 +2072,16 @@ impl PersistentStore {
             .await
     }
 
-    pub(crate) fn data_scrubber(&self) -> DataScrubber {
+    pub(crate) async fn data_scrubber(&self) -> Result<DataScrubber> {
         let scrubber = DataScrubber::new(
-            self.current_state.clone(),
+            self.metadata_store.load_current_state().await?,
             self.manifests_dir.clone(),
             self.chunks_dir.clone(),
             self.metadata_store.clone(),
         );
         #[cfg(test)]
         let scrubber = scrubber.with_run_test_hook(self.data_scrub_run_test_hook.clone());
-        scrubber
+        Ok(scrubber)
     }
 
     pub(crate) fn cluster_replicas_persister(&self) -> ClusterReplicasPersister {
@@ -2064,13 +2092,13 @@ impl PersistentStore {
         ClusterNodesPersister::new(self.metadata_store.clone())
     }
 
-    pub(crate) fn replication_subject_inspector(&self) -> ReplicationSubjectInspector {
-        ReplicationSubjectInspector::new(
-            self.current_state.clone(),
+    pub(crate) async fn replication_subject_inspector(&self) -> Result<ReplicationSubjectInspector> {
+        Ok(ReplicationSubjectInspector::new(
+            self.metadata_store.load_current_state().await?,
             self.manifests_dir.clone(),
             self.chunks_dir.clone(),
             self.metadata_store.clone(),
-        )
+        ))
     }
 
     pub async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
@@ -2166,7 +2194,7 @@ impl PersistentStore {
 
     #[cfg(test)]
     pub async fn run_data_scrub(&self) -> Result<DataScrubReport> {
-        self.data_scrubber().run().await
+        self.data_scrubber().await?.run().await
     }
 
     pub async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
@@ -2219,12 +2247,12 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
-    pub fn object_count(&self) -> usize {
-        self.current_state.objects.len()
+    pub async fn object_count(&self) -> Result<usize> {
+        self.metadata_store.count_current_objects().await
     }
 
-    pub fn current_keys(&self) -> Vec<String> {
-        self.current_state.objects.keys().cloned().collect()
+    pub async fn current_keys(&self) -> Result<Vec<String>> {
+        self.metadata_store.list_current_object_keys().await
     }
 
     #[cfg(test)]
@@ -2292,19 +2320,23 @@ impl PersistentStore {
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
 
-            if self.current_state.object_ids.get(key) == Some(&object_id)
+            if self.object_id_for_key(key).await?.as_deref() == Some(object_id.as_str())
                 && index.preferred_head_version_id.as_deref() == Some(version_id)
             {
-                self.current_state
-                    .objects
-                    .insert(key.to_string(), manifest_hash.clone());
-                self.persist_current_state().await?;
+                self.upsert_current_object(
+                    key,
+                    CurrentObjectEntry {
+                        manifest_hash: manifest_hash.clone(),
+                        object_id: object_id.clone(),
+                    },
+                )
+                .await?;
             }
 
             return Ok(manifest_hash);
         }
 
-        if let Some(object_id) = self.object_id_for_key(key)
+        if let Some(object_id) = self.object_id_for_key(key).await?
             && let Some(mut index) = self.load_version_index_by_object_id(&object_id).await?
         {
             let Some(preferred_head_version_id) = index.preferred_head_version_id.clone() else {
@@ -2316,15 +2348,21 @@ impl PersistentStore {
             record.manifest_hash = manifest_hash.clone();
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index)?;
-            self.persist_current_state().await?;
+            self.sync_current_state_for_key_from_index(key, &index).await?;
             return Ok(manifest_hash);
         }
 
-        self.current_state
-            .objects
-            .insert(key.to_string(), manifest_hash.clone());
-        self.persist_current_state().await?;
+        self.upsert_current_object(
+            key,
+            CurrentObjectEntry {
+                manifest_hash: manifest_hash.clone(),
+                object_id: self
+                    .object_id_for_key(key)
+                    .await?
+                    .with_context(|| format!("missing object id for current key {key}"))?,
+            },
+        )
+        .await?;
         Ok(manifest_hash)
     }
 
@@ -2342,7 +2380,11 @@ impl PersistentStore {
         read_mode: ObjectReadMode,
     ) -> std::result::Result<String, StoreReadError> {
         let manifest_hash = if let Some(version_id) = version_id {
-            let Some(object_id) = self.object_id_for_key(key) else {
+            let Some(object_id) = self
+                .object_id_for_key(key)
+                .await
+                .map_err(StoreReadError::Internal)?
+            else {
                 return Err(StoreReadError::NotFound);
             };
             let index = self
@@ -2368,7 +2410,11 @@ impl PersistentStore {
                 None => None,
             }
         } else {
-            match self.object_id_for_key(key) {
+            match self
+                .object_id_for_key(key)
+                .await
+                .map_err(StoreReadError::Internal)?
+            {
                 Some(object_id) => {
                     let index = self
                         .load_version_index_by_object_id(&object_id)
@@ -2376,10 +2422,18 @@ impl PersistentStore {
                         .map_err(StoreReadError::Internal)?;
                     match index {
                         Some(index) => manifest_hash_for_read_mode(&index, read_mode),
-                        None => self.current_state.objects.get(key).cloned(),
+                        None => self
+                            .current_object_entry(key)
+                            .await
+                            .map_err(StoreReadError::Internal)?
+                            .map(|entry| entry.manifest_hash),
                     }
                 }
-                None => self.current_state.objects.get(key).cloned(),
+                None => self
+                    .current_object_entry(key)
+                    .await
+                    .map_err(StoreReadError::Internal)?
+                    .map(|entry| entry.manifest_hash),
             }
         }
         .ok_or(StoreReadError::NotFound)?;
@@ -2397,6 +2451,7 @@ impl PersistentStore {
         manifest_hash: &str,
     ) -> Result<Option<MediaCacheLookup>> {
         self.store_index_inspector()
+            .await?
             .lookup_media_cache(manifest_hash)
             .await
     }
@@ -2422,9 +2477,10 @@ impl PersistentStore {
     }
 
     pub async fn list_metadata_subjects(&self) -> Result<Vec<String>> {
-        let mut subjects: HashSet<String> = self.current_state.objects.keys().cloned().collect();
+        let snapshot = self.metadata_store.load_current_state().await?;
+        let mut subjects: HashSet<String> = snapshot.objects.keys().cloned().collect();
         let mut indexed_object_ids = HashSet::new();
-        for (path, object_id) in &self.current_state.object_ids {
+        for (path, object_id) in &snapshot.object_ids {
             if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
                 indexed_object_ids.insert(object_id.clone());
                 for head_version_id in &index.head_version_ids {
@@ -2458,16 +2514,17 @@ impl PersistentStore {
 
     #[cfg(test)]
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
+        let snapshot = self.metadata_store.load_current_state().await?;
         let mut subjects: HashSet<String> = HashSet::new();
         let mut indexed_object_ids = HashSet::new();
 
-        for (key, manifest_hash) in &self.current_state.objects {
+        for (key, manifest_hash) in &snapshot.objects {
             if self.manifest_is_fully_local(manifest_hash).await? {
                 subjects.insert(key.clone());
             }
         }
 
-        for (path, object_id) in &self.current_state.object_ids {
+        for (path, object_id) in &snapshot.object_ids {
             if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
                 indexed_object_ids.insert(object_id.clone());
                 for head_version_id in &index.head_version_ids {
@@ -2683,6 +2740,7 @@ impl PersistentStore {
 
         let object_id = self
             .object_id_for_key(key)
+            .await?
             .unwrap_or_else(generate_object_id);
         let mut index = self
             .load_version_index_by_object_id(&object_id)
@@ -2723,15 +2781,12 @@ impl PersistentStore {
             }
 
             let touched_paths = BTreeSet::from([key.to_string()]);
-            let before_manifest = self.current_state.objects.get(key).cloned();
-            let before_object_id = self.current_state.object_ids.get(key).cloned();
+            let before_binding = self.current_state_binding(key).await?;
             if create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index)?;
-            let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-                || self.current_state.object_ids.get(key).cloned() != before_object_id
-            {
+            self.sync_current_state_for_key_from_index(key, &index).await?;
+            let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
                 BTreeSet::new()
@@ -2800,8 +2855,7 @@ impl PersistentStore {
             copied_from_path: None,
         };
         let touched_paths = BTreeSet::from([key.to_string()]);
-        let before_manifest = self.current_state.objects.get(key).cloned();
-        let before_object_id = self.current_state.object_ids.get(key).cloned();
+        let before_binding = self.current_state_binding(key).await?;
         if create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         }
@@ -2820,10 +2874,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)?;
-        let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-            || self.current_state.object_ids.get(key).cloned() != before_object_id
-        {
+        self.sync_current_state_for_key_from_index(key, &index).await?;
+        let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
             BTreeSet::new()
@@ -2849,7 +2901,7 @@ impl PersistentStore {
     }
 
     pub async fn commit_version(&mut self, key: &str, version_id: &str) -> Result<bool> {
-        let Some(object_id) = self.object_id_for_key(key) else {
+        let Some(object_id) = self.object_id_for_key(key).await? else {
             return Ok(false);
         };
 
@@ -2867,18 +2919,15 @@ impl PersistentStore {
         }
 
         let touched_paths = BTreeSet::from([key.to_string()]);
-        let before_manifest = self.current_state.objects.get(key).cloned();
-        let before_object_id = self.current_state.object_ids.get(key).cloned();
+        let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         version.state = VersionConsistencyState::Confirmed;
         index.preferred_head_version_id = choose_preferred_head(&index);
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)?;
-        let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-            || self.current_state.object_ids.get(key).cloned() != before_object_id
-        {
+        self.sync_current_state_for_key_from_index(key, &index).await?;
+        let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
             BTreeSet::new()
@@ -2890,7 +2939,7 @@ impl PersistentStore {
     }
 
     pub async fn list_versions(&self, key: &str) -> Result<Option<VersionGraphSummary>> {
-        let Some(object_id) = self.object_id_for_key(key) else {
+        let Some(object_id) = self.object_id_for_key(key).await? else {
             return Ok(None);
         };
 
@@ -3222,51 +3271,34 @@ impl PersistentStore {
                 report.removed_indexes = report.removed_indexes.saturating_add(1);
 
                 let stale_keys = self
-                    .current_state
-                    .object_ids
-                    .iter()
-                    .filter_map(|(current_key, current_object_id)| {
-                        if current_object_id == &candidate.object_id {
-                            Some(current_key.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                    .metadata_store
+                    .list_keys_for_object_id(&candidate.object_id)
+                    .await?;
                 if !stale_keys.is_empty() {
                     current_state_changed = true;
                 }
                 for stale_key in stale_keys {
-                    self.current_state.objects.remove(&stale_key);
-                    self.current_state.object_ids.remove(&stale_key);
+                    self.remove_current_object(&stale_key).await?;
                 }
             }
 
-            let before_manifest = self.current_state.objects.get(&key).cloned();
-            let before_object_id = self.current_state.object_ids.get(&key).cloned();
-            self.sync_current_state_for_key_from_index(&key, &canonical.index)?;
+            let before_binding = self.current_state_binding(&key).await?;
+            self.sync_current_state_for_key_from_index(&key, &canonical.index)
+                .await?;
             let stale_canonical_keys = self
-                .current_state
-                .object_ids
-                .iter()
-                .filter_map(|(current_key, current_object_id)| {
-                    if current_object_id == &canonical.object_id && current_key != &key {
-                        Some(current_key.clone())
-                    } else {
-                        None
-                    }
-                })
+                .metadata_store
+                .list_keys_for_object_id(&canonical.object_id)
+                .await?
+                .into_iter()
+                .filter(|current_key| current_key != &key)
                 .collect::<Vec<_>>();
             if !stale_canonical_keys.is_empty() {
                 current_state_changed = true;
             }
             for stale_key in stale_canonical_keys {
-                self.current_state.objects.remove(&stale_key);
-                self.current_state.object_ids.remove(&stale_key);
+                self.remove_current_object(&stale_key).await?;
             }
-            if self.current_state.objects.get(&key).cloned() != before_manifest
-                || self.current_state.object_ids.get(&key).cloned() != before_object_id
-            {
+            if self.current_state_binding(&key).await? != before_binding {
                 current_state_changed = true;
             }
         }
@@ -3275,7 +3307,6 @@ impl PersistentStore {
             writer.flush().await?;
         }
         if !dry_run && current_state_changed {
-            self.persist_current_state().await?;
             self.create_snapshot().await?;
         }
 
@@ -3452,7 +3483,7 @@ impl PersistentStore {
     }
 
     pub async fn has_manifest_for_key(&self, key: &str, manifest_hash: &str) -> Result<bool> {
-        let Some(object_id) = self.object_id_for_key(key) else {
+        let Some(object_id) = self.object_id_for_key(key).await? else {
             return Ok(false);
         };
 
@@ -3476,7 +3507,7 @@ impl PersistentStore {
             self.resolve_object_id_for_key_version(key, version_id)
                 .await?
         } else {
-            self.object_id_for_key(key)
+            self.object_id_for_key(key).await?
         };
         let (
             selected_version_id,
@@ -3538,7 +3569,10 @@ impl PersistentStore {
                             )
                         }
                         None => {
-                            let Some(manifest_hash) = self.current_state.objects.get(key).cloned()
+                            let Some(manifest_hash) = self
+                                .current_object_entry(key)
+                                .await?
+                                .map(|entry| entry.manifest_hash)
                             else {
                                 return Ok(None);
                             };
@@ -3558,7 +3592,11 @@ impl PersistentStore {
                     }
                 }
                 None => {
-                    let Some(manifest_hash) = self.current_state.objects.get(key).cloned() else {
+                    let Some(manifest_hash) = self
+                        .current_object_entry(key)
+                        .await?
+                        .map(|entry| entry.manifest_hash)
+                    else {
                         return Ok(None);
                     };
                     (
@@ -3649,10 +3687,14 @@ impl PersistentStore {
                 .await?
         } else {
             self.object_id_for_key(key)
+                .await?
                 .or(self.resolve_object_id_for_key_history(key).await?)
         };
 
-        let current_manifest_hash = self.current_state.objects.get(key).cloned();
+        let current_manifest_hash = self
+            .current_object_entry(key)
+            .await?
+            .map(|entry| entry.manifest_hash);
         let mut versions = Vec::new();
         let mut manifests = Vec::new();
         let mut seen_manifest_hashes = HashSet::new();
@@ -3857,7 +3899,7 @@ impl PersistentStore {
         manifest_payload: &[u8],
     ) -> Result<String> {
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            let object_id = if let Some(object_id) = self.object_id_for_key(key) {
+            let object_id = if let Some(object_id) = self.object_id_for_key(key).await? {
                 object_id
             } else if let Some(object_id) = self.resolve_object_id_for_key_history(key).await? {
                 object_id
@@ -3883,8 +3925,7 @@ impl PersistentStore {
             }
 
             let touched_paths = BTreeSet::from([key.to_string()]);
-            let before_manifest = self.current_state.objects.get(key).cloned();
-            let before_object_id = self.current_state.object_ids.get(key).cloned();
+            let before_binding = self.current_state_binding(key).await?;
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
             index.versions.insert(
@@ -3908,10 +3949,8 @@ impl PersistentStore {
 
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index)?;
-            let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-                || self.current_state.object_ids.get(key).cloned() != before_object_id
-            {
+            self.sync_current_state_for_key_from_index(key, &index).await?;
+            let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
                 BTreeSet::new()
@@ -3969,6 +4008,7 @@ impl PersistentStore {
 
         let object_id = self
             .object_id_for_key(key)
+            .await?
             .unwrap_or_else(generate_object_id);
         let mut index = self
             .load_version_index_by_object_id(&object_id)
@@ -3990,8 +4030,7 @@ impl PersistentStore {
         }
 
         let touched_paths = BTreeSet::from([key.to_string()]);
-        let before_manifest = self.current_state.objects.get(key).cloned();
-        let before_object_id = self.current_state.object_ids.get(key).cloned();
+        let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
         let record = FileVersionRecord {
@@ -4014,10 +4053,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)?;
-        let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-            || self.current_state.object_ids.get(key).cloned() != before_object_id
-        {
+        self.sync_current_state_for_key_from_index(key, &index).await?;
+        let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
             BTreeSet::new()
@@ -4123,40 +4160,28 @@ impl PersistentStore {
             let current_key = preferred_logical_path.unwrap_or(bundle.key.as_str());
             let mut touched_paths = BTreeSet::from([current_key.to_string()]);
             touched_paths.extend(
-                self.current_state
-                    .object_ids
-                    .iter()
-                    .filter(|(key, current_object_id)| {
-                        *current_object_id == &object_id
-                            && Some(key.as_str()) != preferred_logical_path
-                    })
-                    .map(|(key, _)| key.clone()),
+                self.metadata_store
+                    .list_keys_for_object_id(&object_id)
+                    .await?
+                    .into_iter()
+                    .filter(|key| Some(key.as_str()) != preferred_logical_path),
             );
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
-            let before_manifest = self.current_state.objects.get(current_key).cloned();
-            let before_object_id = self.current_state.object_ids.get(current_key).cloned();
-            self.sync_current_state_for_key_from_index(current_key, &index)?;
+            let before_binding = self.current_state_binding(current_key).await?;
+            self.sync_current_state_for_key_from_index(current_key, &index)
+                .await?;
             let stale_keys: Vec<String> = self
-                .current_state
-                .object_ids
-                .iter()
-                .filter_map(|(key, current_object_id)| {
-                    if current_object_id != &object_id {
-                        return None;
-                    }
-                    if Some(key.as_str()) == preferred_logical_path {
-                        return None;
-                    }
-                    Some(key.clone())
-                })
+                .metadata_store
+                .list_keys_for_object_id(&object_id)
+                .await?
+                .into_iter()
+                .filter(|key| Some(key.as_str()) != preferred_logical_path)
                 .collect();
             let removed_stale_keys = !stale_keys.is_empty();
             for stale_key in stale_keys {
-                self.current_state.objects.remove(&stale_key);
-                self.current_state.object_ids.remove(&stale_key);
+                self.remove_current_object(&stale_key).await?;
             }
-            if self.current_state.objects.get(current_key).cloned() != before_manifest
-                || self.current_state.object_ids.get(current_key).cloned() != before_object_id
+            if self.current_state_binding(current_key).await? != before_binding
                 || removed_stale_keys
             {
                 current_state_changed = true;
@@ -4164,17 +4189,15 @@ impl PersistentStore {
             }
         } else if let Some(manifest_hash) = bundle.current_manifest_hash.as_ref() {
             let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
-            if self.current_state.objects.get(&bundle.key) != Some(manifest_hash)
-                || self.current_state.object_ids.get(&bundle.key) != Some(&object_id)
-            {
+            let expected_entry = CurrentObjectEntry {
+                manifest_hash: manifest_hash.clone(),
+                object_id: object_id.clone(),
+            };
+            if self.current_object_entry(&bundle.key).await? != Some(expected_entry.clone()) {
                 let touched_paths = BTreeSet::from([bundle.key.clone()]);
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
-                self.current_state
-                    .objects
-                    .insert(bundle.key.clone(), manifest_hash.clone());
-                self.current_state
-                    .object_ids
-                    .insert(bundle.key.clone(), object_id);
+                self.upsert_current_object(&bundle.key, expected_entry)
+                    .await?;
                 current_state_changed = true;
                 snapshot_changed_paths.extend(touched_paths);
             }
@@ -4294,8 +4317,7 @@ impl PersistentStore {
         self.prune_conflicting_replication_bundle_versions(key, &record)
             .await?;
         let touched_paths = BTreeSet::from([key.to_string()]);
-        let before_manifest = self.current_state.objects.get(key).cloned();
-        let before_object_id = self.current_state.object_ids.get(key).cloned();
+        let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
         if let Some(existing) = index.versions.get(&resolved_version_id) {
@@ -4305,19 +4327,18 @@ impl PersistentStore {
                 index.preferred_head_version_id = choose_preferred_head(&index);
                 self.persist_version_index_by_object_id(&object_id, &index)
                     .await?;
-                self.sync_current_state_for_key_from_index(key, &index)?;
+                self.sync_current_state_for_key_from_index(key, &index)
+                    .await?;
                 if bundle.selected_is_preferred_head
                     && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
                 {
                     self.apply_selected_replica_tombstone_current_state(key, bundle)
                         .await?;
                 } else if bundle.selected_is_preferred_head {
-                    self.promote_current_state_for_key_from_index(key, &index)?;
+                    self.promote_current_state_for_key_from_index(key, &index)
+                        .await?;
                 }
-                let changed_paths = if self.current_state.objects.get(key).cloned()
-                    != before_manifest
-                    || self.current_state.object_ids.get(key).cloned() != before_object_id
-                {
+                let changed_paths = if self.current_state_binding(key).await? != before_binding {
                     touched_paths.clone()
                 } else {
                     BTreeSet::new()
@@ -4331,17 +4352,17 @@ impl PersistentStore {
                 return Ok(resolved_version_id);
             }
 
-            self.sync_current_state_for_key_from_index(key, &index)?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
             {
                 self.apply_selected_replica_tombstone_current_state(key, bundle)
                     .await?;
             } else if bundle.selected_is_preferred_head {
-                self.promote_current_state_for_key_from_index(key, &index)?;
+                self.promote_current_state_for_key_from_index(key, &index)
+                    .await?;
             }
-            let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-                || self.current_state.object_ids.get(key).cloned() != before_object_id
-            {
+            let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths.clone()
             } else {
                 BTreeSet::new()
@@ -4357,16 +4378,15 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)?;
+        self.sync_current_state_for_key_from_index(key, &index).await?;
         if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             self.apply_selected_replica_tombstone_current_state(key, bundle)
                 .await?;
         } else if bundle.selected_is_preferred_head {
-            self.promote_current_state_for_key_from_index(key, &index)?;
+            self.promote_current_state_for_key_from_index(key, &index)
+                .await?;
         }
-        let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-            || self.current_state.object_ids.get(key).cloned() != before_object_id
-        {
+        let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
             BTreeSet::new()
@@ -4386,7 +4406,7 @@ impl PersistentStore {
             return Ok(false);
         };
 
-        let Some(object_id) = self.object_id_for_key(key) else {
+        let Some(object_id) = self.object_id_for_key(key).await? else {
             return Ok(false);
         };
 
@@ -4399,18 +4419,15 @@ impl PersistentStore {
         }
 
         let touched_paths = BTreeSet::from([key.to_string()]);
-        let before_manifest = self.current_state.objects.get(key).cloned();
-        let before_object_id = self.current_state.object_ids.get(key).cloned();
+        let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         index.head_version_ids = recompute_head_version_ids(&index);
         index.preferred_head_version_id = choose_preferred_head(&index);
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)?;
-        let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-            || self.current_state.object_ids.get(key).cloned() != before_object_id
-        {
+        self.sync_current_state_for_key_from_index(key, &index).await?;
+        let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
             BTreeSet::new()
@@ -4452,7 +4469,8 @@ impl PersistentStore {
     pub async fn list_provisional_versions(&self) -> Result<Vec<ReconcileVersionEntry>> {
         let mut output = Vec::new();
         let mut paths_by_object_id: HashMap<String, Vec<String>> = HashMap::new();
-        for (path, object_id) in &self.current_state.object_ids {
+        let snapshot = self.metadata_store.load_current_state().await?;
+        for (path, object_id) in &snapshot.object_ids {
             paths_by_object_id
                 .entry(object_id.clone())
                 .or_default()
@@ -5010,7 +5028,8 @@ impl PersistentStore {
         let marker_root = format!("{normalized_root}/");
         let mut targets = BTreeSet::new();
 
-        for existing_key in self.current_state.objects.keys() {
+        let snapshot = self.metadata_store.load_current_state().await?;
+        for existing_key in snapshot.objects.keys() {
             if existing_key == normalized_root
                 || existing_key == &marker_root
                 || existing_key.starts_with(&marker_root)
@@ -5027,10 +5046,10 @@ impl PersistentStore {
         }
 
         let touched_paths = targets.clone();
-        let before_bindings = touched_paths
-            .iter()
-            .map(|path| (path.clone(), self.current_state_binding(path)))
-            .collect::<HashMap<_, _>>();
+        let mut before_bindings = HashMap::with_capacity(touched_paths.len());
+        for path in &touched_paths {
+            before_bindings.insert(path.clone(), self.current_state_binding(path).await?);
+        }
         if options.create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         }
@@ -5048,7 +5067,7 @@ impl PersistentStore {
         }
 
         if options.create_snapshot && !results.is_empty() {
-            let changed_paths = self.changed_paths_after_bindings(&before_bindings);
+            let changed_paths = self.changed_paths_after_bindings(&before_bindings).await?;
             if !changed_paths.is_empty() {
                 self.record_snapshot_batch(changed_paths, unix_ts()).await?;
             }
@@ -5060,6 +5079,7 @@ impl PersistentStore {
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
         let object_id = self
             .object_id_for_key(key)
+            .await?
             .unwrap_or_else(generate_object_id);
         let mut index = self
             .load_version_index_by_object_id(&object_id)
@@ -5099,15 +5119,12 @@ impl PersistentStore {
             }
 
             let touched_paths = BTreeSet::from([key.to_string()]);
-            let before_manifest = self.current_state.objects.get(key).cloned();
-            let before_object_id = self.current_state.object_ids.get(key).cloned();
+            let before_binding = self.current_state_binding(key).await?;
             if options.create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index)?;
-            let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-                || self.current_state.object_ids.get(key).cloned() != before_object_id
-            {
+            self.sync_current_state_for_key_from_index(key, &index).await?;
+            let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
                 BTreeSet::new()
@@ -5142,8 +5159,7 @@ impl PersistentStore {
             copied_from_path: None,
         };
         let touched_paths = BTreeSet::from([key.to_string()]);
-        let before_manifest = self.current_state.objects.get(key).cloned();
-        let before_object_id = self.current_state.object_ids.get(key).cloned();
+        let before_binding = self.current_state_binding(key).await?;
         if options.create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         }
@@ -5162,10 +5178,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)?;
-        let changed_paths = if self.current_state.objects.get(key).cloned() != before_manifest
-            || self.current_state.object_ids.get(key).cloned() != before_object_id
-        {
+        self.sync_current_state_for_key_from_index(key, &index).await?;
+        let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
             BTreeSet::new()
@@ -5190,14 +5204,12 @@ impl PersistentStore {
             return Ok(PathMutationResult::Applied);
         }
 
-        let Some(object_id) = self.current_state.object_ids.get(from_path).cloned() else {
+        let Some(source_entry) = self.current_object_entry(from_path).await? else {
             return Ok(PathMutationResult::SourceMissing);
         };
-        let Some(_manifest_hash) = self.current_state.objects.get(from_path).cloned() else {
-            return Ok(PathMutationResult::SourceMissing);
-        };
+        let object_id = source_entry.object_id;
 
-        if self.current_state.object_ids.contains_key(to_path) {
+        if self.current_object_entry(to_path).await?.is_some() {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
             }
@@ -5252,14 +5264,15 @@ impl PersistentStore {
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
 
-        self.current_state.object_ids.remove(from_path);
-        self.current_state.objects.remove(from_path);
-        self.current_state
-            .object_ids
-            .insert(to_path.to_string(), object_id);
-        self.current_state
-            .objects
-            .insert(to_path.to_string(), renamed_manifest_hash);
+        self.remove_current_object(from_path).await?;
+        self.upsert_current_object(
+            to_path,
+            CurrentObjectEntry {
+                manifest_hash: renamed_manifest_hash,
+                object_id,
+            },
+        )
+        .await?;
 
         let tombstone_object_id = generate_object_id();
         let tombstone_version_id = format!("rename-tomb-{}", unix_ts_nanos());
@@ -5300,11 +5313,11 @@ impl PersistentStore {
             return Ok(PathMutationResult::Applied);
         }
 
-        let Some(source_object_id) = self.current_state.object_ids.get(from_path).cloned() else {
+        let Some(source_object_id) = self.object_id_for_key(from_path).await? else {
             return Ok(PathMutationResult::SourceMissing);
         };
 
-        if self.current_state.object_ids.contains_key(to_path) {
+        if self.current_object_entry(to_path).await?.is_some() {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
             }
@@ -5358,12 +5371,14 @@ impl PersistentStore {
         self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
             .await?;
 
-        self.current_state
-            .object_ids
-            .insert(to_path.to_string(), copied_object_id);
-        self.current_state
-            .objects
-            .insert(to_path.to_string(), copied_manifest_hash);
+        self.upsert_current_object(
+            to_path,
+            CurrentObjectEntry {
+                manifest_hash: copied_manifest_hash,
+                object_id: copied_object_id,
+            },
+        )
+        .await?;
         self.persist_current_state_with_snapshot_batch(touched_paths, true, unix_ts())
             .await?;
 
@@ -5405,11 +5420,12 @@ impl PersistentStore {
 
             if from_path != to_path
                 && let Some(conflict_path) = self
-                    .current_state
+                    .metadata_store
+                    .load_current_state()
+                    .await?
                     .object_ids
-                    .keys()
-                    .find(|candidate| *candidate == to_path || candidate.starts_with(to_path))
-                    .cloned()
+                    .into_keys()
+                    .find(|candidate| candidate == to_path || candidate.starts_with(to_path))
             {
                 if !overwrite {
                     return Ok(SnapshotRestoreMutationResult::TargetExists {
@@ -5429,10 +5445,10 @@ impl PersistentStore {
                         .map(|suffix| format!("{to_path}{suffix}"))
                 })
                 .collect::<BTreeSet<_>>();
-            let before_bindings = changed_paths
-                .iter()
-                .map(|path| (path.clone(), self.current_state_binding(path)))
-                .collect::<HashMap<_, _>>();
+            let mut before_bindings = HashMap::with_capacity(changed_paths.len());
+            for path in &changed_paths {
+                before_bindings.insert(path.clone(), self.current_state_binding(path).await?);
+            }
             if !changed_paths.is_empty() {
                 self.maybe_rotate_snapshot_batch(&changed_paths).await?;
             }
@@ -5463,7 +5479,7 @@ impl PersistentStore {
                 }
             }
 
-            let changed_paths = self.changed_paths_after_bindings(&before_bindings);
+            let changed_paths = self.changed_paths_after_bindings(&before_bindings).await?;
             if !changed_paths.is_empty() {
                 self.record_snapshot_batch(changed_paths, unix_ts()).await?;
             }
@@ -5871,8 +5887,13 @@ impl PersistentStore {
         dry_run: bool,
     ) -> Result<TombstoneCompactionReport> {
         let now = unix_ts();
-        let bound_object_ids: HashSet<String> =
-            self.current_state.object_ids.values().cloned().collect();
+        let bound_object_ids: HashSet<String> = self
+            .metadata_store
+            .load_current_state()
+            .await?
+            .object_ids
+            .into_values()
+            .collect();
 
         let mut scanned_indexes = 0usize;
         let mut tombstone_head_indexes = 0usize;
@@ -6184,26 +6205,69 @@ impl PersistentStore {
         self.metadata_store.append_data_change_event(event).await
     }
 
-    fn object_id_for_key(&self, key: &str) -> Option<String> {
-        self.current_state.object_ids.get(key).cloned()
+    async fn current_object_entry(&self, key: &str) -> Result<Option<CurrentObjectEntry>> {
+        if let Some(entry) = self
+            .current_objects_cache
+            .lock()
+            .unwrap()
+            .get(&key.to_string())
+        {
+            return Ok(Some((*entry).clone()));
+        }
+
+        let fetched = self.metadata_store.get_current_object(key).await?;
+        if let Some(entry) = &fetched {
+            self.current_objects_cache
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), entry.clone());
+        }
+        Ok(fetched)
     }
 
-    fn current_state_binding(&self, key: &str) -> (Option<String>, Option<String>) {
-        (
-            self.current_state.objects.get(key).cloned(),
-            self.current_state.object_ids.get(key).cloned(),
-        )
+    async fn upsert_current_object(&self, key: &str, entry: CurrentObjectEntry) -> Result<()> {
+        self.metadata_store.upsert_current_object(key, &entry).await?;
+        self.current_objects_cache
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), entry);
+        Ok(())
     }
 
-    fn changed_paths_after_bindings(
+    async fn remove_current_object(&self, key: &str) -> Result<()> {
+        self.metadata_store.remove_current_object(key).await?;
+        self.current_objects_cache
+            .lock()
+            .unwrap()
+            .remove(&key.to_string());
+        Ok(())
+    }
+
+    async fn object_id_for_key(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .current_object_entry(key)
+            .await?
+            .map(|entry| entry.object_id))
+    }
+
+    async fn current_state_binding(&self, key: &str) -> Result<(Option<String>, Option<String>)> {
+        Ok(match self.current_object_entry(key).await? {
+            Some(entry) => (Some(entry.manifest_hash), Some(entry.object_id)),
+            None => (None, None),
+        })
+    }
+
+    async fn changed_paths_after_bindings(
         &self,
         before: &HashMap<String, (Option<String>, Option<String>)>,
-    ) -> BTreeSet<String> {
-        before
-            .iter()
-            .filter(|(path, binding)| self.current_state_binding(path) != **binding)
-            .map(|(path, _)| path.clone())
-            .collect()
+    ) -> Result<BTreeSet<String>> {
+        let mut changed = BTreeSet::new();
+        for (path, binding) in before {
+            if self.current_state_binding(path).await? != *binding {
+                changed.insert(path.clone());
+            }
+        }
+        Ok(changed)
     }
 
     async fn load_version_index_by_object_id(
@@ -6225,16 +6289,15 @@ impl PersistentStore {
             .await
     }
 
-    fn sync_current_state_for_key_from_index(
-        &mut self,
+    async fn sync_current_state_for_key_from_index(
+        &self,
         key: &str,
         index: &FileVersionIndex,
     ) -> Result<()> {
-        let current_object_id = self.current_state.object_ids.get(key).cloned();
+        let current_object_id = self.object_id_for_key(key).await?;
         let Some(preferred_head) = &index.preferred_head_version_id else {
             if current_object_id.as_deref() == Some(index.object_id.as_str()) {
-                self.current_state.objects.remove(key);
-                self.current_state.object_ids.remove(key);
+                self.remove_current_object(key).await?;
             }
             return Ok(());
         };
@@ -6245,8 +6308,7 @@ impl PersistentStore {
 
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             if current_object_id.as_deref() == Some(index.object_id.as_str()) {
-                self.current_state.objects.remove(key);
-                self.current_state.object_ids.remove(key);
+                self.remove_current_object(key).await?;
             }
             return Ok(());
         }
@@ -6254,18 +6316,20 @@ impl PersistentStore {
         if current_object_id.is_none()
             || current_object_id.as_deref() == Some(index.object_id.as_str())
         {
-            self.current_state
-                .objects
-                .insert(key.to_string(), preferred_record.manifest_hash.clone());
-            self.current_state
-                .object_ids
-                .insert(key.to_string(), index.object_id.clone());
+            self.upsert_current_object(
+                key,
+                CurrentObjectEntry {
+                    manifest_hash: preferred_record.manifest_hash.clone(),
+                    object_id: index.object_id.clone(),
+                },
+            )
+            .await?;
         }
         Ok(())
     }
 
-    fn promote_current_state_for_key_from_index(
-        &mut self,
+    async fn promote_current_state_for_key_from_index(
+        &self,
         key: &str,
         index: &FileVersionIndex,
     ) -> Result<()> {
@@ -6279,21 +6343,22 @@ impl PersistentStore {
             return Ok(());
         }
 
-        self.current_state
-            .objects
-            .insert(key.to_string(), preferred_record.manifest_hash.clone());
-        self.current_state
-            .object_ids
-            .insert(key.to_string(), index.object_id.clone());
-        Ok(())
+        self.upsert_current_object(
+            key,
+            CurrentObjectEntry {
+                manifest_hash: preferred_record.manifest_hash.clone(),
+                object_id: index.object_id.clone(),
+            },
+        )
+        .await
     }
 
     async fn apply_selected_replica_tombstone_current_state(
-        &mut self,
+        &self,
         key: &str,
         bundle: &ReplicationExportBundle,
     ) -> Result<()> {
-        let Some(current_object_id) = self.current_state.object_ids.get(key).cloned() else {
+        let Some(current_object_id) = self.object_id_for_key(key).await? else {
             return Ok(());
         };
 
@@ -6306,16 +6371,9 @@ impl PersistentStore {
             .await?;
 
         if same_lineage || copied_from_current || tombstone_supersedes_current {
-            self.current_state.objects.remove(key);
-            self.current_state.object_ids.remove(key);
+            self.remove_current_object(key).await?;
         }
         Ok(())
-    }
-
-    async fn persist_current_state(&self) -> Result<()> {
-        self.metadata_store
-            .persist_current_state(&self.current_state)
-            .await
     }
 
     async fn restore_object_path_from_source(
@@ -6326,7 +6384,9 @@ impl PersistentStore {
         create_snapshot: bool,
         overwrite: bool,
     ) -> Result<PathMutationResult> {
-        if source_path != target_path && self.current_state.object_ids.contains_key(target_path) {
+        if source_path != target_path
+            && self.current_object_entry(target_path).await?.is_some()
+        {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
             }
@@ -6344,6 +6404,7 @@ impl PersistentStore {
         if source_path == target_path {
             let object_id = self
                 .object_id_for_key(target_path)
+                .await?
                 .unwrap_or_else(generate_object_id);
             let mut index = self
                 .load_version_index_by_object_id(&object_id)
@@ -6376,7 +6437,8 @@ impl PersistentStore {
 
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(target_path, &index)?;
+            self.sync_current_state_for_key_from_index(target_path, &index)
+                .await?;
             self.persist_current_state_with_snapshot_batch(
                 touched_paths,
                 create_snapshot,
@@ -6413,7 +6475,8 @@ impl PersistentStore {
         copied_index.preferred_head_version_id = choose_preferred_head(&copied_index);
         self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
             .await?;
-        self.sync_current_state_for_key_from_index(target_path, &copied_index)?;
+        self.sync_current_state_for_key_from_index(target_path, &copied_index)
+            .await?;
         self.persist_current_state_with_snapshot_batch(touched_paths, create_snapshot, unix_ts())
             .await?;
 
@@ -6507,7 +6570,7 @@ impl PersistentStore {
         source_path: &str,
         version_id: &str,
     ) -> Result<Option<SnapshotRestoreSource>> {
-        let Some(source_object_id) = self.object_id_for_key(source_path) else {
+        let Some(source_object_id) = self.object_id_for_key(source_path).await? else {
             return Ok(None);
         };
 
@@ -6550,7 +6613,7 @@ impl PersistentStore {
     }
 
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
-        if let Some(object_id) = self.object_id_for_key(key) {
+        if let Some(object_id) = self.object_id_for_key(key).await? {
             return Ok(Some(object_id));
         }
 
@@ -6568,7 +6631,7 @@ impl PersistentStore {
         key: &str,
         version_id: &str,
     ) -> Result<Option<String>> {
-        if let Some(object_id) = self.object_id_for_key(key)
+        if let Some(object_id) = self.object_id_for_key(key).await?
             && let Some(index) = self.load_version_index_by_object_id(&object_id).await?
             && index.versions.contains_key(version_id)
         {
@@ -6655,7 +6718,8 @@ impl PersistentStore {
             Box::new(DeleteRecreateLoopCleanupCandidate {
                 key: key.clone(),
                 object_id: index.object_id.clone(),
-                bound_current: self.current_state.object_ids.get(&key) == Some(&index.object_id),
+                bound_current: self.object_id_for_key(&key).await?.as_deref()
+                    == Some(index.object_id.as_str()),
                 signature: DeleteRecreateLoopNormalizedIndexSignature {
                     preferred_head_version_id: index.preferred_head_version_id.clone(),
                     head_version_ids,
@@ -6702,7 +6766,7 @@ impl PersistentStore {
                     return Ok(ReplicationImportLineageChoice::existing(object_id));
                 }
 
-                if let Some(object_id) = self.object_id_for_key(key) {
+                if let Some(object_id) = self.object_id_for_key(key).await? {
                     return Ok(ReplicationImportLineageChoice::existing(object_id));
                 }
 
@@ -6736,7 +6800,7 @@ impl PersistentStore {
             return Ok(ReplicationImportLineageChoice::existing(source_object_id));
         }
 
-        if let Some(current_object_id) = self.object_id_for_key(key)
+        if let Some(current_object_id) = self.object_id_for_key(key).await?
             && let Some(index) = self
                 .load_version_index_by_object_id(&current_object_id)
                 .await?
@@ -6767,7 +6831,7 @@ impl PersistentStore {
             return Ok(ReplicationImportLineageChoice::existing(object_id));
         }
 
-        if let Some(object_id) = self.object_id_for_key(key) {
+        if let Some(object_id) = self.object_id_for_key(key).await? {
             return Ok(ReplicationImportLineageChoice::existing(object_id));
         }
 
@@ -6809,16 +6873,17 @@ impl PersistentStore {
             if index.versions.is_empty() {
                 self.delete_version_index_by_object_id(&index.object_id)
                     .await?;
-                if self.current_state.object_ids.get(key) == Some(&index.object_id) {
-                    self.current_state.objects.remove(key);
-                    self.current_state.object_ids.remove(key);
+                if self.object_id_for_key(key).await?.as_deref() == Some(index.object_id.as_str())
+                {
+                    self.remove_current_object(key).await?;
                 }
                 continue;
             }
 
             self.persist_version_index_by_object_id(&index.object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index)?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
         }
 
         Ok(())
@@ -6963,11 +7028,12 @@ impl PersistentStore {
             (batch.snapshot_id.clone(), batch.last_changed_at_unix)
         };
 
+        let current_state = self.metadata_store.load_current_state().await?;
         let manifest = SnapshotManifest {
             id: snapshot_id.clone(),
             created_at_unix: last_changed_at_unix,
-            objects: self.current_state.objects.clone(),
-            object_ids: self.current_state.object_ids.clone(),
+            objects: current_state.objects,
+            object_ids: current_state.object_ids,
         };
 
         self.metadata_store
@@ -6986,8 +7052,6 @@ impl PersistentStore {
         create_snapshot: bool,
         changed_at_unix: u64,
     ) -> Result<Option<String>> {
-        self.persist_current_state().await?;
-
         if !create_snapshot || changed_paths.is_empty() {
             return Ok(None);
         }
@@ -7000,9 +7064,10 @@ impl PersistentStore {
 
     async fn create_snapshot(&mut self) -> Result<String> {
         let created_at_unix = unix_ts();
+        let current_state = self.metadata_store.load_current_state().await?;
         let object_map_payload = serde_json::to_vec(&(
-            self.current_state.objects.clone(),
-            self.current_state.object_ids.clone(),
+            current_state.objects.clone(),
+            current_state.object_ids.clone(),
         ))?;
         let state_hash = hash_hex(&object_map_payload);
         let snapshot_id = format!("snap-{}-{}", unix_ts_nanos(), &state_hash[..12]);
@@ -7010,8 +7075,8 @@ impl PersistentStore {
         let manifest = SnapshotManifest {
             id: snapshot_id.clone(),
             created_at_unix,
-            objects: self.current_state.objects.clone(),
-            object_ids: self.current_state.object_ids.clone(),
+            objects: current_state.objects,
+            object_ids: current_state.object_ids,
         };
 
         self.metadata_store
@@ -7055,7 +7120,7 @@ impl PersistentStore {
     async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
         let mut referenced = HashSet::<String>::new();
 
-        for manifest_hash in self.current_state.objects.values() {
+        for manifest_hash in self.metadata_store.load_current_state().await?.objects.values() {
             referenced.insert(manifest_hash.clone());
         }
 

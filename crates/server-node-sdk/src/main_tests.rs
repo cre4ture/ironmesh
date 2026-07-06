@@ -6247,7 +6247,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     // ensure underlying store current keys no longer include the key
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&key));
 
@@ -6302,7 +6302,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(
         !keys
@@ -6358,7 +6358,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&"docs/".to_string()));
 
@@ -7071,6 +7071,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
 
         let replica_subjects = locked
             .replication_subject_inspector()
+            .await
+            .unwrap()
             .list_replication_subjects()
             .await
             .unwrap();
@@ -8402,6 +8404,9 @@ async fn build_test_state(
         },
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         runtime_log_control: super::RuntimeLogControl::disabled("info"),
+        process_stats_runtime: Arc::new(std::sync::Mutex::new(
+            super::ProcessStatsRuntime::default(),
+        )),
     };
 
     if seed_gap {

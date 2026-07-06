@@ -59,6 +59,14 @@ where
         value
     }
 
+    pub fn remove(&mut self, key: &K) -> Option<Arc<V>> {
+        let removed = self.chunks.remove(key);
+        if removed.is_some() {
+            self.access_order.retain(|existing| existing != key);
+        }
+        removed
+    }
+
     fn touch(&mut self, key: &K) {
         self.access_order.retain(|existing| existing != key);
         self.access_order.push_back(key.clone());
@@ -81,6 +89,25 @@ mod tests {
         assert_eq!(cache.get(&"alpha".to_string()).as_deref(), Some(&1));
         assert_eq!(cache.get(&"beta".to_string()).as_deref(), None);
         assert_eq!(cache.get(&"gamma".to_string()).as_deref(), Some(&3));
+    }
+
+    #[test]
+    fn remove_evicts_entry_and_its_access_order() {
+        let mut cache = RangeChunkCache::<String, usize>::new(2);
+
+        cache.insert("alpha".to_string(), 1);
+        let removed = cache.remove(&"alpha".to_string());
+
+        assert_eq!(removed.as_deref(), Some(&1));
+        assert_eq!(cache.get(&"alpha".to_string()).as_deref(), None);
+
+        cache.insert("beta".to_string(), 2);
+        cache.insert("gamma".to_string(), 3);
+        cache.insert("delta".to_string(), 4);
+
+        assert_eq!(cache.get(&"beta".to_string()).as_deref(), None);
+        assert_eq!(cache.get(&"gamma".to_string()).as_deref(), Some(&3));
+        assert_eq!(cache.get(&"delta".to_string()).as_deref(), Some(&4));
     }
 
     #[test]
