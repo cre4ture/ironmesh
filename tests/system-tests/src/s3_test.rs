@@ -1459,4 +1459,442 @@ mod tests {
         result?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_serves_copy_object_flows() -> Result<()> {
+        let public_bind = "127.0.0.1:19470";
+        let s3_bind = "127.0.0.1:19471";
+        let data_dir = fresh_data_dir("s3-listener-copy-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-copy-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            for (bucket_name, root_prefix) in [
+                ("source.example", "tenant/source"),
+                ("dest.example", "tenant/dest"),
+            ] {
+                let create_bucket_response = http
+                    .post(format!("{public_base}/auth/s3/buckets"))
+                    .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                    .json(&serde_json::json!({
+                        "bucket_name": bucket_name,
+                        "root_prefix": root_prefix,
+                        "versioning_status": "enabled",
+                        "read_only": false
+                    }))
+                    .send()
+                    .await?;
+                assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+            }
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-copy",
+                    "bucket_scope": ["source.example", "dest.example"],
+                    "prefix_scope": ["tenant/source/", "tenant/dest/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let source_payload = b"hello from source".to_vec();
+            let put_source = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/source.example/docs/hello.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[
+                    ("content-type", "text/plain"),
+                    ("cache-control", "max-age=60"),
+                    ("x-amz-meta-color", "blue"),
+                ],
+                source_payload.clone(),
+            )
+            .await?;
+            assert_eq!(put_source.status(), StatusCode::OK);
+
+            let put_existing_dest = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/dest.example/docs/copied.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"old target".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_existing_dest.status(), StatusCode::OK);
+
+            let copy_overwrite = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/dest.example/docs/copied.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("x-amz-copy-source", "/source.example/docs/hello.txt")],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(copy_overwrite.status(), StatusCode::OK);
+            let overwrite_version_id = copy_overwrite
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok())
+                .context("copy overwrite missing x-amz-version-id")?
+                .to_string();
+            let copy_overwrite_xml = copy_overwrite.text().await?;
+            assert!(copy_overwrite_xml.contains("<CopyObjectResult"));
+            assert!(!overwrite_version_id.is_empty());
+
+            let get_copied = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/dest.example/docs/copied.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_copied.status(), StatusCode::OK);
+            assert_eq!(
+                get_copied
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/plain")
+            );
+            assert_eq!(
+                get_copied
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=60")
+            );
+            assert_eq!(
+                get_copied
+                    .headers()
+                    .get("x-amz-meta-color")
+                    .and_then(|value| value.to_str().ok()),
+                Some("blue")
+            );
+            assert_eq!(
+                get_copied.bytes().await?.as_ref(),
+                source_payload.as_slice()
+            );
+
+            let copy_replace = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/dest.example/docs/replaced.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[
+                    ("x-amz-copy-source", "/source.example/docs/hello.txt"),
+                    ("x-amz-metadata-directive", "REPLACE"),
+                    ("content-type", "text/markdown"),
+                    ("x-amz-meta-color", "green"),
+                ],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(copy_replace.status(), StatusCode::OK);
+
+            let get_replaced = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/dest.example/docs/replaced.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_replaced.status(), StatusCode::OK);
+            assert_eq!(
+                get_replaced
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/markdown")
+            );
+            assert_eq!(
+                get_replaced
+                    .headers()
+                    .get("x-amz-meta-color")
+                    .and_then(|value| value.to_str().ok()),
+                Some("green")
+            );
+            assert!(
+                get_replaced
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .is_none(),
+                "metadata replacement should drop omitted cache-control headers"
+            );
+            assert_eq!(
+                get_replaced.bytes().await?.as_ref(),
+                source_payload.as_slice()
+            );
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_serves_delete_objects_batches() -> Result<()> {
+        let public_bind = "127.0.0.1:19472";
+        let s3_bind = "127.0.0.1:19473";
+        let data_dir = fresh_data_dir("s3-listener-delete-objects-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-delete-objects-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "batch.example",
+                    "root_prefix": "tenant/batch",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-delete-objects",
+                    "bucket_scope": ["batch.example"],
+                    "prefix_scope": ["tenant/batch/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let put_v1 = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/batch.example/docs/versioned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"version one".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_v1.status(), StatusCode::OK);
+            let v1_version_id = put_v1
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok())
+                .context("delete-objects fixture missing v1 version id")?
+                .to_string();
+
+            let put_v2 = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/batch.example/docs/versioned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"version two".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_v2.status(), StatusCode::OK);
+
+            let put_current = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/batch.example/docs/current.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"current payload".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_current.status(), StatusCode::OK);
+
+            let delete_body = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Object><Key>docs/versioned.txt</Key><VersionId>{v1_version_id}</VersionId></Object>
+  <Object><Key>docs/current.txt</Key></Object>
+  <Object><Key>docs/missing.txt</Key></Object>
+  <Object><Key>docs/versioned.txt</Key><VersionId>missing-version</VersionId></Object>
+</Delete>"#
+            );
+            let delete_objects = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::POST,
+                "/batch.example?delete=",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "application/xml")],
+                delete_body.into_bytes(),
+            )
+            .await?;
+            assert_eq!(delete_objects.status(), StatusCode::OK);
+            let delete_objects_xml = delete_objects.text().await?;
+            assert!(delete_objects_xml.contains(&format!(
+                "<Deleted><Key>docs/versioned.txt</Key><VersionId>{v1_version_id}</VersionId>"
+            )));
+            assert!(delete_objects_xml.contains(
+                "<Deleted><Key>docs/current.txt</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>"
+            ));
+            assert!(delete_objects_xml.contains("<Deleted><Key>docs/missing.txt</Key>"));
+            assert!(delete_objects_xml.contains(
+                "<Error><Key>docs/versioned.txt</Key><VersionId>missing-version</VersionId><Code>NoSuchVersion</Code>"
+            ));
+
+            let get_deleted_current = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/batch.example/docs/current.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                get_deleted_current
+                    .headers()
+                    .get("x-amz-delete-marker")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+
+            let get_deleted_old_version = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                &format!("/batch.example/docs/versioned.txt?versionId={v1_version_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_deleted_old_version.status(), StatusCode::NOT_FOUND);
+
+            let quiet_delete = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::POST,
+                "/batch.example?delete=",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "application/xml")],
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Quiet>true</Quiet>
+  <Object><Key>docs/versioned.txt</Key></Object>
+</Delete>"#
+                    .to_vec(),
+            )
+            .await?;
+            assert_eq!(quiet_delete.status(), StatusCode::OK);
+            let quiet_delete_xml = quiet_delete.text().await?;
+            assert!(!quiet_delete_xml.contains("<Deleted>"));
+            assert!(!quiet_delete_xml.contains("<Error>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
 }
