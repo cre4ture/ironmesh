@@ -1490,8 +1490,29 @@ function ProcessTemperatureChart({
       (value): value is number => value !== null && Number.isFinite(value)
     )
   );
+
+  if (yValues.length === 0) {
+    return (
+      <Stack gap={6}>
+        <Group justify="space-between" wrap="nowrap">
+          <Text size="sm" fw={600}>
+            Temperature
+          </Text>
+          <Group gap="xs">
+            <Badge variant="light" color="orange">
+              Hottest sensor
+            </Badge>
+            <Badge variant="light" color="green">
+              Average
+            </Badge>
+          </Group>
+        </Group>
+        <Text c="dimmed">No temperature samples collected yet.</Text>
+      </Stack>
+    );
+  }
+
   const yMax = Math.max(1, ...yValues);
-  const hasTemperatureReadings = yValues.length > 0;
 
   return (
     <Stack gap={6}>
@@ -1588,11 +1609,6 @@ function ProcessTemperatureChart({
           </LineChart>
         )}
       />
-      {!hasTemperatureReadings ? (
-        <Text size="xs" c="dimmed">
-          No reporting temperature sensors were available in this sample window.
-        </Text>
-      ) : null}
     </Stack>
   );
 }

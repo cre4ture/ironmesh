@@ -167,6 +167,8 @@ const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thum
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
+const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
+    "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
@@ -1957,6 +1959,52 @@ impl ProcessStatsRuntime {
         let keep = limit.max(1);
         let skip = self.history.len().saturating_sub(keep);
         self.history.iter().skip(skip).cloned().collect()
+    }
+}
+
+fn seed_process_temperature_stats_for_tests(state: &ServerState) {
+    if !env_flag_is_truthy(TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV) {
+        return;
+    }
+
+    let temperature_components = vec![TemperatureComponentStat {
+        label: "Seeded runtime sensor".to_string(),
+        temperature_celsius: Some(42.5),
+        max_celsius: Some(85.0),
+        critical_celsius: Some(100.0),
+    }];
+    let temperature_summary = summarize_temperature_components(&temperature_components);
+    let logical_cpu_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let sample = ProcessStatsSample {
+        collected_at_unix: unix_ts(),
+        main_cpu_percent: 0.0,
+        main_memory_bytes: 0,
+        main_disk_read_bytes_per_sec: 0,
+        main_disk_write_bytes_per_sec: 0,
+        children_cpu_percent: 0.0,
+        children_memory_bytes: 0,
+        children_disk_read_bytes_per_sec: 0,
+        children_disk_write_bytes_per_sec: 0,
+        children_count: 0,
+        temperature_component_count: temperature_summary.component_count,
+        temperature_reporting_component_count: temperature_summary.reporting_component_count,
+        hottest_temperature_celsius: temperature_summary.hottest_temperature_celsius,
+        average_temperature_celsius: temperature_summary.average_temperature_celsius,
+    };
+
+    let mut runtime = match state.process_stats_runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if runtime.history.is_empty() {
+        runtime.push(
+            sample,
+            Vec::new(),
+            temperature_components,
+            logical_cpu_count,
+        );
     }
 }
 
@@ -5633,6 +5681,7 @@ async fn run_inner(
         runtime_log_control,
         process_stats_runtime: Arc::new(StdMutex::new(ProcessStatsRuntime::default())),
     };
+    seed_process_temperature_stats_for_tests(&state);
 
     let internal_peer_url = config
         .internal_tls
