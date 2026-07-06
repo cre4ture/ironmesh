@@ -82,11 +82,7 @@ mod tests {
         let host = s3_base_url
             .trim_end_matches('/')
             .strip_prefix("http://")
-            .or_else(|| {
-                s3_base_url
-                    .trim_end_matches('/')
-                    .strip_prefix("https://")
-            })
+            .or_else(|| s3_base_url.trim_end_matches('/').strip_prefix("https://"))
             .context("S3 base URL must start with http:// or https://")?;
         let url = format!("{}{path_and_query}", s3_base_url.trim_end_matches('/'));
         let parsed_url = reqwest::Url::parse(&url)
@@ -161,8 +157,9 @@ mod tests {
                 Ok(response) => {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    last_error =
-                        Some(format!("unexpected status {status} while waiting for listener: {body}"));
+                    last_error = Some(format!(
+                        "unexpected status {status} while waiting for listener: {body}"
+                    ));
                 }
                 Err(err) => last_error = Some(err.to_string()),
             }
@@ -413,9 +410,10 @@ mod tests {
             assert_eq!(list_objects.status(), StatusCode::OK);
             let list_objects_xml = list_objects.text().await?;
             assert!(list_objects_xml.contains("<Key>docs/hello.txt</Key>"));
-            assert!(list_objects_xml.contains(
-                "<CommonPrefixes><Prefix>docs/nested/</Prefix></CommonPrefixes>"
-            ));
+            assert!(
+                list_objects_xml
+                    .contains("<CommonPrefixes><Prefix>docs/nested/</Prefix></CommonPrefixes>")
+            );
 
             let delete_object = send_signed_s3_request(
                 &http,
@@ -692,7 +690,9 @@ mod tests {
                 &http,
                 &s3_base,
                 Method::PUT,
-                &format!("/media.example/archive/abort.bin?partNumber=1&uploadId={abort_upload_id}"),
+                &format!(
+                    "/media.example/archive/abort.bin?partNumber=1&uploadId={abort_upload_id}"
+                ),
                 &access_key_id,
                 &secret_access_key,
                 &[],
@@ -728,6 +728,239 @@ mod tests {
             assert_eq!(list_aborted_parts.status(), StatusCode::NOT_FOUND);
             let list_aborted_parts_xml = list_aborted_parts.text().await?;
             assert!(list_aborted_parts_xml.contains("<Code>NoSuchUpload</Code>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_serves_versioning_and_delete_markers() -> Result<()> {
+        let public_bind = "127.0.0.1:19464";
+        let s3_bind = "127.0.0.1:19465";
+        let data_dir = fresh_data_dir("s3-listener-versioning-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-versioning-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "versions.example",
+                    "root_prefix": "tenant/versions",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-versioning",
+                    "bucket_scope": ["versions.example"],
+                    "prefix_scope": ["tenant/versions/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let get_versioning = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/versions.example?versioning=",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_versioning.status(), StatusCode::OK);
+            let get_versioning_xml = get_versioning.text().await?;
+            assert!(get_versioning_xml.contains("<Status>Enabled</Status>"));
+
+            let put_v1 = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/versions.example/docs/versioned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"version one".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_v1.status(), StatusCode::OK);
+            let v1_version_id = put_v1
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok())
+                .context("versioned PUT v1 missing x-amz-version-id")?
+                .to_string();
+
+            let put_v2 = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::PUT,
+                "/versions.example/docs/versioned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"version two".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_v2.status(), StatusCode::OK);
+            let v2_version_id = put_v2
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok())
+                .context("versioned PUT v2 missing x-amz-version-id")?
+                .to_string();
+
+            let delete_current = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::DELETE,
+                "/versions.example/docs/versioned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(delete_current.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                delete_current
+                    .headers()
+                    .get("x-amz-delete-marker")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+            let delete_marker_version_id = delete_current
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok())
+                .context("delete marker response missing x-amz-version-id")?
+                .to_string();
+
+            let get_deleted_current = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/versions.example/docs/versioned.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                get_deleted_current
+                    .headers()
+                    .get("x-amz-delete-marker")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+
+            let get_v1 = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                &format!("/versions.example/docs/versioned.txt?versionId={v1_version_id}"),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_v1.status(), StatusCode::OK);
+            assert_eq!(get_v1.bytes().await?.as_ref(), b"version one");
+
+            let get_delete_marker_version = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                &format!(
+                    "/versions.example/docs/versioned.txt?versionId={delete_marker_version_id}"
+                ),
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(
+                get_delete_marker_version.status(),
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+            assert_eq!(
+                get_delete_marker_version
+                    .headers()
+                    .get("x-amz-delete-marker")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+
+            let list_versions = send_signed_s3_request(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/versions.example?versions=&prefix=docs/",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(list_versions.status(), StatusCode::OK);
+            let list_versions_xml = list_versions.text().await?;
+            assert!(list_versions_xml.contains("<DeleteMarker>"));
+            assert!(list_versions_xml.contains(&delete_marker_version_id));
+            assert!(list_versions_xml.contains(&v2_version_id));
+            assert!(list_versions_xml.contains(&v1_version_id));
 
             Ok(())
         }

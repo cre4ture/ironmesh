@@ -162,6 +162,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Recent S3 milestone notes
 
+- 2026-07-06: dedicated-listener runtime coverage now includes versioned-object and delete-marker behavior over real HTTP.
+  The `system-tests` S3 suite now validates enabled-bucket version headers, current-object deletes that produce delete markers, historical reads by `versionId`, and `?versions=` listings against a spawned `server-node` S3 listener.
 - 2026-07-06: dedicated-listener runtime coverage now includes multipart upload flows over real HTTP.
   The `system-tests` S3 suite now drives `CreateMultipartUpload`, `UploadPart`, paged `ListParts`, `CompleteMultipartUpload`, final-object reads, and abort handling against a spawned `server-node` process with `IRONMESH_S3_BIND` enabled.
 - 2026-07-06: `system-tests` now covers a real dedicated S3 listener socket end to end.
