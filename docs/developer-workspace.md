@@ -162,6 +162,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Recent S3 milestone notes
 
+- 2026-07-06: `system-tests` now covers a real dedicated S3 listener socket end to end.
+  The harness reserves `IRONMESH_S3_BIND` ports alongside the public and internal listener ports, and the new runtime test provisions S3 control-plane state through the admin API before exercising SigV4 list, `PUT`, `HEAD`, `GET`, prefix listing, and `DELETE` flows against the bound S3 listener on a spawned `server-node` process.
 - 2026-07-06: relay-backed `serve-s3` gateway coverage now exercises both direct and rendezvous/relay forwarding paths, including streamed `GET` bodies and streamed request-body `PUT` forwarding through the `/s3/*` transport contract.
 - 2026-07-06: bootstrap bundles no longer collapse client direct endpoints to the local node when client auth is enabled.
   Client-credential replication is now treated as part of the working multi-node access model, and bootstrap responses can advertise cluster-wide direct endpoints again.
