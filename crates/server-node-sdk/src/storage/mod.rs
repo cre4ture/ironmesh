@@ -2115,7 +2115,9 @@ impl PersistentStore {
         ClusterNodesPersister::new(self.metadata_store.clone())
     }
 
-    pub(crate) async fn replication_subject_inspector(&self) -> Result<ReplicationSubjectInspector> {
+    pub(crate) async fn replication_subject_inspector(
+        &self,
+    ) -> Result<ReplicationSubjectInspector> {
         Ok(ReplicationSubjectInspector::new(
             self.metadata_store.load_current_state().await?,
             self.manifests_dir.clone(),
@@ -2383,7 +2385,8 @@ impl PersistentStore {
             record.manifest_hash = manifest_hash.clone();
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             return Ok(manifest_hash);
         }
 
@@ -2820,7 +2823,8 @@ impl PersistentStore {
             if create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
@@ -2909,7 +2913,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -2961,7 +2966,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -3984,7 +3990,8 @@ impl PersistentStore {
 
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
@@ -4088,7 +4095,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -4413,7 +4421,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             self.apply_selected_replica_tombstone_current_state(key, bundle)
                 .await?;
@@ -4461,7 +4470,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -5158,7 +5168,8 @@ impl PersistentStore {
             if options.create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index).await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
             let changed_paths = if self.current_state_binding(key).await? != before_binding {
                 touched_paths
             } else {
@@ -5213,7 +5224,8 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)
+            .await?;
         let changed_paths = if self.current_state_binding(key).await? != before_binding {
             touched_paths
         } else {
@@ -6273,7 +6285,9 @@ impl PersistentStore {
     }
 
     async fn upsert_current_object(&self, key: &str, entry: CurrentObjectEntry) -> Result<()> {
-        self.metadata_store.upsert_current_object(key, &entry).await?;
+        self.metadata_store
+            .upsert_current_object(key, &entry)
+            .await?;
         self.current_objects_cache
             .lock()
             .unwrap()
@@ -6431,9 +6445,7 @@ impl PersistentStore {
         create_snapshot: bool,
         overwrite: bool,
     ) -> Result<PathMutationResult> {
-        if source_path != target_path
-            && self.current_object_entry(target_path).await?.is_some()
-        {
+        if source_path != target_path && self.current_object_entry(target_path).await?.is_some() {
             if !overwrite {
                 return Ok(PathMutationResult::TargetExists);
             }
@@ -6920,8 +6932,7 @@ impl PersistentStore {
             if index.versions.is_empty() {
                 self.delete_version_index_by_object_id(&index.object_id)
                     .await?;
-                if self.object_id_for_key(key).await?.as_deref() == Some(index.object_id.as_str())
-                {
+                if self.object_id_for_key(key).await?.as_deref() == Some(index.object_id.as_str()) {
                     self.remove_current_object(key).await?;
                 }
                 continue;
@@ -7167,7 +7178,13 @@ impl PersistentStore {
     async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
         let mut referenced = HashSet::<String>::new();
 
-        for manifest_hash in self.metadata_store.load_current_state().await?.objects.values() {
+        for manifest_hash in self
+            .metadata_store
+            .load_current_state()
+            .await?
+            .objects
+            .values()
+        {
             referenced.insert(manifest_hash.clone());
         }
 

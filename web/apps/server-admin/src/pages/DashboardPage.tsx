@@ -15,6 +15,7 @@ import {
   type StorageStatsSample,
   type ProcessStatsSample,
   type ChildProcessStat,
+  type TemperatureComponentStat,
   type MemoryAttributionSample
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
@@ -74,8 +75,10 @@ const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
 const EMPTY_STORAGE_HISTORY: StorageStatsSample[] = [];
 const EMPTY_PROCESS_HISTORY: ProcessStatsSample[] = [];
 const EMPTY_PROCESS_CHILDREN: ChildProcessStat[] = [];
+const EMPTY_TEMPERATURE_COMPONENTS: TemperatureComponentStat[] = [];
 
 const PROCESS_CHART_COLORS = { main: "#38bdf8", children: "#f59e0b" };
+const PROCESS_TEMPERATURE_CHART_COLORS = { hottest: "#f97316", average: "#22c55e" };
 
 type StorageStatsChartMetricKey =
   | "chunkStoreBytes"
@@ -299,6 +302,14 @@ export function DashboardPage() {
     STORAGE_HISTORY_RANGE_OPTIONS[0];
   const latestProcessSample = processStatsCurrent?.sample ?? null;
   const processChildren = processStatsCurrent?.children ?? EMPTY_PROCESS_CHILDREN;
+  const temperatureComponents =
+    processStatsCurrent?.temperature_components ?? EMPTY_TEMPERATURE_COMPONENTS;
+  const hottestTemperatureComponent =
+    temperatureComponents.find((component) => component.temperature_celsius !== null && component.temperature_celsius !== undefined) ??
+    null;
+  const reportingTemperatureComponentCount = temperatureComponents.filter(
+    (component) => component.temperature_celsius !== null && component.temperature_celsius !== undefined
+  ).length;
 
   return (
     <Stack gap="lg">
@@ -649,8 +660,9 @@ export function DashboardPage() {
                 <Stack gap={4}>
                   <Text fw={700}>Process resource usage</Text>
                   <Text size="sm" c="dimmed" maw={760}>
-                    CPU, memory, and disk I/O for the ironmesh server process, sampled every few seconds. Child
-                    processes (e.g. ffmpeg during video thumbnail generation) are tracked separately.
+                    CPU, memory, disk I/O, and temperature sensors for the ironmesh server host,
+                    sampled every few seconds. Child processes (e.g. ffmpeg during video thumbnail
+                    generation) are tracked separately.
                   </Text>
                 </Stack>
                 <Badge variant="light">
@@ -752,6 +764,57 @@ export function DashboardPage() {
                     }
                   />
                 </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Peak Temperature"
+                    value={
+                      latestProcessSample
+                        ? formatTemperature(latestProcessSample.hottest_temperature_celsius)
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      hottestTemperatureComponent
+                        ? `${hottestTemperatureComponent.label}`
+                        : latestProcessSample
+                          ? "No reporting sensors"
+                          : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Average Temperature"
+                    value={
+                      latestProcessSample
+                        ? formatTemperature(latestProcessSample.average_temperature_celsius)
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      latestProcessSample
+                        ? `${latestProcessSample.temperature_reporting_component_count ?? reportingTemperatureComponentCount} reporting sensor${(latestProcessSample.temperature_reporting_component_count ?? reportingTemperatureComponentCount) === 1 ? "" : "s"}`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Temperature Sensors"
+                    value={
+                      latestProcessSample
+                        ? (latestProcessSample.temperature_component_count ?? temperatureComponents.length) > 0
+                          ? `${latestProcessSample.temperature_reporting_component_count ?? reportingTemperatureComponentCount} / ${latestProcessSample.temperature_component_count ?? temperatureComponents.length}`
+                          : "not available"
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint="Reporting / discovered"
+                  />
+                </Grid.Col>
               </Grid>
               <ProcessStatsCharts samples={processStatsHistory} />
               <Stack gap={6}>
@@ -780,6 +843,35 @@ export function DashboardPage() {
                             <Table.Td>{formatBytes(child.memory_bytes)}</Table.Td>
                             <Table.Td>{formatBytes(child.disk_read_bytes_per_sec)}/s</Table.Td>
                             <Table.Td>{formatBytes(child.disk_write_bytes_per_sec)}/s</Table.Td>
+                          </Table.Tr>
+                        ))}
+                      </Table.Tbody>
+                    </Table>
+                  </ScrollArea>
+                )}
+              </Stack>
+              <Stack gap={6}>
+                <Text size="sm" fw={600}>Temperature sensors</Text>
+                {temperatureComponents.length === 0 ? (
+                  <Text size="sm" c="dimmed">No temperature sensors currently reporting.</Text>
+                ) : (
+                  <ScrollArea type="auto">
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>Sensor</Table.Th>
+                          <Table.Th>Current</Table.Th>
+                          <Table.Th>Max</Table.Th>
+                          <Table.Th>Critical</Table.Th>
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {temperatureComponents.map((component, index) => (
+                          <Table.Tr key={`${component.label}-${index}`}>
+                            <Table.Td>{component.label}</Table.Td>
+                            <Table.Td>{formatOptionalTemperature(component.temperature_celsius)}</Table.Td>
+                            <Table.Td>{formatOptionalTemperature(component.max_celsius)}</Table.Td>
+                            <Table.Td>{formatOptionalTemperature(component.critical_celsius)}</Table.Td>
                           </Table.Tr>
                         ))}
                       </Table.Tbody>
@@ -1058,6 +1150,20 @@ function firstErrorMessage(errors: Array<unknown>): string | null {
   return null;
 }
 
+function formatTemperature(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "not available";
+  }
+  return `${value.toFixed(1)} C`;
+}
+
+function formatOptionalTemperature(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "unknown";
+  }
+  return `${value.toFixed(1)} C`;
+}
+
 function formatRepairActivityState(state: string): string {
   switch (state) {
     case "running":
@@ -1166,6 +1272,13 @@ type ProcessChartPoint = {
   collectedAtUnix: number;
 } & Record<ProcessChartMetricKey, number>;
 
+type TemperatureChartPoint = {
+  collectedAtMs: number;
+  collectedAtUnix: number;
+  hottestTemperatureCelsius: number | null;
+  averageTemperatureCelsius: number | null;
+};
+
 function ProcessStatsCharts({ samples }: { samples: ProcessStatsSample[] }) {
   const chartPoints: ProcessChartPoint[] = useMemo(
     () =>
@@ -1180,6 +1293,16 @@ function ProcessStatsCharts({ samples }: { samples: ProcessStatsSample[] }) {
         childrenDiskReadBytesPerSec: sample.children_disk_read_bytes_per_sec,
         mainDiskWriteBytesPerSec: sample.main_disk_write_bytes_per_sec,
         childrenDiskWriteBytesPerSec: sample.children_disk_write_bytes_per_sec
+      })),
+    [samples]
+  );
+  const temperatureChartPoints: TemperatureChartPoint[] = useMemo(
+    () =>
+      samples.map((sample) => ({
+        collectedAtMs: sample.collected_at_unix * 1000,
+        collectedAtUnix: sample.collected_at_unix,
+        hottestTemperatureCelsius: sample.hottest_temperature_celsius ?? null,
+        averageTemperatureCelsius: sample.average_temperature_celsius ?? null
       })),
     [samples]
   );
@@ -1233,6 +1356,9 @@ function ProcessStatsCharts({ samples }: { samples: ProcessStatsSample[] }) {
           yTickFormatter={(value) => `${formatBytes(value)}/s`}
           tooltipFormatter={(value) => `${formatBytes(value)}/s`}
         />
+      </Grid.Col>
+      <Grid.Col span={{ base: 12, md: 6 }}>
+        <ProcessTemperatureChart points={temperatureChartPoints} />
       </Grid.Col>
     </Grid>
   );
@@ -1344,6 +1470,139 @@ function ProcessMetricChart({
               strokeWidth={2}
               dot={points.length === 1 ? { r: 3, strokeWidth: 2 } : false}
               activeDot={{ r: 4, strokeWidth: 0 }}
+              isAnimationActive={false}
+            />
+            {brush}
+          </LineChart>
+        )}
+      />
+    </Stack>
+  );
+}
+
+function ProcessTemperatureChart({
+  points
+}: {
+  points: TemperatureChartPoint[];
+}) {
+  const yValues = points.flatMap((point) =>
+    [point.hottestTemperatureCelsius, point.averageTemperatureCelsius].filter(
+      (value): value is number => value !== null && Number.isFinite(value)
+    )
+  );
+
+  if (yValues.length === 0) {
+    return (
+      <Stack gap={6}>
+        <Group justify="space-between" wrap="nowrap">
+          <Text size="sm" fw={600}>
+            Temperature
+          </Text>
+          <Group gap="xs">
+            <Badge variant="light" color="orange">
+              Hottest sensor
+            </Badge>
+            <Badge variant="light" color="green">
+              Average
+            </Badge>
+          </Group>
+        </Group>
+        <Text c="dimmed">No temperature samples collected yet.</Text>
+      </Stack>
+    );
+  }
+
+  const yMax = Math.max(1, ...yValues);
+
+  return (
+    <Stack gap={6}>
+      <Group justify="space-between" wrap="nowrap">
+        <Text size="sm" fw={600}>
+          Temperature
+        </Text>
+        <Group gap="xs">
+          <Badge variant="light" color="orange">
+            Hottest sensor
+          </Badge>
+          <Badge variant="light" color="green">
+            Average
+          </Badge>
+        </Group>
+      </Group>
+      <ZoomableTimeSeriesChart
+        points={points}
+        height="12rem"
+        emptyState={<Text c="dimmed">No samples collected yet.</Text>}
+        zoomInAriaLabel="Zoom in on temperature chart"
+        zoomOutAriaLabel="Zoom out of temperature chart"
+        resetZoomAriaLabel="Reset temperature chart zoom"
+        renderChart={({ xDomain, visibleTimeSpanSeconds, brush }) => (
+          <LineChart
+            data={points}
+            margin={{ top: 4, right: 12, bottom: 12, left: 4 }}
+            accessibilityLayer
+            role="img"
+            title="Temperature"
+            desc="Hottest and average host temperature sensor readings over time."
+            {...({ "aria-label": "Temperature chart" } as { "aria-label": string })}
+          >
+            <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" vertical={false} />
+            <XAxis
+              dataKey="collectedAtMs"
+              type="number"
+              scale="time"
+              domain={xDomain}
+              allowDataOverflow
+              tickFormatter={(value) =>
+                formatTimeSeriesChartTimestamp(Math.floor(Number(value) / 1000), visibleTimeSpanSeconds)
+              }
+              tick={{ fill: "#cbd5e1", fontSize: "0.68rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              minTickGap={24}
+            />
+            <YAxis
+              width={64}
+              domain={[0, yMax]}
+              tickFormatter={(value) => `${value.toFixed(0)} C`}
+              tick={{ fill: "#cbd5e1", fontSize: "0.68rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              label={{
+                value: "Temp",
+                angle: -90,
+                position: "insideLeft",
+                fill: "#e2e8f0",
+                fontSize: "0.7rem",
+                fontWeight: 600
+              }}
+            />
+            <Tooltip
+              formatter={(value, name) => [formatTemperature(Number(value)), name]}
+              labelFormatter={(value) => formatUnixTs(Math.floor(Number(value) / 1000))}
+              cursor={{ stroke: "#94a3b8", strokeDasharray: "4 4" }}
+              isAnimationActive={false}
+            />
+            <Line
+              type="linear"
+              dataKey="hottestTemperatureCelsius"
+              name="Hottest sensor"
+              stroke={PROCESS_TEMPERATURE_CHART_COLORS.hottest}
+              strokeWidth={2}
+              dot={points.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+              activeDot={{ r: 4, strokeWidth: 0 }}
+              connectNulls={false}
+              isAnimationActive={false}
+            />
+            <Line
+              type="linear"
+              dataKey="averageTemperatureCelsius"
+              name="Average"
+              stroke={PROCESS_TEMPERATURE_CHART_COLORS.average}
+              strokeWidth={2}
+              dot={points.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+              activeDot={{ r: 4, strokeWidth: 0 }}
+              connectNulls={false}
               isAnimationActive={false}
             />
             {brush}

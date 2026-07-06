@@ -167,6 +167,8 @@ const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thum
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
+const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
+    "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
@@ -190,14 +192,13 @@ use storage::{
     ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
     DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
     DataChangeUploadMode, DataScrubReport, HostDependencyReport, HostDependencyStatus,
-    MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
-    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
-    UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
+    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
+    MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
+    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
+    ReplicationExportBundle, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
     metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
 };
 
@@ -1904,6 +1905,14 @@ struct ChildProcessStat {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct TemperatureComponentStat {
+    label: String,
+    temperature_celsius: Option<f32>,
+    max_celsius: Option<f32>,
+    critical_celsius: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ProcessStatsSample {
     collected_at_unix: u64,
     main_cpu_percent: f32,
@@ -1915,22 +1924,34 @@ struct ProcessStatsSample {
     children_disk_read_bytes_per_sec: u64,
     children_disk_write_bytes_per_sec: u64,
     children_count: u32,
+    temperature_component_count: u32,
+    temperature_reporting_component_count: u32,
+    hottest_temperature_celsius: Option<f32>,
+    average_temperature_celsius: Option<f32>,
 }
 
 #[derive(Default)]
 struct ProcessStatsRuntime {
     history: VecDeque<ProcessStatsSample>,
     latest_children: Vec<ChildProcessStat>,
+    latest_temperature_components: Vec<TemperatureComponentStat>,
     logical_cpu_count: usize,
 }
 
 impl ProcessStatsRuntime {
-    fn push(&mut self, sample: ProcessStatsSample, children: Vec<ChildProcessStat>, logical_cpu_count: usize) {
+    fn push(
+        &mut self,
+        sample: ProcessStatsSample,
+        children: Vec<ChildProcessStat>,
+        temperature_components: Vec<TemperatureComponentStat>,
+        logical_cpu_count: usize,
+    ) {
         self.history.push_back(sample);
         while self.history.len() > PROCESS_STATS_HISTORY_MAX_SAMPLES {
             self.history.pop_front();
         }
         self.latest_children = children;
+        self.latest_temperature_components = temperature_components;
         self.logical_cpu_count = logical_cpu_count;
     }
 
@@ -1939,6 +1960,134 @@ impl ProcessStatsRuntime {
         let skip = self.history.len().saturating_sub(keep);
         self.history.iter().skip(skip).cloned().collect()
     }
+}
+
+fn seed_process_temperature_stats_for_tests(state: &ServerState) {
+    if !env_flag_is_truthy(TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV) {
+        return;
+    }
+
+    let temperature_components = vec![TemperatureComponentStat {
+        label: "Seeded runtime sensor".to_string(),
+        temperature_celsius: Some(42.5),
+        max_celsius: Some(85.0),
+        critical_celsius: Some(100.0),
+    }];
+    let temperature_summary = summarize_temperature_components(&temperature_components);
+    let logical_cpu_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let sample = ProcessStatsSample {
+        collected_at_unix: unix_ts(),
+        main_cpu_percent: 0.0,
+        main_memory_bytes: 0,
+        main_disk_read_bytes_per_sec: 0,
+        main_disk_write_bytes_per_sec: 0,
+        children_cpu_percent: 0.0,
+        children_memory_bytes: 0,
+        children_disk_read_bytes_per_sec: 0,
+        children_disk_write_bytes_per_sec: 0,
+        children_count: 0,
+        temperature_component_count: temperature_summary.component_count,
+        temperature_reporting_component_count: temperature_summary.reporting_component_count,
+        hottest_temperature_celsius: temperature_summary.hottest_temperature_celsius,
+        average_temperature_celsius: temperature_summary.average_temperature_celsius,
+    };
+
+    let mut runtime = match state.process_stats_runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if runtime.history.is_empty() {
+        runtime.push(
+            sample,
+            Vec::new(),
+            temperature_components,
+            logical_cpu_count,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TemperatureSummary {
+    component_count: u32,
+    reporting_component_count: u32,
+    hottest_temperature_celsius: Option<f32>,
+    average_temperature_celsius: Option<f32>,
+}
+
+fn sanitize_temperature_reading(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| value.is_finite())
+}
+
+fn collect_temperature_components(
+    components: &sysinfo::Components,
+) -> Vec<TemperatureComponentStat> {
+    let mut stats = components
+        .iter()
+        .filter_map(|component: &sysinfo::Component| {
+            let temperature_celsius = sanitize_temperature_reading(component.temperature());
+            let max_celsius = sanitize_temperature_reading(component.max());
+            let critical_celsius = sanitize_temperature_reading(component.critical());
+            if temperature_celsius.is_none() && max_celsius.is_none() && critical_celsius.is_none()
+            {
+                return None;
+            }
+
+            let label = component.label().trim();
+            let label = if label.is_empty() {
+                component.id().unwrap_or("unnamed component")
+            } else {
+                label
+            };
+
+            Some(TemperatureComponentStat {
+                label: label.to_string(),
+                temperature_celsius,
+                max_celsius,
+                critical_celsius,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    stats.sort_by(|left, right| {
+        let left_temp = left.temperature_celsius.unwrap_or(f32::NEG_INFINITY);
+        let right_temp = right.temperature_celsius.unwrap_or(f32::NEG_INFINITY);
+        right_temp
+            .partial_cmp(&left_temp)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    stats
+}
+
+fn summarize_temperature_components(components: &[TemperatureComponentStat]) -> TemperatureSummary {
+    let mut summary = TemperatureSummary {
+        component_count: components.len() as u32,
+        ..TemperatureSummary::default()
+    };
+    let mut total_temperature = 0.0_f32;
+
+    for component in components {
+        let Some(temperature_celsius) = component.temperature_celsius else {
+            continue;
+        };
+        summary.reporting_component_count += 1;
+        total_temperature += temperature_celsius;
+        summary.hottest_temperature_celsius = Some(
+            summary
+                .hottest_temperature_celsius
+                .map(|current| current.max(temperature_celsius))
+                .unwrap_or(temperature_celsius),
+        );
+    }
+
+    if summary.reporting_component_count > 0 {
+        summary.average_temperature_celsius =
+            Some(total_temperature / summary.reporting_component_count as f32);
+    }
+
+    summary
 }
 
 /// Snapshot of the most recent `cleanup_unreferenced` (GC) pass, kept for dashboard
@@ -5532,6 +5681,7 @@ async fn run_inner(
         runtime_log_control,
         process_stats_runtime: Arc::new(StdMutex::new(ProcessStatsRuntime::default())),
     };
+    seed_process_temperature_stats_for_tests(&state);
 
     let internal_peer_url = config
         .internal_tls
@@ -6336,6 +6486,7 @@ fn spawn_storage_stats_refresher(state: ServerState) {
 fn spawn_process_stats_sampler(state: ServerState) {
     tokio::spawn(async move {
         let mut system = sysinfo::System::new();
+        let mut temperature_components = sysinfo::Components::new_with_refreshed_list();
         let main_pid = sysinfo::Pid::from_u32(std::process::id());
         let mut ticker =
             tokio::time::interval(Duration::from_secs(PROCESS_STATS_SAMPLE_INTERVAL_SECS));
@@ -6343,6 +6494,7 @@ fn spawn_process_stats_sampler(state: ServerState) {
         loop {
             ticker.tick().await;
             system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            temperature_components.refresh(true);
 
             let main_process = system.process(main_pid);
             let main_cpu_percent = main_process.map(|p| p.cpu_usage()).unwrap_or(0.0);
@@ -6374,13 +6526,17 @@ fn spawn_process_stats_sampler(state: ServerState) {
 
             let children_cpu_percent = children.iter().map(|child| child.cpu_percent).sum();
             let children_memory_bytes = children.iter().map(|child| child.memory_bytes).sum();
-            let children_disk_read_bytes_per_sec =
-                children.iter().map(|child| child.disk_read_bytes_per_sec).sum();
+            let children_disk_read_bytes_per_sec = children
+                .iter()
+                .map(|child| child.disk_read_bytes_per_sec)
+                .sum();
             let children_disk_write_bytes_per_sec = children
                 .iter()
                 .map(|child| child.disk_write_bytes_per_sec)
                 .sum();
             let children_count = children.len() as u32;
+            let temperature_components = collect_temperature_components(&temperature_components);
+            let temperature_summary = summarize_temperature_components(&temperature_components);
 
             let sample = ProcessStatsSample {
                 collected_at_unix: unix_ts(),
@@ -6395,6 +6551,11 @@ fn spawn_process_stats_sampler(state: ServerState) {
                 children_disk_read_bytes_per_sec,
                 children_disk_write_bytes_per_sec,
                 children_count,
+                temperature_component_count: temperature_summary.component_count,
+                temperature_reporting_component_count: temperature_summary
+                    .reporting_component_count,
+                hottest_temperature_celsius: temperature_summary.hottest_temperature_celsius,
+                average_temperature_celsius: temperature_summary.average_temperature_celsius,
             };
 
             let logical_cpu_count = system.cpus().len();
@@ -6402,7 +6563,7 @@ fn spawn_process_stats_sampler(state: ServerState) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            runtime.push(sample, children, logical_cpu_count);
+            runtime.push(sample, children, temperature_components, logical_cpu_count);
         }
     });
 }
@@ -18653,6 +18814,7 @@ async fn storage_stats_history(
 struct ProcessStatsCurrentResponse {
     sample: Option<ProcessStatsSample>,
     children: Vec<ChildProcessStat>,
+    temperature_components: Vec<TemperatureComponentStat>,
     logical_cpu_count: usize,
 }
 
@@ -18680,6 +18842,7 @@ async fn process_stats_current(
     let response = ProcessStatsCurrentResponse {
         sample: runtime.history.back().cloned(),
         children: runtime.latest_children.clone(),
+        temperature_components: runtime.latest_temperature_components.clone(),
         logical_cpu_count: runtime.logical_cpu_count,
     };
 

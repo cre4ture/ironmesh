@@ -3275,21 +3275,28 @@ pub mod runtime {
                 "least-recently-hydrated clean file with no open handle should be evicted"
             );
             assert_eq!(
-                fs.nodes.get(&a).and_then(|node| node.placeholder_version.clone()),
+                fs.nodes
+                    .get(&a)
+                    .and_then(|node| node.placeholder_version.clone()),
                 Some("v-a.bin".to_string()),
                 "evicted file should become a valid placeholder again"
             );
             assert!(
-                fs.nodes.get(&b).is_some_and(|node| node.data.len() == FILE_BYTES),
+                fs.nodes
+                    .get(&b)
+                    .is_some_and(|node| node.data.len() == FILE_BYTES),
                 "file with an open handle must not be evicted"
             );
             assert!(
-                fs.nodes.get(&c).is_some_and(|node| node.data.len() == FILE_BYTES),
+                fs.nodes
+                    .get(&c)
+                    .is_some_and(|node| node.data.len() == FILE_BYTES),
                 "just-hydrated file should be resident"
             );
 
             // Evicted-then-reopened files must still hydrate correctly.
-            fs.hydrate_if_needed(a).expect("re-hydrate a after eviction");
+            fs.hydrate_if_needed(a)
+                .expect("re-hydrate a after eviction");
             assert_eq!(
                 fs.nodes.get(&a).map(|node| node.data.len()),
                 Some(FILE_BYTES)
