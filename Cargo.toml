@@ -23,6 +23,7 @@ members = [
     "apps/android-server-node-app",
     "apps/ios-app",
     "apps/os-integration",
+    "apps/tiny-display-status",
 ]
 exclude = ["tests/system-tests"]
 resolver = "2"
