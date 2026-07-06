@@ -162,8 +162,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Recent S3 milestone notes
 
-- 2026-07-06: gateway compatibility coverage now includes the official AWS Rust SDK over both direct and relay-backed `serve-s3` paths.
-  The `system-tests` S3 suite now drives `ListBuckets`, `PutObject`, `HeadObject`, `GetObject`, `ListObjectsV2`, and `DeleteObject` through spawned `cli-client serve-s3` gateways in both direct and forced-relay modes, and that smoke path fixed two wire-compatibility issues in the frontend itself: malformed S3 XML namespace attributes and missing bucket-root trailing-slash routing.
+- 2026-07-06: official AWS Rust SDK compatibility coverage now spans the native listener plus both direct and relay-backed `serve-s3` gateway paths.
+  The `system-tests` S3 suite now drives `ListBuckets`, `PutObject`, `HeadObject`, `GetObject`, `ListObjectsV2`, and `DeleteObject` against a spawned dedicated S3 listener and through spawned `cli-client serve-s3` gateways in both direct and forced-relay modes, and that smoke path fixed two wire-compatibility issues in the frontend itself: malformed S3 XML namespace attributes and missing bucket-root trailing-slash routing.
 - 2026-07-06: multi-node S3 control-plane replication is now covered as a writable cluster path, not just a read-only fanout.
   The `system-tests` S3 suite now proves an access key created on node A can be revoked through node B's admin API, that the revocation fans back to node A with the peer node recorded as the latest source, and that node A's dedicated S3 listener subsequently rejects the revoked key.
 - 2026-07-06: S3 runtime coverage now reaches beyond single-node listener behavior into real distributed and transport-backed paths.

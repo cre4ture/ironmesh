@@ -818,6 +818,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_s3_listener_supports_aws_sdk_client() -> Result<()> {
+        let public_bind = "127.0.0.1:19596";
+        let s3_bind = "127.0.0.1:19597";
+        let data_dir = fresh_data_dir("s3-listener-aws-sdk-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-aws-sdk-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::new();
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "sdk-listener.example",
+                    "root_prefix": "tenant/sdk-listener",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-listener-aws-sdk",
+                    "bucket_scope": ["sdk-listener.example"],
+                    "prefix_scope": ["tenant/sdk-listener/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            let sdk_payload = (0..((256 * 1024) + 137))
+                .map(|index| (index % 239) as u8)
+                .collect::<Vec<_>>();
+            exercise_aws_sdk_s3_crud(
+                &s3_base,
+                &access_key_id,
+                &secret_access_key,
+                "sdk-listener.example",
+                "sdk/native-listener.bin",
+                sdk_payload,
+            )
+            .await?;
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dedicated_s3_listener_serves_multipart_uploads() -> Result<()> {
         let public_bind = "127.0.0.1:19462";
         let s3_bind = "127.0.0.1:19463";
