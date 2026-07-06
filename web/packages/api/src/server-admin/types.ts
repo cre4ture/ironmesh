@@ -493,6 +493,13 @@ export type ChildProcessStat = {
   disk_write_bytes_per_sec: number;
 };
 
+export type TemperatureComponentStat = {
+  label: string;
+  temperature_celsius?: number | null;
+  max_celsius?: number | null;
+  critical_celsius?: number | null;
+};
+
 export type ProcessStatsSample = {
   collected_at_unix: number;
   main_cpu_percent: number;
@@ -504,11 +511,16 @@ export type ProcessStatsSample = {
   children_disk_read_bytes_per_sec: number;
   children_disk_write_bytes_per_sec: number;
   children_count: number;
+  temperature_component_count: number;
+  temperature_reporting_component_count: number;
+  hottest_temperature_celsius?: number | null;
+  average_temperature_celsius?: number | null;
 };
 
 export type ProcessStatsCurrentResponse = {
   sample?: ProcessStatsSample | null;
   children: ChildProcessStat[];
+  temperature_components: TemperatureComponentStat[];
   logical_cpu_count: number;
 };
 

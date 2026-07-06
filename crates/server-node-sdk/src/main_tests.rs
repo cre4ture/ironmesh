@@ -8584,13 +8584,114 @@ async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass()
     assert_eq!(sample["current_objects_total_count"], 1);
     assert_eq!(sample["in_flight_upload_session_count"], 1);
     assert_eq!(sample["in_flight_upload_bytes"], 4096);
-    assert!(sample["current_objects_cache"]["resident_entries"].as_u64().unwrap() >= 1);
-    assert!(sample["current_objects_cache"]["capacity"].as_u64().unwrap() > 0);
+    assert!(
+        sample["current_objects_cache"]["resident_entries"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        sample["current_objects_cache"]["capacity"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 
     let last_gc_pass = &sample["last_gc_pass"];
     assert_eq!(last_gc_pass["dry_run"], true);
     assert_eq!(last_gc_pass["retained_manifests_processed"], 1);
     assert!(last_gc_pass["peak_manifest_batch_size"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn process_stats_current_reports_temperature_snapshot() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut runtime = state
+            .process_stats_runtime
+            .lock()
+            .expect("process stats runtime lock should not be poisoned");
+        runtime.push(
+            super::ProcessStatsSample {
+                collected_at_unix: 1_720_000_000,
+                main_cpu_percent: 12.5,
+                main_memory_bytes: 512 * 1024 * 1024,
+                main_disk_read_bytes_per_sec: 4096,
+                main_disk_write_bytes_per_sec: 2048,
+                children_cpu_percent: 6.25,
+                children_memory_bytes: 128 * 1024 * 1024,
+                children_disk_read_bytes_per_sec: 1024,
+                children_disk_write_bytes_per_sec: 512,
+                children_count: 1,
+                temperature_component_count: 2,
+                temperature_reporting_component_count: 1,
+                hottest_temperature_celsius: Some(68.25),
+                average_temperature_celsius: Some(68.25),
+            },
+            vec![super::ChildProcessStat {
+                pid: 4242,
+                name: "ffmpeg".to_string(),
+                cpu_percent: 6.25,
+                memory_bytes: 128 * 1024 * 1024,
+                disk_read_bytes_per_sec: 1024,
+                disk_write_bytes_per_sec: 512,
+            }],
+            vec![
+                super::TemperatureComponentStat {
+                    label: "CPU package".to_string(),
+                    temperature_celsius: Some(68.25),
+                    max_celsius: Some(85.0),
+                    critical_celsius: Some(100.0),
+                },
+                super::TemperatureComponentStat {
+                    label: "NVMe".to_string(),
+                    temperature_celsius: None,
+                    max_celsius: Some(72.0),
+                    critical_celsius: Some(84.0),
+                },
+            ],
+            16,
+        );
+    }
+
+    let response = super::process_stats_current(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(payload["logical_cpu_count"], 16);
+    assert_eq!(payload["children"][0]["name"], "ffmpeg");
+    assert_eq!(payload["sample"]["temperature_component_count"], 2);
+    assert_eq!(
+        payload["sample"]["temperature_reporting_component_count"],
+        1
+    );
+    assert_eq!(
+        payload["sample"]["hottest_temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(payload["temperature_components"][0]["label"], "CPU package");
+    assert_eq!(
+        payload["temperature_components"][0]["temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(
+        payload["temperature_components"][1]["critical_celsius"]
+            .as_f64()
+            .unwrap(),
+        84.0
+    );
 }
 
 async fn data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl(

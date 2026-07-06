@@ -22,11 +22,17 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
+  await expect(page.getByText("Process resource usage", { exact: true })).toBeVisible();
+  await expect(page.getByText("Peak Temperature", { exact: true })).toBeVisible();
+  await expect(page.getByText("Temperature sensors", { exact: true })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Collected at (UTC)" })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Storage used (bytes)" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Zoom in on storage history chart" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Zoom out of storage history chart" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Reset storage history chart zoom" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom in on temperature chart" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom out of temperature chart" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reset temperature chart zoom" })).toBeVisible();
   await expect(page.getByRole("button", { name: "30d", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "All", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "0 B", exact: true })).toHaveCount(0);
