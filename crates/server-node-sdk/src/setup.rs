@@ -606,7 +606,11 @@ async fn start_new_cluster(
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(cluster_id);
     managed.node_id = Some(node_id);
-    managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
+    managed.runtime_node_enrollment_path = Some(
+        runtime_node_enrollment_relative_path()
+            .display()
+            .to_string(),
+    );
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
     managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
@@ -800,7 +804,11 @@ async fn import_node_enrollment_package(
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(package.bootstrap.cluster_id);
     managed.node_id = Some(package.bootstrap.node_id);
-    managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
+    managed.runtime_node_enrollment_path = Some(
+        runtime_node_enrollment_relative_path()
+            .display()
+            .to_string(),
+    );
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = None;
     managed.managed_rendezvous_public_url = None;
@@ -1010,7 +1018,15 @@ fn bootstrap_setup_key_path(data_dir: &std::path::Path) -> PathBuf {
 }
 
 fn runtime_node_enrollment_path(data_dir: &std::path::Path) -> PathBuf {
-    managed_setup_dir(data_dir)
+    data_dir.join(runtime_node_enrollment_relative_path())
+}
+
+/// Path of the runtime enrollment file relative to `data_dir`. This is the
+/// form that must be persisted into `ManagedSetupState::runtime_node_enrollment_path`,
+/// since `resolve_materialized_path` re-joins it with `data_dir` on load; storing
+/// the already-`data_dir`-joined path there would double the prefix.
+fn runtime_node_enrollment_relative_path() -> PathBuf {
+    PathBuf::from("managed")
         .join("runtime")
         .join("node-enrollment.json")
 }
@@ -1925,6 +1941,30 @@ mod tests {
         assert_eq!(
             restored.managed_rendezvous_public_url.as_deref(),
             Some("https://node-a.local:9443")
+        );
+    }
+
+    #[test]
+    fn runtime_node_enrollment_relative_path_resolves_without_doubling_data_dir_prefix() {
+        // Regression test: the runtime enrollment path stored in managed setup
+        // state must be relative to `data_dir`, not already joined with it.
+        // `resolve_materialized_path` joins whatever is stored with `data_dir`
+        // again, so storing the already-joined path doubles the prefix
+        // whenever `data_dir` is a relative path (e.g. "./data/server-node"),
+        // causing a valid enrollment file to look "missing" on every restart.
+        let relative_data_dir = std::path::PathBuf::from("./data/server-node");
+        let stored = runtime_node_enrollment_relative_path()
+            .display()
+            .to_string();
+        let resolved = resolve_materialized_path(&relative_data_dir, &stored);
+        assert_eq!(resolved, runtime_node_enrollment_path(&relative_data_dir));
+        assert!(
+            !resolved
+                .display()
+                .to_string()
+                .contains("data/server-node/./data/server-node"),
+            "enrollment path doubled the data_dir prefix: {}",
+            resolved.display()
         );
     }
 
