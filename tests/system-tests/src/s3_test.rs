@@ -2523,6 +2523,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_s3_listener_rejects_peer_revoked_access_keys() -> Result<()> {
+        let bind_a = "127.0.0.1:19590";
+        let bind_b = "127.0.0.1:19592";
+        let s3_bind_a = "127.0.0.1:19591";
+        let s3_bind_b = "127.0.0.1:19593";
+        let node_id_a = "00000000-0000-0000-0000-00000000f1a1";
+        let node_id_b = "00000000-0000-0000-0000-00000000f1b2";
+        let data_a = fresh_data_dir("s3-revoke-node-a");
+        let data_b = fresh_data_dir("s3-revoke-node-b");
+
+        let mut node_a = start_authenticated_server_with_env_options(
+            bind_a,
+            &data_a,
+            node_id_a,
+            2,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind_a)],
+        )
+        .await?;
+        let mut node_b = start_authenticated_server_with_env_options(
+            bind_b,
+            &data_b,
+            node_id_b,
+            2,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind_b)],
+        )
+        .await?;
+
+        let http = reqwest::Client::new();
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let s3_base_a = format!("http://{s3_bind_a}");
+
+        let result: Result<()> = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&http, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+
+            wait_for_online_nodes(&http, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&http, &base_b, 2, 120).await?;
+
+            let create_bucket_response = http
+                .post(format!("{base_a}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "revoke.example",
+                    "root_prefix": "tenant/revoke",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{base_a}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-peer-revoke",
+                    "bucket_scope": ["revoke.example"],
+                    "prefix_scope": ["tenant/revoke/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_s3_control_plane_status(&http, &base_b, 1, 1, Some(node_id_a)).await?;
+
+            let put_object = send_signed_s3_request(
+                &http,
+                &s3_base_a,
+                Method::PUT,
+                "/revoke.example/docs/peer.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                b"accepted before revoke".to_vec(),
+            )
+            .await?;
+            assert_eq!(put_object.status(), StatusCode::OK);
+
+            let revoke_access_key_response = http
+                .post(format!(
+                    "{base_b}/auth/s3/access-keys/{access_key_id}/revoke"
+                ))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .send()
+                .await?;
+            assert_eq!(revoke_access_key_response.status(), StatusCode::NO_CONTENT);
+
+            let status_a =
+                wait_for_s3_control_plane_status(&http, &base_a, 1, 1, Some(node_id_b)).await?;
+            assert_eq!(
+                status_a
+                    .get("last_source_node_id")
+                    .and_then(|value| value.as_str()),
+                Some(node_id_b)
+            );
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base_a,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::FORBIDDEN,
+            )
+            .await?;
+
+            let rejected = send_signed_s3_request(
+                &http,
+                &s3_base_a,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+            let rejected_xml = rejected.text().await?;
+            assert!(rejected_xml.contains("<Code>InvalidAccessKeyId</Code>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn serve_s3_gateway_transports_signed_s3_requests() -> Result<()> {
         let server_bind = "127.0.0.1:19484";
         let gateway_bind = "127.0.0.1:19485";

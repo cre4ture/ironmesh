@@ -162,6 +162,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Recent S3 milestone notes
 
+- 2026-07-06: multi-node S3 control-plane replication is now covered as a writable cluster path, not just a read-only fanout.
+  The `system-tests` S3 suite now proves an access key created on node A can be revoked through node B's admin API, that the revocation fans back to node A with the peer node recorded as the latest source, and that node A's dedicated S3 listener subsequently rejects the revoked key.
 - 2026-07-06: S3 runtime coverage now reaches beyond single-node listener behavior into real distributed and transport-backed paths.
   The `system-tests` S3 suite now proves S3 control-plane fanout from one spawned node to another strongly enough that the peer node's own dedicated S3 listener accepts the replicated bucket mapping and access key, and it also validates a spawned `cli-client serve-s3` gateway carrying signed S3 requests over the real `/s3/*` transport path.
 - 2026-07-06: dedicated-listener runtime coverage now includes the remaining high-value S3 listing edge cases over real HTTP.
