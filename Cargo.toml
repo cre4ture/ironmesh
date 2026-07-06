@@ -44,6 +44,7 @@ blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 git-version = "0.3.9"
+lru = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

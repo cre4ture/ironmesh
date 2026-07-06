@@ -8325,12 +8325,11 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
 pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
     let mut local_metadata_subjects = {
         let store = read_store(state, "cluster_metadata.list_local_subjects").await;
-        store
-            .list_metadata_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-            .into_iter()
-            .collect::<HashSet<_>>()
+        let subjects = match store.list_metadata_subjects().await {
+            Ok(subjects) => subjects,
+            Err(_) => store.current_keys().await.unwrap_or_default(),
+        };
+        subjects.into_iter().collect::<HashSet<_>>()
     };
 
     let peers = {
@@ -8609,12 +8608,18 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
 async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
     let inspector = {
         let store = read_store(state, "availability.recompute_local_subjects.snapshot").await;
-        store.replication_subject_inspector()
+        match store.replication_subject_inspector().await {
+            Ok(inspector) => inspector,
+            Err(err) => {
+                warn!(error = %err, "failed to snapshot current state for replication subjects");
+                return Vec::new();
+            }
+        }
     };
-    let mut subjects = inspector
-        .list_replication_subjects()
-        .await
-        .unwrap_or_else(|_| inspector.current_keys());
+    let mut subjects = match inspector.list_replication_subjects().await {
+        Ok(subjects) => subjects,
+        Err(_) => inspector.current_keys(),
+    };
     subjects.sort();
     subjects
 }
@@ -9035,9 +9040,12 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
     info!(run_id = %tracker.run_id, trigger = ?tracker.trigger, "data scrub run started");
     let scrubber = {
         let store = read_store(&state, "data_scrub.clone_worker").await;
-        store.data_scrubber()
+        store.data_scrubber().await
     };
-    let result = scrubber.run_with_repair_subjects().await;
+    let result = match scrubber {
+        Ok(scrubber) => scrubber.run_with_repair_subjects().await,
+        Err(err) => Err(err),
+    };
 
     match result {
         Ok(output) => {
@@ -10086,7 +10094,13 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
     tokio::spawn(async move {
         let targets = {
             let store = read_store(&state, "media_metadata_backfill.snapshot").await;
-            let inspector = store.store_index_inspector();
+            let inspector = match store.store_index_inspector().await {
+                Ok(inspector) => inspector,
+                Err(err) => {
+                    warn!(error = %err, "failed to snapshot current state for media metadata backfill");
+                    return;
+                }
+            };
             let mut targets = BTreeMap::new();
             for (key, manifest_hash) in inspector.current_object_hashes() {
                 if looks_like_media_path(&key) && manifest_hash != TOMBSTONE_MANIFEST_HASH {
@@ -11382,7 +11396,14 @@ async fn list_store_index_response(
     let snapshot_scan_started_at = Instant::now();
     let (store_index_inspector, snapshot_scan_waited_ms) = {
         let store = read_store(state, "store_index.clone_worker").await;
-        (store.store_index_inspector(), store.waited_ms())
+        let waited_ms = store.waited_ms();
+        match store.store_index_inspector().await {
+            Ok(inspector) => (inspector, waited_ms),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to snapshot current state for store index");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
     };
     let (keys, key_hashes, object_ids, snapshot_created_at_limit): StoreIndexSnapshotScan =
         if let Some(snapshot_id) = query.snapshot.as_deref() {
@@ -12625,7 +12646,9 @@ async fn ensure_media_artifact_with_remote_import(
     let now_unix = unix_ts();
     let (media_cache_worker, store_index_inspector) = {
         let store = read_store(state, "media_cache.remote_import.clone_worker").await;
-        (store.media_cache_worker(), store.store_index_inspector())
+        let media_cache_worker = store.media_cache_worker();
+        let store_index_inspector = store.store_index_inspector().await?;
+        (media_cache_worker, store_index_inspector)
     };
 
     let existing_lookup = store_index_inspector
@@ -13517,6 +13540,13 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
     let store = read_store(state, "versions.list").await;
     match store.list_versions(key).await {
         Ok(Some(summary)) => {
+            let store_index_inspector = match store.store_index_inspector().await {
+                Ok(inspector) => inspector,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to snapshot current state for version media lookups");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
             let mut versions = Vec::with_capacity(summary.versions.len());
             for version in summary.versions {
                 let is_tombstone = version.manifest_hash == TOMBSTONE_MANIFEST_HASH;
@@ -13552,8 +13582,7 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
                         }
                     }
 
-                    match store
-                        .store_index_inspector()
+                    match store_index_inspector
                         .lookup_media_cache(&version.manifest_hash)
                         .await
                     {
@@ -20117,10 +20146,10 @@ async fn local_available_subjects(State(state): State<ServerState>) -> impl Into
 async fn local_metadata_subjects(State(state): State<ServerState>) -> impl IntoResponse {
     let mut subjects = {
         let store = read_store(&state, "metadata_subjects.list").await;
-        store
-            .list_metadata_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
+        match store.list_metadata_subjects().await {
+            Ok(subjects) => subjects,
+            Err(_) => store.current_keys().await.unwrap_or_default(),
+        }
     };
     subjects.sort();
 
