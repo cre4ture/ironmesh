@@ -19,6 +19,7 @@ use client_sdk::{
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::DownloadRangeRequest,
 };
+use common::logging::{LogBuffer, LogBufferEntry};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -112,6 +113,7 @@ pub struct WebUiConfig {
     pub connection_bootstrap: Option<ConnectionBootstrap>,
     pub connection_bootstrap_persistence: Option<WebUiBootstrapPersistence>,
     pub transport_client: Option<IronMeshClient>,
+    pub log_buffer: Option<Arc<LogBuffer>>,
     pub map_glyphs_root: Option<PathBuf>,
 }
 
@@ -153,6 +155,7 @@ impl WebUiConfig {
             connection_bootstrap: None,
             connection_bootstrap_persistence: None,
             transport_client: None,
+            log_buffer: None,
             map_glyphs_root: None,
         }
     }
@@ -166,6 +169,7 @@ impl WebUiConfig {
             connection_bootstrap: None,
             connection_bootstrap_persistence: None,
             transport_client: Some(client),
+            log_buffer: None,
             map_glyphs_root: None,
         }
     }
@@ -203,6 +207,11 @@ impl WebUiConfig {
         self
     }
 
+    pub fn with_log_buffer(mut self, log_buffer: Arc<LogBuffer>) -> Self {
+        self.log_buffer = Some(log_buffer);
+        self
+    }
+
     pub fn with_map_glyphs_root(mut self, map_glyphs_root: impl Into<PathBuf>) -> Self {
         self.map_glyphs_root = Some(map_glyphs_root.into());
         self
@@ -214,6 +223,7 @@ struct WebState {
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     service_name: String,
+    log_buffer: Arc<LogBuffer>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     runtime: Arc<RwLock<WebRuntime>>,
 }
@@ -267,10 +277,14 @@ pub fn router(config: WebUiConfig) -> Router {
     if map_perf_logging_enabled {
         info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
     }
+    let log_buffer = config
+        .log_buffer
+        .unwrap_or_else(|| Arc::new(LogBuffer::new(500)));
     let state = WebState {
         map_perf_logging_enabled,
         map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
         service_name: config.service_name,
+        log_buffer,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         runtime: Arc::new(RwLock::new(WebRuntime {
             sdk: sdk.clone(),
@@ -296,6 +310,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_map_vector_tile))
         .route("/maps/fonts/{fontstack}/{range}", get(web_map_font_range))
         .route("/health", get(web_health))
+        .route("/logs", get(web_logs))
         .route("/snapshots", get(web_snapshots))
         .route("/versions", get(web_versions))
         .route(
@@ -346,6 +361,7 @@ pub fn router(config: WebUiConfig) -> Router {
             get(web_map_font_range),
         )
         .route("/api/health", get(web_health))
+        .route("/api/logs", get(web_logs))
         .route("/api/snapshots", get(web_snapshots))
         .route("/api/versions", get(web_versions))
         .route(
@@ -577,6 +593,16 @@ struct WebLatencyProbeRequest {
     pause_between_samples_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebLogsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebLogsResponse {
+    entries: Vec<LogBufferEntry>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct WebClientRendezvousView {
     available: bool,
@@ -658,6 +684,25 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> axum::respo
         }),
     )
         .into_response()
+}
+
+fn push_runtime_log(state: &WebState, level: &str, message: impl AsRef<str>) {
+    state
+        .log_buffer
+        .push(format!("{level} web_ui_backend {}", message.as_ref()));
+}
+
+fn logged_error_response(
+    state: &WebState,
+    status: StatusCode,
+    context: &str,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    let message = message.into();
+    if status.is_server_error() {
+        push_runtime_log(state, "ERROR", format!("{context}: {message}"));
+    }
+    error_response(status, message)
 }
 
 async fn fetch_server_json(state: &WebState, path: &str) -> Result<serde_json::Value> {
@@ -1124,11 +1169,23 @@ async fn probe_rendezvous_and_build_view(state: &WebState) -> WebClientRendezvou
         let mut runtime = state.runtime.write().await;
         match probe_result {
             Ok(snapshot) => {
+                let active_url = snapshot.active_url.clone();
                 runtime.last_rendezvous_probe_statuses = snapshot.endpoint_statuses;
                 runtime.last_rendezvous_probe_error = None;
+                if let Some(active_url) = active_url.as_deref() {
+                    push_runtime_log(
+                        state,
+                        "INFO",
+                        format!(
+                            "rendezvous probe connected via {}",
+                            active_url.trim_end_matches('/')
+                        ),
+                    );
+                }
             }
             Err(error) => {
                 runtime.last_rendezvous_probe_error = Some(error.to_string());
+                push_runtime_log(state, "ERROR", format!("rendezvous probe failed: {error}"));
             }
         }
     }
@@ -1153,6 +1210,7 @@ async fn apply_runtime_client(
     });
     runtime.last_rendezvous_probe_error = None;
     runtime.last_rendezvous_probe_statuses = Vec::new();
+    push_runtime_log(state, "INFO", "runtime client configuration updated");
     Ok(())
 }
 
@@ -1589,17 +1647,41 @@ async fn web_ping(State(state): State<WebState>) -> impl IntoResponse {
         .into_response()
 }
 
+async fn web_logs(
+    State(state): State<WebState>,
+    Query(query): Query<WebLogsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    (
+        StatusCode::OK,
+        Json(WebLogsResponse {
+            entries: state.log_buffer.recent(limit),
+        }),
+    )
+        .into_response()
+}
+
 async fn web_health(State(state): State<WebState>) -> impl IntoResponse {
     match fetch_server_json(&state, "/health").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "health request failed",
+            err.to_string(),
+        ),
     }
 }
 
 async fn web_snapshots(State(state): State<WebState>) -> impl IntoResponse {
     match fetch_server_json(&state, "/snapshots").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "snapshots request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -1622,7 +1704,12 @@ async fn web_versions(
         .await
     {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "version history request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -1649,7 +1736,12 @@ async fn web_version_restore(
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "version restore failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -1672,7 +1764,14 @@ async fn web_media_thumbnail(
         .await
     {
         Ok(response) => response,
-        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => {
+            return logged_error_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "thumbnail request failed",
+                err.to_string(),
+            );
+        }
     };
 
     let mut headers = HeaderMap::new();
@@ -1705,7 +1804,14 @@ async fn web_media_cache_retry(
         .await
     {
         Ok(response) => response,
-        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => {
+            return logged_error_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "media cache retry failed",
+                err.to_string(),
+            );
+        }
     };
 
     let mut headers = HeaderMap::new();
@@ -1727,7 +1833,14 @@ async fn web_map_mbtiles_metadata(
 
     let source = match get_or_create_mbtiles_source(&state, query.manifest_key.trim()).await {
         Ok(source) => source,
-        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => {
+            return logged_error_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "map metadata request failed",
+                err.to_string(),
+            );
+        }
     };
     let metadata = source.metadata();
     if state.map_perf_logging_enabled {
@@ -1772,7 +1885,14 @@ async fn web_map_logical_file(
     let loaded_manifest =
         match load_split_logical_file_manifest(&state, query.manifest_key.trim()).await {
             Ok(manifest) => manifest,
-            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            Err(err) => {
+                return logged_error_response(
+                    &state,
+                    StatusCode::BAD_GATEWAY,
+                    "logical map manifest request failed",
+                    err.to_string(),
+                );
+            }
         };
 
     let total_size_bytes = loaded_manifest.manifest.logical_size_bytes;
@@ -1903,7 +2023,14 @@ async fn web_map_logical_file(
         .await
         {
             Ok(bytes) => body.extend_from_slice(&bytes),
-            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            Err(err) => {
+                return logged_error_response(
+                    &state,
+                    StatusCode::BAD_GATEWAY,
+                    "logical map range download failed",
+                    err.to_string(),
+                );
+            }
         }
     }
 
@@ -2106,21 +2233,36 @@ fn is_safe_glyph_range_segment(value: &str) -> bool {
 async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {
     match fetch_server_json(&state, "/cluster/status").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "cluster status request failed",
+            err.to_string(),
+        ),
     }
 }
 
 async fn web_cluster_nodes(State(state): State<WebState>) -> impl IntoResponse {
     match fetch_server_json(&state, "/cluster/nodes").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "cluster nodes request failed",
+            err.to_string(),
+        ),
     }
 }
 
 async fn web_replication_plan(State(state): State<WebState>) -> impl IntoResponse {
     match fetch_server_json(&state, "/cluster/replication/plan").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "replication plan request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2187,7 +2329,12 @@ async fn web_store_list(
         .await
     {
         Ok(value) => (StatusCode::OK, Json(serde_json::json!(value))).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store list request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2241,7 +2388,12 @@ async fn web_store_get(
             )
                 .into_response()
         }
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store get request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2268,7 +2420,12 @@ async fn web_store_put(
             })),
         )
             .into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store put request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2298,7 +2455,12 @@ async fn web_store_rename(
             })),
         )
             .into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store rename request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2323,7 +2485,12 @@ async fn web_store_delete(
             )
                 .into_response()
         }
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store delete request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2368,7 +2535,12 @@ async fn web_store_restore(
             })),
         )
             .into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store restore request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2386,7 +2558,12 @@ async fn web_store_upload_start(
         .await
     {
         Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "upload session start failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2405,7 +2582,12 @@ async fn web_store_upload_chunk(
         .await
     {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "upload session chunk failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2423,7 +2605,12 @@ async fn web_store_upload_complete(
         .await
     {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "upload session completion failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2459,7 +2646,12 @@ async fn web_store_put_binary(
             )
                 .into_response()
         }
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "binary put request failed",
+            err.to_string(),
+        ),
     }
 }
 
@@ -2481,7 +2673,14 @@ async fn web_store_get_binary(
         .await
     {
         Ok(bytes) => bytes,
-        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => {
+            return logged_error_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "binary download request failed",
+                err.to_string(),
+            );
+        }
     };
 
     let fallback_name = query
@@ -2533,7 +2732,14 @@ async fn web_store_stream_binary(
         .await
     {
         Ok(head) => head,
-        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err) => {
+            return logged_error_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "binary head request failed",
+                err.to_string(),
+            );
+        }
     };
 
     let total_size_bytes = head.total_size_bytes;
@@ -2653,7 +2859,14 @@ async fn web_store_stream_binary(
             .await
             {
                 Ok(bytes) => bytes,
-                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+                Err(err) => {
+                    return logged_error_response(
+                        &state,
+                        StatusCode::BAD_GATEWAY,
+                        "binary range download failed",
+                        err.to_string(),
+                    );
+                }
             }
         } else {
             let full_payload = match current_client(&state)
@@ -2666,7 +2879,14 @@ async fn web_store_stream_binary(
                 .await
             {
                 Ok(bytes) => bytes,
-                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+                Err(err) => {
+                    return logged_error_response(
+                        &state,
+                        StatusCode::BAD_GATEWAY,
+                        "binary fallback download failed",
+                        err.to_string(),
+                    );
+                }
             };
             full_payload[range.start as usize..=range.end_inclusive as usize].to_vec()
         }
@@ -2681,7 +2901,14 @@ async fn web_store_stream_binary(
             .await
         {
             Ok(bytes) => bytes.to_vec(),
-            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            Err(err) => {
+                return logged_error_response(
+                    &state,
+                    StatusCode::BAD_GATEWAY,
+                    "binary stream request failed",
+                    err.to_string(),
+                );
+            }
         }
     };
 
@@ -2725,7 +2952,14 @@ async fn web_latency_test(
             .transpose();
         let diagnostic_targets = match diagnostic_targets {
             Ok(targets) => targets.unwrap_or_default(),
-            Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+            Err(error) => {
+                return logged_error_response(
+                    &state,
+                    StatusCode::BAD_GATEWAY,
+                    "latency diagnostics bootstrap expansion failed",
+                    error.to_string(),
+                );
+            }
         };
         (
             runtime.sdk.clone(),
@@ -2839,10 +3073,19 @@ async fn web_update_rendezvous(
     .await;
     let sdk = match sdk_result {
         Ok(Ok(client)) => client,
-        Ok(Err(error)) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
-        Err(error) => {
-            return error_response(
+        Ok(Err(error)) => {
+            return logged_error_response(
+                &state,
                 StatusCode::BAD_GATEWAY,
+                "rendezvous client rebuild failed",
+                error.to_string(),
+            );
+        }
+        Err(error) => {
+            return logged_error_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "rendezvous client rebuild task failed",
                 format!("client rebuild task panicked: {error}"),
             );
         }
@@ -2851,7 +3094,12 @@ async fn web_update_rendezvous(
     if let Some(persistence) = existing.persistence.as_ref()
         && let Err(error) = persistence.persist(&bootstrap)
     {
-        return error_response(StatusCode::BAD_GATEWAY, error.to_string());
+        return logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "rendezvous bootstrap persistence failed",
+            error.to_string(),
+        );
     }
 
     if let Err(error) = apply_runtime_client(
@@ -2863,7 +3111,12 @@ async fn web_update_rendezvous(
     )
     .await
     {
-        return error_response(StatusCode::BAD_GATEWAY, error.to_string());
+        return logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "runtime client swap failed",
+            error.to_string(),
+        );
     }
 
     (

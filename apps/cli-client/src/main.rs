@@ -274,7 +274,7 @@ async fn main() -> Result<()> {
                 WebUiConfig::new("http://127.0.0.1:9")
             }
             .with_service_name("cli-client-web");
-            let app = web_ui_backend::router(web_ui_config);
+            let app = web_ui_backend::router(web_ui_config.with_log_buffer(cli_web_log_buffer()));
 
             info!(bind_addr = %bind_addr, "cli web interface listening");
             println!("web interface at http://{bind_addr}");
@@ -317,11 +317,20 @@ fn init_cli_tracing() {
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt_layer)
+            .with(common::logging::LogCaptureLayer::new(cli_web_log_buffer()))
             .try_init();
     });
     if perf_logging_enabled {
         info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
     }
+}
+
+fn cli_web_log_buffer() -> std::sync::Arc<common::logging::LogBuffer> {
+    static LOG_BUFFER: std::sync::OnceLock<std::sync::Arc<common::logging::LogBuffer>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(
+        LOG_BUFFER.get_or_init(|| std::sync::Arc::new(common::logging::LogBuffer::new(500))),
+    )
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {

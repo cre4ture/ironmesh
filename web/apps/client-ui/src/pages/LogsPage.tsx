@@ -9,11 +9,13 @@ export function LogsPage() {
     <>
       <PageHeader
         title="Logs"
-        description="Inspect recent runtime output from the connected node without leaving the client web UI."
+        description="Inspect recent client runtime, SDK, and transport logs without leaving the client web UI."
       />
       <LogsSurface
-        description="This mirrors the dedicated admin log view so you can keep a live tail running, then scroll back through recent raw server output when you need more detail on a failure."
+        description="This stream is captured inside the client process. Use it to diagnose failed direct or relay connections, SDK request failures, rendezvous probe errors, and other transport/runtime issues."
         loadLogs={loadLogs}
+        cardTitle="Recent client runtime logs"
+        emptyStateLabel="no client runtime logs yet"
       />
     </>
   );
