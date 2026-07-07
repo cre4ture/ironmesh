@@ -1592,6 +1592,98 @@ run_on_all_metadata_backends!(
     list_replication_subjects_includes_all_heads_for_divergent_versions_turso
 );
 
+// Regression test: a corrupt manifest (0-byte or invalid JSON) used to make
+// `list_replication_subjects` bubble up a hard `Err`, which callers treated as
+// "trust every locally indexed key" (see `recompute_local_cluster_available_subjects`
+// in lib.rs). That meant a single bad manifest anywhere on the node silently
+// disabled replication-gap detection for every object. The scan must instead
+// evaluate each manifest independently, excluding only the corrupt ones.
+async fn list_replication_subjects_excludes_only_corrupt_manifests_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("replication-subjects-corrupt-manifests")
+        .await;
+
+    let mut valid_keys = Vec::new();
+    for i in 0..5 {
+        let key = format!("docs/valid-{i}.txt");
+        store
+            .put_object_versioned(
+                &key,
+                Bytes::from(format!("valid-payload-{i}").into_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        valid_keys.push(key);
+    }
+
+    let mut corrupt_keys = Vec::new();
+    for i in 0..2 {
+        let key = format!("docs/corrupt-empty-{i}.txt");
+        store
+            .put_object_versioned(
+                &key,
+                Bytes::from(format!("corrupt-payload-{i}").into_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        // 0-byte manifest file: fails to parse as JSON.
+        store
+            .replace_manifest_bytes_for_subject_for_test(&key, None, b"")
+            .await
+            .unwrap();
+        corrupt_keys.push(key);
+    }
+    for i in 0..2 {
+        let key = format!("docs/corrupt-invalid-json-{i}.txt");
+        store
+            .put_object_versioned(
+                &key,
+                Bytes::from(format!("corrupt-payload-json-{i}").into_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .replace_manifest_bytes_for_subject_for_test(&key, None, br#"{not-valid-json"#)
+            .await
+            .unwrap();
+        corrupt_keys.push(key);
+    }
+
+    let inspector = store.replication_subject_inspector().await.unwrap();
+    let subjects = inspector
+        .list_replication_subjects()
+        .await
+        .expect("a corrupt manifest must not abort the whole replication-subject scan");
+
+    for key in &valid_keys {
+        assert!(
+            subjects.contains(key),
+            "expected valid key {key} to be reported available, subjects={subjects:?}"
+        );
+    }
+    for key in &corrupt_keys {
+        assert!(
+            !subjects
+                .iter()
+                .any(|subject| subject == key || subject.starts_with(&format!("{key}@"))),
+            "expected corrupt key {key} to be excluded from available subjects, subjects={subjects:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    list_replication_subjects_excludes_only_corrupt_manifests_impl,
+    list_replication_subjects_excludes_only_corrupt_manifests,
+    list_replication_subjects_excludes_only_corrupt_manifests_turso
+);
+
 async fn tombstone_creates_tombstone_version_and_removes_current_key_impl(
     backend: StorageTestBackend,
 ) {

@@ -1841,8 +1841,21 @@ impl ReplicationSubjectInspector {
             return Ok(true);
         }
 
-        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
-            return Ok(false);
+        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                // A single corrupt/unreadable manifest must not abort availability
+                // checks for every other object on this node: treat it as not
+                // locally available (so it gets queued for repair) and keep going
+                // rather than propagating the error out of the whole scan.
+                warn!(
+                    manifest_hash = %manifest_hash,
+                    error = %err,
+                    "manifest unreadable or invalid; treating as not locally available"
+                );
+                return Ok(false);
+            }
         };
 
         for chunk in &manifest.chunks {
