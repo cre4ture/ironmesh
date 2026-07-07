@@ -6247,7 +6247,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     // ensure underlying store current keys no longer include the key
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&key));
 
@@ -6302,7 +6302,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(
         !keys
@@ -6358,7 +6358,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&"docs/".to_string()));
 
@@ -7071,6 +7071,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
 
         let replica_subjects = locked
             .replication_subject_inspector()
+            .await
+            .unwrap()
             .list_replication_subjects()
             .await
             .unwrap();
@@ -8317,6 +8319,7 @@ async fn build_test_state(
                 String,
                 Arc<super::web_maps::LogicalMbtilesSource>,
             >::new())),
+            last_gc_pass: Arc::new(std::sync::Mutex::new(None)),
         },
         access: super::ServerAccessRuntime {
             client_credentials: Arc::new(Mutex::new(
@@ -8402,6 +8405,9 @@ async fn build_test_state(
         },
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         runtime_log_control: super::RuntimeLogControl::disabled("info"),
+        process_stats_runtime: Arc::new(std::sync::Mutex::new(
+            super::ProcessStatsRuntime::default(),
+        )),
     };
 
     if seed_gap {
@@ -8503,6 +8509,188 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
     assert_eq!(
         state.storage.upload_sessions_dirty.load(Ordering::SeqCst),
         0
+    );
+}
+
+#[tokio::test]
+async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut store = lock_store(&state, "tests.process_stats_memory.seed").await;
+        store
+            .put_object_versioned(
+                "docs/live.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let now = super::unix_ts();
+    {
+        let mut sessions =
+            super::write_upload_sessions(&state, "tests.process_stats_memory.seed").await;
+        sessions.sessions.insert(
+            "upload-in-flight".to_string(),
+            super::UploadSessionRecord {
+                upload_id: "upload-in-flight".to_string(),
+                owner_device_id: None,
+                key: "uploads/in-flight.bin".to_string(),
+                total_size_bytes: 4096,
+                chunk_size_bytes: 4096,
+                chunk_count: 1,
+                state: VersionConsistencyState::Confirmed,
+                parent_version_ids: Vec::new(),
+                explicit_version_id: None,
+                received_chunks: vec![None],
+                created_at_unix: now,
+                updated_at_unix: now,
+                expires_at_unix: now + 300,
+                finalizing: false,
+                completed: false,
+                completed_result: None,
+            },
+        );
+    }
+
+    let cleanup_response = super::run_cleanup(
+        State(state.clone()),
+        headers.clone(),
+        Query(super::CleanupQuery {
+            retention_secs: Some(0),
+            dry_run: Some(true),
+            approve: Some(false),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cleanup_response.status(), StatusCode::OK);
+
+    let memory_response = super::process_stats_memory(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(memory_response.status(), StatusCode::OK);
+
+    let body = to_bytes(memory_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let sample: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(sample["current_objects_total_count"], 1);
+    assert_eq!(sample["in_flight_upload_session_count"], 1);
+    assert_eq!(sample["in_flight_upload_bytes"], 4096);
+    assert!(
+        sample["current_objects_cache"]["resident_entries"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        sample["current_objects_cache"]["capacity"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let last_gc_pass = &sample["last_gc_pass"];
+    assert_eq!(last_gc_pass["dry_run"], true);
+    assert_eq!(last_gc_pass["retained_manifests_processed"], 1);
+    assert!(last_gc_pass["peak_manifest_batch_size"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn process_stats_current_reports_temperature_snapshot() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut runtime = state
+            .process_stats_runtime
+            .lock()
+            .expect("process stats runtime lock should not be poisoned");
+        runtime.push(
+            super::ProcessStatsSample {
+                collected_at_unix: 1_720_000_000,
+                main_cpu_percent: 12.5,
+                main_memory_bytes: 512 * 1024 * 1024,
+                main_disk_read_bytes_per_sec: 4096,
+                main_disk_write_bytes_per_sec: 2048,
+                children_cpu_percent: 6.25,
+                children_memory_bytes: 128 * 1024 * 1024,
+                children_disk_read_bytes_per_sec: 1024,
+                children_disk_write_bytes_per_sec: 512,
+                children_count: 1,
+                temperature_component_count: 2,
+                temperature_reporting_component_count: 1,
+                hottest_temperature_celsius: Some(68.25),
+                average_temperature_celsius: Some(68.25),
+            },
+            vec![super::ChildProcessStat {
+                pid: 4242,
+                name: "ffmpeg".to_string(),
+                cpu_percent: 6.25,
+                memory_bytes: 128 * 1024 * 1024,
+                disk_read_bytes_per_sec: 1024,
+                disk_write_bytes_per_sec: 512,
+            }],
+            vec![
+                super::TemperatureComponentStat {
+                    label: "CPU package".to_string(),
+                    temperature_celsius: Some(68.25),
+                    max_celsius: Some(85.0),
+                    critical_celsius: Some(100.0),
+                },
+                super::TemperatureComponentStat {
+                    label: "NVMe".to_string(),
+                    temperature_celsius: None,
+                    max_celsius: Some(72.0),
+                    critical_celsius: Some(84.0),
+                },
+            ],
+            16,
+        );
+    }
+
+    let response = super::process_stats_current(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(payload["logical_cpu_count"], 16);
+    assert_eq!(payload["children"][0]["name"], "ffmpeg");
+    assert_eq!(payload["sample"]["temperature_component_count"], 2);
+    assert_eq!(
+        payload["sample"]["temperature_reporting_component_count"],
+        1
+    );
+    assert_eq!(
+        payload["sample"]["hottest_temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(payload["temperature_components"][0]["label"], "CPU package");
+    assert_eq!(
+        payload["temperature_components"][0]["temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(
+        payload["temperature_components"][1]["critical_celsius"]
+            .as_f64()
+            .unwrap(),
+        84.0
     );
 }
 

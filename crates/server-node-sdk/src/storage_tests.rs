@@ -36,13 +36,14 @@ async fn persist_snapshot_fixture(
     snapshot_id: &str,
     created_at_unix: u64,
 ) {
+    let current_state = store.metadata_store.load_current_state().await.unwrap();
     store
         .metadata_store
         .persist_snapshot_manifest(&SnapshotManifest {
             id: snapshot_id.to_string(),
             created_at_unix,
-            objects: store.current_state.objects.clone(),
-            object_ids: store.current_state.object_ids.clone(),
+            objects: current_state.objects,
+            object_ids: current_state.object_ids,
         })
         .await
         .unwrap();
@@ -1004,6 +1005,50 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_deletes_orphan_manifest_and_chunk_turso
 );
 
+async fn cleanup_unreferenced_processes_retained_manifests_across_batches_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("cleanup-gc-batching").await;
+    // Force a batch size far smaller than the number of live objects below so the
+    // retained-manifest loop in cleanup_unreferenced must span multiple batches;
+    // a bug that only processed the first batch would wrongly treat later objects'
+    // chunks as unreferenced and delete them.
+    store.set_gc_manifest_load_batch_size_for_test(2);
+
+    let keys: Vec<String> = (0..5).map(|i| format!("docs/live-{i}.txt")).collect();
+    for key in &keys {
+        store
+            .put_object_versioned(
+                key,
+                Bytes::from(format!("payload-{key}")),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let report = store.cleanup_unreferenced(0, false).await.unwrap();
+    assert_eq!(report.deleted_manifests, 0);
+    assert_eq!(report.deleted_chunks, 0);
+    assert_eq!(report.protected_manifests, keys.len());
+
+    for key in &keys {
+        let payload = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(payload.as_ref(), format!("payload-{key}").as_bytes());
+    }
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_processes_retained_manifests_across_batches_impl,
+    cleanup_unreferenced_processes_retained_manifests_across_batches,
+    cleanup_unreferenced_processes_retained_manifests_across_batches_turso
+);
+
 async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index_impl(
     backend: StorageTestBackend,
 ) {
@@ -1578,7 +1623,7 @@ async fn tombstone_creates_tombstone_version_and_removes_current_key_impl(
     assert!(store.list_versions("will-delete").await.unwrap().is_none());
 
     // current keys should not include the key after tombstone
-    let keys = store.current_keys();
+    let keys = store.current_keys().await.unwrap();
     assert!(!keys.contains(&"will-delete".to_string()));
 
     // reading the object via store should return NotFound
@@ -1667,7 +1712,7 @@ async fn recursive_tombstone_removes_directory_marker_and_descendants_impl(
         ])
     );
 
-    let current_keys = store.current_keys();
+    let current_keys = store.current_keys().await.unwrap();
     assert!(
         !current_keys
             .iter()
@@ -2011,11 +2056,12 @@ async fn cleanup_duplicate_delete_recreate_loop_metadata_removes_redundant_histo
         })
         .collect::<Vec<_>>();
     assert_eq!(remaining_histories.len(), 1);
+    let current_state = store.metadata_store.load_current_state().await.unwrap();
     assert!(
-        !store.current_state.object_ids.contains_key(key),
+        !current_state.object_ids.contains_key(key),
         "tombstoned loop cleanup must not resurrect the deleted key"
     );
-    assert!(!store.current_state.objects.contains_key(key));
+    assert!(!current_state.objects.contains_key(key));
 
     let _ = fs::remove_dir_all(root).await;
 }
@@ -2534,10 +2580,9 @@ async fn reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl(
     assert_eq!(mutation, PathMutationResult::Applied);
 
     let object_id = store
-        .current_state
-        .object_ids
-        .get("docs/b.txt")
-        .cloned()
+        .object_id_for_key("docs/b.txt")
+        .await
+        .unwrap()
         .expect("renamed object should be current at destination");
     let mut index = store
         .load_version_index_by_object_id(&object_id)
@@ -2643,10 +2688,9 @@ async fn reconcile_legacy_rename_logical_paths_repairs_intermediate_stale_paths_
     assert_eq!(mutation, PathMutationResult::Applied);
 
     let object_id = store
-        .current_state
-        .object_ids
-        .get("docs/b.txt")
-        .cloned()
+        .object_id_for_key("docs/b.txt")
+        .await
+        .unwrap()
         .expect("renamed object should be current at destination");
 
     // Simulate legacy rename behavior: the original put version's logical_path was incorrectly
@@ -3286,10 +3330,9 @@ async fn rename_replication_subjects_use_each_heads_own_logical_path_impl(
     assert_eq!(mutation, PathMutationResult::Applied);
 
     let renamed_object_id = store
-        .current_state
-        .object_ids
-        .get("docs/b.txt")
-        .cloned()
+        .object_id_for_key("docs/b.txt")
+        .await
+        .unwrap()
         .expect("renamed destination path should remain current");
     let renamed_index = store
         .load_version_index_by_object_id(&renamed_object_id)
@@ -4773,7 +4816,7 @@ async fn lookup_media_cache_many_preserves_valid_entries_and_cleans_invalid_rows
     )
     .await;
 
-    let inspector = store.store_index_inspector();
+    let inspector = store.store_index_inspector().await.unwrap();
     let lookups = inspector
         .lookup_media_cache_many_by_content_fingerprint(&[
             first_metadata.content_fingerprint.clone(),
@@ -4986,8 +5029,11 @@ async fn metadata_roundtrips_current_state_version_indexes_and_snapshots_impl(
     drop(store);
 
     let reopened = backend.open_store(root.clone()).await;
-    assert_eq!(reopened.object_count(), 1);
-    assert_eq!(reopened.current_keys(), vec!["docs/hello.txt".to_string()]);
+    assert_eq!(reopened.object_count().await.unwrap(), 1);
+    assert_eq!(
+        reopened.current_keys().await.unwrap(),
+        vec!["docs/hello.txt".to_string()]
+    );
 
     let payload = reopened
         .get_object("docs/hello.txt", None, None, ObjectReadMode::Preferred)
@@ -5014,6 +5060,45 @@ run_on_all_metadata_backends!(
     metadata_roundtrips_current_state_version_indexes_and_snapshots_impl,
     metadata_roundtrips_current_state_version_indexes_and_snapshots,
     metadata_roundtrips_current_state_version_indexes_and_snapshots_turso
+);
+
+async fn current_objects_cache_stays_bounded_while_lookups_stay_correct_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("current-objects-cache-bound").await;
+    store.set_current_objects_cache_capacity_for_test(2);
+
+    let keys: Vec<String> = (0..5).map(|i| format!("docs/file-{i}.txt")).collect();
+    for key in &keys {
+        store
+            .put_object_versioned(key, Bytes::from_static(b"payload"), PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    // The cache can only hold 2 entries, so most of these lookups must fall back
+    // to sqlite rather than being served from the resident cache.
+    for key in &keys {
+        assert!(
+            store.object_id_for_key(key).await.unwrap().is_some(),
+            "expected {key} to resolve even though it was evicted from the bounded cache"
+        );
+    }
+
+    assert_eq!(store.object_count().await.unwrap(), keys.len());
+    let mut current_keys = store.current_keys().await.unwrap();
+    current_keys.sort();
+    let mut expected_keys = keys.clone();
+    expected_keys.sort();
+    assert_eq!(current_keys, expected_keys);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    current_objects_cache_stays_bounded_while_lookups_stay_correct_impl,
+    current_objects_cache_stays_bounded_while_lookups_stay_correct,
+    current_objects_cache_stays_bounded_while_lookups_stay_correct_turso
 );
 
 async fn metadata_roundtrips_media_cache_metadata_impl(backend: StorageTestBackend) {
@@ -5665,6 +5750,8 @@ async fn store_index_uses_persisted_manifest_summary_when_manifest_file_is_missi
         .collect::<std::collections::HashMap<_, _>>();
     let (sizes, content_fingerprints) = store
         .store_index_inspector()
+        .await
+        .unwrap()
         .object_sizes_and_content_fingerprints_by_key(&object_hashes)
         .await
         .unwrap();

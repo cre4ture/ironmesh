@@ -484,6 +484,70 @@ export type StorageStatsCurrentResponse = {
   last_error?: string | null;
 };
 
+export type ChildProcessStat = {
+  pid: number;
+  name: string;
+  cpu_percent: number;
+  memory_bytes: number;
+  disk_read_bytes_per_sec: number;
+  disk_write_bytes_per_sec: number;
+};
+
+export type TemperatureComponentStat = {
+  label: string;
+  temperature_celsius?: number | null;
+  max_celsius?: number | null;
+  critical_celsius?: number | null;
+};
+
+export type ProcessStatsSample = {
+  collected_at_unix: number;
+  main_cpu_percent: number;
+  main_memory_bytes: number;
+  main_disk_read_bytes_per_sec: number;
+  main_disk_write_bytes_per_sec: number;
+  children_cpu_percent: number;
+  children_memory_bytes: number;
+  children_disk_read_bytes_per_sec: number;
+  children_disk_write_bytes_per_sec: number;
+  children_count: number;
+  temperature_component_count: number;
+  temperature_reporting_component_count: number;
+  hottest_temperature_celsius?: number | null;
+  average_temperature_celsius?: number | null;
+};
+
+export type ProcessStatsCurrentResponse = {
+  sample?: ProcessStatsSample | null;
+  children: ChildProcessStat[];
+  temperature_components: TemperatureComponentStat[];
+  logical_cpu_count: number;
+};
+
+export type CurrentObjectsCacheStats = {
+  resident_entries: number;
+  capacity: number;
+  estimated_resident_bytes: number;
+};
+
+export type GcPassSummary = {
+  collected_at_unix: number;
+  dry_run: boolean;
+  retained_manifests_processed: number;
+  peak_manifest_batch_size: number;
+  deleted_manifests: number;
+  deleted_chunks: number;
+};
+
+export type MemoryAttributionSample = {
+  collected_at_unix: number;
+  current_objects_cache: CurrentObjectsCacheStats;
+  current_objects_total_count: number;
+  in_flight_upload_session_count: number;
+  in_flight_upload_bytes: number;
+  last_gc_pass?: GcPassSummary | null;
+};
+
 export type MetadataDbBackendKind = "sqlite" | "turso";
 
 export type MetadataDbTableLogicalBreakdown = {

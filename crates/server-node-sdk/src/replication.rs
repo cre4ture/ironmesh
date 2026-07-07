@@ -2378,7 +2378,7 @@ async fn pull_bundle_from_source(
 async fn verify_local_repair_subject(state: &ServerState, subject: &str) -> Result<()> {
     let scrubber = {
         let store = read_store(state, "replication_repair.verify_subject").await;
-        store.data_scrubber()
+        store.data_scrubber().await?
     };
     let subjects = BTreeSet::from([subject.to_string()]);
     let report = scrubber.run_for_subjects(&subjects).await?;

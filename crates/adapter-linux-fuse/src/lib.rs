@@ -159,6 +159,18 @@ pub mod runtime {
     const XATTR_CONFLICT_REASON: &str = "user.ironmesh.conflict_reason";
     const XATTR_CONFLICT_COPY: &str = "user.ironmesh.conflict_copy";
     const XATTR_SOURCE_PATH: &str = "user.ironmesh.source_path";
+    /// Default global budget for resident `FsNode.data` bytes across the mount, before
+    /// least-recently-hydrated clean files get proactively re-placeholdered. Overridable
+    /// via `IRONMESH_FUSE_HYDRATION_BUDGET_BYTES` (see
+    /// docs/node-memory-footprint-reduction-plan.md Slice 1a).
+    const DEFAULT_HYDRATION_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+    fn hydration_byte_budget() -> u64 {
+        std::env::var("IRONMESH_FUSE_HYDRATION_BUDGET_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_HYDRATION_BYTE_BUDGET)
+    }
 
     #[derive(Debug, Clone)]
     pub struct FuseMountConfig {
@@ -459,6 +471,7 @@ pub mod runtime {
         next_handle: u64,
         uid: u32,
         gid: u32,
+        hydration_byte_budget: u64,
     }
 
     impl IronmeshFuseFs {
@@ -480,6 +493,7 @@ pub mod runtime {
                 next_handle: 1,
                 uid,
                 gid,
+                hydration_byte_budget: hydration_byte_budget(),
             };
             fs.nodes.insert(
                 ROOT_INODE,
@@ -1428,8 +1442,57 @@ pub mod runtime {
             self.nodes.keys().max().copied().unwrap_or(ROOT_INODE) + 1
         }
 
+        fn resident_hydrated_bytes(&self) -> u64 {
+            self.nodes.values().map(|node| node.data.len() as u64).sum()
+        }
+
+        /// Proactively re-placeholders (frees `data` for) the least-recently-hydrated
+        /// *clean* files with no open handle when hydrating `additional_bytes` more
+        /// would exceed the configured budget. This complements the existing
+        /// opportunistic re-placeholder-on-refresh path (`ensure_placeholder_file_for_refresh`),
+        /// which only runs when the remote side reports a change and is skipped entirely
+        /// while any handle is open — so a file hydrated once could otherwise stay
+        /// resident forever. "Clean" here means `placeholder_content_hash` is still set:
+        /// every mutation path (write, truncate, local-only upsert) clears it as soon as
+        /// local content might diverge from the last known remote content, so its
+        /// presence after hydration is a reliable signal that `data` still matches
+        /// `sync_metadata.remote_version` and can be safely dropped and re-fetched later.
+        fn evict_hydrated_data_to_fit(&mut self, additional_bytes: u64) {
+            let budget = self.hydration_byte_budget;
+            let mut resident = self.resident_hydrated_bytes();
+            if resident.saturating_add(additional_bytes) <= budget {
+                return;
+            }
+
+            let mut candidates: Vec<(u64, SystemTime, u64)> = self
+                .nodes
+                .iter()
+                .filter(|(inode, node)| {
+                    node.kind == FileType::RegularFile
+                        && !node.data.is_empty()
+                        && node.placeholder_content_hash.is_some()
+                        && node.sync_metadata.remote_version.is_some()
+                        && !self.inode_has_open_handle(**inode)
+                })
+                .map(|(&inode, node)| (inode, node.modified_at, node.data.len() as u64))
+                .collect();
+            candidates.sort_by_key(|&(_, modified_at, _)| modified_at);
+
+            for (inode, _, data_len) in candidates {
+                if resident.saturating_add(additional_bytes) <= budget {
+                    break;
+                }
+                let Some(node) = self.nodes.get_mut(&inode) else {
+                    continue;
+                };
+                node.data = Vec::new();
+                node.placeholder_version = node.sync_metadata.remote_version.clone();
+                resident = resident.saturating_sub(data_len);
+            }
+        }
+
         fn hydrate_if_needed(&mut self, inode: u64) -> Result<()> {
-            let (path, version, content_hash) = {
+            let (path, version, content_hash, size) = {
                 let node = self
                     .nodes
                     .get(&inode)
@@ -1448,8 +1511,11 @@ pub mod runtime {
                     node.content_path(self.resolve_full_path(inode)),
                     version,
                     content_hash,
+                    node.size,
                 )
             };
+
+            self.evict_hydrated_data_to_fit(size);
 
             let data = self
                 .hydrator
@@ -1467,7 +1533,6 @@ pub mod runtime {
             file.size = file.data.len() as u64;
             file.modified_at = SystemTime::now();
             file.placeholder_version = None;
-            file.placeholder_content_hash = None;
 
             Ok(())
         }
@@ -3139,6 +3204,105 @@ pub mod runtime {
                 Some("h-photo")
             );
             assert_eq!(fs.nodes.get(&photo_inode).map(|node| node.size), Some(4096));
+        }
+
+        #[derive(Debug, Clone, Default)]
+        struct SizedHydrator {
+            sizes_by_path: HashMap<String, usize>,
+        }
+
+        impl Hydrator for SizedHydrator {
+            fn hydrate(
+                &self,
+                path: &str,
+                _remote_version: &str,
+                _remote_content_hash: &str,
+            ) -> Result<Vec<u8>> {
+                let size = self.sizes_by_path.get(path).copied().unwrap_or(0);
+                Ok(vec![b'x'; size])
+            }
+        }
+
+        #[test]
+        fn hydration_budget_evicts_lru_clean_files_but_protects_open_handles() {
+            const FILE_BYTES: usize = 4 * 1024 * 1024;
+            let paths = ["a.bin", "b.bin", "c.bin"];
+            let mut sizes_by_path = HashMap::new();
+            let actions = paths
+                .iter()
+                .map(|path| {
+                    sizes_by_path.insert(path.to_string(), FILE_BYTES);
+                    FuseAction::EnsurePlaceholder {
+                        path: path.to_string(),
+                        remote_version: format!("v-{path}"),
+                        remote_content_hash: format!("h-{path}"),
+                        remote_size: Some(FILE_BYTES as u64),
+                    }
+                })
+                .collect();
+            let plan = FuseActionPlan { actions };
+            let hydrator = SizedHydrator { sizes_by_path };
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &plan,
+                Box::new(hydrator),
+                Box::new(DemoUploader),
+                None,
+            );
+            // Budget fits two files but not three.
+            fs.hydration_byte_budget = (FILE_BYTES as u64) * 2 + 1;
+
+            let inode = |name: &str| {
+                fs.lookup_inode_by_relative_path(name)
+                    .unwrap_or_else(|| panic!("missing inode for {name}"))
+            };
+            let (a, b, c) = (inode("a.bin"), inode("b.bin"), inode("c.bin"));
+
+            fs.hydrate_if_needed(a).expect("hydrate a");
+            fs.hydrate_if_needed(b).expect("hydrate b");
+            // Keep b's handle open so it must survive eviction even though it was
+            // hydrated before c.
+            let b_handle = fs.alloc_open_handle(b, true, false);
+
+            fs.hydrate_if_needed(c).expect("hydrate c");
+
+            assert_eq!(
+                fs.resident_hydrated_bytes(),
+                (FILE_BYTES as u64) * 2,
+                "resident bytes must stay within budget after eviction"
+            );
+            assert!(
+                fs.nodes.get(&a).is_some_and(|node| node.data.is_empty()),
+                "least-recently-hydrated clean file with no open handle should be evicted"
+            );
+            assert_eq!(
+                fs.nodes
+                    .get(&a)
+                    .and_then(|node| node.placeholder_version.clone()),
+                Some("v-a.bin".to_string()),
+                "evicted file should become a valid placeholder again"
+            );
+            assert!(
+                fs.nodes
+                    .get(&b)
+                    .is_some_and(|node| node.data.len() == FILE_BYTES),
+                "file with an open handle must not be evicted"
+            );
+            assert!(
+                fs.nodes
+                    .get(&c)
+                    .is_some_and(|node| node.data.len() == FILE_BYTES),
+                "just-hydrated file should be resident"
+            );
+
+            // Evicted-then-reopened files must still hydrate correctly.
+            fs.hydrate_if_needed(a)
+                .expect("re-hydrate a after eviction");
+            assert_eq!(
+                fs.nodes.get(&a).map(|node| node.data.len()),
+                Some(FILE_BYTES)
+            );
+
+            fs.open_handles.remove(&b_handle);
         }
 
         #[test]

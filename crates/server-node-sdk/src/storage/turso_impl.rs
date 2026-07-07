@@ -11,12 +11,12 @@ use crate::cluster::NodeDescriptor;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord,
-    FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
+    DataScrubRunRecord, FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo,
+    SnapshotManifest, StorageStatsSample, StorageStatsState, compress_snapshot_json,
+    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -102,6 +102,84 @@ impl MetadataStore for TursoMetadataStore {
         }
 
         Ok(state)
+    }
+
+    async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT manifest_hash, object_id FROM current_objects WHERE key = ?1",
+                (key,),
+            )
+            .await?;
+
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(CurrentObjectEntry {
+            manifest_hash: row_string(&row, 0, "current_objects.manifest_hash")?,
+            object_id: row_string(&row, 1, "current_objects.object_id")?,
+        }))
+    }
+
+    async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO current_objects (key, manifest_hash, object_id)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    manifest_hash = excluded.manifest_hash,
+                    object_id = excluded.object_id",
+                (key, entry.manifest_hash.as_str(), entry.object_id.as_str()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_current_object(&self, key: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM current_objects WHERE key = ?1", (key,))
+            .await?;
+        Ok(())
+    }
+
+    async fn count_current_objects(&self) -> Result<usize> {
+        let mut rows = self
+            .connection
+            .query("SELECT COUNT(*) FROM current_objects", ())
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(0);
+        };
+        Ok(usize::try_from(row_u64(&row, 0, "current_objects.count")?).unwrap_or(0))
+    }
+
+    async fn list_current_object_keys(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .connection
+            .query("SELECT key FROM current_objects", ())
+            .await?;
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next().await? {
+            keys.push(row_string(&row, 0, "current_objects.key")?);
+        }
+        Ok(keys)
+    }
+
+    async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT key FROM current_objects WHERE object_id = ?1",
+                (object_id,),
+            )
+            .await?;
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next().await? {
+            keys.push(row_string(&row, 0, "current_objects.key")?);
+        }
+        Ok(keys)
     }
 
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
@@ -1019,36 +1097,6 @@ impl MetadataStore for TursoMetadataStore {
             )
             .await?;
         Ok(())
-    }
-
-    async fn persist_current_state(&self, current_state: &CurrentState) -> Result<()> {
-        self.connection.execute_batch("BEGIN IMMEDIATE").await?;
-        let result: Result<()> = async {
-            self.connection
-                .execute("DELETE FROM current_objects", ())
-                .await?;
-            for (key, manifest_hash) in &current_state.objects {
-                let object_id = current_state
-                    .object_ids
-                    .get(key)
-                    .with_context(|| format!("missing object id for current key {key}"))?;
-                self.connection
-                    .execute(
-                        "INSERT INTO current_objects (key, manifest_hash, object_id)
-                         VALUES (?1, ?2, ?3)",
-                        (key.as_str(), manifest_hash.as_str(), object_id.as_str()),
-                    )
-                    .await?;
-            }
-            self.connection.execute_batch("COMMIT").await?;
-            Ok(())
-        }
-        .await;
-
-        if result.is_err() {
-            self.rollback().await;
-        }
-        result
     }
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {

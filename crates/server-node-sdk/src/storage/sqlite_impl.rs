@@ -13,12 +13,12 @@ use crate::cluster::NodeDescriptor;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord,
-    FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
+    DataScrubRunRecord, FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo,
+    SnapshotManifest, StorageStatsSample, StorageStatsState, compress_snapshot_json,
+    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
@@ -75,6 +75,70 @@ impl MetadataStore for SqliteMetadataStore {
     async fn load_current_state(&self) -> Result<CurrentState> {
         let db = self.metadata_conn()?;
         load_current_state_from_db(&db)
+    }
+
+    async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>> {
+        let db = self.metadata_conn()?;
+        db.query_row(
+            "SELECT manifest_hash, object_id FROM current_objects WHERE key = ?1",
+            params![key],
+            |row| {
+                Ok(CurrentObjectEntry {
+                    manifest_hash: row.get(0)?,
+                    object_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to query current object")
+    }
+
+    async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute(
+            "INSERT INTO current_objects (key, manifest_hash, object_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                manifest_hash = excluded.manifest_hash,
+                object_id = excluded.object_id",
+            params![key, entry.manifest_hash, entry.object_id],
+        )?;
+        Ok(())
+    }
+
+    async fn remove_current_object(&self, key: &str) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute("DELETE FROM current_objects WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    async fn count_current_objects(&self) -> Result<usize> {
+        let db = self.metadata_conn()?;
+        let count: i64 =
+            db.query_row("SELECT COUNT(*) FROM current_objects", [], |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    async fn list_current_object_keys(&self) -> Result<Vec<String>> {
+        let db = self.metadata_conn()?;
+        let mut stmt = db.prepare("SELECT key FROM current_objects")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row?);
+        }
+        Ok(keys)
+    }
+
+    async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
+        let db = self.metadata_conn()?;
+        let mut stmt = db.prepare("SELECT key FROM current_objects WHERE object_id = ?1")?;
+        let rows = stmt.query_map(params![object_id], |row| row.get::<_, String>(0))?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row?);
+        }
+        Ok(keys)
     }
 
     async fn load_repair_attempts(
@@ -998,24 +1062,6 @@ impl MetadataStore for SqliteMetadataStore {
             params![object_id, payload],
         )?;
         Ok(())
-    }
-
-    async fn persist_current_state(&self, current_state: &CurrentState) -> Result<()> {
-        self.in_metadata_tx(|db| {
-            db.execute("DELETE FROM current_objects", [])?;
-            let mut stmt = db.prepare(
-                "INSERT INTO current_objects (key, manifest_hash, object_id)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for (key, manifest_hash) in &current_state.objects {
-                let object_id = current_state
-                    .object_ids
-                    .get(key)
-                    .with_context(|| format!("missing object id for current key {key}"))?;
-                stmt.execute(params![key, manifest_hash, object_id])?;
-            }
-            Ok(())
-        })
     }
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
