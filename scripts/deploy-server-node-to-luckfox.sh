@@ -80,4 +80,4 @@ log "marking remote binary executable"
 ssh "${HOST}" "chmod +x '${REMOTE_PATH}'"
 
 log "deployed: ${HOST}:${REMOTE_PATH}"
-ssh "${HOST}" "'${REMOTE_PATH}' --version" || true
+ssh "${HOST}" "'${REMOTE_PATH}' --version"
