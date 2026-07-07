@@ -118,9 +118,9 @@ pub struct StorageInfo {
 pub fn collect_storage_info() -> StorageInfo {
     StorageInfo {
         root_used_percent: df_used_percent("/"),
-        ssd1_free_gb: df_free_gb("/mnt/ssd1"),
-        ssd2_free_gb: df_free_gb("/mnt/ssd2"),
-        sdcard_free_gb: df_free_gb("/mnt/sdcard"),
+        ssd1_free_gb: mounted_df_free_gb("/mnt/ssd1"),
+        ssd2_free_gb: mounted_df_free_gb("/mnt/ssd2"),
+        sdcard_free_gb: mounted_df_free_gb("/mnt/sdcard"),
     }
 }
 
@@ -149,6 +149,28 @@ fn df_free_gb(path: &str) -> Option<f32> {
     Some(available_kb / (1024.0 * 1024.0))
 }
 
+/// Like `df_free_gb`, but only for paths that are themselves a mount point.
+/// Optional volumes like `/mnt/ssd1` may exist as plain (empty) directories
+/// on the root filesystem when the device isn't present; `df` would then
+/// silently report root filesystem free space instead of "not mounted".
+fn mounted_df_free_gb(path: &str) -> Option<f32> {
+    if !is_mount_point(path) {
+        return None;
+    }
+    df_free_gb(path)
+}
+
+fn is_mount_point(path: &str) -> bool {
+    let mountinfo = match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+    mountinfo
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .any(|mount_point| mount_point == path)
+}
+
 pub struct IronmeshInfo {
     pub reachable: bool,
     pub node_id: Option<String>,
@@ -159,7 +181,6 @@ pub struct IronmeshInfo {
 
 pub fn collect_ironmesh_info(base_url: &str) -> IronmeshInfo {
     let client = match reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(2))
         .build()
     {

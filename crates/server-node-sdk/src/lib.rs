@@ -2484,6 +2484,7 @@ pub struct ServerNodeConfig {
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
     pub internal_ca_key_path: Option<PathBuf>,
+    pub local_status_bind_addr: Option<SocketAddr>,
     pub rendezvous_ca_cert_path: Option<PathBuf>,
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
@@ -2557,6 +2558,27 @@ fn parse_require_client_auth_env(allow_unauthenticated_clients: bool) -> bool {
         .ok()
         .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
         .unwrap_or(!allow_unauthenticated_clients)
+}
+
+/// Parses the optional plain-HTTP, loopback-only status listener bind address.
+/// Unset by default; when set, must be a loopback address since the listener
+/// serves `/health` and cluster status without any authentication.
+fn parse_local_status_bind_addr() -> Result<Option<SocketAddr>> {
+    let Some(raw) = std::env::var("IRONMESH_LOCAL_STATUS_BIND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let addr: SocketAddr = raw.parse().context("invalid IRONMESH_LOCAL_STATUS_BIND")?;
+    if !addr.ip().is_loopback() {
+        bail!(
+            "IRONMESH_LOCAL_STATUS_BIND must bind to a loopback address (127.0.0.1 or ::1) \
+             since it serves health/cluster status without authentication; got {addr}"
+        );
+    }
+    Ok(Some(addr))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4347,6 +4369,7 @@ impl ServerNodeConfig {
             public_peer_api_enabled: bootstrap.public_peer_api_enabled,
             internal_tls,
             internal_ca_key_path: None,
+            local_status_bind_addr: parse_local_status_bind_addr()?,
             rendezvous_ca_cert_path: None,
             rendezvous_urls: bootstrap.rendezvous_urls,
             rendezvous_registration_enabled: rendezvous_configured,
@@ -4626,6 +4649,7 @@ impl ServerNodeConfig {
             internal_ca_key_path: std::env::var("IRONMESH_INTERNAL_TLS_CA_KEY")
                 .ok()
                 .map(PathBuf::from),
+            local_status_bind_addr: parse_local_status_bind_addr()?,
             rendezvous_ca_cert_path,
             rendezvous_urls,
             rendezvous_registration_enabled,
@@ -5711,6 +5735,7 @@ async fn run_inner(
 struct ServerApps {
     public_app: Router,
     internal_app: Router,
+    local_status_app: Router,
 }
 
 async fn start_background_runtimes(
@@ -6198,9 +6223,15 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             require_internal_caller,
         ));
 
+    let local_status_app = Router::new()
+        .route("/health", get(health))
+        .route("/api/v1/cluster/status", get(cluster_status))
+        .with_state(state.clone());
+
     ServerApps {
         public_app,
         internal_app,
+        local_status_app,
     }
 }
 
@@ -6212,11 +6243,29 @@ async fn run_server_listeners(
     let ServerApps {
         public_app,
         internal_app,
+        local_status_app,
     } = apps;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut internal_server_handle = None;
     let mut internal_server_task = None;
     let mut embedded_rendezvous_task = None;
+    let mut local_status_server_task = None;
+
+    if let Some(local_status_bind_addr) = config.local_status_bind_addr {
+        let shutdown_rx = shutdown_rx.clone();
+        local_status_server_task = Some(tokio::spawn(async move {
+            info!(
+                bind_addr = %local_status_bind_addr,
+                "server node local status (unauthenticated, loopback-only) listener"
+            );
+
+            let listener = tokio::net::TcpListener::bind(local_status_bind_addr).await?;
+            axum::serve(listener, local_status_app)
+                .with_graceful_shutdown(wait_for_shutdown_trigger(shutdown_rx))
+                .await
+                .context("local status server listener stopped")
+        }));
+    }
 
     if let Some(internal_tls) = config.internal_tls.as_ref() {
         let internal_bind_addr = internal_tls.bind_addr;
@@ -6310,6 +6359,9 @@ async fn run_server_listeners(
             if let Some(task) = internal_server_task.take() {
                 task.await.context("internal server task join failure")??;
             }
+            if let Some(task) = local_status_server_task.take() {
+                task.await.context("local status server task join failure")??;
+            }
             if let Some(task) = embedded_rendezvous_task.take() {
                 task.await.context("embedded rendezvous supervisor task join failure")?;
             }
@@ -6326,6 +6378,10 @@ async fn run_server_listeners(
     }
     if let Some(task) = internal_server_task {
         task.await.context("internal server task join failure")??;
+    }
+    if let Some(task) = local_status_server_task {
+        task.await
+            .context("local status server task join failure")??;
     }
     if let Some(task) = embedded_rendezvous_task {
         task.abort();

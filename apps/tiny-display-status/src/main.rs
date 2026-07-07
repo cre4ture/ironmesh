@@ -19,7 +19,9 @@ use framebuffer::FrameBuffer;
 
 const FB_DEVICE: &str = "/dev/fb0";
 const TOUCH_DEVICE: &str = "/dev/input/event0";
-const IRONMESH_BASE_URL: &str = "https://127.0.0.1:8443";
+// Matches the server-node's optional unauthenticated local status listener,
+// see IRONMESH_LOCAL_STATUS_BIND (crates/server-node-sdk).
+const IRONMESH_BASE_URL: &str = "http://127.0.0.1:18090";
 const NUM_PAGES: usize = 3;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 

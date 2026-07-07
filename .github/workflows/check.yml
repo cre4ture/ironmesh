@@ -499,4 +499,4 @@ jobs:
         run: cargo check -p adapter-windows-cfapi --all-targets
 
       - name: Run Windows workspace clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude tiny-display-status -- -D warnings

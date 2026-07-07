@@ -314,6 +314,7 @@ fn test_cluster_config_without_internal_tls(
         public_peer_api_enabled: false,
         internal_tls: None,
         internal_ca_key_path: None,
+        local_status_bind_addr: None,
         rendezvous_ca_cert_path: None,
         rendezvous_urls: vec![format!("http://{bind_addr}")],
         rendezvous_registration_enabled: false,
