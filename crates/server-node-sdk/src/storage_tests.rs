@@ -1654,6 +1654,56 @@ async fn list_replication_subjects_excludes_only_corrupt_manifests_impl(
         corrupt_keys.push(key);
     }
 
+    let orphan_corrupt_key = "docs/corrupt-orphan-head.txt";
+    let orphan_head = store
+        .put_object_versioned(
+            orphan_corrupt_key,
+            Bytes::from_static(b"orphan-corrupt-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let orphan_object_id = store
+        .object_id_for_key(orphan_corrupt_key)
+        .await
+        .unwrap()
+        .expect("orphan corrupt subject should have a current object id before detaching");
+    store
+        .replace_manifest_bytes_for_subject_for_test(
+            orphan_corrupt_key,
+            Some(&orphan_head.version_id),
+            br#"{not-valid-json"#,
+        )
+        .await
+        .unwrap();
+    let mut orphan_index = store
+        .load_version_index_by_object_id(&orphan_object_id)
+        .await
+        .unwrap()
+        .expect("orphan corrupt subject should retain its version index");
+    orphan_index
+        .versions
+        .get_mut(&orphan_head.version_id)
+        .expect("orphan corrupt subject should retain its head record")
+        .logical_path = None;
+    store
+        .persist_version_index_by_object_id(&orphan_object_id, &orphan_index)
+        .await
+        .unwrap();
+    store
+        .remove_current_object(orphan_corrupt_key)
+        .await
+        .unwrap();
+    let current_state = store.metadata_store.load_current_state().await.unwrap();
+    assert!(
+        !current_state.object_ids.contains_key(orphan_corrupt_key),
+        "orphan corrupt subject should be detached from current_state.object_ids"
+    );
+    assert!(
+        !current_state.objects.contains_key(orphan_corrupt_key),
+        "orphan corrupt subject should be detached from current_state.objects"
+    );
+
     let inspector = store.replication_subject_inspector().await.unwrap();
     let subjects = inspector
         .list_replication_subjects()
@@ -1674,6 +1724,12 @@ async fn list_replication_subjects_excludes_only_corrupt_manifests_impl(
             "expected corrupt key {key} to be excluded from available subjects, subjects={subjects:?}"
         );
     }
+    assert!(
+        !subjects.iter().any(|subject| {
+            subject == orphan_corrupt_key || subject.starts_with(&format!("{orphan_corrupt_key}@"))
+        }),
+        "expected orphan corrupt key {orphan_corrupt_key} to be excluded from available subjects, subjects={subjects:?}"
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }

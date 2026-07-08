@@ -1924,8 +1924,18 @@ impl ReplicationSubjectInspector {
                 continue;
             }
 
-            if let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await? {
-                return Ok(Some(manifest.key));
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving replication subject key; skipping record"
+                    );
+                }
             }
         }
 
@@ -1941,10 +1951,20 @@ impl ReplicationSubjectInspector {
             return Ok(Some(logical_path));
         }
 
-        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH
-            && let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await?
-        {
-            return Ok(Some(manifest.key));
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving replication subject key; falling back to index lookup"
+                    );
+                }
+            }
         }
 
         self.resolve_key_for_version_index(index).await
@@ -4599,8 +4619,17 @@ impl PersistentStore {
             return Ok(true);
         }
 
-        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
-            return Ok(false);
+        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                warn!(
+                    manifest_hash = %manifest_hash,
+                    error = %err,
+                    "manifest unreadable or invalid; treating as not locally available"
+                );
+                return Ok(false);
+            }
         };
 
         for chunk in &manifest.chunks {
@@ -7022,8 +7051,18 @@ impl PersistentStore {
                 continue;
             }
 
-            if let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await? {
-                return Ok(Some(manifest.key));
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving version key; skipping record"
+                    );
+                }
             }
         }
 
@@ -7039,10 +7078,20 @@ impl PersistentStore {
             return Ok(Some(logical_path));
         }
 
-        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH
-            && let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await?
-        {
-            return Ok(Some(manifest.key));
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving version key; falling back to index lookup"
+                    );
+                }
+            }
         }
 
         self.resolve_key_for_version_index(index).await
