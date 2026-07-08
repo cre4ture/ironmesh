@@ -192,7 +192,7 @@ pub fn collect_ironmesh_info(base_url: &str) -> IronmeshInfo {
                 version: None,
                 online_nodes: None,
                 offline_nodes: None,
-            }
+            };
         }
     };
 
