@@ -24,15 +24,15 @@ struct Cli {}
 fn main() -> Result<()> {
     Cli::parse();
 
-    // Defaults to the multi-thread scheduler (matches prior `#[tokio::main]`
-    // behavior) since most deployments have multiple cores. Single-core
-    // hosts (e.g. the LuckFox PicoKVM) can opt into the current-thread
-    // runtime to drop the worker-pool thread stacks and cross-thread wake
-    // overhead, which is pure cost with no parallelism to gain on one core.
-    let use_current_thread = std::env::var_os("IRONMESH_TOKIO_CURRENT_THREAD")
-        .is_some_and(|v| v != "0");
+    let use_current_thread =
+        std::env::var_os("IRONMESH_TOKIO_CURRENT_THREAD").is_some_and(|v| v != "0");
 
     let runtime = if use_current_thread {
+        eprintln!(
+            "ironmesh-server-node: using Tokio current-thread runtime because \
+IRONMESH_TOKIO_CURRENT_THREAD is set; this avoids worker-pool overhead on \
+single-core hosts"
+        );
         tokio::runtime::Builder::new_current_thread()
     } else {
         tokio::runtime::Builder::new_multi_thread()
