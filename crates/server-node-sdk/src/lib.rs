@@ -8870,9 +8870,22 @@ async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<
             }
         }
     };
+    // Per-manifest corruption is already handled inside `list_replication_subjects`
+    // (a single unreadable/invalid manifest is excluded from the result rather than
+    // aborting the scan), so an `Err` here reflects a genuinely unexpected failure
+    // unrelated to any specific manifest (e.g. the metadata store itself being
+    // unreachable). Falling back to `current_keys()` in that case still risks
+    // over-trusting local data, but it's the best information available; log it so
+    // the fallback is visible instead of silent.
     let mut subjects = match inspector.list_replication_subjects().await {
         Ok(subjects) => subjects,
-        Err(_) => inspector.current_keys(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to compute replication subjects; falling back to current keys"
+            );
+            inspector.current_keys()
+        }
     };
     subjects.sort();
     subjects
