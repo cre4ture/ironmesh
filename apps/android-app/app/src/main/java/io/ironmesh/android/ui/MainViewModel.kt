@@ -34,9 +34,10 @@ enum class GalleryViewMode {
 }
 
 enum class MainSection {
+    HOME,
+    SYNC,
+    LIBRARY,
     SETTINGS,
-    WEB_UI,
-    GALLERY,
 }
 
 enum class FolderSyncActivityFilter {
@@ -104,7 +105,7 @@ data class MainUiState(
     val newSyncAllowOtherConnections: Boolean = true,
     val newSyncAllowRoaming: Boolean = false,
     val newSyncAllowedWifiSsids: String = "",
-    val selectedSection: MainSection = MainSection.SETTINGS,
+    val selectedSection: MainSection = MainSection.HOME,
     val webUiUrl: String = "",
     val galleryMode: GalleryViewMode = GalleryViewMode.FLATTENED_ALL_IMAGES,
     val galleryItems: List<GalleryImageItem> = emptyList(),
@@ -233,8 +234,16 @@ class MainViewModel(
 
     fun selectSection(section: MainSection) {
         uiState.value = uiState.value.copy(selectedSection = section)
-        if (section == MainSection.SETTINGS) {
+        if (section == MainSection.SYNC) {
             refreshExpandedFolderSyncHistory(force = true)
+        }
+        if (
+            section == MainSection.LIBRARY &&
+            uiState.value.galleryItems.isEmpty() &&
+            uiState.value.galleryDirectories.isEmpty() &&
+            !uiState.value.galleryLoading
+        ) {
+            refreshGallery()
         }
     }
 
@@ -531,7 +540,6 @@ class MainViewModel(
         val clientIdentityJson = currentClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             uiState.value = uiState.value.copy(
-                selectedSection = MainSection.WEB_UI,
                 webUiUrl = "",
                 status = "Enroll this device before opening the Web UI.",
             )
@@ -539,7 +547,6 @@ class MainViewModel(
         }
         uiState.value = uiState.value.copy(
             loading = true,
-            selectedSection = MainSection.WEB_UI,
             webUiUrl = "",
             status = "Starting Web UI...",
         )
@@ -603,6 +610,7 @@ class MainViewModel(
                         deviceAuthState = authState,
                         bootstrapInput = "",
                         deviceLabelInput = authState.label.orEmpty(),
+                        selectedSection = MainSection.HOME,
                         status = "Device enrolled: ${authState.deviceId}",
                     )
                     FolderSyncScheduler.reschedule(getApplication())
@@ -622,6 +630,8 @@ class MainViewModel(
             deviceAuthState = DeviceAuthState(),
             bootstrapInput = "",
             deviceLabelInput = "",
+            selectedSection = MainSection.HOME,
+            webUiUrl = "",
             status = "Cleared local device credential",
         )
         FolderSyncScheduler.reschedule(getApplication())
@@ -665,7 +675,7 @@ class MainViewModel(
     }
 
     private fun refreshExpandedFolderSyncHistory(force: Boolean = false) {
-        if (uiState.value.selectedSection != MainSection.SETTINGS) {
+        if (uiState.value.selectedSection != MainSection.SYNC) {
             return
         }
         val historyStates = uiState.value.folderSyncHistory
