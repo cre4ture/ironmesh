@@ -166,12 +166,20 @@ main() {
     # /proc/cpuinfo on the LuckFox PicoKVM) instead of the generic armv7
     # baseline, which benefits blake3's SIMD hashing kernels among others.
     #
+    # This must be set via the target-scoped CARGO_TARGET_*_RUSTFLAGS var,
+    # not a bare RUSTFLAGS: a bare RUSTFLAGS applies to every rustc
+    # invocation cargo makes for this build, including host build-script
+    # and proc-macro compilation (server-node has apps/server-node/build.rs,
+    # plus proc-macro deps like clap_derive) - cortex-a7 is not a valid
+    # target-cpu on the x86_64 build host.
+    #
     # panic=abort is set here via --config rather than in the shared
     # workspace Cargo.toml: it's safe for this standalone binary, but
     # unsafe to apply workspace-wide since the android/ios app crates rely
     # on catching panics at their FFI boundary to avoid aborting the host
     # app process.
-    RUSTFLAGS="-C target-cpu=cortex-a7" cargo zigbuild \
+    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-C target-cpu=cortex-a7" \
+      cargo zigbuild \
       --config profile.release.panic='"abort"' \
       --target "${TARGET_TRIPLE}" --release -p "${PACKAGE}" --bin "${BIN_NAME}"
   )
