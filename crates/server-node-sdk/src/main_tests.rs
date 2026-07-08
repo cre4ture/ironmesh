@@ -5900,6 +5900,82 @@ run_on_main_metadata_backends!(
     startup_repair_runs_when_gaps_exist_turso
 );
 
+// Regression test for the availability computation that backs gap detection
+// (`spawn_local_availability_refresher` / `spawn_startup_replication_repair` /
+// `spawn_replication_auditor` all rely on this). A node with a mix of healthy and
+// corrupt (0-byte / invalid-JSON) manifests must still report the healthy objects
+// as available and the corrupt ones as not, rather than erroring out and falling
+// back to trusting every locally indexed key.
+async fn recompute_local_cluster_available_subjects_excludes_corrupt_manifests_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+
+    let mut valid_keys = Vec::new();
+    for i in 0..5 {
+        let key = format!("gap-detect-valid-{i}.bin");
+        {
+            let mut store = lock_store(&state, "tests.availability.put_valid").await;
+            store
+                .put_object_versioned(
+                    &key,
+                    Bytes::from(format!("valid-payload-{i}").into_bytes()),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+        valid_keys.push(key);
+    }
+
+    let mut corrupt_keys = Vec::new();
+    for i in 0..2 {
+        let key = format!("gap-detect-corrupt-{i}.bin");
+        {
+            let mut store = lock_store(&state, "tests.availability.put_corrupt").await;
+            store
+                .put_object_versioned(
+                    &key,
+                    Bytes::from(format!("corrupt-payload-{i}").into_bytes()),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+            // 0-byte manifest file: fails to parse as JSON.
+            store
+                .replace_manifest_bytes_for_subject_for_test(&key, None, b"")
+                .await
+                .unwrap();
+        }
+        corrupt_keys.push(key);
+    }
+
+    let subjects = super::recompute_local_cluster_available_subjects(&state).await;
+
+    for key in &valid_keys {
+        assert!(
+            subjects.contains(key),
+            "expected valid key {key} to be reported available, subjects={subjects:?}"
+        );
+    }
+    for key in &corrupt_keys {
+        assert!(
+            !subjects
+                .iter()
+                .any(|subject| subject == key || subject.starts_with(&format!("{key}@"))),
+            "expected corrupt key {key} to be excluded from available subjects, subjects={subjects:?}"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    recompute_local_cluster_available_subjects_excludes_corrupt_manifests_impl,
+    recompute_local_cluster_available_subjects_excludes_corrupt_manifests,
+    recompute_local_cluster_available_subjects_excludes_corrupt_manifests_turso
+);
+
 async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTestBackend) {
     let state = build_test_state(2, true, backend).await;
 

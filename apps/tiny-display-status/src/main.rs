@@ -3,13 +3,13 @@ mod palette;
 mod stats;
 mod touch;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_8X13};
 use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::mono_font::ascii::{FONT_8X13, FONT_10X20};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, PrimitiveStyle};
@@ -196,8 +196,7 @@ fn render_page(fb: &mut FrameBuffer, page: usize) {
             .draw(fb)
             .ok();
 
-        let value_style =
-            MonoTextStyle::new(&FONT_8X13, entry.value_color.unwrap_or(accent));
+        let value_style = MonoTextStyle::new(&FONT_8X13, entry.value_color.unwrap_or(accent));
         let value_x = 8 + (entry.label.chars().count() as i32) * BODY_CHAR_WIDTH;
         Text::new(&entry.value, Point::new(value_x, y), value_style)
             .draw(fb)

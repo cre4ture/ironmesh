@@ -2,9 +2,9 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use embedded_graphics::Pixel;
 use embedded_graphics::pixelcolor::{IntoStorage, Rgb565};
 use embedded_graphics::prelude::*;
-use embedded_graphics::Pixel;
 
 pub const WIDTH: usize = 240;
 pub const HEIGHT: usize = 240;

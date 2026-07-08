@@ -108,6 +108,8 @@ use sync_agent_core::{
     run_folder_agent_with_control,
 };
 use tokio::task::JoinHandle;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -115,7 +117,7 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
         return Ok(rt);
     }
 
-    common::logging::init_compact_tracing_default("info");
+    init_android_tracing();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -126,6 +128,25 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     RUNTIME
         .get()
         .ok_or_else(|| anyhow::anyhow!("runtime initialization race"))
+}
+
+fn init_android_tracing() {
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+    TRACING_INIT.call_once(|| {
+        let env_filter = common::logging::env_filter_from_default_env("info");
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(common::logging::compact_fmt_layer())
+            .with(common::logging::LogCaptureLayer::new(
+                android_web_log_buffer(),
+            ))
+            .try_init();
+    });
+}
+
+fn android_web_log_buffer() -> Arc<common::logging::LogBuffer> {
+    static LOG_BUFFER: OnceLock<Arc<common::logging::LogBuffer>> = OnceLock::new();
+    Arc::clone(LOG_BUFFER.get_or_init(|| Arc::new(common::logging::LogBuffer::new(500))))
 }
 
 struct WebUiServer {
@@ -451,6 +472,8 @@ impl AndroidFolderSyncManager {
         label: String,
         options: FolderAgentRuntimeOptions,
     ) -> Result<()> {
+        init_android_tracing();
+
         let previous = self.runs.remove(&profile_id);
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
@@ -807,7 +830,7 @@ fn start_embedded_web_ui(
     if let Some(identity) = configured.client_identity {
         web_ui_config = web_ui_config.with_client_identity(identity);
     }
-    let app = web_ui_backend::router(web_ui_config);
+    let app = web_ui_backend::router(web_ui_config.with_log_buffer(android_web_log_buffer()));
 
     let task = rt.spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -1540,6 +1563,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
     client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
+        init_android_tracing();
+
         let connection_input: String = env.get_string(&connection_input)?.into();
         let local_folder: String = env.get_string(&local_folder)?.into();
         let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
@@ -1605,6 +1630,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
     client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
+        init_android_tracing();
+
         let profile_id: String = env.get_string(&profile_id)?.into();
         let label: String = env.get_string(&label)?.into();
         let connection_input: String = env.get_string(&connection_input)?.into();

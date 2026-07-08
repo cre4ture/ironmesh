@@ -47,9 +47,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("https://node-alpha.local", { exact: true })).toBeVisible();
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
-  await expect(page.getByText("Recent server logs", { exact: true })).toBeVisible();
-  await expect(page.getByText("2023-11-14T22:13:20.000Z INFO runtime ready")).toBeVisible();
-  await expect(page.getByText("replication audit healthy")).toBeVisible();
+  await expect(page.getByText("Recent client runtime logs", { exact: true })).toBeVisible();
+  await expect(page.getByText("2023-11-14T22:13:20.000Z INFO client_sdk client transport ready")).toBeVisible();
+  await expect(page.getByText("connection refused")).toBeVisible();
 
   await page.getByText("Store", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
@@ -363,6 +363,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
       apiV1("/ping"),
       apiV1("/health"),
       apiV1("/cluster/status"),
+      apiV1("/logs"),
       apiV1("/rendezvous"),
       apiV1("/store/list"),
       apiV1("/store/uploads/start")
@@ -575,16 +576,16 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       });
     }
 
-    if (pathname === "/logs" && method === "GET") {
+    if (pathname === apiV1("/logs") && method === "GET") {
       return json(route, {
         entries: [
           {
             captured_at_unix: 1_700_000_000,
-            line: "INFO runtime ready"
+            line: "INFO client_sdk client transport ready"
           },
           {
             captured_at_unix: 1_700_000_002,
-            line: "INFO replication audit healthy"
+            line: "ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health: connection refused"
           }
         ]
       });
