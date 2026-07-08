@@ -188,7 +188,7 @@ const pages = [
     id: "logs" as const,
     label: "Logs",
     icon: IconFileText,
-    description: "Inspect recent runtime logs from the connected server node with the same live-tail view as admin."
+    description: "Inspect client runtime, SDK, and transport logs from this embedded client process."
   }
 ];
 

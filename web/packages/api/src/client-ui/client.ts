@@ -57,7 +57,7 @@ export async function getClientClusterStatus(): Promise<JsonObject> {
 
 export async function getClientRecentLogs(limit = 200): Promise<LogsResponse> {
   const resolvedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(1000, Math.trunc(limit))) : 200;
-  return fetchJson<LogsResponse>(`/logs?limit=${resolvedLimit}`, {
+  return fetchJson<LogsResponse>(`${apiV1("/logs")}?limit=${resolvedLimit}`, {
     credentials: "same-origin",
     cache: "no-store"
   });
