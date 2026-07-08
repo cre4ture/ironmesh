@@ -472,6 +472,8 @@ impl AndroidFolderSyncManager {
         label: String,
         options: FolderAgentRuntimeOptions,
     ) -> Result<()> {
+        init_android_tracing();
+
         let previous = self.runs.remove(&profile_id);
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
@@ -1561,6 +1563,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
     client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
+        init_android_tracing();
+
         let connection_input: String = env.get_string(&connection_input)?.into();
         let local_folder: String = env.get_string(&local_folder)?.into();
         let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
@@ -1626,6 +1630,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
     client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
+        init_android_tracing();
+
         let profile_id: String = env.get_string(&profile_id)?.into();
         let label: String = env.get_string(&label)?.into();
         let connection_input: String = env.get_string(&connection_input)?.into();
