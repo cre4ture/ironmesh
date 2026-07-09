@@ -7,6 +7,7 @@ import android.graphics.Point
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Log
+import android.util.LruCache
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -710,6 +711,30 @@ private fun GalleryFullscreenPage(
     }
 }
 
+/**
+ * Keeps decoded thumbnails around across scroll-driven dispose/recompose cycles so
+ * revisiting a card doesn't re-trigger the SAF thumbnail IPC (and the underlying
+ * network round trip) for an image that was already fetched. Entries are keyed by
+ * document URI (path-based), which doesn't change when a file's content is updated
+ * in place, so callers that reload the gallery listing (e.g. [MainViewModel.refreshGallery])
+ * must call [clear] to avoid showing a stale thumbnail after such an update.
+ */
+internal object ThumbnailBitmapCache {
+    private val cache = object : LruCache<String, Bitmap>((Runtime.getRuntime().maxMemory() / 8).toInt()) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    fun get(key: String): Bitmap? = cache.get(key)
+
+    fun put(key: String, bitmap: Bitmap) {
+        cache.put(key, bitmap)
+    }
+
+    fun clear() {
+        cache.evictAll()
+    }
+}
+
 @Composable
 private fun ProviderThumbnail(
     documentUri: Uri,
@@ -717,9 +742,12 @@ private fun ProviderThumbnail(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val thumbnail by produceState<Bitmap?>(initialValue = null, documentUri) {
-        value = withContext(Dispatchers.IO) {
-            loadDocumentThumbnail(context.contentResolver, documentUri, 384)
+    val cacheKey = documentUri.toString()
+    val thumbnail by produceState<Bitmap?>(initialValue = ThumbnailBitmapCache.get(cacheKey), documentUri) {
+        if (value == null) {
+            value = withContext(Dispatchers.IO) {
+                loadDocumentThumbnail(context.contentResolver, documentUri, 384)
+            }?.also { ThumbnailBitmapCache.put(cacheKey, it) }
         }
     }
 

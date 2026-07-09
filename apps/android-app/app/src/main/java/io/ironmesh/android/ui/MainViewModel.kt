@@ -13,6 +13,7 @@ import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncServiceStatus
+import io.ironmesh.android.ui.screens.ThumbnailBitmapCache
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.parseAllowedWifiSsidsInput
@@ -275,6 +276,7 @@ class MainViewModel(
     }
 
     fun refreshGallery() {
+        ThumbnailBitmapCache.clear()
         val request = currentGalleryRequest(pageSize = uiState.value.galleryCollection?.pageSize ?: GALLERY_PAGE_SIZE)
         val requestVersion = nextGalleryRequestVersion()
         pinnedGalleryItemIndex = null

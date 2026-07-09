@@ -1165,6 +1165,75 @@ fn configured_client_node(
     )?))
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct AndroidClientCacheKey {
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+}
+
+struct AndroidClientCacheEntry {
+    key: AndroidClientCacheKey,
+    client: IronMeshClient,
+}
+
+/// Building an `IronMeshClient` from scratch runs a network connection-quality
+/// probe (see `order_clients_by_startup_probe` in client-sdk), so every JNI
+/// call on the Android data plane (thumbnail streaming in particular) shares
+/// one cached client per distinct connection identity instead of rebuilding
+/// it - and re-probing targets - on every call.
+fn android_client_cache() -> &'static Mutex<Option<AndroidClientCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<AndroidClientCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_configured_sdk(
+    connection_input: impl Into<String>,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<IronMeshClient> {
+    let key = AndroidClientCacheKey {
+        connection_input: connection_input.into(),
+        server_ca_pem,
+        client_identity_json,
+    };
+
+    // Recover from poisoning rather than propagating it: a panic while building one
+    // client must not permanently break every future JNI call in the process.
+    let mut slot = android_client_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(entry) = slot.as_ref()
+        && entry.key == key
+    {
+        return Ok(entry.client.clone());
+    }
+
+    let client = configured_sdk(
+        key.connection_input.clone(),
+        key.server_ca_pem.clone(),
+        key.client_identity_json.clone(),
+    )?;
+    *slot = Some(AndroidClientCacheEntry {
+        key,
+        client: client.clone(),
+    });
+    Ok(client)
+}
+
+fn cached_configured_client_node(
+    connection_input: impl Into<String>,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<ClientNode> {
+    Ok(ClientNode::with_client(cached_configured_sdk(
+        connection_input,
+        server_ca_pem,
+        client_identity_json,
+    )?))
+}
+
 fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("raw") => Ok(Some(StoreIndexView::Raw)),
@@ -1298,7 +1367,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_put
         let payload = env.convert_byte_array(&payload_ref)?;
 
         let rt = runtime()?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         let report = rt.block_on(client.put_large_aware(key, Bytes::from(payload)))?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -1335,7 +1405,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
         let stage_root = android_download_stage_root("jni-downloads", &connection_input)?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         let mut bytes = Vec::new();
         client.download_to_writer_resumable_staged(
             key,
@@ -1386,7 +1457,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
-        let sdk = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
         let response = sdk.store_index_blocking(
             prefix.as_deref(),
             usize::try_from(depth).unwrap_or(1).max(1),
@@ -1443,7 +1514,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
-        let sdk = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
         let options = StoreIndexRequestOptions {
             view: parse_store_index_view(view.as_deref())?,
             offset: usize::try_from(offset).ok(),
@@ -1508,7 +1579,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
         let mut reader = JavaInputStreamReader::new(&mut env, input_stream)?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         let report = client.put_large_aware_reader(key, &mut reader, size_bytes)?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -1541,7 +1613,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_del
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
         let rt = runtime()?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         rt.block_on(client.delete_path(key))?;
         Ok(204)
     })();
@@ -1582,7 +1655,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         initialize_android_preferences_bridge(&mut env)?;
         let stage_root = android_download_stage_root("jni-downloads", &connection_input)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         client.download_to_writer_resumable_staged(
             key,
             snapshot.as_deref(),
@@ -1620,7 +1694,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         initialize_android_preferences_bridge(&mut env)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
         let rt = runtime()?;
-        let client = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let client = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
         let response = rt.block_on(client.get_relative_path(&relative_url))?;
         if !response.status.is_success() {
             anyhow::bail!(
