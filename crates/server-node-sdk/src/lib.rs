@@ -80,11 +80,11 @@ use transport_sdk::{
     NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
     RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelSession, RelayTunnelSessionKind,
-    RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
-    TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader, TransportPathKind,
-    TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, credential_fingerprint,
-    perform_transport_client_handshake, perform_transport_server_handshake,
+    RelayWakeClient, RelayWakeEvent, RelayWakeRegistration, RendezvousClientConfig,
+    RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
+    TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
+    credential_fingerprint, perform_transport_client_handshake, perform_transport_server_handshake,
     read_buffered_transport_response, read_transport_request_head, verify_signed_request_headers,
     write_buffered_transport_request, write_buffered_transport_response,
     write_transport_response_head,
@@ -142,6 +142,22 @@ const UPLOAD_SESSION_PERSIST_COALESCE_SECS: u64 = 5;
 const RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS: u64 = 50;
 const RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS: u64 = 250;
 const RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS: u64 = 30;
+/// Short timeout for the on-demand `AcceptTarget` dial made in reaction to a wake push
+/// (or the fallback tick): by the time we dial, we were just told a source is likely
+/// waiting, so there's no reason to hold the connection open for the old 15s poll
+/// window.
+const RENDEZVOUS_RELAY_WAKE_DRAIN_TIMEOUT_MS: u64 = 3_000;
+/// Eventual-correctness safety net: even with the wake channel healthy and connected,
+/// poll at this (much lower) frequency in case a push was somehow lost, without
+/// reintroducing the old tight poll cycle.
+const RENDEZVOUS_RELAY_WAKE_FALLBACK_POLL_SECS: u64 = 45;
+/// Bounds how many pending sources we drain in one reaction to a single wake/fallback
+/// tick, so a pathological flood of sources can't hold this loop hostage.
+const RENDEZVOUS_RELAY_WAKE_DRAIN_MAX_ITERATIONS: usize = 64;
+/// Keeps the wake connection's keepalive traffic comfortably below typical
+/// NAT/firewall idle-connection timeouts.
+const RENDEZVOUS_RELAY_WAKE_PING_INTERVAL_SECS: u64 = 20;
+const RENDEZVOUS_RELAY_WAKE_IDLE_TIMEOUT_SECS: u64 = 60;
 const EMBEDDED_RENDEZVOUS_RESTART_INITIAL_DELAY_SECS: u64 = 1;
 
 fn ensure_rustls_crypto_provider_installed() {
@@ -8269,48 +8285,157 @@ fn spawn_rendezvous_relay_multiplex_session_task(
     });
 }
 
-fn spawn_rendezvous_relay_multiplex_accept_task(
+/// Drains any relay sources currently pending for this node against `endpoint`, in
+/// reaction to either a wake push or the periodic fallback tick. Each dial uses a
+/// short timeout since, by construction, we only call this when a source is believed
+/// to be waiting right now -- unlike the old poll loop, this is not a "wait and see"
+/// call.
+async fn drain_pending_relay_multiplex_targets(
+    state: &ServerState,
+    endpoint: &RendezvousEndpointClient,
+) {
+    let cluster_id = state.cluster_id;
+    let node_id = state.node_id;
+
+    for _ in 0..RENDEZVOUS_RELAY_WAKE_DRAIN_MAX_ITERATIONS {
+        let result = endpoint
+            .control
+            .accept_relay_multiplex_target(
+                &RelayTunnelAcceptRequest {
+                    cluster_id,
+                    target: PeerIdentity::Node(node_id),
+                    session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                    wait_timeout_ms: Some(RENDEZVOUS_RELAY_WAKE_DRAIN_TIMEOUT_MS),
+                },
+                MultiplexConfig::default(),
+            )
+            .await;
+
+        match result {
+            Ok((relay_session, multiplexed)) => {
+                spawn_rendezvous_relay_multiplex_session_task(
+                    state.clone(),
+                    endpoint.url.clone(),
+                    relay_session,
+                    multiplexed,
+                );
+                // Keep draining: a burst of several sources may have arrived together.
+            }
+            Err(err)
+                if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
+                    &err.to_string(),
+                ) =>
+            {
+                // Queue empty -- done until the next wake or fallback tick.
+                return;
+            }
+            Err(err) => {
+                let error_text = err.to_string();
+                let failures =
+                    record_rendezvous_registration_failure(state, &endpoint.url, &error_text).await;
+                warn!(
+                    error = %err,
+                    rendezvous_url = %endpoint.url,
+                    consecutive_failures = failures,
+                    "multiplex relay drain failed"
+                );
+                // Don't hot-loop on a genuine error; the next wake/fallback tick retries.
+                return;
+            }
+        }
+    }
+}
+
+/// Runs one connected relay wake session to completion: reacts to `Wake` pushes and a
+/// low-frequency fallback tick by draining pending sources, and pings periodically to
+/// keep the connection alive through NAT/firewall idle timeouts. Returns when the
+/// connection ends for any reason (clean close, read error, or receive-idle timeout),
+/// so the caller can reconnect.
+async fn run_rendezvous_relay_wake_session(
+    state: &ServerState,
+    endpoint: &RendezvousEndpointClient,
+    wake_client: &mut RelayWakeClient,
+) {
+    let mut fallback_ticker = tokio::time::interval(Duration::from_secs(
+        RENDEZVOUS_RELAY_WAKE_FALLBACK_POLL_SECS,
+    ));
+    fallback_ticker.tick().await; // consume the immediate first tick; we already drained on connect
+    let mut ping_ticker = tokio::time::interval(Duration::from_secs(
+        RENDEZVOUS_RELAY_WAKE_PING_INTERVAL_SECS,
+    ));
+    ping_ticker.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            event = tokio::time::timeout(
+                Duration::from_secs(RENDEZVOUS_RELAY_WAKE_IDLE_TIMEOUT_SECS),
+                wake_client.next_event(),
+            ) => {
+                match event {
+                    Ok(Ok(RelayWakeEvent::Wake)) => {
+                        drain_pending_relay_multiplex_targets(state, endpoint).await;
+                    }
+                    Ok(Ok(RelayWakeEvent::Closed)) => return,
+                    Ok(Err(err)) => {
+                        tracing::debug!(
+                            error = %err,
+                            rendezvous_url = %endpoint.url,
+                            "relay wake channel read failed"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            rendezvous_url = %endpoint.url,
+                            "relay wake channel idle timeout, reconnecting"
+                        );
+                        return;
+                    }
+                }
+            }
+            _ = fallback_ticker.tick() => {
+                drain_pending_relay_multiplex_targets(state, endpoint).await;
+            }
+            _ = ping_ticker.tick() => {
+                if wake_client.send_ping().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Maintains the long-lived relay wake channel for one rendezvous endpoint: connects,
+/// registers as the target identity, drains anything already pending, then runs the
+/// session until it ends, and reconnects immediately (no delay) since a healthy
+/// disconnect-and-retry is the normal way this loop turns over. Only a genuine
+/// connect failure backs off, using the same backoff as before.
+fn spawn_rendezvous_relay_wake_task(
     state: ServerState,
     endpoint: RendezvousEndpointClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let cluster_id = state.cluster_id;
-        let node_id = state.node_id;
+        let registration = RelayWakeRegistration {
+            cluster_id: state.cluster_id,
+            target: PeerIdentity::Node(state.node_id),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+        };
 
         loop {
-            let result = endpoint
-                .control
-                .accept_relay_multiplex_target(
-                    &RelayTunnelAcceptRequest {
-                        cluster_id,
-                        target: PeerIdentity::Node(node_id),
-                        session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                        wait_timeout_ms: Some(15_000),
-                    },
-                    MultiplexConfig::default(),
-                )
-                .await;
-
-            match result {
-                Ok((relay_session, multiplexed)) => {
-                    spawn_rendezvous_relay_multiplex_session_task(
-                        state.clone(),
-                        endpoint.url.clone(),
-                        relay_session,
-                        multiplexed,
-                    );
+            match endpoint.control.connect_relay_wake(&registration).await {
+                Ok(mut wake_client) => {
+                    let _ = record_rendezvous_registration_success(
+                        &state,
+                        &endpoint.url,
+                        RendezvousRegistrationSuccessVersionUpdate::Preserve,
+                    )
+                    .await;
+                    drain_pending_relay_multiplex_targets(&state, &endpoint).await;
+                    run_rendezvous_relay_wake_session(&state, &endpoint, &mut wake_client).await;
+                    // Falls through here on any disconnect; loop back and reconnect
+                    // immediately below, with no sleep.
                 }
                 Err(err) => {
-                    if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(&err.to_string())
-                    {
-                        tracing::debug!(
-                            error = %err,
-                            rendezvous_url = %endpoint.url,
-                            "multiplex relay accept timed out without a source connection"
-                        );
-                        continue;
-                    }
-
                     let error_text = err.to_string();
                     let failures =
                         record_rendezvous_registration_failure(&state, &endpoint.url, &error_text)
@@ -8322,7 +8447,7 @@ fn spawn_rendezvous_relay_multiplex_accept_task(
                             rendezvous_url = %endpoint.url,
                             consecutive_failures = failures,
                             next_retry_ms = retry_delay.as_millis(),
-                            "multiplex relay accept failed"
+                            "relay wake channel connect failed"
                         );
                     } else {
                         tracing::debug!(
@@ -8330,7 +8455,7 @@ fn spawn_rendezvous_relay_multiplex_accept_task(
                             rendezvous_url = %endpoint.url,
                             consecutive_failures = failures,
                             next_retry_ms = retry_delay.as_millis(),
-                            "multiplex relay accept failed"
+                            "relay wake channel connect failed"
                         );
                     }
                     tokio::time::sleep(retry_delay).await;
@@ -8373,7 +8498,7 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                 }
                 accept_tasks.insert(
                     endpoint.url.clone(),
-                    spawn_rendezvous_relay_multiplex_accept_task(state.clone(), endpoint),
+                    spawn_rendezvous_relay_wake_task(state.clone(), endpoint),
                 );
             }
 

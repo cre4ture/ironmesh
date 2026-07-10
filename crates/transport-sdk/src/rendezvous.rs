@@ -21,6 +21,7 @@ use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
 use crate::relay::{RelayTicket, RelayTicketRequest};
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSession};
+use crate::relay_wake::{RelayWakeClient, RelayWakeRegistration};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -378,6 +379,50 @@ impl RendezvousControlClient {
                 Err(err) => {
                     let message = self.decorate_transport_error(format!(
                         "failed accepting relay tunnel target at {base_url}: {err}"
+                    ));
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+    }
+
+    /// Registers on the long-lived relay "wake" channel: instead of the caller having
+    /// to repeatedly reopen a short-lived `accept_relay_tunnel` connection to poll for
+    /// a peer, it holds this one connection open and gets pushed a wake the instant a
+    /// peer is waiting, then reacts by dialing `accept_relay_tunnel` on demand.
+    pub async fn connect_relay_wake(
+        &self,
+        registration: &RelayWakeRegistration,
+    ) -> Result<RelayWakeClient> {
+        registration.validate()?;
+        if registration.cluster_id != self.config.cluster_id {
+            bail!(
+                "relay wake registration cluster_id {} does not match rendezvous client cluster_id {}",
+                registration.cluster_id,
+                self.config.cluster_id
+            );
+        }
+
+        let mut last_error = None;
+        for base_url in &self.config.rendezvous_urls {
+            match RelayWakeClient::connect(
+                base_url,
+                self.server_ca_pem.as_deref(),
+                self.client_identity_pem.as_deref(),
+                registration.clone(),
+            )
+            .await
+            {
+                Ok(client) => {
+                    self.record_endpoint_result(base_url, Ok(()), true);
+                    return Ok(client);
+                }
+                Err(err) => {
+                    let message = self.decorate_transport_error(format!(
+                        "failed connecting relay wake channel at {base_url}: {err}"
                     ));
                     self.record_endpoint_result(base_url, Err(message.clone()), true);
                     last_error = Some(anyhow!(message));

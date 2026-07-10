@@ -21,5 +21,10 @@ tracing.workspace = true
 transport-sdk = { path = "../transport-sdk" }
 x509-parser = "0.16"
 
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+uuid = { workspace = true }
+
 [lints]
 workspace = true

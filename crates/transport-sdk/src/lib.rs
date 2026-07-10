@@ -8,6 +8,7 @@ pub mod mux;
 pub mod peer;
 pub mod relay;
 pub mod relay_tunnel;
+pub mod relay_wake;
 pub mod rendezvous;
 pub mod rendezvous_runtime;
 pub mod request_auth;
@@ -47,6 +48,9 @@ pub use relay_tunnel::{
     RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelControlMessage, RelayTunnelEvent,
     RelayTunnelSession, relay_tunnel_ws_url,
 };
+pub use relay_wake::{
+    RelayWakeClient, RelayWakeControlMessage, RelayWakeEvent, RelayWakeRegistration,
+};
 pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
@@ -57,7 +61,7 @@ pub use rendezvous::{
 };
 pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayTunnelBroker,
-    RelayTunnelEndpoint, RelayTunnelFrame, issue_relay_ticket,
+    RelayTunnelEndpoint, RelayTunnelFrame, WakeRegistrationHandle, issue_relay_ticket,
 };
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,
