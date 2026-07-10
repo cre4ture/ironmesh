@@ -202,12 +202,12 @@ mod tests {
         };
 
         let started_at = Instant::now();
-        let error = match RelayWakeClient::connect(&format!("ws://{addr}"), None, None, registration)
-            .await
-        {
-            Ok(_) => panic!("stalled websocket handshake should fail"),
-            Err(error) => error,
-        };
+        let error =
+            match RelayWakeClient::connect(&format!("ws://{addr}"), None, None, registration).await
+            {
+                Ok(_) => panic!("stalled websocket handshake should fail"),
+                Err(error) => error,
+            };
 
         server_task.abort();
 

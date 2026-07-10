@@ -961,7 +961,9 @@ mod tests {
             mtls: None,
         });
         let server_handle = tokio::spawn(async move {
-            serve(state).await.expect("test rendezvous server should run");
+            serve(state)
+                .await
+                .expect("test rendezvous server should run");
         });
 
         // Wait for the listener to actually be accepting connections.
@@ -1050,12 +1052,11 @@ mod tests {
                 match serde_json::from_str::<RelayTunnelControlMessage>(&text)
                     .expect("response should parse")
                 {
-                    RelayTunnelControlMessage::Paired { session } => {
+                    RelayTunnelControlMessage::Paired { .. } => {
                         panic!(
                             "zombie-queue bug confirmed: target paired with an already-abandoned \
-                             source (session_id={}); the real source's socket was closed ~300ms \
-                             earlier and can never receive this pairing",
-                            session.session_id
+                             source; the real source's socket was closed ~300ms earlier and can \
+                             never receive this pairing"
                         );
                     }
                     RelayTunnelControlMessage::Error { message } => {
@@ -1087,7 +1088,9 @@ mod tests {
             mtls: None,
         });
         let server_handle = tokio::spawn(async move {
-            serve(state).await.expect("test rendezvous server should run");
+            serve(state)
+                .await
+                .expect("test rendezvous server should run");
         });
 
         for _ in 0..100 {
@@ -1241,8 +1244,7 @@ mod tests {
         let target = PeerIdentity::Node(Uuid::now_v7());
         let wake_url = format!("ws://{bind_addr}/relay/wake/ws");
 
-        let ws1 =
-            connect_and_register_wake(&wake_url, bind_addr, cluster_id, target.clone()).await;
+        let ws1 = connect_and_register_wake(&wake_url, bind_addr, cluster_id, target.clone()).await;
         // Abrupt drop, no close handshake -- simulates a network blip or process restart.
         drop(ws1);
 

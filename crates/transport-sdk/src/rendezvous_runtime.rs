@@ -487,12 +487,12 @@ impl RelayTunnelBroker {
     /// newer, still-live registration for the same target.
     pub async fn unregister_wake(&self, handle: &WakeRegistrationHandle) {
         let mut state = self.inner.lock().await;
-        if let std::collections::hash_map::Entry::Occupied(entry) =
-            state.wake_channels_by_target.entry(handle.target_key.clone())
+        if let std::collections::hash_map::Entry::Occupied(entry) = state
+            .wake_channels_by_target
+            .entry(handle.target_key.clone())
+            && entry.get().connection_id == handle.connection_id
         {
-            if entry.get().connection_id == handle.connection_id {
-                entry.remove();
-            }
+            entry.remove();
         }
     }
 
@@ -951,7 +951,11 @@ mod tests {
         let target = PeerIdentity::Node(uuid::Uuid::now_v7());
 
         let handle = broker
-            .register_wake(cluster_id, &target, RelayTunnelSessionKind::MultiplexTransport)
+            .register_wake(
+                cluster_id,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
             .await;
 
         let ticket = issue_relay_ticket(
@@ -998,10 +1002,18 @@ mod tests {
         let target = PeerIdentity::Node(uuid::Uuid::now_v7());
 
         let stale_handle = broker
-            .register_wake(cluster_id, &target, RelayTunnelSessionKind::MultiplexTransport)
+            .register_wake(
+                cluster_id,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
             .await;
         let live_handle = broker
-            .register_wake(cluster_id, &target, RelayTunnelSessionKind::MultiplexTransport)
+            .register_wake(
+                cluster_id,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
             .await;
         assert_ne!(stale_handle.connection_id, live_handle.connection_id);
 
@@ -1023,7 +1035,8 @@ mod tests {
             expires_at_unix: unix_ts() + 3,
         };
         let broker_for_source = broker.clone();
-        let source_task = tokio::spawn(async move { broker_for_source.connect_source(ticket).await });
+        let source_task =
+            tokio::spawn(async move { broker_for_source.connect_source(ticket).await });
 
         tokio::time::timeout(Duration::from_secs(2), live_handle.notify.notified())
             .await

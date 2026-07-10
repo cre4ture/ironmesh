@@ -81,11 +81,10 @@ use transport_sdk::{
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
     RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelSession, RelayTunnelSessionKind,
     RelayWakeClient, RelayWakeEvent, RelayWakeRegistration, RendezvousClientConfig,
-    RendezvousControlClient, SignedRequestHeaders,
-    TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader, TransportPathKind,
-    TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, credential_fingerprint,
-    perform_transport_client_handshake, perform_transport_server_handshake,
+    RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
+    TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
+    credential_fingerprint, perform_transport_client_handshake, perform_transport_server_handshake,
     read_buffered_transport_response, read_transport_request_head, verify_signed_request_headers,
     write_buffered_transport_request, write_buffered_transport_response,
     write_transport_response_head,
@@ -8323,7 +8322,9 @@ async fn drain_pending_relay_multiplex_targets(
                 // Keep draining: a burst of several sources may have arrived together.
             }
             Err(err)
-                if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(&err.to_string()) =>
+                if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
+                    &err.to_string(),
+                ) =>
             {
                 // Queue empty -- done until the next wake or fallback tick.
                 return;
@@ -8331,8 +8332,7 @@ async fn drain_pending_relay_multiplex_targets(
             Err(err) => {
                 let error_text = err.to_string();
                 let failures =
-                    record_rendezvous_registration_failure(state, &endpoint.url, &error_text)
-                        .await;
+                    record_rendezvous_registration_failure(state, &endpoint.url, &error_text).await;
                 warn!(
                     error = %err,
                     rendezvous_url = %endpoint.url,
@@ -8356,11 +8356,13 @@ async fn run_rendezvous_relay_wake_session(
     endpoint: &RendezvousEndpointClient,
     wake_client: &mut RelayWakeClient,
 ) {
-    let mut fallback_ticker =
-        tokio::time::interval(Duration::from_secs(RENDEZVOUS_RELAY_WAKE_FALLBACK_POLL_SECS));
+    let mut fallback_ticker = tokio::time::interval(Duration::from_secs(
+        RENDEZVOUS_RELAY_WAKE_FALLBACK_POLL_SECS,
+    ));
     fallback_ticker.tick().await; // consume the immediate first tick; we already drained on connect
-    let mut ping_ticker =
-        tokio::time::interval(Duration::from_secs(RENDEZVOUS_RELAY_WAKE_PING_INTERVAL_SECS));
+    let mut ping_ticker = tokio::time::interval(Duration::from_secs(
+        RENDEZVOUS_RELAY_WAKE_PING_INTERVAL_SECS,
+    ));
     ping_ticker.tick().await; // consume the immediate first tick
 
     loop {
