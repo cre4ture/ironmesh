@@ -45,6 +45,21 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
+    external fun storeIndexWithOptions(
+        connectionInput: String,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int,
+        limit: Int,
+        sort: String?,
+        mediaFilter: String?,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): String
+
+    @JvmStatic
     external fun streamPutObject(
         connectionInput: String,
         key: String,

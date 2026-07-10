@@ -1,7 +1,11 @@
 package io.ironmesh.android.data
 
 import io.ironmesh.android.api.StoreIndexEntry
+import io.ironmesh.android.api.StoreIndexMediaFilter
+import io.ironmesh.android.api.StoreIndexRequestOptions
 import io.ironmesh.android.api.StoreIndexResponse
+import io.ironmesh.android.api.StoreIndexSortOrder
+import io.ironmesh.android.api.StoreIndexView
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Json
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -144,16 +148,98 @@ class IronmeshRepository {
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): List<StoreIndexEntry> {
-        val responseJson = RustClientBridge.storeIndex(
-            normalizedConnectionInput(connectionInput),
-            prefix,
-            depth.coerceAtLeast(1),
-            snapshot,
-            serverCaPem,
-            normalizedClientIdentityJson(clientIdentityJson),
+        val parsed = storeIndexResponse(
+            connectionInput = connectionInput,
+            prefix = prefix,
+            depth = depth,
+            snapshot = snapshot,
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
         )
-        val parsed = decodeJson(responseJson, StoreIndexResponse::class.java)
         return parsed.entries
+    }
+
+    suspend fun storeIndexResponse(
+        connectionInput: String,
+        prefix: String? = null,
+        depth: Int = 1,
+        snapshot: String? = null,
+        options: StoreIndexRequestOptions = StoreIndexRequestOptions(),
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): StoreIndexResponse {
+        val responseJson = if (
+            options == StoreIndexRequestOptions()
+        ) {
+            RustClientBridge.storeIndex(
+                normalizedConnectionInput(connectionInput),
+                prefix,
+                depth.coerceAtLeast(1),
+                snapshot,
+                serverCaPem,
+                normalizedClientIdentityJson(clientIdentityJson),
+            )
+        } else {
+            RustClientBridge.storeIndexWithOptions(
+                normalizedConnectionInput(connectionInput),
+                prefix,
+                depth.coerceAtLeast(1),
+                snapshot,
+                options.view?.wireValue,
+                options.offset ?: -1,
+                options.limit ?: -1,
+                options.sort?.wireValue,
+                options.mediaFilter?.wireValue,
+                serverCaPem,
+                normalizedClientIdentityJson(clientIdentityJson),
+            )
+        }
+        return decodeJson(responseJson, StoreIndexResponse::class.java)
+    }
+
+    suspend fun storeIndexImagePage(
+        connectionInput: String,
+        prefix: String? = null,
+        depth: Int,
+        offset: Int,
+        limit: Int,
+        sort: StoreIndexSortOrder,
+        snapshot: String? = null,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): StoreIndexResponse {
+        return storeIndexResponse(
+            connectionInput = connectionInput,
+            prefix = prefix,
+            depth = depth.coerceAtLeast(1),
+            snapshot = snapshot,
+            options = StoreIndexRequestOptions(
+                view = StoreIndexView.TREE,
+                offset = offset.coerceAtLeast(0),
+                limit = limit.coerceAtLeast(1),
+                sort = sort,
+                mediaFilter = StoreIndexMediaFilter.IMAGE,
+            ),
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
+        )
+    }
+
+    suspend fun storeIndexDirectoryListing(
+        connectionInput: String,
+        prefix: String? = null,
+        depth: Int = 1,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): StoreIndexResponse {
+        return storeIndexResponse(
+            connectionInput = connectionInput,
+            prefix = prefix,
+            depth = depth.coerceAtLeast(1),
+            options = StoreIndexRequestOptions(view = StoreIndexView.TREE),
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
+        )
     }
 
     suspend fun putObjectBytes(

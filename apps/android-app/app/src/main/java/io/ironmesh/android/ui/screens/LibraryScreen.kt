@@ -7,6 +7,7 @@ import android.graphics.Point
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Log
+import android.util.LruCache
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -26,16 +27,18 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -45,6 +48,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -55,6 +59,7 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -72,7 +77,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import io.ironmesh.android.DocumentBitmapLoader
+import io.ironmesh.android.ui.GalleryCollectionState
 import io.ironmesh.android.ui.GalleryImageItem
+import io.ironmesh.android.ui.GalleryPageState
+import io.ironmesh.android.ui.GalleryPageStatus
 import io.ironmesh.android.ui.GallerySortOption
 import io.ironmesh.android.ui.GalleryViewMode
 import io.ironmesh.android.ui.MainUiState
@@ -81,149 +89,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
+private const val GALLERY_PAGE_KEY_PREFIX = "gallery-page:"
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun LibraryScreen(
     state: MainUiState,
     vm: MainViewModel,
 ) {
-    var fullscreenIndex by remember(state.galleryItems, state.galleryCurrentDirectoryPath) {
+    val totalGalleryItems = state.galleryCollection?.totalItemCount ?: 0
+    var fullscreenIndex by remember(state.galleryMode, state.galleryCurrentDirectoryPath, totalGalleryItems) {
         mutableStateOf<Int?>(null)
     }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Button(onClick = vm::refreshGallery) {
-                Text("Refresh")
-            }
-            FilterChip(
-                selected = state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES,
-                onClick = { vm.updateGalleryViewMode(GalleryViewMode.FLATTENED_ALL_IMAGES) },
-                label = { Text("All images") },
-            )
-            FilterChip(
-                selected = state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY,
-                onClick = { vm.updateGalleryViewMode(GalleryViewMode.CURRENT_DIRECTORY) },
-                label = { Text("Current folder") },
-            )
-            FilterChip(
-                selected = state.gallerySort == GallerySortOption.CREATION_TIME,
-                onClick = { vm.updateGallerySort(GallerySortOption.CREATION_TIME) },
-                label = { Text("Newest") },
-            )
-            FilterChip(
-                selected = state.gallerySort == GallerySortOption.NAME,
-                onClick = { vm.updateGallerySort(GallerySortOption.NAME) },
-                label = { Text("Name") },
-            )
-        }
-
-        if (state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY) {
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                tonalElevation = 2.dp,
-                shape = RoundedCornerShape(22.dp),
-            ) {
-                Column(
-                    modifier = Modifier.padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = "Current folder: ${state.galleryCurrentDirectoryPath}",
-                        style = MaterialTheme.typography.titleSmall,
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = vm::navigateGalleryToRoot) {
-                            Text("Root")
-                        }
-                        OutlinedButton(
-                            onClick = vm::navigateGalleryUp,
-                            enabled = state.galleryBreadcrumbs.isNotEmpty(),
-                        ) {
-                            Text("Up")
-                        }
-                    }
-                    if (state.galleryBreadcrumbs.isNotEmpty()) {
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            OutlinedButton(onClick = vm::navigateGalleryToRoot) {
-                                Text("/")
-                            }
-                            state.galleryBreadcrumbs.forEachIndexed { index, breadcrumb ->
-                                OutlinedButton(onClick = { vm.navigateGalleryToBreadcrumb(index) }) {
-                                    Text(breadcrumb.label)
-                                }
-                            }
-                        }
-                    }
-                    if (state.galleryDirectories.isNotEmpty()) {
-                        Text("Folders", style = MaterialTheme.typography.titleSmall)
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            state.galleryDirectories.forEach { directory ->
-                                OutlinedButton(onClick = { vm.openGalleryDirectory(directory) }) {
-                                    Text(directory.displayName)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        when {
-            state.galleryLoading -> CircularProgressIndicator()
-            state.galleryItems.isEmpty() && state.galleryDirectories.isEmpty() -> Text(
-                if (state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
-                    "No images loaded from the document provider."
-                } else {
-                    "No images or nested folders found in the current directory."
-                },
-            )
-            state.galleryItems.isEmpty() -> Text("No images in the current directory.")
-            else -> {
-                GalleryGrid(
-                    items = state.galleryItems,
-                    onItemClick = { index -> fullscreenIndex = index },
-                )
-                Text(
-                    text = "Pinch the gallery to change thumbnail density.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
-    }
-
-    val selectedIndex = fullscreenIndex
-    if (selectedIndex != null && state.galleryItems.isNotEmpty()) {
-        GalleryFullscreenViewer(
-            items = state.galleryItems,
-            initialIndex = selectedIndex.coerceIn(0, state.galleryItems.lastIndex),
-            onDismiss = { fullscreenIndex = null },
-        )
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun GalleryGrid(
-    items: List<GalleryImageItem>,
-    onItemClick: (Int) -> Unit,
-) {
-    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val density = LocalDensity.current
         val gap = 12.dp
         val autoColumns = when {
@@ -240,13 +118,30 @@ private fun GalleryGrid(
         }
         val cardWidth = with(density) {
             val availableWidthPx =
-                (maxWidth.roundToPx() - gap.roundToPx() * (columns - 1)).coerceAtLeast(columns)
-            (availableWidthPx / columns).toDp()
+                (maxWidth.roundToPx() - gap.roundToPx() * (clampedColumns - 1)).coerceAtLeast(clampedColumns)
+            (availableWidthPx / clampedColumns).toDp()
+        }
+        val listState = rememberLazyListState()
+        val pageCount = state.galleryCollection?.pageCount ?: 0
+        val showDetails = clampedColumns < 3
+
+        LaunchedEffect(listState, pageCount) {
+            snapshotFlow {
+                listState.layoutInfo.visibleItemsInfo.mapNotNull { item ->
+                    (item.key as? String)
+                        ?.takeIf { it.startsWith(GALLERY_PAGE_KEY_PREFIX) }
+                        ?.removePrefix(GALLERY_PAGE_KEY_PREFIX)
+                        ?.toIntOrNull()
+                }.toSet()
+            }.collect { visiblePages ->
+                vm.updateVisibleGalleryPages(visiblePages)
+            }
         }
 
-        FlowRow(
+        LazyColumn(
+            state = listState,
             modifier = Modifier
-                .fillMaxWidth()
+                .fillMaxSize()
                 .galleryGridPinchGesture(
                     onPinch = { zoom ->
                         accumulatedZoom *= zoom
@@ -259,17 +154,254 @@ private fun GalleryGrid(
                         }
                     },
                 ),
-            maxItemsInEachRow = columns,
-            horizontalArrangement = Arrangement.spacedBy(gap),
-            verticalArrangement = Arrangement.spacedBy(gap),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            items.forEachIndexed { index, item ->
-                GalleryCard(
-                    item = item,
-                    showDetails = columns < 3,
-                    onClick = { onItemClick(index) },
-                    modifier = Modifier.width(cardWidth),
-                )
+            item(key = "gallery-controls") {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(onClick = vm::refreshGallery) {
+                        Text("Refresh")
+                    }
+                    FilterChip(
+                        selected = state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES,
+                        onClick = { vm.updateGalleryViewMode(GalleryViewMode.FLATTENED_ALL_IMAGES) },
+                        label = { Text("All images") },
+                    )
+                    FilterChip(
+                        selected = state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY,
+                        onClick = { vm.updateGalleryViewMode(GalleryViewMode.CURRENT_DIRECTORY) },
+                        label = { Text("Current folder") },
+                    )
+                    FilterChip(
+                        selected = state.gallerySort == GallerySortOption.CREATION_TIME,
+                        onClick = { vm.updateGallerySort(GallerySortOption.CREATION_TIME) },
+                        label = { Text("Newest") },
+                    )
+                    FilterChip(
+                        selected = state.gallerySort == GallerySortOption.NAME,
+                        onClick = { vm.updateGallerySort(GallerySortOption.NAME) },
+                        label = { Text("Name") },
+                    )
+                }
+            }
+
+            if (state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY) {
+                item(key = "gallery-directory") {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        tonalElevation = 2.dp,
+                        shape = RoundedCornerShape(22.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = "Current folder: ${state.galleryCurrentDirectoryPath}",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = vm::navigateGalleryToRoot) {
+                                    Text("Root")
+                                }
+                                OutlinedButton(
+                                    onClick = vm::navigateGalleryUp,
+                                    enabled = state.galleryBreadcrumbs.isNotEmpty(),
+                                ) {
+                                    Text("Up")
+                                }
+                            }
+                            if (state.galleryBreadcrumbs.isNotEmpty()) {
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    OutlinedButton(onClick = vm::navigateGalleryToRoot) {
+                                        Text("/")
+                                    }
+                                    state.galleryBreadcrumbs.forEachIndexed { index, breadcrumb ->
+                                        OutlinedButton(onClick = { vm.navigateGalleryToBreadcrumb(index) }) {
+                                            Text(breadcrumb.label)
+                                        }
+                                    }
+                                }
+                            }
+                            if (state.galleryDirectories.isNotEmpty()) {
+                                Text("Folders", style = MaterialTheme.typography.titleSmall)
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    state.galleryDirectories.forEach { directory ->
+                                        OutlinedButton(onClick = { vm.openGalleryDirectory(directory) }) {
+                                            Text(directory.displayName)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            when {
+                state.galleryLoading -> {
+                    item(key = "gallery-loading") {
+                        CircularProgressIndicator()
+                    }
+                }
+                totalGalleryItems == 0 && state.galleryDirectories.isEmpty() -> {
+                    item(key = "gallery-empty") {
+                        Text(
+                            if (state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
+                                "No images loaded from the gallery index."
+                            } else {
+                                "No images or nested folders found in the current directory."
+                            },
+                        )
+                    }
+                }
+                totalGalleryItems == 0 -> {
+                    item(key = "gallery-empty-directory") {
+                        Text("No images in the current directory.")
+                    }
+                }
+                else -> {
+                    items(
+                        count = pageCount,
+                        key = { pageIndex -> "$GALLERY_PAGE_KEY_PREFIX$pageIndex" },
+                    ) { pageIndex ->
+                        GalleryVirtualPage(
+                            pageIndex = pageIndex,
+                            page = state.galleryPages[pageIndex],
+                            collection = state.galleryCollection,
+                            columns = clampedColumns,
+                            gap = gap,
+                            cardWidth = cardWidth,
+                            showDetails = showDetails,
+                            onItemClick = { index -> fullscreenIndex = index },
+                            onRetry = { vm.retryGalleryPage(pageIndex) },
+                        )
+                    }
+                    item(key = "gallery-hint") {
+                        Text(
+                            text = "Pinch the gallery to change thumbnail density.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    val selectedIndex = fullscreenIndex
+    if (selectedIndex != null && totalGalleryItems > 0) {
+        GalleryFullscreenViewer(
+            itemCount = totalGalleryItems,
+            initialIndex = selectedIndex.coerceIn(0, totalGalleryItems - 1),
+            itemAt = vm::galleryItemAt,
+            onRequestIndex = vm::ensureGalleryItemLoaded,
+            onFocusIndex = vm::pinGalleryItem,
+            onDismiss = { fullscreenIndex = null },
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GalleryVirtualPage(
+    pageIndex: Int,
+    page: GalleryPageState?,
+    collection: GalleryCollectionState?,
+    columns: Int,
+    gap: androidx.compose.ui.unit.Dp,
+    cardWidth: androidx.compose.ui.unit.Dp,
+    showDetails: Boolean,
+    onItemClick: (Int) -> Unit,
+    onRetry: () -> Unit,
+) {
+    val totalItemCount = collection?.totalItemCount ?: 0
+    val pageSize = collection?.pageSize ?: 1
+    val expectedEntryCount = resolveGalleryVirtualPageEntryCount(
+        pageIndex = pageIndex,
+        totalItemCount = totalItemCount,
+        pageSize = pageSize,
+    )
+    val minHeight = resolveGalleryVirtualPageEstimatedHeight(
+        columns = columns,
+        cardWidth = cardWidth,
+        gap = gap,
+        showDetails = showDetails,
+        entryCount = expectedEntryCount,
+    )
+
+    when (page?.status) {
+        GalleryPageStatus.READY -> {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                maxItemsInEachRow = columns,
+                horizontalArrangement = Arrangement.spacedBy(gap),
+                verticalArrangement = Arrangement.spacedBy(gap),
+            ) {
+                val pageOffset = pageIndex * pageSize
+                page.items.forEachIndexed { entryOffset, item ->
+                    GalleryCard(
+                        item = item,
+                        showDetails = showDetails,
+                        onClick = { onItemClick(pageOffset + entryOffset) },
+                        modifier = Modifier.width(cardWidth),
+                    )
+                }
+            }
+        }
+
+        GalleryPageStatus.ERROR -> {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                tonalElevation = 2.dp,
+                shape = RoundedCornerShape(20.dp),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = "Failed to load gallery page",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    Text(
+                        text = page.error ?: "The requested page did not load.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Button(onClick = onRetry) {
+                        Text("Retry page")
+                    }
+                }
+            }
+        }
+
+        else -> {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.Transparent)
+                        .height(minHeight),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator()
+                }
             }
         }
     }
@@ -334,16 +466,42 @@ private fun GalleryCard(
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 private fun GalleryFullscreenViewer(
-    items: List<GalleryImageItem>,
+    itemCount: Int,
     initialIndex: Int,
+    itemAt: (Int) -> GalleryImageItem?,
+    onRequestIndex: (Int) -> Unit,
+    onFocusIndex: (Int?) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val zoomedPages = remember { mutableStateMapOf<Int, Boolean>() }
     val pagerState = rememberPagerState(
         initialPage = initialIndex,
-        pageCount = { items.size },
+        pageCount = { itemCount },
     )
     BackHandler(onBack = onDismiss)
+
+    DisposableEffect(Unit) {
+        onDispose {
+            onFocusIndex(null)
+        }
+    }
+
+    LaunchedEffect(pagerState.currentPage, itemCount) {
+        if (itemCount <= 0) {
+            onFocusIndex(null)
+            return@LaunchedEffect
+        }
+        onFocusIndex(pagerState.currentPage)
+        onRequestIndex(pagerState.currentPage)
+        val previous = pagerState.currentPage - 1
+        val next = pagerState.currentPage + 1
+        if (previous >= 0) {
+            onRequestIndex(previous)
+        }
+        if (next < itemCount) {
+            onRequestIndex(next)
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -363,7 +521,8 @@ private fun GalleryFullscreenViewer(
                     modifier = Modifier.fillMaxSize(),
                 ) { page ->
                     GalleryFullscreenPage(
-                        item = items[page],
+                        item = itemAt(page),
+                        onRequestLoad = { onRequestIndex(page) },
                         onZoomStateChanged = { zoomed ->
                             zoomedPages[page] = zoomed
                         },
@@ -388,7 +547,7 @@ private fun GalleryFullscreenViewer(
                             Text("Close")
                         }
                         Text(
-                            text = items[pagerState.currentPage].displayName,
+                            text = itemAt(pagerState.currentPage)?.displayName ?: "Loading image...",
                             color = Color.White,
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1,
@@ -396,7 +555,7 @@ private fun GalleryFullscreenViewer(
                             modifier = Modifier.weight(1f),
                         )
                         Text(
-                            text = "${pagerState.currentPage + 1}/${items.size}",
+                            text = "${pagerState.currentPage + 1}/$itemCount",
                             color = Color.White,
                             style = MaterialTheme.typography.bodyMedium,
                         )
@@ -416,27 +575,28 @@ private fun GalleryFullscreenViewer(
                             .padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        val item = items[pagerState.currentPage]
-                        Text(
-                            text = item.remotePath,
-                            color = Color.White,
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        galleryMetaText(item)?.let { meta ->
+                        itemAt(pagerState.currentPage)?.let { item ->
                             Text(
-                                text = meta,
-                                color = Color.White.copy(alpha = 0.8f),
-                                style = MaterialTheme.typography.bodySmall,
+                                text = item.remotePath,
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
                             )
-                        }
-                        item.createdAtUnixMs?.let { createdAt ->
-                            Text(
-                                text = "Created ${formatTimestamp(createdAt)}",
-                                color = Color.White.copy(alpha = 0.8f),
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+                            galleryMetaText(item)?.let { meta ->
+                                Text(
+                                    text = meta,
+                                    color = Color.White.copy(alpha = 0.8f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            item.createdAtUnixMs?.let { createdAt ->
+                                Text(
+                                    text = "Created ${formatTimestamp(createdAt)}",
+                                    color = Color.White.copy(alpha = 0.8f),
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                         }
                     }
                 }
@@ -455,23 +615,31 @@ private sealed interface GalleryFullscreenImageState {
 
 @Composable
 private fun GalleryFullscreenPage(
-    item: GalleryImageItem,
+    item: GalleryImageItem?,
+    onRequestLoad: () -> Unit,
     onZoomStateChanged: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
-    var scale by remember(item.documentUri) { mutableFloatStateOf(1f) }
-    var offsetX by remember(item.documentUri) { mutableFloatStateOf(0f) }
-    var offsetY by remember(item.documentUri) { mutableFloatStateOf(0f) }
+    val documentUri = item?.documentUri
+    var scale by remember(documentUri) { mutableFloatStateOf(1f) }
+    var offsetX by remember(documentUri) { mutableFloatStateOf(0f) }
+    var offsetY by remember(documentUri) { mutableFloatStateOf(0f) }
     val imageState by produceState<GalleryFullscreenImageState>(
         initialValue = GalleryFullscreenImageState.Loading,
-        key1 = item.documentUri,
+        key1 = documentUri,
     ) {
+        val resolvedItem = item
+        if (resolvedItem == null) {
+            onRequestLoad()
+            value = GalleryFullscreenImageState.Loading
+            return@produceState
+        }
         value = withContext(Dispatchers.IO) {
             DocumentBitmapLoader.load(
                 context = context,
                 contentResolver = context.contentResolver,
-                documentUri = item.documentUri,
+                documentUri = resolvedItem.documentUri,
                 maxDimensionPx = 2048,
             )?.let { bitmap ->
                 GalleryFullscreenImageState.Loaded(bitmap)
@@ -502,12 +670,12 @@ private fun GalleryFullscreenPage(
                 )
                 Image(
                     bitmap = loadedBitmap.asImageBitmap(),
-                    contentDescription = item.displayName,
+                    contentDescription = item?.displayName ?: "Gallery image",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
                         .fillMaxSize()
                         .zoomableImageGesture(
-                            gestureKey = item.documentUri,
+                            gestureKey = item?.documentUri,
                             fittedSize = fittedSize,
                             containerWidth = widthPx,
                             containerHeight = heightPx,
@@ -543,6 +711,30 @@ private fun GalleryFullscreenPage(
     }
 }
 
+/**
+ * Keeps decoded thumbnails around across scroll-driven dispose/recompose cycles so
+ * revisiting a card doesn't re-trigger the SAF thumbnail IPC (and the underlying
+ * network round trip) for an image that was already fetched. Entries are keyed by
+ * document URI (path-based), which doesn't change when a file's content is updated
+ * in place, so callers that reload the gallery listing (e.g. [MainViewModel.refreshGallery])
+ * must call [clear] to avoid showing a stale thumbnail after such an update.
+ */
+internal object ThumbnailBitmapCache {
+    private val cache = object : LruCache<String, Bitmap>((Runtime.getRuntime().maxMemory() / 8).toInt()) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    fun get(key: String): Bitmap? = cache.get(key)
+
+    fun put(key: String, bitmap: Bitmap) {
+        cache.put(key, bitmap)
+    }
+
+    fun clear() {
+        cache.evictAll()
+    }
+}
+
 @Composable
 private fun ProviderThumbnail(
     documentUri: Uri,
@@ -550,9 +742,12 @@ private fun ProviderThumbnail(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val thumbnail by produceState<Bitmap?>(initialValue = null, documentUri) {
-        value = withContext(Dispatchers.IO) {
-            loadDocumentThumbnail(context.contentResolver, documentUri, 384)
+    val cacheKey = documentUri.toString()
+    val thumbnail by produceState<Bitmap?>(initialValue = ThumbnailBitmapCache.get(cacheKey), documentUri) {
+        if (value == null) {
+            value = withContext(Dispatchers.IO) {
+                loadDocumentThumbnail(context.contentResolver, documentUri, 384)
+            }?.also { ThumbnailBitmapCache.put(cacheKey, it) }
         }
     }
 
@@ -587,6 +782,30 @@ private fun galleryMetaText(item: GalleryImageItem): String? {
         parts += item.thumbnailStatus
     }
     return parts.takeIf { it.isNotEmpty() }?.joinToString(" | ")
+}
+
+private fun resolveGalleryVirtualPageEntryCount(
+    pageIndex: Int,
+    totalItemCount: Int,
+    pageSize: Int,
+): Int {
+    val safePageSize = pageSize.coerceAtLeast(1)
+    val offset = pageIndex * safePageSize
+    return (totalItemCount - offset).coerceIn(0, safePageSize)
+}
+
+private fun resolveGalleryVirtualPageEstimatedHeight(
+    columns: Int,
+    cardWidth: androidx.compose.ui.unit.Dp,
+    gap: androidx.compose.ui.unit.Dp,
+    showDetails: Boolean,
+    entryCount: Int,
+): androidx.compose.ui.unit.Dp {
+    val safeColumns = columns.coerceAtLeast(1)
+    val safeEntryCount = entryCount.coerceAtLeast(1)
+    val rowCount = ((safeEntryCount + safeColumns - 1) / safeColumns).coerceAtLeast(1)
+    val cardHeight = if (showDetails) cardWidth + 124.dp else cardWidth
+    return (cardHeight * rowCount) + (gap * (rowCount - 1).coerceAtLeast(0))
 }
 
 private fun loadDocumentThumbnail(
