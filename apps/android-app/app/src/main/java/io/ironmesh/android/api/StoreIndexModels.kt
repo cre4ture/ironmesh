@@ -4,7 +4,41 @@ data class StoreIndexResponse(
     val prefix: String,
     val depth: Int,
     val entry_count: Int,
+    val total_entry_count: Int = entry_count,
+    val offset: Int = 0,
+    val limit: Int? = null,
+    val has_more: Boolean = false,
     val entries: List<StoreIndexEntry>,
+)
+
+enum class StoreIndexView(
+    val wireValue: String,
+) {
+    RAW("raw"),
+    TREE("tree"),
+}
+
+enum class StoreIndexSortOrder(
+    val wireValue: String,
+) {
+    PATH_ASC("path_asc"),
+    CAPTURED_DESC("captured_desc"),
+}
+
+enum class StoreIndexMediaFilter(
+    val wireValue: String,
+) {
+    ALL("all"),
+    IMAGE("image"),
+    VIDEO("video"),
+}
+
+data class StoreIndexRequestOptions(
+    val view: StoreIndexView? = null,
+    val offset: Int? = null,
+    val limit: Int? = null,
+    val sort: StoreIndexSortOrder? = null,
+    val mediaFilter: StoreIndexMediaFilter? = null,
 )
 
 data class StoreIndexEntry(
