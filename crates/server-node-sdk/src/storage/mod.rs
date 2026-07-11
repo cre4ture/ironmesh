@@ -7817,7 +7817,7 @@ async fn validate_local_chunk_integrity(
 }
 
 pub(super) fn chunk_path_for_hash(chunks_dir: &Path, hash: &str) -> anyhow::Result<PathBuf> {
-    if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+    if hash.len() != blake3::OUT_LEN * 2 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!("invalid chunk hash: {hash}");
     }
     let prefix = &hash[..2];
