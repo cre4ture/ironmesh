@@ -5578,6 +5578,68 @@ run_on_main_metadata_backends!(
     multiplex_transport_get_upload_session_routes_to_handler_turso
 );
 
+async fn start_upload_session_prefills_existing_chunk_refs_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let first_chunk = vec![b'P'; 1024 * 1024];
+    let first_chunk_hash = blake3::hash(&first_chunk).to_hex().to_string();
+
+    state
+        .storage
+        .upload_chunk_ingestor
+        .ingest_chunk(&first_chunk_hash, &first_chunk)
+        .await
+        .expect("seed chunk should ingest");
+
+    let response = super::start_upload_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::UploadSessionStartRequest {
+            key: "uploads/reused.bin".to_string(),
+            total_size_bytes: (first_chunk.len() + 5) as u64,
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+            chunk_refs: vec![
+                super::UploadChunkRef {
+                    hash: first_chunk_hash,
+                    size_bytes: first_chunk.len(),
+                },
+                super::UploadChunkRef {
+                    hash: blake3::hash(b"tail!").to_hex().to_string(),
+                    size_bytes: 5,
+                },
+            ],
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let payload = serde_json::from_slice::<super::UploadSessionView>(&body)
+        .expect("upload session view should parse");
+    assert_eq!(payload.received_indexes, vec![0]);
+
+    let sessions = super::read_upload_sessions(&state, "tests.upload_sessions.assert").await;
+    let session = sessions
+        .sessions
+        .get(&payload.upload_id)
+        .expect("upload session should be persisted");
+    assert!(session.received_chunks[0].is_some());
+    assert!(session.received_chunks[1].is_none());
+    drop(sessions);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    start_upload_session_prefills_existing_chunk_refs_impl,
+    start_upload_session_prefills_existing_chunk_refs,
+    start_upload_session_prefills_existing_chunk_refs_turso
+);
+
 #[test]
 fn store_index_depth_groups_prefixes() {
     let keys = vec![

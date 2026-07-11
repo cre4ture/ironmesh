@@ -815,6 +815,8 @@ struct UploadSessionStartRequest {
     #[serde(default)]
     parent: Vec<String>,
     version_id: Option<String>,
+    #[serde(default)]
+    chunk_refs: Vec<UploadChunkRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -11097,6 +11099,44 @@ async fn start_upload_session(
     } else {
         ((request.total_size_bytes - 1) / chunk_size_bytes as u64 + 1) as usize
     };
+    if !request.chunk_refs.is_empty() && request.chunk_refs.len() != chunk_count {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    for (index, chunk_ref) in request.chunk_refs.iter().enumerate() {
+        let Some(expected_size) = expected_upload_chunk_size(
+            request.total_size_bytes,
+            chunk_size_bytes,
+            chunk_count,
+            index,
+        ) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if chunk_ref.size_bytes != expected_size {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
+
+    let received_chunks = if request.chunk_refs.is_empty() {
+        vec![None; chunk_count]
+    } else {
+        match state
+            .storage
+            .upload_chunk_ingestor
+            .available_upload_chunk_refs(&request.chunk_refs)
+            .await
+        {
+            Ok(received_chunks) => received_chunks,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = %key,
+                    chunk_count = request.chunk_refs.len(),
+                    "rejected upload session start with invalid chunk refs"
+                );
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+    };
     let now = unix_ts();
 
     let mut sessions = write_upload_sessions(&state, "upload_sessions.start").await;
@@ -11112,7 +11152,7 @@ async fn start_upload_session(
         state: version_state,
         parent_version_ids: request.parent,
         explicit_version_id: request.version_id,
-        received_chunks: vec![None; chunk_count],
+        received_chunks,
         created_at_unix: now,
         updated_at_unix: now,
         expires_at_unix: now.saturating_add(UPLOAD_SESSION_TTL_SECS),
@@ -11127,6 +11167,7 @@ async fn start_upload_session(
         total_size_bytes = request.total_size_bytes,
         chunk_count,
         chunk_size_bytes,
+        reused_chunks = response.received_indexes.len(),
         state = ?session.state,
         "started upload session"
     );

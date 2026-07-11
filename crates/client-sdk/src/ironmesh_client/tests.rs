@@ -360,6 +360,7 @@ async fn spawn_direct_http_route_server(
 #[derive(Clone, Default)]
 struct UploadSessionHttpSharedState {
     sessions: Arc<Mutex<std::collections::HashMap<String, UploadSessionView>>>,
+    available_chunk_hashes: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -381,13 +382,26 @@ async fn upload_session_http_start(
     } else {
         ((request.total_size_bytes - 1) / chunk_size_bytes as u64 + 1) as usize
     };
+    let available_chunk_hashes = state.shared.available_chunk_hashes.lock().await;
+    let mut received_indexes = request
+        .chunk_refs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk_ref)| {
+            available_chunk_hashes
+                .contains(&chunk_ref.hash)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    received_indexes.sort_unstable();
+    drop(available_chunk_hashes);
     let view = UploadSessionView {
         upload_id: format!("upload-{}", uuid::Uuid::now_v7()),
         key: request.key,
         total_size_bytes: request.total_size_bytes,
         chunk_size_bytes,
         chunk_count,
-        received_indexes: Vec::new(),
+        received_indexes,
         completed: false,
         completed_result: None,
         expires_at_unix: unix_ts().saturating_add(60),
@@ -1667,6 +1681,41 @@ async fn upload_session_affinity_uses_same_node_after_path_change() {
     let _ = node_b_server.await;
     node_a_secondary_server.abort();
     let _ = node_a_secondary_server.await;
+}
+
+#[tokio::test]
+async fn put_large_aware_skips_chunks_already_available_on_server() {
+    let shared = UploadSessionHttpSharedState::default();
+    let chunk_size = CHUNK_UPLOAD_SIZE_BYTES;
+    let mut payload = vec![b'A'; chunk_size];
+    payload.extend(vec![b'B'; 257]);
+
+    shared
+        .available_chunk_hashes
+        .lock()
+        .await
+        .insert(hash_hex(&payload[..chunk_size]));
+
+    let (base_url, state, server) = spawn_upload_session_http_server(
+        "127.0.0.1:0".parse().expect("bind addr should parse"),
+        shared.clone(),
+    )
+    .await;
+    let client = IronMeshClient::from_direct_http_client(base_url, HttpClient::new());
+
+    let report = client
+        .put_large_aware("photos/reused.bin", Bytes::from(payload))
+        .await
+        .expect("chunked upload should succeed");
+
+    assert!(matches!(report.upload_mode, UploadMode::Chunked));
+    assert_eq!(report.chunk_count, Some(2));
+    assert_eq!(state.start_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.chunk_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.complete_hits.load(Ordering::SeqCst), 1);
+
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

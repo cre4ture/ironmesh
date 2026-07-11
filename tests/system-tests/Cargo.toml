@@ -8,6 +8,7 @@ authors = ["ironmesh contributors"]
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+blake3 = "1"
 bytes = "1"
 client-sdk = { path = "../../crates/client-sdk" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -25,7 +26,6 @@ web-ui-backend = { path = "../../crates/web-ui-backend" }
 
 [target.'cfg(windows)'.dependencies]
 adapter-windows-cfapi = { path = "../../crates/adapter-windows-cfapi" }
-blake3 = "1"
 windows-thumbnail-provider = { path = "../../crates/windows-thumbnail-provider" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

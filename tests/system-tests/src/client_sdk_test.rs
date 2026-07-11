@@ -30,7 +30,8 @@ mod tests {
     use bytes::Bytes;
     use client_sdk::{
         BootstrapEndpointUse, ClientNode, ConnectionBootstrap, ContentAddressedClientCache,
-        IronMeshClient, LatencyProbeConfig, UploadMode, enroll_connection_input_blocking,
+        IronMeshClient, LatencyProbeConfig, UploadMode, UploadSessionChunkRef,
+        enroll_connection_input_blocking,
     };
     use serde_json::json;
     use time::OffsetDateTime;
@@ -934,8 +935,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_resumable_file_helpers_roundtrip_large_files() -> Result<()> {
+    async fn upload_session_start_with_chunk_refs_only_requires_missing_chunks() -> Result<()> {
         let bind = "127.0.0.1:19239";
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "upload-session-missing-chunks-server",
+            "upload-session-missing-chunks-client",
+        )
+        .await?;
+        let sdk = enrolled.build_client_async().await?;
+
+        let first_chunk = vec![b'R'; CHUNK_UPLOAD_THRESHOLD_BYTES];
+        let seed_tail = vec![b'S'; 123];
+        let mut seed_payload = first_chunk.clone();
+        seed_payload.extend(seed_tail);
+        sdk.put_large_aware("seed/existing.bin", Bytes::from(seed_payload))
+            .await?;
+
+        let missing_tail = vec![b'T'; 257];
+        let mut target_payload = first_chunk.clone();
+        target_payload.extend(missing_tail.clone());
+        let chunk_refs = target_payload
+            .chunks(CHUNK_UPLOAD_THRESHOLD_BYTES)
+            .map(|chunk| UploadSessionChunkRef {
+                hash: blake3::hash(chunk).to_hex().to_string(),
+                size_bytes: chunk.len(),
+            })
+            .collect::<Vec<_>>();
+
+        let session = sdk
+            .begin_upload_session_with_chunk_refs(
+                "uploads/reused-first-chunk.bin",
+                target_payload.len() as u64,
+                chunk_refs,
+            )
+            .await?;
+        assert_eq!(session.received_indexes, vec![0]);
+        assert_eq!(session.chunk_count, 2);
+
+        let chunk_status = sdk
+            .upload_session_chunk_bytes(&session.upload_id, 1, missing_tail)
+            .await?;
+        assert_eq!(chunk_status.received_index, 1);
+
+        let completed = sdk.finalize_upload_session(&session.upload_id).await?;
+        assert_eq!(completed.total_size_bytes, target_payload.len() as u64);
+
+        let fetched = sdk.get("uploads/reused-first-chunk.bin").await?;
+        assert_eq!(fetched, Bytes::from(target_payload));
+
+        stop_server(&mut server).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ironmesh_client_resumable_file_helpers_roundtrip_large_files() -> Result<()> {
+        let bind = "127.0.0.1:19253";
         let (mut server, enrolled) = start_authenticated_test_client(
             bind,
             "resumable-file-helpers-server",

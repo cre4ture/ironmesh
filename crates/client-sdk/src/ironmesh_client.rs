@@ -967,6 +967,12 @@ pub struct UploadSessionStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSessionChunkRef {
+    pub hash: String,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSessionChunkStatus {
     pub stored: bool,
     pub received_index: usize,
@@ -1023,6 +1029,8 @@ struct UploadSessionStartRequest {
     parent: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    chunk_refs: Vec<UploadSessionChunkRef>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2262,6 +2270,16 @@ impl IronMeshClient {
         key: &str,
         total_size_bytes: u64,
     ) -> Result<UploadSessionView> {
+        self.start_upload_session_with_chunk_refs(key, total_size_bytes, Vec::new())
+            .await
+    }
+
+    async fn start_upload_session_with_chunk_refs(
+        &self,
+        key: &str,
+        total_size_bytes: u64,
+        chunk_refs: Vec<UploadSessionChunkRef>,
+    ) -> Result<UploadSessionView> {
         let url = self.store_upload_session_start_url()?;
         let payload = serde_json::to_vec(&UploadSessionStartRequest {
             key: key.to_string(),
@@ -2269,6 +2287,7 @@ impl IronMeshClient {
             state: None,
             parent: Vec::new(),
             version_id: None,
+            chunk_refs,
         })
         .context("failed to encode upload session start payload")?;
 
@@ -2301,8 +2320,18 @@ impl IronMeshClient {
         key: impl AsRef<str>,
         total_size_bytes: u64,
     ) -> Result<UploadSessionStatus> {
+        self.begin_upload_session_with_chunk_refs(key, total_size_bytes, Vec::new())
+            .await
+    }
+
+    pub async fn begin_upload_session_with_chunk_refs(
+        &self,
+        key: impl AsRef<str>,
+        total_size_bytes: u64,
+        chunk_refs: Vec<UploadSessionChunkRef>,
+    ) -> Result<UploadSessionStatus> {
         let view = self
-            .start_upload_session(key.as_ref(), total_size_bytes)
+            .start_upload_session_with_chunk_refs(key.as_ref(), total_size_bytes, chunk_refs)
             .await?;
         Ok(upload_session_status_from_view(view))
     }
@@ -2887,11 +2916,25 @@ impl IronMeshClient {
                     _ => {
                         self.clear_upload_session_affinity(&state.upload_id);
                         remove_file_if_exists(state_path)?;
-                        runtime.block_on(self.start_upload_session(&key, source_size_bytes))?
+                        let chunk_refs =
+                            upload_session_chunk_refs_for_file(source_path, source_size_bytes)?;
+                        runtime.block_on(self.start_upload_session_with_chunk_refs(
+                            &key,
+                            source_size_bytes,
+                            chunk_refs,
+                        ))?
                     }
                 }
             }
-            None => runtime.block_on(self.start_upload_session(&key, source_size_bytes))?,
+            None => {
+                let chunk_refs =
+                    upload_session_chunk_refs_for_file(source_path, source_size_bytes)?;
+                runtime.block_on(self.start_upload_session_with_chunk_refs(
+                    &key,
+                    source_size_bytes,
+                    chunk_refs,
+                ))?
+            }
         };
 
         persist_json_file_atomic(
@@ -3279,8 +3322,22 @@ impl IronMeshClient {
                 chunk_count: None,
             });
         }
-        let session = self.start_upload_session(&key, length as u64).await?;
+        let session = self
+            .start_upload_session_with_chunk_refs(
+                &key,
+                length as u64,
+                upload_session_chunk_refs_for_bytes(&data),
+            )
+            .await?;
+        let received = session
+            .received_indexes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         for (index, chunk) in data.chunks(CHUNK_UPLOAD_SIZE_BYTES).enumerate() {
+            if received.contains(&index) {
+                continue;
+            }
             self.upload_session_chunk(&session.upload_id, index, chunk.to_vec())
                 .await?;
         }
@@ -4250,6 +4307,52 @@ fn expected_chunk_size(
         });
     }
     Some(chunk_size_bytes)
+}
+
+fn upload_session_chunk_refs_for_bytes(data: &[u8]) -> Vec<UploadSessionChunkRef> {
+    data.chunks(CHUNK_UPLOAD_SIZE_BYTES)
+        .map(|chunk| UploadSessionChunkRef {
+            hash: hash_hex(chunk),
+            size_bytes: chunk.len(),
+        })
+        .collect()
+}
+
+fn upload_session_chunk_refs_for_file(
+    source_path: &Path,
+    total_size_bytes: u64,
+) -> Result<Vec<UploadSessionChunkRef>> {
+    if total_size_bytes == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = File::open(source_path)
+        .with_context(|| format!("failed to open upload source {}", source_path.display()))?;
+    let mut remaining = total_size_bytes;
+    let mut buffer = vec![0_u8; CHUNK_UPLOAD_SIZE_BYTES];
+    let mut chunk_refs = Vec::new();
+
+    while remaining > 0 {
+        let next_chunk_size = remaining.min(CHUNK_UPLOAD_SIZE_BYTES as u64) as usize;
+        file.read_exact(&mut buffer[..next_chunk_size])
+            .with_context(|| {
+                format!(
+                    "failed to hash upload chunk from source {}",
+                    source_path.display()
+                )
+            })?;
+        chunk_refs.push(UploadSessionChunkRef {
+            hash: hash_hex(&buffer[..next_chunk_size]),
+            size_bytes: next_chunk_size,
+        });
+        remaining -= next_chunk_size as u64;
+    }
+
+    Ok(chunk_refs)
+}
+
+fn hash_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 fn upload_result_from_session_complete(
