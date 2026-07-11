@@ -777,6 +777,9 @@ export async function generateSetupJoinRequest(request: {
   });
 }
 
+// Initializes the joining node's local admin credential during setup import.
+// The password is stored on this node and is not verified against another
+// cluster member.
 export async function importSetupEnrollmentPackage(request: {
   admin_password: string;
   package_json: string;

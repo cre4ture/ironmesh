@@ -30,7 +30,7 @@ export function SetupPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [startPassword, setStartPassword] = useState("");
-  const [joinAdminPassword, setJoinAdminPassword] = useState("");
+  const [nodeAdminPassword, setNodeAdminPassword] = useState("");
   const [enrollmentJson, setEnrollmentJson] = useState("");
   const [joinRequestOutput, setJoinRequestOutput] = useState<Record<string, unknown> | null>(null);
   const [transitionOutput, setTransitionOutput] = useState<SetupTransitionResponse | null>(null);
@@ -97,8 +97,8 @@ export function SetupPage() {
   }
 
   async function handleImportEnrollment() {
-    if (!joinAdminPassword.trim()) {
-      setActionError("cluster admin password is required");
+    if (!nodeAdminPassword.trim()) {
+      setActionError("administrator password for this node is required");
       return;
     }
     if (!enrollmentJson.trim()) {
@@ -110,11 +110,11 @@ export function SetupPage() {
     setActionError(null);
     try {
       const payload = await importSetupEnrollmentPackage({
-        admin_password: joinAdminPassword,
+        admin_password: nodeAdminPassword,
         package_json: enrollmentJson
       });
       setTransitionOutput(payload);
-      await waitForRuntimeTransition(joinAdminPassword, login);
+      await waitForRuntimeTransition(nodeAdminPassword, login);
     } catch (setupError) {
       setActionError(setupError instanceof Error ? setupError.message : String(setupError));
     } finally {
@@ -243,9 +243,10 @@ export function SetupPage() {
             Paste the enrollment package issued by an existing cluster and transition this node into normal runtime.
           </Text>
           <PasswordInput
-            label="Cluster admin password"
-            value={joinAdminPassword}
-            onChange={(event) => setJoinAdminPassword(event.currentTarget.value)}
+            label="Administrator password for this node"
+            description="Set the password used to administer this node after enrollment. It is stored locally and does not need to match other cluster nodes."
+            value={nodeAdminPassword}
+            onChange={(event) => setNodeAdminPassword(event.currentTarget.value)}
           />
           <Textarea
             label="Node enrollment package JSON"

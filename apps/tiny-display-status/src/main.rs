@@ -1,6 +1,7 @@
 mod framebuffer;
 mod palette;
 mod stats;
+#[cfg(target_os = "linux")]
 mod touch;
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use embedded_graphics::text::Text;
 use framebuffer::FrameBuffer;
 
 const FB_DEVICE: &str = "/dev/fb0";
+#[cfg(target_os = "linux")]
 const TOUCH_DEVICE: &str = "/dev/input/event0";
 // Matches the server-node's optional unauthenticated local status listener,
 // see IRONMESH_LOCAL_STATUS_BIND (crates/server-node-sdk).
@@ -55,6 +57,7 @@ fn line_colored(label: &'static str, value: String, color: Rgb565) -> Line {
 fn main() -> anyhow::Result<()> {
     let page_index = Arc::new(AtomicUsize::new(0));
 
+    #[cfg(target_os = "linux")]
     {
         let page_index = Arc::clone(&page_index);
         thread::spawn(move || {

@@ -1,3 +1,29 @@
+ironmesh (1.0.32-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add cluster node state persistence across restarts, backfill from legacy
+    replica state, and ignore offline replicas in over-replication planning.
+  * Add rendezvous registration state tracking to connections and fix stale
+    rendezvous version after heartbeat.
+  * Fix replication gap detection and repair bundle export mishandling
+    corrupt/orphaned manifests; skip repair export for over-replicated-only
+    items.
+  * Replace relay accept poll loop with a push-based wake channel.
+  * Add dashboard CPU/RAM/IO and GC/memory attribution telemetry; bound FUSE,
+    GC, and current-objects index memory with fixed-size caches and O(1) LRU
+    eviction.
+  * Add armv7/single-core LuckFox performance optimizations, a cross-compile
+    script, and a PicoKVM deployment script.
+  * Add tiny-display-status app for small SPI TFT status panels.
+  * Redesign the Android client UI shell, improve the gallery for large
+    libraries, reuse the JNI client across calls, and cache thumbnails.
+  * Show client runtime logs on the logs page and initialize Android log
+    capture before folder sync.
+  * Fix runtime enrollment path doubling the data_dir prefix on relative
+    paths.
+  * Roll the workspace release to 1.0.32.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 11 Jul 2026 01:40:38 +0200
+
 ironmesh (1.0.31-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Android folder sync network rules for metered and Wi-Fi policy

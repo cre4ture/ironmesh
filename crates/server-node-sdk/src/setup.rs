@@ -202,6 +202,9 @@ struct SetupGenerateJoinRequest {
 
 #[derive(Debug, Deserialize)]
 struct SetupImportEnrollmentRequest {
+    // Initializes the joining node's local admin credential after the
+    // enrollment package is imported. This is not verified against an
+    // existing cluster member.
     admin_password: String,
     package_json: String,
 }
@@ -1888,6 +1891,66 @@ mod tests {
         }
     }
 
+    fn test_node_enrollment_package(
+        data_dir: &std::path::Path,
+        bind_addr: SocketAddr,
+    ) -> NodeEnrollmentPackage {
+        let node_id = NodeId::new_v4();
+        let cluster_id = Uuid::now_v7();
+        let internal_bind_addr = default_internal_bind_addr(bind_addr);
+        let rendezvous_bind_addr = default_managed_rendezvous_bind_addr(bind_addr);
+        let public_url = format!("https://127.0.0.1:{}", bind_addr.port());
+        let internal_url = format!("https://127.0.0.1:{}", internal_bind_addr.port());
+        let rendezvous_url = format!("https://127.0.0.1:{}", rendezvous_bind_addr.port());
+
+        issue_self_managed_cluster_artifacts(TransportNodeBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            node_id,
+            mode: NodeBootstrapMode::Cluster,
+            data_dir: data_dir.display().to_string(),
+            bind_addr: bind_addr.to_string(),
+            public_url: Some(public_url.clone()),
+            labels: default_setup_labels(),
+            public_tls: Some(BootstrapServerTlsFiles {
+                cert_path: "managed/runtime/public/public.pem".to_string(),
+                key_path: "managed/runtime/public/public.key".to_string(),
+            }),
+            public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
+            public_peer_api_enabled: false,
+            internal_bind_addr: Some(internal_bind_addr.to_string()),
+            internal_url: Some(internal_url.clone()),
+            internal_tls: Some(BootstrapTlsFiles {
+                ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
+                cert_path: "managed/runtime/internal/node.pem".to_string(),
+                key_path: "managed/runtime/internal/node.key".to_string(),
+            }),
+            rendezvous_urls: vec![rendezvous_url.clone()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![
+                BootstrapEndpoint {
+                    url: public_url.clone(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(node_id),
+                },
+                BootstrapEndpoint {
+                    url: internal_url,
+                    usage: Some(BootstrapEndpointUse::PeerApi),
+                    node_id: Some(node_id),
+                },
+            ],
+            relay_mode: RelayMode::Fallback,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            enrollment_issuer_url: Some(public_url),
+        })
+        .unwrap()
+        .package
+    }
+
     #[test]
     fn managed_setup_state_roundtrip() {
         let dir = temp_dir("state-roundtrip");
@@ -2058,6 +2121,67 @@ mod tests {
             vec!["https://node-a.local:9443".to_string()]
         );
         assert!(package.bootstrap.trust_roots.rendezvous_ca_pem.is_some());
+    }
+
+    #[tokio::test]
+    async fn import_node_enrollment_package_uses_node_local_admin_password() {
+        let dir = temp_dir("import-node-local-admin-password");
+        let data_dir = dir.join("data");
+        let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
+        let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr);
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let state = SetupServerState {
+            config,
+            managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
+            completion_tx,
+        };
+        let package = test_node_enrollment_package(&data_dir, bind_addr);
+        let issuer_admin_password = "issuer-admin-password";
+        let node_admin_password = "joining-node-admin-password";
+
+        let response = import_node_enrollment_package(
+            State(state.clone()),
+            Json(SetupImportEnrollmentRequest {
+                admin_password: node_admin_password.to_string(),
+                package_json: package.to_json_pretty().unwrap(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let managed = state.managed_state.lock().await.clone();
+        let managed_hash = managed
+            .admin_password_hash
+            .as_deref()
+            .expect("managed state should persist an admin password hash");
+        assert!(crate::password_hash_matches(
+            managed_hash,
+            node_admin_password
+        ));
+        assert!(!crate::password_hash_matches(
+            managed_hash,
+            issuer_admin_password
+        ));
+
+        let completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("runtime transition should be scheduled")
+            .expect("runtime transition channel should stay open");
+        let runtime_hash = completion
+            .config
+            .admin_password_hash
+            .as_deref()
+            .expect("runtime config should receive an admin password hash");
+        assert!(crate::password_hash_matches(
+            runtime_hash,
+            node_admin_password
+        ));
+        assert!(!crate::password_hash_matches(
+            runtime_hash,
+            issuer_admin_password
+        ));
     }
 
     #[test]
