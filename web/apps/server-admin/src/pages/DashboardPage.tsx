@@ -53,12 +53,18 @@ import {
   YAxis,
   type TooltipContentProps
 } from "recharts";
+import {
+  resolveLivePollInterval,
+  useLivePollingMode,
+  useViewportVisibility
+} from "../lib/live-polling";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
 type StorageHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
 
 const STORAGE_HISTORY_MAX_POINTS = 360;
+const PROCESS_STATS_HISTORY_LIMIT = 120;
 const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
   key: StorageHistoryRangeKey;
   label: string;
@@ -122,6 +128,17 @@ export function DashboardPage() {
     !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
   const canInspectCluster = canRunAdminMaintenance;
   const canInspectRendezvous = canRunAdminMaintenance;
+  const dashboardPollingMode = useLivePollingMode();
+  const {
+    ref: processStatsSectionRef,
+    isVisible: processStatsSectionVisible
+  } = useViewportVisibility<HTMLDivElement>({
+    initialVisible: false,
+    rootMargin: "240px 0px",
+    threshold: 0.1
+  });
+  const shouldLoadProcessStats =
+    canInspectCluster && processStatsSectionVisible;
 
   const backendHealthQuery = useQuery({
     queryKey: ["dashboard", "health"],
@@ -140,20 +157,36 @@ export function DashboardPage() {
   const processStatsCurrentQuery = useQuery({
     queryKey: ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsCurrent(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectCluster,
-    refetchInterval: 3_000
+    enabled: shouldLoadProcessStats,
+    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
+      live: 5_000,
+      passive: 15_000,
+      hidden: 30_000
+    })
   });
   const processStatsHistoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
-    queryFn: () => getProcessStatsHistory(undefined, normalizedAdminTokenOverride || undefined),
-    enabled: canInspectCluster,
-    refetchInterval: 3_000
+    queryFn: () =>
+      getProcessStatsHistory(
+        PROCESS_STATS_HISTORY_LIMIT,
+        normalizedAdminTokenOverride || undefined
+      ),
+    enabled: shouldLoadProcessStats,
+    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
+      live: 15_000,
+      passive: 45_000,
+      hidden: false
+    })
   });
   const processStatsMemoryQuery = useQuery({
     queryKey: ["dashboard", "process-stats-memory", normalizedAdminTokenOverride],
     queryFn: () => getProcessStatsMemory(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 5_000
+    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
+      live: 10_000,
+      passive: 30_000,
+      hidden: 60_000
+    })
   });
   const clusterSummaryQuery = useQuery({
     queryKey: ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
@@ -175,7 +208,11 @@ export function DashboardPage() {
     queryKey: ["dashboard", "repair-activity", normalizedAdminTokenOverride],
     queryFn: () => getRepairActivityStatus(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: 3_000
+    refetchInterval: resolveLivePollInterval(dashboardPollingMode, {
+      live: 5_000,
+      passive: 15_000,
+      hidden: 30_000
+    })
   });
   const rendezvousConfigQuery = useQuery({
     queryKey: ["dashboard", "rendezvous-config", normalizedAdminTokenOverride],
@@ -186,8 +223,13 @@ export function DashboardPage() {
   const refresh = useCallback(async () => {
     const queryKeys: ReadonlyArray<readonly unknown[]> = [
       ["dashboard", "health"],
-      ["dashboard", "storage-stats-current"],
-      ["dashboard", "storage-stats-history", storageHistoryRange],
+      ["dashboard", "storage-stats-current", normalizedAdminTokenOverride],
+      [
+        "dashboard",
+        "storage-stats-history",
+        storageHistoryRange,
+        normalizedAdminTokenOverride
+      ],
       ...(canInspectCluster
         ? [
             ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
@@ -243,9 +285,11 @@ export function DashboardPage() {
   const storageStats = storageStatsQuery.data ?? null;
   const storageHistory = storageHistoryQuery.data ?? EMPTY_STORAGE_HISTORY;
   const processStatsCurrent =
-    canInspectCluster ? processStatsCurrentQuery.data ?? null : null;
+    shouldLoadProcessStats ? processStatsCurrentQuery.data ?? null : null;
   const processStatsHistory =
-    canInspectCluster ? processStatsHistoryQuery.data ?? EMPTY_PROCESS_HISTORY : EMPTY_PROCESS_HISTORY;
+    shouldLoadProcessStats
+      ? processStatsHistoryQuery.data ?? EMPTY_PROCESS_HISTORY
+      : EMPTY_PROCESS_HISTORY;
   const memoryAttribution: MemoryAttributionSample | null =
     canInspectCluster ? processStatsMemoryQuery.data ?? null : null;
   const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
@@ -259,8 +303,9 @@ export function DashboardPage() {
         nodesQuery.isFetching ||
         replicationPlanQuery.isFetching ||
         repairActivityQuery.isFetching ||
-        processStatsCurrentQuery.isFetching ||
-        processStatsHistoryQuery.isFetching ||
+        (shouldLoadProcessStats &&
+          (processStatsCurrentQuery.isFetching ||
+            processStatsHistoryQuery.isFetching)) ||
         processStatsMemoryQuery.isFetching)) ||
     (canInspectRendezvous && rendezvousConfigQuery.isFetching);
   const error = firstErrorMessage([
@@ -272,8 +317,8 @@ export function DashboardPage() {
     canInspectCluster ? nodesQuery.error : null,
     canInspectCluster ? replicationPlanQuery.error : null,
     canInspectCluster ? repairActivityQuery.error : null,
-    canInspectCluster ? processStatsCurrentQuery.error : null,
-    canInspectCluster ? processStatsHistoryQuery.error : null,
+    shouldLoadProcessStats ? processStatsCurrentQuery.error : null,
+    shouldLoadProcessStats ? processStatsHistoryQuery.error : null,
     canInspectCluster ? processStatsMemoryQuery.error : null
   ]);
 
@@ -654,8 +699,9 @@ export function DashboardPage() {
           </Card>
         </Grid.Col>
         <Grid.Col span={12}>
-          <Card withBorder radius="md" padding="lg">
-            <Stack gap="md">
+          <div ref={processStatsSectionRef}>
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="md">
               <Group justify="space-between" align="flex-start">
                 <Stack gap={4}>
                   <Text fw={700}>Process resource usage</Text>
@@ -879,8 +925,9 @@ export function DashboardPage() {
                   </ScrollArea>
                 )}
               </Stack>
-            </Stack>
-          </Card>
+              </Stack>
+            </Card>
+          </div>
         </Grid.Col>
         <Grid.Col span={12}>
           <Card withBorder radius="md" padding="lg">

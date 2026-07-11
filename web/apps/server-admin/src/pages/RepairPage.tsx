@@ -36,6 +36,7 @@ import {
 } from "@mantine/core";
 import { JsonBlock, StatCard } from "@ironmesh/ui";
 import { useCallback, useEffect, useState } from "react";
+import { resolveLivePollInterval, useLivePollingMode } from "../lib/live-polling";
 import { formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
@@ -47,9 +48,12 @@ const REPAIR_LIST_PAGE_SIZE_OPTIONS = [10, 20, 50, 100].map((value) => ({
   label: `${value} per list`
 }));
 
+type RepairTabValue = "replication" | "manual-actions" | "data-scrub";
+
 export function RepairPage() {
   const queryClient = useQueryClient();
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
+  const [activeTab, setActiveTab] = useState<RepairTabValue>("replication");
   const [selectedRun, setSelectedRun] = useState<RepairRunRecord | null>(null);
   const [selectedManualRepairRun, setSelectedManualRepairRun] =
     useState<ManualRepairActionRunRecord | null>(null);
@@ -61,28 +65,58 @@ export function RepairPage() {
   const loginRequired = sessionStatus?.login_required ?? true;
   const canInspectRepair =
     !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
+  const repairPagePollingMode = useLivePollingMode();
+  const replicationTabActive = activeTab === "replication";
+  const manualActionsTabActive = activeTab === "manual-actions";
+  const dataScrubTabActive = activeTab === "data-scrub";
 
   const repairActivityQuery = useQuery({
     queryKey: ["repair-page", "activity", normalizedAdminTokenOverride],
     queryFn: () => getRepairActivityStatus(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair,
-    refetchInterval: 3_000
+    enabled: canInspectRepair && replicationTabActive,
+    refetchInterval: (query) =>
+      resolveLivePollInterval(repairPagePollingMode, {
+        live:
+          (query.state.data?.active_runs.length ?? 0) > 0 ? 3_000 : 15_000,
+        passive:
+          (query.state.data?.active_runs.length ?? 0) > 0 ? 10_000 : 30_000,
+        hidden:
+          (query.state.data?.active_runs.length ?? 0) > 0 ? 20_000 : false
+      })
   });
   const repairHistoryQuery = useQuery({
     queryKey: ["repair-page", "history", normalizedAdminTokenOverride],
     queryFn: () => getRepairHistory({ limit: 120 }, normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair
+    enabled: canInspectRepair && replicationTabActive
   });
   const manualRepairActionsQuery = useQuery({
     queryKey: ["repair-page", "manual-actions", normalizedAdminTokenOverride],
     queryFn: () => getManualRepairActions(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair
+    enabled: canInspectRepair && manualActionsTabActive
   });
   const manualRepairActivityQuery = useQuery({
     queryKey: ["repair-page", "manual-action-activity", normalizedAdminTokenOverride],
     queryFn: () => getManualRepairActionActivityStatus(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair,
-    refetchInterval: 3_000
+    enabled:
+      canInspectRepair &&
+      (manualActionsTabActive || pendingManualRepairRunId !== null),
+    refetchInterval: (query) => {
+      const manualRepairActive =
+        (query.state.data?.active_runs.length ?? 0) > 0 ||
+        pendingManualRepairRunId !== null;
+
+      return manualRepairActive
+        ? resolveLivePollInterval(repairPagePollingMode, {
+            live: 3_000,
+            passive: 10_000,
+            hidden: 20_000
+          })
+        : resolveLivePollInterval(repairPagePollingMode, {
+            live: 15_000,
+            passive: false,
+            hidden: false
+          });
+    }
   });
   const manualRepairActivity = canInspectRepair ? manualRepairActivityQuery.data ?? null : null;
   const activeManualRepairRun = manualRepairActivity?.active_runs[0] ?? null;
@@ -91,21 +125,39 @@ export function RepairPage() {
     queryKey: ["repair-page", "manual-action-history", normalizedAdminTokenOverride],
     queryFn: () =>
       getManualRepairActionHistory({ limit: 120 }, normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair,
+    enabled:
+      canInspectRepair &&
+      (manualActionsTabActive || pendingManualRepairRunId !== null),
     refetchInterval:
-      hasActiveManualRepairRun || pendingManualRepairRunId !== null ? 3_000 : false
+      hasActiveManualRepairRun || pendingManualRepairRunId !== null
+        ? resolveLivePollInterval(repairPagePollingMode, {
+            live: 5_000,
+            passive: 15_000,
+            hidden: 30_000
+          })
+        : false
   });
   const replicationPlanQuery = useQuery({
     queryKey: ["repair-page", "replication-plan", normalizedAdminTokenOverride],
     queryFn: () => getReplicationPlan(normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair
+    enabled: canInspectRepair && replicationTabActive
   });
   const scrubClusterQuery = useQuery({
     queryKey: ["repair-page", "scrub-cluster", normalizedAdminTokenOverride],
     queryFn: () =>
       getDataScrubClusterStatus({ limit: 120 }, normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair,
-    refetchInterval: 5_000
+    enabled: canInspectRepair && dataScrubTabActive,
+    refetchInterval: (query) => {
+      const scrubClusterActive =
+        query.state.data?.nodes.some((node) => node.active_runs.length > 0) ??
+        false;
+
+      return resolveLivePollInterval(repairPagePollingMode, {
+        live: scrubClusterActive ? 5_000 : 20_000,
+        passive: scrubClusterActive ? 15_000 : 30_000,
+        hidden: scrubClusterActive ? 30_000 : false
+      });
+    }
   });
 
   const repairActivity = canInspectRepair ? repairActivityQuery.data ?? null : null;
@@ -337,6 +389,12 @@ export function RepairPage() {
     setScrubRunsPageIndex(0);
   }
 
+  function handleActiveTabChange(value: string | null) {
+    if (value === "replication" || value === "manual-actions" || value === "data-scrub") {
+      setActiveTab(value);
+    }
+  }
+
   return (
     <Stack gap="lg">
       <Group justify="space-between" align="flex-start">
@@ -387,7 +445,7 @@ export function RepairPage() {
       ) : null}
       {error ? <Alert color="red" title="Failed to load maintenance state">{error}</Alert> : null}
 
-      <Tabs defaultValue="replication">
+      <Tabs value={activeTab} onChange={handleActiveTabChange}>
         <Tabs.List>
           <Tabs.Tab value="replication">Replication Repair</Tabs.Tab>
           <Tabs.Tab value="manual-actions">Manual Actions</Tabs.Tab>

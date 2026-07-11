@@ -38,6 +38,11 @@ import {
   YAxis,
   type TooltipContentProps
 } from "recharts";
+import {
+  resolveLivePollInterval,
+  useLivePollingMode,
+  useViewportVisibility
+} from "../lib/live-polling";
 import { formatBytes, formatRelativeUnixTs, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
@@ -125,6 +130,15 @@ export function MetadataPage() {
   const loginRequired = sessionStatus?.login_required ?? true;
   const canInspectDbDistribution =
     !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
+  const metadataPollingMode = useLivePollingMode();
+  const {
+    ref: dbDistributionSectionRef,
+    isVisible: dbDistributionSectionVisible
+  } = useViewportVisibility<HTMLDivElement>({
+    initialVisible: false,
+    rootMargin: "200px 0px",
+    threshold: 0.05
+  });
 
   const currentQuery = useQuery({
     queryKey: ["metadata-page", "storage-stats-current", normalizedAdminTokenOverride],
@@ -145,8 +159,25 @@ export function MetadataPage() {
     queryFn: () =>
       getMetadataDbLogicalDistributionStatus(normalizedAdminTokenOverride || undefined),
     enabled: canInspectDbDistribution,
-    refetchInterval: (query) =>
-      query.state.data?.state === "running" ? 1_000 : false
+    refetchInterval: (query) => {
+      if (query.state.data?.state !== "running") {
+        return false;
+      }
+
+      if (dbDistributionSectionVisible) {
+        return resolveLivePollInterval(metadataPollingMode, {
+          live: 1_000,
+          passive: 3_000,
+          hidden: 10_000
+        });
+      }
+
+      return resolveLivePollInterval(metadataPollingMode, {
+        live: 5_000,
+        passive: 10_000,
+        hidden: 15_000
+      });
+    }
   });
   const startDbDistributionMutation = useMutation({
     mutationFn: () => startMetadataDbLogicalDistribution(normalizedAdminTokenOverride || undefined),
@@ -172,8 +203,13 @@ export function MetadataPage() {
 
   const refresh = useCallback(async () => {
     const queryKeys: ReadonlyArray<readonly unknown[]> = [
-      ["metadata-page", "storage-stats-current"],
-      ["metadata-page", "storage-stats-history", historyRange],
+      ["metadata-page", "storage-stats-current", normalizedAdminTokenOverride],
+      [
+        "metadata-page",
+        "storage-stats-history",
+        historyRange,
+        normalizedAdminTokenOverride
+      ],
       ...(canInspectDbDistribution
         ? [[
             "metadata-page",
@@ -445,67 +481,68 @@ export function MetadataPage() {
         </Stack>
       </Card>
 
-      <Card withBorder radius="md" padding="lg">
-        <Stack gap="md">
-          <Group justify="space-between" align="flex-start">
-            <Stack gap={4}>
-              <Text fw={700}>Metadata DB Logical Distribution</Text>
-              <Text size="sm" c="dimmed" maw={800}>
-                This first-pass database view estimates where logical content lives inside the
-                metadata database by summing the stored byte lengths of tracked TEXT and BLOB
-                columns per table. It is intentionally not a physical SQLite page breakdown yet, so
-                it excludes WAL growth, free pages, B-tree overhead, index pages, and most integer
-                storage.
-              </Text>
-              <Text size="sm" c="dimmed" maw={800}>
-                This scan now runs only when requested because it can be expensive on large
-                metadata databases. Once completed, the latest result stays cached in memory until
-                the next explicit refresh or a server restart.
-              </Text>
-            </Stack>
-            <Stack gap="xs" align="flex-end">
-              {canInspectDbDistribution ? (
-                <Button
-                  variant="light"
-                  onClick={() => void startDbDistributionMutation.mutateAsync()}
-                  loading={startDbDistributionMutation.isPending}
-                  disabled={dbDistributionRunning}
-                >
-                  {dbDistributionRunning
-                    ? "Analysis running"
-                    : dbDistribution
-                      ? "Refresh analysis"
-                      : "Analyze metadata DB"}
-                </Button>
-              ) : null}
-              {dbDistributionStatus ? (
-                <Group gap="xs">
-                  <Badge variant="light" color={dbDistributionRunning ? "blue" : "gray"}>
-                    {dbDistributionRunning ? "running" : "idle"}
-                  </Badge>
-                  <Badge variant="light">
-                    backend {dbDistributionStatus.backend}
-                  </Badge>
-                  {dbDistribution ? (
-                    <Badge variant="light">
-                      generated {formatUnixTs(dbDistribution.generated_at_unix)}
+      <div ref={dbDistributionSectionRef}>
+        <Card withBorder radius="md" padding="lg">
+          <Stack gap="md">
+            <Group justify="space-between" align="flex-start">
+              <Stack gap={4}>
+                <Text fw={700}>Metadata DB Logical Distribution</Text>
+                <Text size="sm" c="dimmed" maw={800}>
+                  This first-pass database view estimates where logical content lives inside the
+                  metadata database by summing the stored byte lengths of tracked TEXT and BLOB
+                  columns per table. It is intentionally not a physical SQLite page breakdown yet, so
+                  it excludes WAL growth, free pages, B-tree overhead, index pages, and most integer
+                  storage.
+                </Text>
+                <Text size="sm" c="dimmed" maw={800}>
+                  This scan now runs only when requested because it can be expensive on large
+                  metadata databases. Once completed, the latest result stays cached in memory until
+                  the next explicit refresh or a server restart.
+                </Text>
+              </Stack>
+              <Stack gap="xs" align="flex-end">
+                {canInspectDbDistribution ? (
+                  <Button
+                    variant="light"
+                    onClick={() => void startDbDistributionMutation.mutateAsync()}
+                    loading={startDbDistributionMutation.isPending}
+                    disabled={dbDistributionRunning}
+                  >
+                    {dbDistributionRunning
+                      ? "Analysis running"
+                      : dbDistribution
+                        ? "Refresh analysis"
+                        : "Analyze metadata DB"}
+                  </Button>
+                ) : null}
+                {dbDistributionStatus ? (
+                  <Group gap="xs">
+                    <Badge variant="light" color={dbDistributionRunning ? "blue" : "gray"}>
+                      {dbDistributionRunning ? "running" : "idle"}
                     </Badge>
-                  ) : null}
-                </Group>
-              ) : null}
-            </Stack>
-          </Group>
+                    <Badge variant="light">
+                      backend {dbDistributionStatus.backend}
+                    </Badge>
+                    {dbDistribution ? (
+                      <Badge variant="light">
+                        generated {formatUnixTs(dbDistribution.generated_at_unix)}
+                      </Badge>
+                    ) : null}
+                  </Group>
+                ) : null}
+              </Stack>
+            </Group>
 
-          {!canInspectDbDistribution ? (
-            <Text size="sm" c="dimmed">
-              Sign in with the local admin password to inspect the per-table distribution inside
-              the metadata database.
-            </Text>
-          ) : dbDistributionError ? (
-            <Alert color="red" title="Failed to load metadata DB logical distribution">
-              {dbDistributionError}
-            </Alert>
-          ) : null}
+            {!canInspectDbDistribution ? (
+              <Text size="sm" c="dimmed">
+                Sign in with the local admin password to inspect the per-table distribution inside
+                the metadata database.
+              </Text>
+            ) : dbDistributionError ? (
+              <Alert color="red" title="Failed to load metadata DB logical distribution">
+                {dbDistributionError}
+              </Alert>
+            ) : null}
 
           {canInspectDbDistribution &&
           dbDistributionRunning &&
@@ -560,8 +597,8 @@ export function MetadataPage() {
             </Text>
           ) : null}
 
-          {canInspectDbDistribution && dbDistribution ? (
-            <>
+            {canInspectDbDistribution && dbDistribution ? (
+              <>
               <Grid>
                 <Grid.Col span={{ base: 12, md: 6, xl: 3 }}>
                   <StatCard
@@ -656,10 +693,11 @@ export function MetadataPage() {
                   </Table.Tbody>
                 </Table>
               </ScrollArea>
-            </>
-          ) : null}
-        </Stack>
-      </Card>
+              </>
+            ) : null}
+          </Stack>
+        </Card>
+      </div>
 
       <Grid>
         <Grid.Col span={{ base: 12, xl: 8 }}>
