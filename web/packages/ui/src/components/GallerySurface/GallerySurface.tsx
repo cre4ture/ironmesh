@@ -34,17 +34,22 @@ import {
   IconPlayerPlay,
   IconRefresh
 } from "@tabler/icons-react";
-import {
-  GalleryBasemapMap,
-  type GalleryBasemapConfig,
-  type GalleryMapProjection
-} from "./GalleryBasemapMap";
+import { type GalleryBasemapConfig, type GalleryMapProjection } from "./GalleryBasemapMap";
 import {
   clusterScreenPoints,
   type ClusterableScreenPoint,
   type ScreenPointCluster
 } from "./gallery-marker-clusters";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode
+} from "react";
 import {
   MediaLightboxModal,
   type MediaLightboxItem,
@@ -63,6 +68,11 @@ import {
 } from "../store-paths";
 
 export type { GalleryBasemapConfig } from "./GalleryBasemapMap";
+
+const LazyGalleryBasemapMap = lazy(async () => {
+  const module = await import("./GalleryBasemapMap");
+  return { default: module.GalleryBasemapMap };
+});
 
 type GallerySortOrder = "captured_desc" | "path_asc";
 type GalleryMediaKind = "image" | "video";
@@ -2057,23 +2067,23 @@ function GalleryMapPanel({
     />
   );
 
-  if (!activeBasemap) {
-    return fallbackMap;
-  }
-
-  const basemapMap = (
-    <GalleryBasemapMap
-      basemap={activeBasemap}
-      projection={activeProjection}
-      entries={entries}
-      hiddenOnMapCount={hiddenOnMapCount}
-      isFullscreen={isFullscreen}
-      selectedPath={selectedPath}
-      getMarkerRequest={getMarkerRequest}
-      onSelectPath={onSelectPath}
-      onToggleFullscreen={toggleFullscreen}
-      fallback={fallbackMap}
-    />
+  const basemapContent = !activeBasemap ? (
+    fallbackMap
+  ) : (
+    <Suspense fallback={fallbackMap}>
+      <LazyGalleryBasemapMap
+        basemap={activeBasemap}
+        projection={activeProjection}
+        entries={entries}
+        hiddenOnMapCount={hiddenOnMapCount}
+        isFullscreen={isFullscreen}
+        selectedPath={selectedPath}
+        getMarkerRequest={getMarkerRequest}
+        onSelectPath={onSelectPath}
+        onToggleFullscreen={toggleFullscreen}
+        fallback={fallbackMap}
+      />
+    </Suspense>
   );
 
   return (
@@ -2114,7 +2124,7 @@ function GalleryMapPanel({
         ) : null}
       </div>
 
-      <div>{basemapMap}</div>
+      <div>{basemapContent}</div>
     </Stack>
   );
 }
