@@ -334,6 +334,7 @@ export function DashboardPage() {
               clusterSummary ? `${clusterSummary.online_nodes} / ${clusterSummary.total_nodes}` : loading ? <Loader size="sm" /> : "unknown"
             }
             hint="Online / total nodes"
+            testId="dashboard-cluster-nodes-card"
           />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 4 }}>

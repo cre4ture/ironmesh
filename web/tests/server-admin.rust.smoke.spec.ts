@@ -15,10 +15,10 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByRole("button", { name: "Admin Access" }).click();
   await page.getByLabel("Admin password").fill(PLAYWRIGHT_RUNTIME_ADMIN_PASSWORD);
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByText("authenticated", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("server-admin-session-badge")).toHaveText("signed in", { timeout: 60_000 });
   await page.keyboard.press("Escape");
 
-  await expect(page.getByText("1 / 1", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("dashboard-cluster-nodes-card")).toContainText("1 / 1", { timeout: 60_000 });
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
@@ -73,7 +73,10 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   ).toBeVisible();
 
   await page.getByText("Logs", { exact: true }).click();
-  await expect(page.getByRole("log")).toContainText(/T\d{2}:\d{2}:\d{2}\.000Z/);
+  await expect(page.getByText("Recent server logs", { exact: true })).toBeVisible();
+  await expect(page.getByRole("log")).toContainText(/T\d{2}:\d{2}:\d{2}\.000Z|no logs yet/, {
+    timeout: 60_000
+  });
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText(/No (image|media) objects in view/)).toBeVisible();

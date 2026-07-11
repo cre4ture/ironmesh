@@ -5,11 +5,12 @@ type StatCardProps = {
   label: string;
   value: ReactNode;
   hint?: string;
+  testId?: string;
 };
 
-export function StatCard({ label, value, hint }: StatCardProps) {
+export function StatCard({ label, value, hint, testId }: StatCardProps) {
   return (
-    <Card withBorder radius="md" padding="lg">
+    <Card withBorder radius="md" padding="lg" data-testid={testId}>
       <Stack gap={6}>
         <Text size="sm" tt="uppercase" fw={700} c="dimmed">
           {label}
