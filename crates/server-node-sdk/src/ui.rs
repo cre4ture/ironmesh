@@ -21,6 +21,7 @@ const ENTRYPOINT_CACHE_CONTROL: &str = "public, max-age=0, must-revalidate";
 const STATIC_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const FAVICON_CACHE_CONTROL: &str = "public, max-age=86400, must-revalidate";
 
+static INDEX_JS_REWRITTEN: OnceLock<Box<str>> = OnceLock::new();
 static INDEX_HTML_ETAG: OnceLock<HeaderValue> = OnceLock::new();
 static INDEX_CSS_ETAG: OnceLock<HeaderValue> = OnceLock::new();
 static INDEX_JS_ETAG: OnceLock<HeaderValue> = OnceLock::new();
@@ -83,7 +84,7 @@ pub(crate) async fn app_css(headers: HeaderMap) -> impl IntoResponse {
 pub(crate) async fn app_js(headers: HeaderMap) -> impl IntoResponse {
     cacheable_response(
         &headers,
-        INDEX_JS.as_bytes(),
+        index_js().as_bytes(),
         "application/javascript; charset=utf-8",
         ENTRYPOINT_CACHE_CONTROL,
         index_js_etag(),
@@ -176,9 +177,18 @@ fn index_css_etag() -> &'static HeaderValue {
 }
 
 fn index_js_etag() -> &'static HeaderValue {
-    INDEX_JS_ETAG.get_or_init(|| build_etag(INDEX_JS.as_bytes()))
+    INDEX_JS_ETAG.get_or_init(|| build_etag(index_js().as_bytes()))
 }
 
 fn favicon_etag() -> &'static HeaderValue {
     FAVICON_ETAG.get_or_init(|| build_etag(FAVICON_SVG.as_bytes()))
+}
+
+fn index_js() -> &'static str {
+    INDEX_JS_REWRITTEN.get_or_init(|| {
+        INDEX_JS
+            .replace("import(\"./", "import(\"./assets/")
+            .replace("import('./", "import('./assets/")
+            .into_boxed_str()
+    })
 }

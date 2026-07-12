@@ -2,7 +2,7 @@ import { getSetupStatus, isHttpErrorStatus } from "@ironmesh/api";
 import { ColorSchemeControl, NavigationShell, PageHeader } from "@ironmesh/ui";
 import { Alert, Badge, Button, Center, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useState, type ReactNode } from "react";
 import { serverAdminRoutes } from "./routes";
 import { AdminAccessDrawer } from "../components/AdminAccessDrawer";
 import { useAdminAccess } from "../lib/admin-access";
@@ -71,6 +71,7 @@ export function ServerAdminShell() {
         headerActions={
           <>
             <Badge
+              data-testid="server-admin-session-badge"
               color={
                 surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? "teal" : "gray"
               }
@@ -110,7 +111,7 @@ export function ServerAdminShell() {
               </Alert>
             ) : null}
             <Suspense fallback={<RouteLoadingState routeLabel={activeRoute.label} />}>
-              {activeRoute.element}
+              <RouteReadyState routeId={activeRoute.id}>{activeRoute.element}</RouteReadyState>
             </Suspense>
           </>
         )}
@@ -129,4 +130,14 @@ function RouteLoadingState({ routeLabel }: RouteLoadingStateProps) {
       </Stack>
     </Center>
   );
+}
+
+function RouteReadyState({
+  routeId,
+  children
+}: {
+  routeId: (typeof serverAdminRoutes)[number]["id"];
+  children: ReactNode;
+}) {
+  return <div data-testid={`server-admin-route-${routeId}`}>{children}</div>;
 }

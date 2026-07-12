@@ -360,6 +360,8 @@ pub(crate) async fn run_setup_mode(
         .route("/", get(ui::index))
         .route("/health", get(setup_health))
         .route("/ironmesh-favicon.svg", get(ui::favicon))
+        .route("/assets/{*path}", get(ui::static_asset))
+        .route("/ui/assets/{*path}", get(ui::static_asset))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
         .route("/setup/status", get(get_setup_status))
