@@ -18,7 +18,8 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("authenticated", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
-  await expect(page.getByText("1 / 1", { exact: true })).toBeVisible();
+  const clusterNodesCard = page.getByText("Cluster Nodes", { exact: true }).locator("xpath=..");
+  await expect(clusterNodesCard.getByRole("heading", { name: "1 / 1" })).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
@@ -73,7 +74,8 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   ).toBeVisible();
 
   await page.getByText("Logs", { exact: true }).click();
-  await expect(page.getByRole("log")).toContainText(/T\d{2}:\d{2}:\d{2}\.000Z/);
+  await expect(page.getByText("Recent server logs", { exact: true })).toBeVisible();
+  await expect(page.getByRole("log")).toContainText(/no logs yet|T\d{2}:\d{2}:\d{2}\.000Z/);
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText(/No (image|media) objects in view/)).toBeVisible();

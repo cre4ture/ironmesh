@@ -205,9 +205,10 @@ async fn cli_latency_test_supports_list_targets_and_explicit_node_and_relay_sele
             .get("targets")
             .and_then(|value| value.as_array())
             .context("relay output missing targets array")?;
-        assert!(
-            !relay_targets.is_empty(),
-            "expected at least one relay target, got {relay}"
+        assert_eq!(
+            relay_targets.len(),
+            1,
+            "expected exactly one pinned relay target, got {relay}"
         );
         for target in relay_targets {
             assert_eq!(
@@ -218,6 +219,13 @@ async fn cli_latency_test_supports_list_targets_and_explicit_node_and_relay_sele
             assert!(
                 target.get("error").is_none_or(serde_json::Value::is_null),
                 "expected relay probe to succeed, got {relay}"
+            );
+            assert!(
+                target
+                    .get("target")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value.contains(&rendezvous_url)),
+                "expected pinned relay target to use {rendezvous_url}, got {relay}"
             );
         }
 
@@ -267,12 +275,17 @@ async fn cli_latency_test_supports_list_targets_and_explicit_node_and_relay_sele
             .get("targets")
             .and_then(|value| value.as_array())
             .context("combined output missing targets array")?;
+        assert_eq!(
+            combined_targets.len(),
+            1,
+            "expected exactly one combined relay target, got {combined}"
+        );
         assert!(
             combined_targets.iter().any(|target| {
                 target
                     .get("target")
                     .and_then(|value| value.as_str())
-                    .is_some_and(|value| value.contains(NODE_ID_B))
+                    .is_some_and(|value| value.contains(NODE_ID_B) && value.contains(&rendezvous_url))
             }),
             "expected a relay target addressing node B, got {combined}"
         );
