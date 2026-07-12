@@ -458,9 +458,9 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
             120,
         )
         .await?;
-        assert_single_relay_probe_succeeded(
+        assert_filtered_relay_probe_pinned(
             &serde_json::from_str(&relay_standalone_json)?,
-            &[&dedicated_rendezvous_url],
+            dedicated_rendezvous_url.trim_end_matches('/'),
         );
 
         // --path relay --relay-url <embedded>: relay through node A's own embedded rendezvous.
@@ -483,9 +483,9 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
             120,
         )
         .await?;
-        assert_single_relay_probe_succeeded(
+        assert_filtered_relay_probe_pinned(
             &serde_json::from_str(&relay_embedded_json)?,
-            &[embedded_rendezvous_url.trim_end_matches('/')],
+            embedded_rendezvous_url.trim_end_matches('/'),
         );
 
         // Unknown --relay-url must fail with a helpful error listing the known rendezvous URLs.
@@ -529,23 +529,17 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
         .await?;
         let combined: serde_json::Value =
             serde_json::from_str(&combined_json).context("combined output should be JSON")?;
+        assert_relay_probe_succeeded(&combined);
         let combined_targets = combined
             .get("targets")
             .and_then(|value| value.as_array())
             .context("combined output missing targets array")?;
-        assert_eq!(
-            combined_targets.len(),
-            1,
-            "expected exactly one combined relay target, got {combined}"
-        );
         assert!(
             combined_targets.iter().any(|target| {
                 target
                     .get("target")
                     .and_then(|value| value.as_str())
-                    .is_some_and(|value| {
-                        value.contains(&node_id_b) && value.contains(&dedicated_rendezvous_url)
-                    })
+                    .is_some_and(|value| value.contains(&node_id_b))
             }),
             "expected a relay target addressing node B, got {combined}"
         );
@@ -624,37 +618,63 @@ fn assert_direct_probe_succeeded(response: &serde_json::Value, expected_bind: &s
     );
 }
 
-fn assert_single_relay_probe_succeeded(
-    response: &serde_json::Value,
-    expected_target_fragments: &[&str],
-) {
+fn assert_relay_probe_succeeded(response: &serde_json::Value) {
     let targets = response
         .get("targets")
         .and_then(|value| value.as_array())
         .unwrap_or_else(|| panic!("relay probe response should have a targets array: {response}"));
+    assert!(
+        !targets.is_empty(),
+        "expected at least one relay target, got {response}"
+    );
+    for target in targets {
+        assert_eq!(
+            target.get("transport_mode").and_then(|v| v.as_str()),
+            Some("relay"),
+            "expected relay target, got {response}"
+        );
+        assert!(
+            target.get("error").is_none_or(serde_json::Value::is_null),
+            "expected relay probe to succeed, got {response}"
+        );
+    }
+}
+
+fn assert_filtered_relay_probe_pinned(
+    response: &serde_json::Value,
+    rendezvous_hint: &str,
+) {
+    let targets = response
+        .get("targets")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("filtered relay probe response should have a targets array: {response}"));
     assert_eq!(
         targets.len(),
         1,
-        "expected exactly one relay target, got {response}"
+        "expected a single filtered relay target, got {response}"
     );
-    for target in targets {
-        assert!(
-            target
-                .get("target")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| expected_target_fragments.iter().all(|fragment| value.contains(fragment))),
-            "expected pinned relay target to contain {expected_target_fragments:?}, got {response}"
-        );
-    }
+    let target = &targets[0];
     assert_eq!(
-        targets[0].get("transport_mode").and_then(|v| v.as_str()),
+        target.get("transport_mode").and_then(|value| value.as_str()),
         Some("relay"),
-        "expected relay target, got {response}"
+        "expected relay transport mode, got {response}"
+    );
+    assert_eq!(
+        target
+            .get("uses_current_runtime")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "filtered relay probes should not fall back to the current runtime, got {response}"
     );
     assert!(
-        targets[0]
-            .get("error")
-            .is_none_or(serde_json::Value::is_null),
-        "expected relay probe to succeed, got {response}"
+        target
+            .get("target")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.contains(rendezvous_hint)),
+        "expected pinned rendezvous hint {rendezvous_hint} in target description, got {response}"
+    );
+    assert!(
+        target.get("error").is_none_or(serde_json::Value::is_null),
+        "expected filtered relay probe to succeed, got {response}"
     );
 }

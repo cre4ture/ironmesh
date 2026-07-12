@@ -972,20 +972,9 @@ pub async fn run_latency_cli_allow_failure(
     ))
 }
 
-fn latency_cli_output_has_probe_errors(output: &str) -> Result<bool> {
-    let response: serde_json::Value =
-        serde_json::from_str(output).context("latency-test --json output should be valid JSON")?;
-    let targets = response
-        .get("targets")
-        .and_then(|value| value.as_array())
-        .context("latency-test --json output missing targets array")?;
-    Ok(targets
-        .iter()
-        .any(|target| target.get("error").is_some_and(|value| !value.is_null())))
-}
-
-/// Like [`run_latency_cli`], but retries on failure. Useful right after enrollment, where a
-/// freshly issued client credential may not have propagated/be trusted everywhere yet.
+/// Like [`run_latency_cli`], but retries both process failures and successful `--json` responses
+/// that still contain per-target probe errors. Useful right after enrollment, where a freshly
+/// issued client credential may not have propagated/be trusted everywhere yet.
 #[allow(dead_code)]
 pub async fn run_latency_cli_with_retry(
     bootstrap_arg: &str,
@@ -993,28 +982,26 @@ pub async fn run_latency_cli_with_retry(
     extra: &[&str],
     retries: usize,
 ) -> Result<String> {
-    let expects_json = extra.contains(&"--json");
+    let json_requested = extra.contains(&"--json");
     let mut last_err = None;
     for attempt in 0..retries {
-        match run_latency_cli(bootstrap_arg, identity_arg, extra).await {
-            Ok(output) => {
-                if expects_json {
-                    match latency_cli_output_has_probe_errors(&output) {
-                        Ok(false) => return Ok(output),
-                        Ok(true) => {
-                            last_err = Some(anyhow::anyhow!(
-                                "latency-test succeeded but returned probe errors: {output}"
-                            ));
-                        }
-                        Err(err) => {
-                            last_err = Some(err.context(
-                                "latency-test succeeded but its JSON output could not be validated",
-                            ));
-                        }
-                    }
+        match run_latency_cli_allow_failure(bootstrap_arg, identity_arg, extra).await {
+            Ok((true, stdout, stderr)) => {
+                if json_requested && latency_cli_output_has_probe_errors(&stdout)? {
+                    last_err = Some(anyhow::anyhow!(
+                        "latency-test returned probe-level errors before the target became reachable: {}",
+                        stderr.trim().if_empty_then("<no stderr>")
+                    ));
                 } else {
-                    return Ok(output);
+                    return Ok(stdout);
                 }
+            }
+            Ok((false, stdout, stderr)) => {
+                last_err = Some(anyhow::anyhow!(
+                    "latency-test exited non-zero: {}\n{}",
+                    stderr.trim().if_empty_then("<no stderr>"),
+                    stdout.trim().if_empty_then("<no stdout>")
+                ));
             }
             Err(err) => {
                 last_err = Some(err);
@@ -1028,6 +1015,58 @@ pub async fn run_latency_cli_with_retry(
         "latency-test did not succeed after {retries} attempts: {:#}",
         last_err.expect("at least one attempt should have run")
     )
+}
+
+fn latency_cli_output_has_probe_errors(output: &str) -> Result<bool> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(output).context("latency-test --json output should be valid JSON")?;
+    let targets = parsed
+        .get("targets")
+        .and_then(|value| value.as_array())
+        .context("latency-test JSON output should contain a targets array")?;
+    Ok(targets
+        .iter()
+        .any(|target| target.get("error").is_some_and(|value| !value.is_null())))
+}
+
+trait EmptyStringExt {
+    fn if_empty_then<'a>(&'a self, fallback: &'a str) -> &'a str;
+}
+
+impl EmptyStringExt for str {
+    fn if_empty_then<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.is_empty() { fallback } else { self }
+    }
+}
+
+#[test]
+fn latency_cli_output_error_detection_ignores_successful_targets() {
+    let output = serde_json::json!({
+        "targets": [
+            { "path_id": "relay-1", "error": null },
+            { "path_id": "relay-2", "error": null }
+        ]
+    });
+
+    let has_errors = latency_cli_output_has_probe_errors(&output.to_string())
+        .expect("JSON fixture should parse");
+
+    assert!(!has_errors);
+}
+
+#[test]
+fn latency_cli_output_error_detection_flags_probe_level_errors() {
+    let output = serde_json::json!({
+        "targets": [
+            { "path_id": "relay-1", "error": null },
+            { "path_id": "relay-2", "error": "credential not trusted yet" }
+        ]
+    });
+
+    let has_errors = latency_cli_output_has_probe_errors(&output.to_string())
+        .expect("JSON fixture should parse");
+
+    assert!(has_errors);
 }
 
 #[allow(dead_code)]

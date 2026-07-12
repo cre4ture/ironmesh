@@ -539,12 +539,12 @@ async fn run_latency_test(
     log_client_transport_ready("latency_test_current_client", &current_client);
     let bootstrap = load_bootstrap_from_cli(cli)?;
     let identity = read_client_identity_from_cli(cli)?;
-    let pin_bootstrap_target = node_id.is_some() || relay_url.is_some();
     let diagnostic_targets = bootstrap
         .as_ref()
         .map(|bootstrap| bootstrap.diagnostic_targets_selecting(node_id, relay_url))
         .transpose()?
         .unwrap_or_default();
+    let relay_probe_is_pinned = node_id.is_some() || relay_url.is_some();
 
     let mut targets = match path_selection {
         LatencyTestPathSelection::Current => {
@@ -568,7 +568,9 @@ async fn run_latency_test(
                 &diagnostic_targets,
                 identity.as_ref(),
                 &config,
-                !pin_bootstrap_target,
+                // Once the operator pins a relay target, the relay suite should only exercise the
+                // selected bootstrap-derived path(s), not the unfiltered current runtime.
+                !relay_probe_is_pinned,
             )
             .await
         }
@@ -594,7 +596,9 @@ async fn run_latency_test(
                     &diagnostic_targets,
                     identity.as_ref(),
                     &config,
-                    !pin_bootstrap_target,
+                    // `all` already includes the current runtime explicitly via the `current`
+                    // target above, so relay diagnostics should only add bootstrap-derived paths.
+                    false,
                 )
                 .await,
             );
