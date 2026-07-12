@@ -69,6 +69,7 @@ export function RepairPage() {
   const replicationTabActive = activeTab === "replication";
   const manualActionsTabActive = activeTab === "manual-actions";
   const dataScrubTabActive = activeTab === "data-scrub";
+  const repairHistoryTabActive = replicationTabActive || dataScrubTabActive;
 
   const repairActivityQuery = useQuery({
     queryKey: ["repair-page", "activity", normalizedAdminTokenOverride],
@@ -87,7 +88,14 @@ export function RepairPage() {
   const repairHistoryQuery = useQuery({
     queryKey: ["repair-page", "history", normalizedAdminTokenOverride],
     queryFn: () => getRepairHistory({ limit: 120 }, normalizedAdminTokenOverride || undefined),
-    enabled: canInspectRepair && replicationTabActive
+    enabled: canInspectRepair && repairHistoryTabActive,
+    refetchInterval: repairHistoryTabActive
+      ? resolveLivePollInterval(repairPagePollingMode, {
+          live: 15_000,
+          passive: 30_000,
+          hidden: false
+        })
+      : false
   });
   const manualRepairActionsQuery = useQuery({
     queryKey: ["repair-page", "manual-actions", normalizedAdminTokenOverride],
