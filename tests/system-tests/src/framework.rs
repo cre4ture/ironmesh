@@ -928,6 +928,108 @@ pub async fn run_cli(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+pub async fn run_latency_cli(
+    bootstrap_arg: &str,
+    identity_arg: &str,
+    extra: &[&str],
+) -> Result<String> {
+    let mut args = vec![
+        "--bootstrap-file",
+        bootstrap_arg,
+        "--client-identity-file",
+        identity_arg,
+        "latency-test",
+    ];
+    args.extend_from_slice(extra);
+    run_cli(&args).await
+}
+
+/// Like [`run_latency_cli`], but returns the raw exit status instead of failing the caller, so it
+/// can assert on the CLI's error-path behavior (unknown --node-id/--relay-url, etc.).
+pub async fn run_latency_cli_allow_failure(
+    bootstrap_arg: &str,
+    identity_arg: &str,
+    extra: &[&str],
+) -> Result<(bool, String, String)> {
+    let cli_bin = binary_path("cli-client")?;
+    let mut args = vec![
+        "--bootstrap-file",
+        bootstrap_arg,
+        "--client-identity-file",
+        identity_arg,
+        "latency-test",
+    ];
+    args.extend_from_slice(extra);
+    let output = Command::new(cli_bin)
+        .args(&args)
+        .output()
+        .await
+        .context("failed to execute cli-client")?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn latency_cli_output_has_probe_errors(output: &str) -> Result<bool> {
+    let response: serde_json::Value =
+        serde_json::from_str(output).context("latency-test --json output should be valid JSON")?;
+    let targets = response
+        .get("targets")
+        .and_then(|value| value.as_array())
+        .context("latency-test --json output missing targets array")?;
+    Ok(targets
+        .iter()
+        .any(|target| target.get("error").is_some_and(|value| !value.is_null())))
+}
+
+/// Like [`run_latency_cli`], but retries on failure. Useful right after enrollment, where a
+/// freshly issued client credential may not have propagated/be trusted everywhere yet.
+#[allow(dead_code)]
+pub async fn run_latency_cli_with_retry(
+    bootstrap_arg: &str,
+    identity_arg: &str,
+    extra: &[&str],
+    retries: usize,
+) -> Result<String> {
+    let expects_json = extra.contains(&"--json");
+    let mut last_err = None;
+    for attempt in 0..retries {
+        match run_latency_cli(bootstrap_arg, identity_arg, extra).await {
+            Ok(output) => {
+                if expects_json {
+                    match latency_cli_output_has_probe_errors(&output) {
+                        Ok(false) => return Ok(output),
+                        Ok(true) => {
+                            last_err = Some(anyhow::anyhow!(
+                                "latency-test succeeded but returned probe errors: {output}"
+                            ));
+                        }
+                        Err(err) => {
+                            last_err = Some(err.context(
+                                "latency-test succeeded but its JSON output could not be validated",
+                            ));
+                        }
+                    }
+                } else {
+                    return Ok(output);
+                }
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+        if attempt + 1 < retries {
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+    bail!(
+        "latency-test did not succeed after {retries} attempts: {:#}",
+        last_err.expect("at least one attempt should have run")
+    )
+}
+
 #[allow(dead_code)]
 pub async fn issue_pairing_token(
     http: &reqwest::Client,
