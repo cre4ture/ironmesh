@@ -64,14 +64,21 @@ export async function getClientRecentLogs(limit = 200): Promise<LogsResponse> {
 }
 
 export async function getClientRendezvous(): Promise<ClientRendezvousView> {
-  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous"));
-}
-
-export async function refreshClientRendezvous(): Promise<ClientRendezvousView> {
-  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous/refresh"), {
-    method: "POST"
+  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous"), {
+    credentials: "same-origin",
+    cache: "no-store"
   });
 }
+
+export async function probeClientRendezvous(): Promise<ClientRendezvousView> {
+  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous/refresh"), {
+    method: "POST",
+    credentials: "same-origin",
+    cache: "no-store"
+  });
+}
+
+export const refreshClientRendezvous = probeClientRendezvous;
 
 export async function runClientLatencyTest(request?: {
   sample_count?: number;

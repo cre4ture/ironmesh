@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -1582,56 +1582,116 @@ fn content_type_for(path: &str) -> &'static str {
     }
 }
 
-async fn web_static_index() -> Response {
-    (
-        StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
-        assets::index_html().as_bytes().to_vec(),
-    )
-        .into_response()
+fn static_cache_control_for(path: &str) -> &'static str {
+    if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else if path == "index.html" {
+        "no-cache"
+    } else {
+        "public, max-age=0, must-revalidate"
+    }
 }
 
-async fn web_static_file(Path(path): Path<String>) -> Response {
+fn static_asset_etag(path: &str, body: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for &byte in path.as_bytes().iter().chain(body.iter()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("\"{:x}-{:016x}\"", body.len(), hash)
+}
+
+fn request_matches_etag(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || candidate == etag
+                    || candidate
+                        .strip_prefix("W/")
+                        .is_some_and(|weak| weak.trim() == etag)
+            })
+        })
+}
+
+fn static_asset_response(
+    request_headers: &HeaderMap,
+    path: &str,
+    content_type: &'static str,
+    body: &'static [u8],
+) -> Response {
+    let etag = static_asset_etag(path, body);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(static_cache_control_for(path)),
+    );
+    headers.insert(
+        ETAG,
+        HeaderValue::from_str(&etag)
+            .unwrap_or_else(|_| HeaderValue::from_static("\"invalid-etag\"")),
+    );
+
+    if request_matches_etag(request_headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, headers).into_response();
+    }
+
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    (StatusCode::OK, headers, Bytes::from_static(body)).into_response()
+}
+
+async fn web_static_index(request_headers: HeaderMap) -> Response {
+    static_asset_response(
+        &request_headers,
+        "index.html",
+        "text/html; charset=utf-8",
+        assets::index_html().as_bytes(),
+    )
+}
+
+async fn web_static_file(request_headers: HeaderMap, Path(path): Path<String>) -> Response {
     if path.starts_with("api/") {
         return StatusCode::NOT_FOUND.into_response();
     }
 
     if path.is_empty() || path == "index.html" {
-        return web_static_index().await;
+        return static_asset_response(
+            &request_headers,
+            "index.html",
+            "text/html; charset=utf-8",
+            assets::index_html().as_bytes(),
+        );
     }
 
     let body = match path.as_str() {
-        "app.js" => Some(assets::app_js().as_bytes().to_vec()),
-        "app.css" => Some(assets::app_css().as_bytes().to_vec()),
+        "app.js" => Some(assets::app_js().as_bytes()),
+        "app.css" => Some(assets::app_css().as_bytes()),
         _ => None,
     };
 
     match body {
-        Some(bytes) => (
-            StatusCode::OK,
-            [("content-type", content_type_for(&path))],
-            bytes,
-        )
-            .into_response(),
+        Some(bytes) => {
+            static_asset_response(&request_headers, &path, content_type_for(&path), bytes)
+        }
         None => match assets::extra_asset(&path) {
-            Some((bytes, content_type)) => (
-                StatusCode::OK,
-                [("content-type", content_type)],
-                bytes.to_vec(),
-            )
-                .into_response(),
+            Some((bytes, content_type)) => {
+                static_asset_response(&request_headers, &path, content_type, bytes)
+            }
             None => StatusCode::NOT_FOUND.into_response(),
         },
     }
 }
 
-async fn web_static_favicon() -> Response {
-    (
-        StatusCode::OK,
-        [("content-type", "image/svg+xml; charset=utf-8")],
-        assets::favicon_svg().as_bytes().to_vec(),
+async fn web_static_favicon(request_headers: HeaderMap) -> Response {
+    static_asset_response(
+        &request_headers,
+        "ironmesh-favicon.svg",
+        "image/svg+xml; charset=utf-8",
+        assets::favicon_svg().as_bytes(),
     )
-        .into_response()
 }
 
 async fn web_ping(State(state): State<WebState>) -> impl IntoResponse {

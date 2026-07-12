@@ -54,9 +54,9 @@ import {
   getVersionGraph,
   listSnapshots,
   listStoreEntries,
+  probeClientRendezvous,
   putBinaryObject,
   putStoreValue,
-  refreshClientRendezvous,
   renameStorePath,
   updateClientRendezvous,
   type BinaryUploadProgress,
@@ -832,11 +832,12 @@ function RendezvousPage() {
         setLoading(true);
       }
       try {
-        const payload = await refreshClientRendezvous();
+        const payload = await getClientRendezvous();
         if (cancelled) {
           return;
         }
         setRendezvous(payload);
+        setError(null);
         if (!preserveDraft || !urlsDirtyRef.current) {
           setEditableUrlsText(payload.configured_urls.join("\n"));
           setUrlsDirty(false);
@@ -867,14 +868,14 @@ function RendezvousPage() {
     setPendingAction("refresh");
     setError(null);
     try {
-      const payload = await refreshClientRendezvous();
+      const payload = await probeClientRendezvous();
       setRendezvous(payload);
       if (!urlsDirtyRef.current) {
         setEditableUrlsText(payload.configured_urls.join("\n"));
         setUrlsDirty(false);
       }
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "Failed refreshing rendezvous status");
+      setError(nextError instanceof Error ? nextError.message : "Failed probing rendezvous status");
     } finally {
       setPendingAction(null);
     }
@@ -906,7 +907,7 @@ function RendezvousPage() {
     <>
       <PageHeader
         title="Rendezvous"
-        description="Shared relay endpoint status and bootstrap rendezvous URL controls for Android and CLI-backed web sessions."
+        description="Auto-refresh reads passive shared relay status every 5 seconds. Use Refresh to run an active probe across the configured rendezvous endpoints."
         actions={
           <Button
             leftSection={<IconRefresh size={16} />}
@@ -1036,7 +1037,7 @@ function RendezvousPage() {
                 </Badge>
               </Group>
               <Text c="dimmed" size="sm">
-                The active URL comes from the live relay transport. Other rows show the latest shared-web probe result for each configured rendezvous service.
+                The active URL comes from the live relay transport. Other rows show the latest shared-web probe result for each configured rendezvous service; automatic page refresh only reloads this cached snapshot.
               </Text>
               <Table.ScrollContainer minWidth={820}>
                 <Table striped highlightOnHover withTableBorder>
