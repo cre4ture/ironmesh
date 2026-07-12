@@ -1105,11 +1105,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     );
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
-    let remote_change_wait_timeout = REMOTE_CHANGE_WAIT_TIMEOUT.max(refresh_interval);
     let local_scan_interval = Duration::from_millis(options.local_scan_interval_ms.max(250));
 
-    let refresh_poller =
-        RemoteSnapshotPoller::server_notifications(remote_change_wait_timeout, refresh_interval);
+    let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
     let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
     store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
@@ -1125,11 +1123,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_latest_metrics = latest_metrics.clone();
     let remote_last_success = last_success_shared.clone();
     let remote_idle_message = idle_watch_message.clone();
-    let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
+    let remote_thread = refresh_poller.spawn_changed_paths_loop(
         remote_running,
         Some(initial_snapshot),
-        refresh_fetcher,
-        move |fetcher| {
+        move || {
             fetch_remote_snapshot_with_status_progress(
                 &remote_options,
                 &remote_connection_target,
@@ -1138,9 +1135,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 remote_status_callback.as_ref(),
                 "running",
                 "steady-state",
-                "refreshing-remote-snapshot",
-                "Refreshing remote snapshot",
-                fetcher,
+                "checking-remote-snapshot",
+                "Checking remote snapshot for changes",
+                &refresh_fetcher,
                 latest_metrics_value(&remote_latest_metrics),
                 load_optional_unix_ms(&remote_last_success),
                 Some(remote_idle_message.as_str()),
@@ -2066,6 +2063,19 @@ fn matching_local_entry_for_remote_file_change<B: FolderAgentLocalBackend>(
     Ok(Some(entry_state))
 }
 
+fn remote_index_contains_path_or_descendants(remote_index: &RemoteTreeIndex, path: &str) -> bool {
+    if remote_index.files.contains(path) || remote_index.directories.contains(path) {
+        return true;
+    }
+
+    let prefix = format!("{path}/");
+    remote_index
+        .files
+        .iter()
+        .chain(remote_index.directories.iter())
+        .any(|entry| entry.starts_with(&prefix))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     backend: &mut B,
@@ -2188,6 +2198,15 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                     }
                     None => {
                         outcome.changed_path_count += 1;
+                        let local_entry = backend.local_entry_state(options, path)?;
+                        if local_entry.is_some()
+                            && !remote_index_contains_path_or_descendants(remote_index, path)
+                        {
+                            tracing::info!(
+                                "remote-sync: skipped stale remote delete for {path}; local path was recreated after the remote path was already known absent"
+                            );
+                            continue;
+                        }
                         outcome.removed_local_path_count += 1;
                         let remote_key = scope
                             .local_to_remote(path)
@@ -2294,7 +2313,6 @@ const LOCAL_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const LOCAL_SCAN_PROGRESS_ENTRY_STRIDE: u64 = 256;
 const REMOTE_FETCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const REMOTE_FETCH_PROGRESS_ENTRY_STRIDE: u64 = 512;
-const REMOTE_CHANGE_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 
 fn run_with_status_heartbeat<T, F>(
     callback: Option<FolderAgentStatusCallback>,
@@ -3088,6 +3106,65 @@ mod tests {
         );
         assert!(suppressed_uploads.is_empty());
         assert!(remote_index.directories.is_empty());
+        assert!(remote_index.files.is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_skips_stale_remote_delete_for_locally_recreated_path() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "empty-lifecycle/marker-only".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 16,
+                modified_unix_ms: 42,
+            },
+        );
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::directory("empty-lifecycle")],
+        };
+        let changed_paths = vec!["empty-lifecycle/marker-only".to_string()];
+        let scope = PathScope::new(None);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        remote_index
+            .directories
+            .insert("empty-lifecycle".to_string());
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("stale remote delete should be skipped");
+
+        assert_eq!(outcome.changed_path_count, 1);
+        assert_eq!(outcome.removed_local_path_count, 0);
+        assert!(
+            backend
+                .local_entries
+                .contains_key("empty-lifecycle/marker-only"),
+            "locally recreated file should be preserved"
+        );
+        assert!(backend.operations.is_empty());
+        assert!(suppressed_uploads.is_empty());
+        assert_eq!(
+            remote_index.directories,
+            BTreeSet::from(["empty-lifecycle".to_string()])
+        );
         assert!(remote_index.files.is_empty());
     }
 }

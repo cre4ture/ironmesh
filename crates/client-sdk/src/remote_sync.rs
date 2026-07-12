@@ -345,13 +345,14 @@ impl RemoteSnapshotPoller {
 
                     while running.load(Ordering::SeqCst) {
                         let mut should_fetch = current_snapshot.is_none();
+                        let mut observed_sequence = last_sequence;
                         if notifications_available {
                             match fetcher.client.wait_for_store_index_change_blocking(
                                 last_sequence,
                                 wait_timeout.as_millis() as u64,
                             ) {
                                 Ok(response) => {
-                                    last_sequence = response.sequence;
+                                    observed_sequence = response.sequence;
                                     should_fetch |= response.changed;
                                 }
                                 Err(error) => {
@@ -385,6 +386,7 @@ impl RemoteSnapshotPoller {
                                 continue;
                             }
                         };
+                        last_sequence = observed_sequence;
                         apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
                     }
                 })
@@ -867,6 +869,72 @@ mod tests {
             update.changed_paths,
             vec!["docs/new.txt".to_string(), "docs/readme.md".to_string()],
         );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn server_notification_loop_retries_changed_snapshot_after_fetch_failure() {
+        use axum::extract::Query;
+
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(
+                |Query(params): Query<std::collections::HashMap<String, String>>| async move {
+                    let since = params
+                        .get("since")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or_default();
+                    let changed = since < 1;
+                    Json(serde_json::json!({ "sequence": 1, "changed": changed }))
+                },
+            ),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let fetch_attempts = Arc::new(AtomicUsize::new(0));
+        let fetch_attempts_for_loop = Arc::clone(&fetch_attempts);
+        let (tx, rx) = mpsc::channel();
+        let running_for_callback = Arc::clone(&running);
+
+        let handle = poller.spawn_fetcher_loop_with_fetch(
+            Arc::clone(&running),
+            Some(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+            }),
+            fetcher,
+            move |_fetcher| {
+                let attempt = fetch_attempts_for_loop.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("simulated snapshot refresh failure");
+                }
+                Ok(SyncSnapshot {
+                    local: Vec::new(),
+                    remote: vec![NamespaceEntry::file("docs/readme.md", "v2", "h2")],
+                })
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update).expect("update should send");
+            },
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("changed wait should be retried after a fetch failure");
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        assert_eq!(fetch_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(update.changed_paths, vec!["docs/readme.md".to_string()]);
 
         let _ = shutdown_tx.send(());
         let _ = server.join();

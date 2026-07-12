@@ -47,7 +47,6 @@ struct Args {
     prefix: Option<String>,
     #[arg(long, default_value_t = 64, global = true)]
     depth: usize,
-    /// Fallback polling interval for remote refreshes when server change wait is unavailable.
     #[arg(long, default_value_t = 3000, global = true)]
     remote_refresh_interval_ms: u64,
     #[arg(long, default_value_t = 2000, global = true)]
