@@ -924,6 +924,8 @@ async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> 
             .await?;
 
             delete_remote_key_by_query(&sdk, "remote-type-flip/file-to-dir").await?;
+            wait_for_remote_path_absence_any_shape(&sdk, "remote-type-flip/file-to-dir", 240)
+                .await?;
             sdk.put("remote-type-flip/file-to-dir/", Bytes::new())
                 .await?;
             sdk.put_large_aware(
@@ -933,11 +935,33 @@ async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> 
             .await?;
 
             delete_remote_key_by_query(&sdk, "remote-type-flip/dir-to-file/").await?;
+            wait_for_remote_path_absence_any_shape(&sdk, "remote-type-flip/dir-to-file", 240)
+                .await?;
             sdk.put_large_aware(
                 "remote-type-flip/dir-to-file",
                 Bytes::from_static(b"remote-file-v2"),
             )
             .await?;
+
+            wait_for_remote_directory_marker_shape(&sdk, "remote-type-flip/file-to-dir", 240)
+                .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "remote-type-flip/file-to-dir/child.txt",
+                b"remote-dir-v2",
+                240,
+            )
+            .await?;
+            wait_for_remote_plain_file_shape(&sdk, "remote-type-flip/dir-to-file", 240).await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "remote-type-flip/dir-to-file",
+                b"remote-file-v2",
+                240,
+            )
+            .await?;
+            wait_for_remote_file_absence(&sdk, "remote-type-flip/dir-to-file/child.txt", 240)
+                .await?;
 
             wait_for_local_dir(&local_root.join("remote-type-flip/file-to-dir"), 240).await?;
             wait_for_local_file_bytes(

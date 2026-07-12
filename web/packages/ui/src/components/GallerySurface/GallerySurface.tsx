@@ -34,17 +34,24 @@ import {
   IconPlayerPlay,
   IconRefresh
 } from "@tabler/icons-react";
-import {
-  GalleryBasemapMap,
-  type GalleryBasemapConfig,
-  type GalleryMapProjection
-} from "./GalleryBasemapMap";
+import { type GalleryBasemapConfig, type GalleryMapProjection } from "./GalleryBasemapMap";
 import {
   clusterScreenPoints,
   type ClusterableScreenPoint,
   type ScreenPointCluster
 } from "./gallery-marker-clusters";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Component,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ErrorInfo,
+  type ReactNode
+} from "react";
 import {
   MediaLightboxModal,
   type MediaLightboxItem,
@@ -63,6 +70,52 @@ import {
 } from "../store-paths";
 
 export type { GalleryBasemapConfig } from "./GalleryBasemapMap";
+
+const LazyGalleryBasemapMap = lazy(async () => {
+  const module = await import("./GalleryBasemapMap");
+  return { default: module.GalleryBasemapMap };
+});
+
+type GalleryBasemapErrorBoundaryProps = {
+  children: ReactNode;
+  fallback: ReactNode;
+  resetKey: string;
+};
+
+type GalleryBasemapErrorBoundaryState = {
+  hasError: boolean;
+};
+
+class GalleryBasemapErrorBoundary extends Component<
+  GalleryBasemapErrorBoundaryProps,
+  GalleryBasemapErrorBoundaryState
+> {
+  state: GalleryBasemapErrorBoundaryState = {
+    hasError: false
+  };
+
+  static getDerivedStateFromError(): GalleryBasemapErrorBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo) {
+    console.error("Failed to load gallery basemap chunk.", error, info);
+  }
+
+  componentDidUpdate(prevProps: GalleryBasemapErrorBoundaryProps) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
+      this.setState({ hasError: false });
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback;
+    }
+
+    return this.props.children;
+  }
+}
 
 type GallerySortOrder = "captured_desc" | "path_asc";
 type GalleryMediaKind = "image" | "video";
@@ -2057,23 +2110,28 @@ function GalleryMapPanel({
     />
   );
 
-  if (!activeBasemap) {
-    return fallbackMap;
-  }
-
-  const basemapMap = (
-    <GalleryBasemapMap
-      basemap={activeBasemap}
-      projection={activeProjection}
-      entries={entries}
-      hiddenOnMapCount={hiddenOnMapCount}
-      isFullscreen={isFullscreen}
-      selectedPath={selectedPath}
-      getMarkerRequest={getMarkerRequest}
-      onSelectPath={onSelectPath}
-      onToggleFullscreen={toggleFullscreen}
+  const basemapContent = !activeBasemap ? (
+    fallbackMap
+  ) : (
+    <GalleryBasemapErrorBoundary
       fallback={fallbackMap}
-    />
+      resetKey={`${activeBasemap.id}:${activeProjection}`}
+    >
+      <Suspense fallback={fallbackMap}>
+        <LazyGalleryBasemapMap
+          basemap={activeBasemap}
+          projection={activeProjection}
+          entries={entries}
+          hiddenOnMapCount={hiddenOnMapCount}
+          isFullscreen={isFullscreen}
+          selectedPath={selectedPath}
+          getMarkerRequest={getMarkerRequest}
+          onSelectPath={onSelectPath}
+          onToggleFullscreen={toggleFullscreen}
+          fallback={fallbackMap}
+        />
+      </Suspense>
+    </GalleryBasemapErrorBoundary>
   );
 
   return (
@@ -2085,7 +2143,7 @@ function GalleryMapPanel({
               ? basemaps.map((basemap) => (
                   <Button
                     key={basemap.id}
-                    variant={basemap.id === activeBasemap.id ? "filled" : "default"}
+                    variant={basemap.id === activeBasemap?.id ? "filled" : "default"}
                     onClick={() => onSelectBasemap(basemap.id)}
                   >
                     {basemap.modeLabel ?? basemap.label ?? basemap.id}
@@ -2114,7 +2172,7 @@ function GalleryMapPanel({
         ) : null}
       </div>
 
-      <div>{basemapMap}</div>
+      <div>{basemapContent}</div>
     </Stack>
   );
 }

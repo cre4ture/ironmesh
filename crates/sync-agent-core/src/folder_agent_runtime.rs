@@ -2063,6 +2063,66 @@ fn matching_local_entry_for_remote_file_change<B: FolderAgentLocalBackend>(
     Ok(Some(entry_state))
 }
 
+#[derive(Debug, Default)]
+struct NormalizedRemoteSnapshotEntries {
+    directories: BTreeSet<String>,
+    files: BTreeMap<String, String>,
+    file_hashes: BTreeMap<String, String>,
+}
+
+fn normalized_remote_snapshot_entries(
+    snapshot: &SyncSnapshot,
+    scope: &PathScope,
+) -> NormalizedRemoteSnapshotEntries {
+    let mut normalized = NormalizedRemoteSnapshotEntries::default();
+
+    for entry in &snapshot.remote {
+        let remote_path = crate::normalize_relative_path(&entry.path);
+        let Some(local_path) = scope.remote_to_local(&remote_path) else {
+            continue;
+        };
+        if local_path.is_empty() {
+            continue;
+        }
+
+        for parent in parent_directories(&local_path) {
+            normalized.directories.insert(parent);
+        }
+
+        match entry.kind {
+            EntryKind::Directory => {
+                normalized.directories.insert(local_path.clone());
+                normalized.files.remove(&local_path);
+                normalized.file_hashes.remove(&local_path);
+            }
+            EntryKind::File => {
+                if normalized.directories.contains(&local_path) {
+                    continue;
+                }
+
+                normalized.files.insert(local_path.clone(), remote_path);
+                if let Some(content_hash) = entry
+                    .content_fingerprint
+                    .as_deref()
+                    .or(entry.content_hash.as_deref())
+                    && !content_hash.trim().is_empty()
+                {
+                    normalized
+                        .file_hashes
+                        .insert(local_path, content_hash.to_string());
+                }
+            }
+        }
+    }
+
+    for directory in normalized.directories.iter() {
+        normalized.files.remove(directory);
+        normalized.file_hashes.remove(directory);
+    }
+
+    normalized
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     backend: &mut B,
@@ -2080,37 +2140,11 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     modification_context: Option<&ModificationLogContext>,
 ) -> Result<RemoteApplyOutcome> {
     let mut outcome = RemoteApplyOutcome::default();
-    let mut next_index = RemoteTreeIndex::default();
-    let mut entry_kinds: BTreeMap<String, (EntryKind, String)> = BTreeMap::new();
-    let mut entry_hashes: BTreeMap<String, String> = BTreeMap::new();
-
-    for entry in &snapshot.remote {
-        let remote_path = crate::normalize_relative_path(&entry.path);
-        let Some(local_path) = scope.remote_to_local(&remote_path) else {
-            continue;
-        };
-        if local_path.is_empty() {
-            continue;
-        }
-
-        match entry.kind {
-            EntryKind::Directory => {
-                next_index.directories.insert(local_path.clone());
-            }
-            EntryKind::File => {
-                next_index.files.insert(local_path.clone());
-                if let Some(content_hash) = entry
-                    .content_fingerprint
-                    .as_deref()
-                    .or(entry.content_hash.as_deref())
-                    && !content_hash.trim().is_empty()
-                {
-                    entry_hashes.insert(local_path.clone(), content_hash.to_string());
-                }
-            }
-        }
-        entry_kinds.insert(local_path, (entry.kind, remote_path));
-    }
+    let normalized_snapshot = normalized_remote_snapshot_entries(snapshot, scope);
+    let next_index = RemoteTreeIndex {
+        directories: normalized_snapshot.directories.clone(),
+        files: normalized_snapshot.files.keys().cloned().collect(),
+    };
 
     match changed_paths {
         Some(changed_paths) => {
@@ -2125,87 +2159,117 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                 changed_local_paths.insert(path);
             }
 
+            let changed_descendants = changed_local_paths.clone();
+            for path in changed_descendants {
+                for parent in parent_directories(&path) {
+                    if normalized_snapshot.directories.contains(&parent) {
+                        changed_local_paths.insert(parent);
+                    }
+                }
+            }
+
             // Directories first: ensures type transitions (file→directory) complete
             // before any file download, so a transient download error cannot prevent
             // directory creation for an unrelated path.
             for path in &changed_local_paths {
                 let path = path.as_str();
-                if let Some((EntryKind::Directory, _)) = entry_kinds.get(path) {
-                    outcome.changed_path_count += 1;
-                    outcome.ensured_directory_count += 1;
-                    backend.ensure_local_directory(options, path)?;
+                if !normalized_snapshot.directories.contains(path) {
+                    continue;
+                }
+
+                let local_entry_state = backend.local_entry_state(options, path)?;
+                if local_entry_state
+                    .as_ref()
+                    .is_some_and(|entry| entry.kind == LocalEntryKind::Directory)
+                {
                     if let Some(store) = state_store
-                        && let Some(entry_state) = backend.local_entry_state(options, path)?
+                        && let Some(entry_state) = local_entry_state.as_ref()
                     {
                         store
-                            .upsert_baseline_entry(path, &entry_state)
+                            .upsert_baseline_entry(path, entry_state)
                             .with_context(|| {
                                 format!("failed to persist baseline directory entry for {path}")
                             })?;
                     }
+                    continue;
+                }
+
+                outcome.changed_path_count += 1;
+                outcome.ensured_directory_count += 1;
+                backend.ensure_local_directory(options, path)?;
+                if let Some(store) = state_store
+                    && let Some(entry_state) = backend.local_entry_state(options, path)?
+                {
+                    store
+                        .upsert_baseline_entry(path, &entry_state)
+                        .with_context(|| {
+                            format!("failed to persist baseline directory entry for {path}")
+                        })?;
                 }
             }
 
             for path in changed_local_paths {
                 let path = path.as_str();
-                match entry_kinds.get(path) {
-                    Some((EntryKind::Directory, _)) => {
-                        // Already handled above.
-                    }
-                    Some((EntryKind::File, remote_key)) => {
-                        outcome.changed_path_count += 1;
-                        let content_hash = entry_hashes.get(path).map(|hash| hash.as_str());
-                        if let Some(entry_state) = matching_local_entry_for_remote_file_change(
-                            backend,
-                            options,
-                            path,
-                            content_hash,
-                            state_store,
-                        )? {
-                            tracing::info!(
-                                "remote-sync: skipped download for {path}; local file already matches remote content"
-                            );
-                            suppressed_uploads.insert(path.to_string(), entry_state);
-                            continue;
-                        }
-
-                        outcome.downloaded_file_count += 1;
-                        let entry_state = download_remote_file_with_logging(
-                            backend,
-                            options,
-                            client,
-                            path,
-                            remote_key,
-                            content_hash,
-                            state_store,
-                            modification_log,
-                            modification_context,
-                        )?;
-                        suppressed_uploads.insert(path.to_string(), entry_state);
-                    }
-                    None => {
-                        outcome.changed_path_count += 1;
-                        outcome.removed_local_path_count += 1;
-                        let remote_key = scope
-                            .local_to_remote(path)
-                            .unwrap_or_else(|| path.to_string());
-                        remove_local_path_with_logging(
-                            backend,
-                            options,
-                            path,
-                            remote_key.as_str(),
-                            state_store,
-                            modification_log,
-                            modification_context,
-                        )?;
-                        suppressed_uploads.remove(path);
-                    }
+                if normalized_snapshot.directories.contains(path) {
+                    continue;
                 }
+
+                if let Some(remote_key) = normalized_snapshot.files.get(path) {
+                    outcome.changed_path_count += 1;
+                    let content_hash = normalized_snapshot
+                        .file_hashes
+                        .get(path)
+                        .map(|hash| hash.as_str());
+                    if let Some(entry_state) = matching_local_entry_for_remote_file_change(
+                        backend,
+                        options,
+                        path,
+                        content_hash,
+                        state_store,
+                    )? {
+                        tracing::info!(
+                            "remote-sync: skipped download for {path}; local file already matches remote content"
+                        );
+                        suppressed_uploads.insert(path.to_string(), entry_state);
+                        continue;
+                    }
+
+                    outcome.downloaded_file_count += 1;
+                    let entry_state = download_remote_file_with_logging(
+                        backend,
+                        options,
+                        client,
+                        path,
+                        remote_key,
+                        content_hash,
+                        state_store,
+                        modification_log,
+                        modification_context,
+                    )?;
+                    suppressed_uploads.insert(path.to_string(), entry_state);
+                    continue;
+                }
+
+                outcome.changed_path_count += 1;
+                outcome.removed_local_path_count += 1;
+                let remote_key = scope
+                    .local_to_remote(path)
+                    .unwrap_or_else(|| path.to_string());
+                remove_local_path_with_logging(
+                    backend,
+                    options,
+                    path,
+                    remote_key.as_str(),
+                    state_store,
+                    modification_log,
+                    modification_context,
+                )?;
+                suppressed_uploads.remove(path);
             }
             *remote_index = next_index;
         }
         None => {
-            for directory in &next_index.directories {
+            for directory in &normalized_snapshot.directories {
                 if backend
                     .local_entry_state(options, directory)?
                     .is_some_and(|entry| entry.kind == LocalEntryKind::Directory)
@@ -2229,10 +2293,7 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                 }
             }
 
-            for file in &next_index.files {
-                let Some((EntryKind::File, remote_key)) = entry_kinds.get(file) else {
-                    continue;
-                };
+            for (file, remote_key) in &normalized_snapshot.files {
                 let local_entry_state = backend.local_entry_state(options, file)?;
                 if preserve_local_files.is_some_and(|set| set.contains(file))
                     && local_entry_state
@@ -2250,7 +2311,10 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                 }
                 outcome.changed_path_count += 1;
                 outcome.downloaded_file_count += 1;
-                let content_hash = entry_hashes.get(file).map(|hash| hash.as_str());
+                let content_hash = normalized_snapshot
+                    .file_hashes
+                    .get(file)
+                    .map(|hash| hash.as_str());
                 let entry_state = download_remote_file_with_logging(
                     backend,
                     options,
@@ -3085,5 +3149,76 @@ mod tests {
         assert!(suppressed_uploads.is_empty());
         assert!(remote_index.directories.is_empty());
         assert!(remote_index.files.is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_promotes_changed_file_parents_to_directories() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "albums".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 0,
+            },
+        );
+        backend.local_entries.insert(
+            "albums/report".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 9,
+                modified_unix_ms: 0,
+            },
+        );
+
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                sync_core::NamespaceEntry::file("albums/report", "v1", "h1"),
+                sync_core::NamespaceEntry::file("albums/report/child.txt", "v2", "h2"),
+            ],
+        };
+        let changed_paths = vec!["albums/report/child.txt".to_string()];
+        let scope = PathScope::new(None);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("remote path type transition should apply");
+
+        assert_eq!(outcome.changed_path_count, 2);
+        assert_eq!(outcome.ensured_directory_count, 1);
+        assert_eq!(outcome.downloaded_file_count, 1);
+        assert_eq!(
+            backend.operations,
+            vec![
+                BackendOperation::EnsureDirectory("albums/report".to_string()),
+                BackendOperation::DownloadFile {
+                    local_path: "albums/report/child.txt".to_string(),
+                    remote_key: "albums/report/child.txt".to_string(),
+                },
+            ]
+        );
+        assert!(remote_index.directories.contains("albums"));
+        assert!(remote_index.directories.contains("albums/report"));
+        assert!(!remote_index.files.contains("albums/report"));
+        assert!(remote_index.files.contains("albums/report/child.txt"));
+        assert!(suppressed_uploads.contains_key("albums/report/child.txt"));
     }
 }

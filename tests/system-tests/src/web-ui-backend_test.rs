@@ -124,11 +124,21 @@ mod tests {
         })
     }
 
-    fn extract_referenced_asset_path(bundle: &str, needle: &str) -> Option<String> {
-        let start = bundle.find(needle)?;
-        let quoted_start = bundle[..start].rfind('"')?;
-        let quoted_end = bundle[start..].find('"')? + start;
-        Some(bundle[quoted_start + 1..quoted_end].to_string())
+    fn extract_referenced_asset_path(bundle: &str, needles: &[&str]) -> Option<String> {
+        for needle in needles {
+            let Some(start) = bundle.find(needle) else {
+                continue;
+            };
+            let quoted_start = bundle[..start].rfind('"')?;
+            let quoted_end = bundle[start..].find('"')? + start;
+            let path = &bundle[quoted_start + 1..quoted_end];
+            return Some(if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("/{path}")
+            });
+        }
+        None
     }
 
     async fn upload_binary_via_web(
@@ -382,8 +392,24 @@ mod tests {
                 .await?;
             assert!(js.contains("Transport-aware"));
 
-            let worker_asset_path = extract_referenced_asset_path(&js, "/assets/sqlite.worker-")
-                .context("client bundle should reference sqlite.worker asset")?;
+            let basemap_chunk_path = extract_referenced_asset_path(
+                &js,
+                &["/assets/GalleryBasemapMap-", "assets/GalleryBasemapMap-"],
+            )
+                    .context("client bundle should lazy-load GalleryBasemapMap chunk")?;
+            let basemap_chunk = client
+                .get(format!("{web_base}{basemap_chunk_path}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+
+            let worker_asset_path = extract_referenced_asset_path(
+                &basemap_chunk,
+                &["/assets/sqlite.worker-", "assets/sqlite.worker-"],
+            )
+                    .context("gallery basemap chunk should reference sqlite.worker asset")?;
             let worker_response = client
                 .get(format!("{web_base}{worker_asset_path}"))
                 .send()
@@ -399,8 +425,11 @@ mod tests {
             assert!(worker_content_type.starts_with("application/javascript"));
             assert!(worker_body.starts_with(b"!function"));
 
-            let wasm_asset_path = extract_referenced_asset_path(&js, "/assets/sql-wasm-")
-                .context("client bundle should reference sql-wasm asset")?;
+            let wasm_asset_path = extract_referenced_asset_path(
+                &basemap_chunk,
+                &["/assets/sql-wasm-", "assets/sql-wasm-"],
+            )
+                    .context("gallery basemap chunk should reference sql-wasm asset")?;
             let wasm_response = client
                 .get(format!("{web_base}{wasm_asset_path}"))
                 .send()
