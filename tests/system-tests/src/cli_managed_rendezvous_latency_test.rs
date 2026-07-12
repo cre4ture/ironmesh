@@ -330,14 +330,8 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
         bootstrap.write_to_path(&bootstrap_path)?;
         let merged_bootstrap_path = client_dir.join("cli-managed-latency-merged.bootstrap.json");
         merged_bootstrap.write_to_path(&merged_bootstrap_path)?;
-        let mut relay_only_bootstrap = merged_bootstrap.clone();
-        relay_only_bootstrap.direct_endpoints.clear();
-        let relay_only_bootstrap_path =
-            client_dir.join("cli-managed-latency-relay-only.bootstrap.json");
-        relay_only_bootstrap.write_to_path(&relay_only_bootstrap_path)?;
 
         let bootstrap_arg = merged_bootstrap_path.to_string_lossy().into_owned();
-        let relay_only_bootstrap_arg = relay_only_bootstrap_path.to_string_lossy().into_owned();
         // The identity file lives next to the *originally issued* bootstrap file; the merged
         // bootstrap above reuses that same enrolled identity.
         let identity_path = default_client_identity_path(&bootstrap_path);
@@ -446,7 +440,7 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
 
         // --path relay --relay-url <standalone>: relay through the dedicated rendezvous service.
         let relay_standalone_json = run_latency_cli_with_retry(
-            &relay_only_bootstrap_arg,
+            &bootstrap_arg,
             &identity_arg,
             &[
                 "--path",
@@ -471,7 +465,7 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
 
         // --path relay --relay-url <embedded>: relay through node A's own embedded rendezvous.
         let relay_embedded_json = run_latency_cli_with_retry(
-            &relay_only_bootstrap_arg,
+            &bootstrap_arg,
             &identity_arg,
             &[
                 "--path",

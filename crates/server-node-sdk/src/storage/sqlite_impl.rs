@@ -96,6 +96,23 @@ impl SqliteMetadataStore {
         })
         .await
     }
+
+    async fn delete_invalid_media_cache_row_if_payload_matches(
+        &self,
+        content_fingerprint: String,
+        payload: Vec<u8>,
+    ) -> Result<bool> {
+        self.write(move |db| {
+            let deleted = db.execute(
+                "DELETE FROM media_cache
+                 WHERE content_fingerprint = ?1
+                   AND metadata_json = ?2",
+                params![content_fingerprint, payload],
+            )?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
 }
 
 async fn open_sqlite_writer_connection(metadata_db_path: &Path) -> Result<TokioConnection> {
@@ -853,25 +870,24 @@ impl MetadataStore for SqliteMetadataStore {
             Some(payload) => match serde_json::from_slice::<CachedMediaMetadata>(&payload) {
                 Ok(metadata) => Ok(Some(metadata)),
                 Err(err) => {
-                    let invalid_content_fingerprint = content_fingerprint_owned.clone();
-                    self.write(move |db| {
-                        db.execute(
-                            "DELETE FROM media_cache WHERE content_fingerprint = ?1",
-                            params![invalid_content_fingerprint],
+                    let deleted = self
+                        .delete_invalid_media_cache_row_if_payload_matches(
+                            content_fingerprint_owned.clone(),
+                            payload,
                         )
+                        .await
                         .with_context(|| {
                             format!(
                                 "failed to delete invalid media metadata row for {content_fingerprint_owned}"
                             )
                         })?;
-                        Ok(())
-                    })
-                    .await?;
-                    warn!(
-                        content_fingerprint = %content_fingerprint,
-                        error = %err,
-                        "deleted invalid cached media metadata row from sqlite"
-                    );
+                    if deleted {
+                        warn!(
+                            content_fingerprint = %content_fingerprint,
+                            error = %err,
+                            "deleted invalid cached media metadata row from sqlite"
+                        );
+                    }
                     Ok(None)
                 }
             },
@@ -916,7 +932,9 @@ impl MetadataStore for SqliteMetadataStore {
                                 metadata_by_content_fingerprint
                                     .insert(content_fingerprint, metadata);
                             }
-                            Err(err) => invalid_rows.push((content_fingerprint, err.to_string())),
+                            Err(err) => {
+                                invalid_rows.push((content_fingerprint, payload, err.to_string()));
+                            }
                         }
                     }
                 }
@@ -925,25 +943,23 @@ impl MetadataStore for SqliteMetadataStore {
             })
             .await?;
 
-        for (content_fingerprint, error) in invalid_rows {
-            let delete_target = content_fingerprint.clone();
-            let log_target = content_fingerprint.clone();
-            self.write(move |db| {
-                db.execute(
-                    "DELETE FROM media_cache WHERE content_fingerprint = ?1",
-                    params![delete_target],
+        for (content_fingerprint, payload, error) in invalid_rows {
+            let deleted = self
+                .delete_invalid_media_cache_row_if_payload_matches(
+                    content_fingerprint.clone(),
+                    payload,
                 )
+                .await
                 .with_context(|| {
-                    format!("failed to delete invalid media metadata row for {log_target}")
+                    format!("failed to delete invalid media metadata row for {content_fingerprint}")
                 })?;
-                Ok(())
-            })
-            .await?;
-            warn!(
-                content_fingerprint = %content_fingerprint,
-                error,
-                "deleted invalid cached media metadata row from sqlite"
-            );
+            if deleted {
+                warn!(
+                    content_fingerprint = %content_fingerprint,
+                    error,
+                    "deleted invalid cached media metadata row from sqlite"
+                );
+            }
         }
 
         Ok(metadata_by_content_fingerprint)
@@ -2104,6 +2120,19 @@ fn usize_to_i64(value: usize) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::MediaCacheStatus;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sqlite_test_db_path(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ironmesh-{name}-{}-{stamp}.sqlite",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn init_metadata_db_persists_schema_version() {
@@ -2160,5 +2189,110 @@ mod tests {
             err.to_string()
                 .contains("unsupported sqlite metadata schema version: 99")
         );
+    }
+
+    #[tokio::test]
+    async fn conditional_invalid_media_cleanup_preserves_rewritten_row() {
+        let metadata_db_path = sqlite_test_db_path("conditional-invalid-media-cleanup");
+        let store = SqliteMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("sqlite metadata store should open");
+        let content_fingerprint = "fingerprint-1".to_string();
+        let invalid_payload = br#"{"broken":true}"#.to_vec();
+        let valid_payload = serde_json::to_vec_pretty(&CachedMediaMetadata {
+            schema_version: 5,
+            content_fingerprint: content_fingerprint.clone(),
+            source_manifest_hash: "manifest-1".to_string(),
+            status: MediaCacheStatus::Ready,
+            media_type: Some("image".to_string()),
+            mime_type: Some("image/jpeg".to_string()),
+            width: Some(64),
+            height: Some(48),
+            orientation: Some(1),
+            taken_at_unix: Some(1),
+            gps: None,
+            thumbnail: None,
+            source_size_bytes: 1024,
+            generated_at_unix: 2,
+            retry_after_unix: None,
+            error: None,
+        })
+        .expect("valid media metadata should serialize");
+
+        store
+            .write({
+                let content_fingerprint = content_fingerprint.clone();
+                let invalid_payload = invalid_payload.clone();
+                move |db| {
+                    db.execute(
+                        "INSERT INTO media_cache (content_fingerprint, metadata_json)
+                         VALUES (?1, ?2)",
+                        params![content_fingerprint, invalid_payload],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("invalid row should persist");
+
+        let observed_payload = store
+            .read({
+                let content_fingerprint = content_fingerprint.clone();
+                move |db| {
+                    db.query_row(
+                        "SELECT metadata_json FROM media_cache WHERE content_fingerprint = ?1",
+                        params![content_fingerprint],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .map_err(Into::into)
+                }
+            })
+            .await
+            .expect("invalid row should load");
+        assert!(
+            serde_json::from_slice::<CachedMediaMetadata>(&observed_payload).is_err(),
+            "fixture payload should remain invalid"
+        );
+
+        store
+            .write({
+                let content_fingerprint = content_fingerprint.clone();
+                let valid_payload = valid_payload.clone();
+                move |db| {
+                    db.execute(
+                        "INSERT INTO media_cache (content_fingerprint, metadata_json)
+                         VALUES (?1, ?2)
+                         ON CONFLICT(content_fingerprint) DO UPDATE SET metadata_json = excluded.metadata_json",
+                        params![content_fingerprint, valid_payload],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("valid row should replace invalid row");
+
+        let deleted = store
+            .delete_invalid_media_cache_row_if_payload_matches(
+                content_fingerprint.clone(),
+                observed_payload,
+            )
+            .await
+            .expect("conditional cleanup should succeed");
+        assert!(!deleted, "cleanup should not delete rewritten row");
+
+        let remaining_payload = store
+            .read(move |db| {
+                db.query_row(
+                    "SELECT metadata_json FROM media_cache WHERE content_fingerprint = ?1",
+                    params![content_fingerprint],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("rewritten row should remain present");
+        assert_eq!(remaining_payload, valid_payload);
+
+        let _ = std::fs::remove_file(metadata_db_path);
     }
 }
