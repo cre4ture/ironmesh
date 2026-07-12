@@ -74,6 +74,7 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
 
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByText("Recent server logs", { exact: true })).toBeVisible();
+  await expect(page.getByText("Failed to load logs", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("log")).toContainText(/T\d{2}:\d{2}:\d{2}\.000Z|no logs yet/, {
     timeout: 60_000
   });
