@@ -1105,9 +1105,11 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     );
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
+    let remote_change_wait_timeout = REMOTE_CHANGE_WAIT_TIMEOUT.max(refresh_interval);
     let local_scan_interval = Duration::from_millis(options.local_scan_interval_ms.max(250));
 
-    let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
+    let refresh_poller =
+        RemoteSnapshotPoller::server_notifications(remote_change_wait_timeout, refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
     let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
     store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
@@ -1123,10 +1125,11 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_latest_metrics = latest_metrics.clone();
     let remote_last_success = last_success_shared.clone();
     let remote_idle_message = idle_watch_message.clone();
-    let remote_thread = refresh_poller.spawn_changed_paths_loop(
+    let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
         remote_running,
         Some(initial_snapshot),
-        move || {
+        refresh_fetcher,
+        move |fetcher| {
             fetch_remote_snapshot_with_status_progress(
                 &remote_options,
                 &remote_connection_target,
@@ -1135,9 +1138,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 remote_status_callback.as_ref(),
                 "running",
                 "steady-state",
-                "checking-remote-snapshot",
-                "Checking remote snapshot for changes",
-                &refresh_fetcher,
+                "refreshing-remote-snapshot",
+                "Refreshing remote snapshot",
+                fetcher,
                 latest_metrics_value(&remote_latest_metrics),
                 load_optional_unix_ms(&remote_last_success),
                 Some(remote_idle_message.as_str()),
@@ -2291,6 +2294,7 @@ const LOCAL_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const LOCAL_SCAN_PROGRESS_ENTRY_STRIDE: u64 = 256;
 const REMOTE_FETCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const REMOTE_FETCH_PROGRESS_ENTRY_STRIDE: u64 = 512;
+const REMOTE_CHANGE_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 
 fn run_with_status_heartbeat<T, F>(
     callback: Option<FolderAgentStatusCallback>,

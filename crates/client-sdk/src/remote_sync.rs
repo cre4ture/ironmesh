@@ -300,16 +300,37 @@ impl RemoteSnapshotPoller {
         running: Arc<AtomicBool>,
         initial_snapshot: Option<SyncSnapshot>,
         fetcher: RemoteSnapshotFetcher,
+        on_change: C,
+    ) -> JoinHandle<()>
+    where
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+    {
+        self.spawn_fetcher_loop_with_fetch(
+            running,
+            initial_snapshot,
+            fetcher,
+            |fetcher| fetcher.fetch_snapshot_blocking(),
+            on_change,
+        )
+    }
+
+    pub fn spawn_fetcher_loop_with_fetch<F, C>(
+        &self,
+        running: Arc<AtomicBool>,
+        initial_snapshot: Option<SyncSnapshot>,
+        fetcher: RemoteSnapshotFetcher,
+        mut fetch_snapshot: F,
         mut on_change: C,
     ) -> JoinHandle<()>
     where
+        F: FnMut(&RemoteSnapshotFetcher) -> Result<SyncSnapshot> + Send + 'static,
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
         match self.scheduler.strategy.mode {
             RemoteSyncMode::Polling { .. } => self.spawn_changed_paths_loop(
                 running,
                 initial_snapshot,
-                move || fetcher.fetch_snapshot_blocking(),
+                move || fetch_snapshot(&fetcher),
                 on_change,
             ),
             RemoteSyncMode::ServerNotifications {
@@ -323,6 +344,7 @@ impl RemoteSnapshotPoller {
                     let mut notifications_available = true;
 
                     while running.load(Ordering::SeqCst) {
+                        let mut should_fetch = current_snapshot.is_none();
                         if notifications_available {
                             match fetcher.client.wait_for_store_index_change_blocking(
                                 last_sequence,
@@ -330,6 +352,7 @@ impl RemoteSnapshotPoller {
                             ) {
                                 Ok(response) => {
                                     last_sequence = response.sequence;
+                                    should_fetch |= response.changed;
                                 }
                                 Err(error) => {
                                     tracing::warn!(
@@ -345,29 +368,24 @@ impl RemoteSnapshotPoller {
                         {
                             break;
                         }
+                        if !notifications_available {
+                            should_fetch = true;
+                        }
                         if !running.load(Ordering::SeqCst) {
                             break;
                         }
+                        if !should_fetch {
+                            continue;
+                        }
 
-                        let next_snapshot = match fetcher.fetch_snapshot_blocking() {
+                        let next_snapshot = match fetch_snapshot(&fetcher) {
                             Ok(snapshot) => snapshot,
                             Err(error) => {
                                 tracing::warn!("remote-refresh: snapshot refresh error: {error:#}");
                                 continue;
                             }
                         };
-
-                        if let Some(previous) = current_snapshot.as_ref() {
-                            let changed_paths = changed_paths_between(previous, &next_snapshot);
-                            if !changed_paths.is_empty() {
-                                on_change(RemoteSnapshotUpdate {
-                                    snapshot: next_snapshot.clone(),
-                                    changed_paths,
-                                });
-                            }
-                        }
-
-                        current_snapshot = Some(next_snapshot);
+                        apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
                     }
                 })
             }
@@ -402,21 +420,30 @@ impl RemoteSnapshotPoller {
                         continue;
                     }
                 };
-
-                if let Some(previous) = current_snapshot.as_ref() {
-                    let changed_paths = changed_paths_between(previous, &next_snapshot);
-                    if !changed_paths.is_empty() {
-                        on_change(RemoteSnapshotUpdate {
-                            snapshot: next_snapshot.clone(),
-                            changed_paths,
-                        });
-                    }
-                }
-
-                current_snapshot = Some(next_snapshot);
+                apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
             }
         })
     }
+}
+
+fn apply_snapshot_update<C>(
+    current_snapshot: &mut Option<SyncSnapshot>,
+    next_snapshot: SyncSnapshot,
+    on_change: &mut C,
+) where
+    C: FnMut(RemoteSnapshotUpdate),
+{
+    if let Some(previous) = current_snapshot.as_ref() {
+        let changed_paths = changed_paths_between(previous, &next_snapshot);
+        if !changed_paths.is_empty() {
+            on_change(RemoteSnapshotUpdate {
+                snapshot: next_snapshot.clone(),
+                changed_paths,
+            });
+        }
+    }
+
+    *current_snapshot = Some(next_snapshot);
 }
 
 pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) -> Vec<String> {
@@ -487,6 +514,7 @@ mod tests {
     use super::*;
     use axum::{Json, Router, routing::get};
     use common::ClusterId;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use sync_core::{NamespaceEntry, SyncSnapshot};
     use transport_sdk::{BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, RelayMode};
@@ -512,6 +540,42 @@ mod tests {
             device_label: None,
             device_id: None,
         }
+    }
+
+    fn spawn_test_server(
+        router: Router,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener should bind");
+                let addr = listener.local_addr().expect("listener addr");
+                addr_tx.send(addr).expect("listener addr should send");
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .expect("test server should run");
+            });
+        });
+
+        (
+            addr_rx.recv().expect("listener addr should arrive"),
+            shutdown_tx,
+            server,
+        )
     }
 
     #[test]
@@ -706,6 +770,106 @@ mod tests {
             vec!["docs/new.txt".to_string(), "docs/readme.md".to_string(),],
         );
         assert_eq!(update.snapshot.remote.len(), 2);
+    }
+
+    #[test]
+    fn server_notification_loop_skips_fetch_without_remote_changes() {
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(|| async { Json(serde_json::json!({ "sequence": 0, "changed": false })) }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_loop = Arc::clone(&fetch_count);
+
+        let handle = poller.spawn_fetcher_loop_with_fetch(
+            Arc::clone(&running),
+            Some(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+            }),
+            fetcher,
+            move |_fetcher| {
+                fetch_count_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(SyncSnapshot {
+                    local: Vec::new(),
+                    remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+                })
+            },
+            |_update| panic!("unchanged wait response should not emit an update"),
+        );
+
+        std::thread::sleep(Duration::from_millis(350));
+        running.store(false, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 0);
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn server_notification_loop_falls_back_to_polling_when_wait_is_unavailable() {
+        let (addr, shutdown_tx, server) = spawn_test_server(Router::new());
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let next_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                NamespaceEntry::file("docs/readme.md", "v2", "h2"),
+                NamespaceEntry::file("docs/new.txt", "v1", "h-new"),
+            ],
+        };
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_loop = Arc::clone(&fetch_count);
+        let (tx, rx) = mpsc::channel();
+        let running_for_callback = Arc::clone(&running);
+
+        let handle = poller.spawn_fetcher_loop_with_fetch(
+            Arc::clone(&running),
+            Some(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+            }),
+            fetcher,
+            move |_fetcher| {
+                fetch_count_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(next_snapshot.clone())
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update).expect("update should send");
+            },
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("polling fallback should produce an update");
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            update.changed_paths,
+            vec!["docs/new.txt".to_string(), "docs/readme.md".to_string()],
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
     }
 
     #[test]
