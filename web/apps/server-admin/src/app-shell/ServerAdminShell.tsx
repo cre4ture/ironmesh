@@ -60,6 +60,44 @@ export function ServerAdminShell() {
     };
   }, []);
 
+  useEffect(() => {
+    if (surfaceMode !== "setup") {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    async function probeForRuntimeTransition() {
+      try {
+        await getSetupStatus();
+      } catch (error) {
+        if (!cancelled && isHttpErrorStatus(error, 401, 403, 404)) {
+          setSurfaceMode("runtime");
+          setSurfaceError(null);
+          return;
+        }
+      }
+
+      if (!cancelled) {
+        timeoutId = window.setTimeout(() => {
+          void probeForRuntimeTransition();
+        }, 1000);
+      }
+    }
+
+    timeoutId = window.setTimeout(() => {
+      void probeForRuntimeTransition();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [surfaceMode]);
+
   return (
     <>
       <NavigationShell
