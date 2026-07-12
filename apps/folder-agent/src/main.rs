@@ -49,6 +49,8 @@ struct Args {
     depth: usize,
     #[arg(long, default_value_t = 3000, global = true)]
     remote_refresh_interval_ms: u64,
+    /// Poll interval for local rescans when `--no-watch-local` is active.
+    /// With local watching enabled this becomes a slower fallback verification interval.
     #[arg(long, default_value_t = 2000, global = true)]
     local_scan_interval_ms: u64,
     #[arg(long, default_value_t = false, global = true)]

@@ -291,6 +291,10 @@ pub trait FolderAgentLocalBackend {
 
     fn start_local_change_monitor(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()>;
 
+    fn local_watch_hints_available(&self, _options: &FolderAgentRuntimeOptions) -> bool {
+        false
+    }
+
     fn local_change_hint_pending(&mut self, options: &FolderAgentRuntimeOptions) -> Result<bool>;
 
     fn acknowledge_local_change_hint(
@@ -301,10 +305,19 @@ pub trait FolderAgentLocalBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LocalChangeMonitorState {
+    #[default]
+    Uninitialized,
+    WatchHints,
+    PollingFallback,
+}
+
 #[derive(Default)]
 struct NativeFilesystemBackend {
     local_event_rx: Option<mpsc::Receiver<()>>,
     watcher: Option<RecommendedWatcher>,
+    local_change_monitor_state: LocalChangeMonitorState,
 }
 
 impl FolderAgentLocalBackend for NativeFilesystemBackend {
@@ -313,7 +326,7 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
     }
 
     fn watch_mode_label(&self, options: &FolderAgentRuntimeOptions) -> &'static str {
-        watch_mode_label(options)
+        watch_mode_label(options, self.local_change_monitor_state)
     }
 
     fn state_identity_root(&self, options: &FolderAgentRuntimeOptions) -> Result<PathBuf> {
@@ -447,16 +460,31 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
     fn start_local_change_monitor(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
         self.local_event_rx = None;
         self.watcher = None;
+        self.local_change_monitor_state = LocalChangeMonitorState::PollingFallback;
 
         if options.run_once || options.no_watch_local {
             return Ok(());
         }
 
         let (local_event_tx, local_event_rx) = mpsc::channel::<()>();
-        let watcher = start_local_watcher(options.root_dir.clone(), local_event_tx)?;
-        self.local_event_rx = Some(local_event_rx);
-        self.watcher = Some(watcher);
+        match start_local_watcher(options.root_dir.clone(), local_event_tx) {
+            Ok(watcher) => {
+                self.local_event_rx = Some(local_event_rx);
+                self.watcher = Some(watcher);
+                self.local_change_monitor_state = LocalChangeMonitorState::WatchHints;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "local-watch: failed to start filesystem watcher for {}; falling back to periodic rescans: {error:#}",
+                    options.root_dir.display()
+                );
+            }
+        }
         Ok(())
+    }
+
+    fn local_watch_hints_available(&self, _options: &FolderAgentRuntimeOptions) -> bool {
+        self.local_change_monitor_state == LocalChangeMonitorState::WatchHints
     }
 
     fn local_change_hint_pending(&mut self, _options: &FolderAgentRuntimeOptions) -> Result<bool> {
@@ -1105,7 +1133,6 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     );
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
-    let local_scan_interval = Duration::from_millis(options.local_scan_interval_ms.max(250));
 
     let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
@@ -1152,7 +1179,8 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
 
     backend.start_local_change_monitor(options)?;
 
-    let mut next_local_scan = Instant::now() + local_scan_interval;
+    let mut next_local_scan = Instant::now()
+        + steady_state_local_scan_interval(options, backend.local_watch_hints_available(options));
 
     while running.load(Ordering::SeqCst) {
         let mut baseline_dirty = false;
@@ -1216,6 +1244,11 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 None,
             );
             baseline_dirty = true;
+            next_local_scan = Instant::now()
+                + steady_state_local_scan_interval(
+                    options,
+                    backend.local_watch_hints_available(options),
+                );
             last_success_unix_ms = Some(now_unix_ms());
             store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
             let mut remote_runtime_metrics =
@@ -1249,23 +1282,36 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         }
 
         let local_scan_requested = backend.local_change_hint_pending(options)?;
+        let watch_hints_available = backend.local_watch_hints_available(options);
+        let local_scan_interval = steady_state_local_scan_interval(options, watch_hints_available);
+        let local_scan_trigger = local_scan_trigger(
+            local_scan_requested,
+            Instant::now(),
+            next_local_scan,
+            watch_hints_available,
+        );
 
-        if local_scan_requested || Instant::now() >= next_local_scan {
-            let previous_local_state = local_state.clone();
-            let local_scan_state = if local_scan_requested {
+        if let Some(local_scan_trigger) = local_scan_trigger {
+            let local_scan_state = if matches!(local_scan_trigger, LocalScanTrigger::WatchHint) {
                 "syncing"
             } else {
                 "running"
             };
-            let local_scan_message = if local_scan_requested {
-                format!("Local change detected; scanning {local_tree_label}")
-            } else {
-                format!("Checking {local_tree_label} for changes")
-            };
-            let local_scan_base_message = if local_scan_requested {
-                format!("Scanning {local_tree_label} and reconciling event-driven local changes")
-            } else {
-                format!("Checking {local_tree_label} for changes")
+            let (local_scan_message, local_scan_base_message) = match local_scan_trigger {
+                LocalScanTrigger::WatchHint => (
+                    format!("Local change detected; scanning {local_tree_label}"),
+                    format!(
+                        "Scanning {local_tree_label} and reconciling event-driven local changes"
+                    ),
+                ),
+                LocalScanTrigger::PollingInterval => (
+                    format!("Checking {local_tree_label} for changes"),
+                    format!("Checking {local_tree_label} for changes"),
+                ),
+                LocalScanTrigger::WatchFallbackInterval => (
+                    format!("Verifying {local_tree_label} after a quiet watch interval"),
+                    format!("Verifying {local_tree_label} after a quiet watch interval"),
+                ),
             };
             emit_status(
                 status_callback.as_ref(),
@@ -1327,10 +1373,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                     )
                 },
             )?;
-            if local_state != previous_local_state {
+            if local_sync_outcome.changed_path_count > 0 {
                 baseline_dirty = true;
             }
-            if local_scan_requested {
+            if matches!(local_scan_trigger, LocalScanTrigger::WatchHint) {
                 backend.acknowledge_local_change_hint(options)?;
             }
             next_local_scan = Instant::now() + local_scan_interval;
@@ -2298,13 +2344,58 @@ fn usize_to_u64(value: usize) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
 }
 
-fn watch_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalScanTrigger {
+    WatchHint,
+    PollingInterval,
+    WatchFallbackInterval,
+}
+
+const LOCAL_SCAN_INTERVAL_FLOOR: Duration = Duration::from_millis(250);
+const WATCH_LOCAL_FALLBACK_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+fn watch_mode_label(
+    options: &FolderAgentRuntimeOptions,
+    local_change_monitor_state: LocalChangeMonitorState,
+) -> &'static str {
     if options.run_once {
         "not-watching"
     } else if options.no_watch_local {
         "polling-only"
+    } else if local_change_monitor_state == LocalChangeMonitorState::PollingFallback {
+        "polling-fallback"
     } else {
-        "fs-notify+polling"
+        "fs-notify+fallback-polling"
+    }
+}
+
+fn steady_state_local_scan_interval(
+    options: &FolderAgentRuntimeOptions,
+    watch_hints_available: bool,
+) -> Duration {
+    let configured =
+        Duration::from_millis(options.local_scan_interval_ms).max(LOCAL_SCAN_INTERVAL_FLOOR);
+    if watch_hints_available && !options.no_watch_local {
+        configured.max(WATCH_LOCAL_FALLBACK_SCAN_INTERVAL)
+    } else {
+        configured
+    }
+}
+
+fn local_scan_trigger(
+    local_scan_requested: bool,
+    now: Instant,
+    next_local_scan: Instant,
+    watch_hints_available: bool,
+) -> Option<LocalScanTrigger> {
+    if local_scan_requested {
+        Some(LocalScanTrigger::WatchHint)
+    } else if now < next_local_scan {
+        None
+    } else if watch_hints_available {
+        Some(LocalScanTrigger::WatchFallbackInterval)
+    } else {
+        Some(LocalScanTrigger::PollingInterval)
     }
 }
 
@@ -2987,6 +3078,56 @@ mod tests {
             run_once: true,
             ui_bind: None,
         }
+    }
+
+    #[test]
+    fn steady_state_local_scan_interval_keeps_polling_cadence_without_watch_hints() {
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        options.no_watch_local = true;
+        options.local_scan_interval_ms = 2_000;
+
+        assert_eq!(
+            steady_state_local_scan_interval(&options, false),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn steady_state_local_scan_interval_slows_periodic_verification_with_watch_hints() {
+        let mut options = test_runtime_options();
+        options.run_once = false;
+        options.no_watch_local = false;
+        options.local_scan_interval_ms = 2_000;
+
+        assert_eq!(
+            steady_state_local_scan_interval(&options, true),
+            WATCH_LOCAL_FALLBACK_SCAN_INTERVAL
+        );
+    }
+
+    #[test]
+    fn local_scan_trigger_prefers_watch_hints_over_due_timers() {
+        let now = Instant::now();
+
+        assert_eq!(
+            local_scan_trigger(true, now, now, true),
+            Some(LocalScanTrigger::WatchHint)
+        );
+    }
+
+    #[test]
+    fn local_scan_trigger_uses_watch_fallback_after_quiet_interval() {
+        let now = Instant::now();
+
+        assert_eq!(
+            local_scan_trigger(false, now, now, true),
+            Some(LocalScanTrigger::WatchFallbackInterval)
+        );
+        assert_eq!(
+            local_scan_trigger(false, now, now, false),
+            Some(LocalScanTrigger::PollingInterval)
+        );
     }
 
     #[test]
