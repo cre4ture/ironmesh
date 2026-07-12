@@ -382,8 +382,20 @@ mod tests {
                 .await?;
             assert!(js.contains("Transport-aware"));
 
-            let worker_asset_path = extract_referenced_asset_path(&js, "/assets/sqlite.worker-")
-                .context("client bundle should reference sqlite.worker asset")?;
+            let basemap_chunk_path =
+                extract_referenced_asset_path(&js, "/assets/GalleryBasemapMap-")
+                    .context("client bundle should lazy-load GalleryBasemapMap chunk")?;
+            let basemap_chunk = client
+                .get(format!("{web_base}{basemap_chunk_path}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+
+            let worker_asset_path =
+                extract_referenced_asset_path(&basemap_chunk, "/assets/sqlite.worker-")
+                    .context("gallery basemap chunk should reference sqlite.worker asset")?;
             let worker_response = client
                 .get(format!("{web_base}{worker_asset_path}"))
                 .send()
@@ -399,8 +411,9 @@ mod tests {
             assert!(worker_content_type.starts_with("application/javascript"));
             assert!(worker_body.starts_with(b"!function"));
 
-            let wasm_asset_path = extract_referenced_asset_path(&js, "/assets/sql-wasm-")
-                .context("client bundle should reference sql-wasm asset")?;
+            let wasm_asset_path =
+                extract_referenced_asset_path(&basemap_chunk, "/assets/sql-wasm-")
+                    .context("gallery basemap chunk should reference sql-wasm asset")?;
             let wasm_response = client
                 .get(format!("{web_base}{wasm_asset_path}"))
                 .send()

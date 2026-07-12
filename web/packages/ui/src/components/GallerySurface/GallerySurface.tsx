@@ -2095,7 +2095,7 @@ function GalleryMapPanel({
               ? basemaps.map((basemap) => (
                   <Button
                     key={basemap.id}
-                    variant={basemap.id === activeBasemap.id ? "filled" : "default"}
+                    variant={basemap.id === activeBasemap?.id ? "filled" : "default"}
                     onClick={() => onSelectBasemap(basemap.id)}
                   >
                     {basemap.modeLabel ?? basemap.label ?? basemap.id}

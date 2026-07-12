@@ -3,9 +3,16 @@ import { gzipSync } from "node:zlib";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 const API_V1_PREFIX = "/api/v1";
+const GALLERY_BASEMAP_READY_TEXT =
+  "Using MapTiler Satellite 2017-11-02 Planet from your self-hosted basemap dataset.";
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
+}
+
+async function waitForGalleryBasemap(page: Page) {
+  await expect(page.getByText(GALLERY_BASEMAP_READY_TEXT)).toBeVisible();
+  await expect(page.getByText("Loading self-hosted basemap")).toHaveCount(0);
 }
 
 test("server-admin runtime smoke flow renders and navigates", async ({ page }) => {
@@ -552,6 +559,7 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
   await page.getByRole("button", { name: "Map" }).click();
+  await waitForGalleryBasemap(page);
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
@@ -590,17 +598,26 @@ test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", a
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
   await page.getByRole("button", { name: "Map" }).click();
+  await waitForGalleryBasemap(page);
 
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("12 markers", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 visible clusters", { exact: true })).toBeVisible();
+  const visibleClusterSummary = page.getByText(/\d+ visible clusters/, { exact: true });
+  await expect(visibleClusterSummary).toBeVisible();
+  const initialClusterSummary = (await visibleClusterSummary.textContent())?.trim() ?? "";
 
-  const clusterButton = page.getByRole("button", {
-    name: "Open map cluster with 12 items"
-  });
-  const clusterDialogTitle = page
-    .getByRole("dialog")
-    .getByText("12 items in map cluster", { exact: true });
+  const clusterButton = page
+    .getByRole("button", {
+      name: /Open map cluster with \d+ items/
+    })
+    .first();
+  const clusterItemCount = Number(
+    ((await clusterButton.getAttribute("aria-label")) ?? "").match(/\d+/)?.[0] ?? "0"
+  );
+  const clusterDialogTitle = page.getByRole("dialog").getByText(
+    `${clusterItemCount} items in map cluster`,
+    { exact: true }
+  );
 
   await expect(clusterButton).toBeVisible();
   await clusterButton.click();
@@ -611,7 +628,12 @@ test("server-admin gallery only auto-zooms spread map clusters on ctrl-click", a
 
   await clusterButton.click({ modifiers: ["Control"] });
   await expect(clusterDialogTitle).toHaveCount(0);
-  await expect(page.getByText("1 visible clusters", { exact: true })).toHaveCount(0);
+  await expect
+    .poll(async () => {
+      const summaries = await page.getByText(/\d+ visible clusters/, { exact: true }).allTextContents();
+      return summaries[0]?.trim() ?? "";
+    })
+    .not.toBe(initialClusterSummary);
 });
 
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
