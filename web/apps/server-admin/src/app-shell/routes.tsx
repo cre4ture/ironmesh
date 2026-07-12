@@ -1,18 +1,46 @@
 import { IconActivity, IconArrowsTransferUp, IconCertificate, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
-import { DashboardPage } from "../pages/DashboardPage";
-import { RepairPage } from "../pages/RepairPage";
+import { lazy } from "react";
 import { SetupPage } from "../pages/SetupPage";
-import { BootstrapBundlesPage } from "../pages/BootstrapBundlesPage";
-import { ClientCredentialsPage } from "../pages/ClientCredentialsPage";
-import { ClientConnectionsPage } from "../pages/ClientConnectionsPage";
-import { CertificatesPage } from "../pages/CertificatesPage";
-import { ControlPlanePage } from "../pages/ControlPlanePage";
-import { DataChangesPage } from "../pages/DataChangesPage";
-import { DependenciesPage } from "../pages/DependenciesPage";
-import { LogsPage } from "../pages/LogsPage";
-import { GalleryPage } from "../pages/GalleryPage";
-import { ExplorerPage } from "../pages/ExplorerPage";
-import { MetadataPage } from "../pages/MetadataPage";
+
+const DashboardPage = lazy(async () => ({
+  default: (await import("../pages/DashboardPage")).DashboardPage
+}));
+const RepairPage = lazy(async () => ({
+  default: (await import("../pages/RepairPage")).RepairPage
+}));
+const BootstrapBundlesPage = lazy(async () => ({
+  default: (await import("../pages/BootstrapBundlesPage")).BootstrapBundlesPage
+}));
+const ClientCredentialsPage = lazy(async () => ({
+  default: (await import("../pages/ClientCredentialsPage")).ClientCredentialsPage
+}));
+const ClientConnectionsPage = lazy(async () => ({
+  default: (await import("../pages/ClientConnectionsPage")).ClientConnectionsPage
+}));
+const CertificatesPage = lazy(async () => ({
+  default: (await import("../pages/CertificatesPage")).CertificatesPage
+}));
+const ControlPlanePage = lazy(async () => ({
+  default: (await import("../pages/ControlPlanePage")).ControlPlanePage
+}));
+const DataChangesPage = lazy(async () => ({
+  default: (await import("../pages/DataChangesPage")).DataChangesPage
+}));
+const DependenciesPage = lazy(async () => ({
+  default: (await import("../pages/DependenciesPage")).DependenciesPage
+}));
+const LogsPage = lazy(async () => ({
+  default: (await import("../pages/LogsPage")).LogsPage
+}));
+const GalleryPage = lazy(async () => ({
+  default: (await import("../pages/GalleryPage")).GalleryPage
+}));
+const ExplorerPage = lazy(async () => ({
+  default: (await import("../pages/ExplorerPage")).ExplorerPage
+}));
+const MetadataPage = lazy(async () => ({
+  default: (await import("../pages/MetadataPage")).MetadataPage
+}));
 
 export const serverAdminRoutes = [
   {

@@ -2,12 +2,16 @@ import { getSetupStatus, isHttpErrorStatus } from "@ironmesh/api";
 import { ColorSchemeControl, NavigationShell, PageHeader } from "@ironmesh/ui";
 import { Alert, Badge, Button, Center, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState, type ReactNode } from "react";
 import { serverAdminRoutes } from "./routes";
 import { AdminAccessDrawer } from "../components/AdminAccessDrawer";
 import { useAdminAccess } from "../lib/admin-access";
 
 type SurfaceMode = "probing" | "runtime" | "setup";
+
+type RouteLoadingStateProps = {
+  routeLabel: string;
+};
 
 export function ServerAdminShell() {
   const [accessOpened, accessControls] = useDisclosure(false);
@@ -56,6 +60,44 @@ export function ServerAdminShell() {
     };
   }, []);
 
+  useEffect(() => {
+    if (surfaceMode !== "setup") {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    async function probeForRuntimeTransition() {
+      try {
+        await getSetupStatus();
+      } catch (error) {
+        if (!cancelled && isHttpErrorStatus(error, 401, 403, 404)) {
+          setSurfaceMode("runtime");
+          setSurfaceError(null);
+          return;
+        }
+      }
+
+      if (!cancelled) {
+        timeoutId = window.setTimeout(() => {
+          void probeForRuntimeTransition();
+        }, 1000);
+      }
+    }
+
+    timeoutId = window.setTimeout(() => {
+      void probeForRuntimeTransition();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [surfaceMode]);
+
   return (
     <>
       <NavigationShell
@@ -67,6 +109,7 @@ export function ServerAdminShell() {
         headerActions={
           <>
             <Badge
+              data-testid="server-admin-session-badge"
               color={
                 surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? "teal" : "gray"
               }
@@ -93,7 +136,7 @@ export function ServerAdminShell() {
             <Center py="xl">
               <Stack align="center" gap="sm">
                 <Loader color="teal" />
-                <Text c="dimmed">Loading the server-admin surface…</Text>
+                <Text c="dimmed">Loading the server-admin surface...</Text>
               </Stack>
             </Center>
           </>
@@ -105,11 +148,34 @@ export function ServerAdminShell() {
                 {surfaceError}
               </Alert>
             ) : null}
-            {activeRoute.element}
+            <Suspense fallback={<RouteLoadingState routeLabel={activeRoute.label} />}>
+              <RouteReadyState routeId={activeRoute.id}>{activeRoute.element}</RouteReadyState>
+            </Suspense>
           </>
         )}
       </NavigationShell>
       <AdminAccessDrawer opened={accessOpened} onClose={accessControls.close} />
     </>
   );
+}
+
+function RouteLoadingState({ routeLabel }: RouteLoadingStateProps) {
+  return (
+    <Center py="xl">
+      <Stack align="center" gap="sm">
+        <Loader color="teal" />
+        <Text c="dimmed">Loading {routeLabel}...</Text>
+      </Stack>
+    </Center>
+  );
+}
+
+function RouteReadyState({
+  routeId,
+  children
+}: {
+  routeId: (typeof serverAdminRoutes)[number]["id"];
+  children: ReactNode;
+}) {
+  return <div data-testid={`server-admin-route-${routeId}`}>{children}</div>;
 }
