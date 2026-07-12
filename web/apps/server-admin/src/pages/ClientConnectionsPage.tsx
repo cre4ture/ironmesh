@@ -20,7 +20,7 @@ import {
   Table,
   Text
 } from "@mantine/core";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RendezvousRegistrationStateSection } from "../components/RendezvousRegistrationStateSection";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatRelativeUnixTs, formatUnixTs } from "../lib/format";
@@ -28,6 +28,7 @@ import { formatRelativeUnixTs, formatUnixTs } from "../lib/format";
 const CLIENT_CONNECTION_POLL_INTERVAL_MS = 3_000;
 const RENDEZVOUS_REGISTRATION_POLL_INTERVAL_MS = 5_000;
 const RELATIVE_TIME_REFRESH_INTERVAL_MS = 1_000;
+const SNAPSHOT_RELATIVE_TIME_REFRESH_INTERVAL_MS = 30_000;
 const LIMIT_OPTIONS = ["25", "50", "100", "200"].map((value) => ({
   value,
   label: `${value} active connections`
@@ -50,27 +51,15 @@ export function ClientConnectionsPage() {
   const [pageCursor, setPageCursor] = useState<ClientConnectionCursor | null>(null);
   const [cursorHistory, setCursorHistory] = useState<Array<ClientConnectionCursor | null>>([]);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const isPageVisible = usePageVisibility();
   const resolvedLimit = clampLimit(limit);
   const pageIndex = cursorHistory.length;
+  const shouldLiveRefreshConnections = pageIndex === 0 && isPageVisible;
 
   useEffect(() => {
     setPageCursor(null);
     setCursorHistory([]);
   }, [normalizedAdminTokenOverride, resolvedLimit]);
-
-  useEffect(() => {
-    if (!canInspectConnections) {
-      return;
-    }
-
-    const intervalId = window.setInterval(() => {
-      setNowMs(Date.now());
-    }, RELATIVE_TIME_REFRESH_INTERVAL_MS);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [canInspectConnections]);
 
   const connectionsQuery = useQuery({
     queryKey: [
@@ -89,18 +78,62 @@ export function ClientConnectionsPage() {
         normalizedAdminTokenOverride || undefined
       ),
     enabled: canInspectConnections,
-    refetchInterval: pageIndex === 0 ? CLIENT_CONNECTION_POLL_INTERVAL_MS : false
+    refetchInterval: shouldLiveRefreshConnections ? CLIENT_CONNECTION_POLL_INTERVAL_MS : false,
+    refetchIntervalInBackground: false
   });
   const rendezvousConfigQuery = useQuery({
     queryKey: ["rendezvous-config", normalizedAdminTokenOverride],
     queryFn: () => getRendezvousConfig(normalizedAdminTokenOverride || undefined),
     enabled: canInspectConnections,
-    refetchInterval: RENDEZVOUS_REGISTRATION_POLL_INTERVAL_MS
+    refetchInterval: isPageVisible ? RENDEZVOUS_REGISTRATION_POLL_INTERVAL_MS : false,
+    refetchIntervalInBackground: false
   });
 
   const summary = canInspectConnections ? connectionsQuery.data?.summary ?? EMPTY_SUMMARY : EMPTY_SUMMARY;
   const entries = canInspectConnections ? connectionsQuery.data?.entries ?? [] : [];
   const nextCursor = connectionsQuery.data?.next_cursor ?? null;
+  const relativeTimeRefreshIntervalMs =
+    !canInspectConnections || !isPageVisible || entries.length === 0
+      ? null
+      : pageIndex === 0
+        ? RELATIVE_TIME_REFRESH_INTERVAL_MS
+        : SNAPSHOT_RELATIVE_TIME_REFRESH_INTERVAL_MS;
+  const previousPageVisibleRef = useRef(isPageVisible);
+
+  useEffect(() => {
+    if (relativeTimeRefreshIntervalMs == null) {
+      return;
+    }
+
+    setNowMs(Date.now());
+    const intervalId = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, relativeTimeRefreshIntervalMs);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [relativeTimeRefreshIntervalMs]);
+
+  useEffect(() => {
+    const wasVisible = previousPageVisibleRef.current;
+    previousPageVisibleRef.current = isPageVisible;
+    if (!canInspectConnections || !isPageVisible || wasVisible) {
+      return;
+    }
+
+    const refreshes = [rendezvousConfigQuery.refetch()];
+    if (pageIndex === 0) {
+      refreshes.push(connectionsQuery.refetch());
+    }
+    void Promise.all(refreshes);
+  }, [
+    canInspectConnections,
+    connectionsQuery.refetch,
+    isPageVisible,
+    pageIndex,
+    rendezvousConfigQuery.refetch
+  ]);
 
   function handleOlderPage() {
     if (!nextCursor || connectionsQuery.isFetching) {
@@ -204,11 +237,24 @@ export function ClientConnectionsPage() {
               Page {pageIndex + 1}
             </Text>
             <Text size="xs" c="dimmed">
-              Showing {entries.length} live entries from the current runtime registry. Older pages can
-              shift while connections open and close.
+              {pageIndex === 0
+                ? isPageVisible
+                  ? `Showing ${entries.length} live entries from the current runtime registry.`
+                  : `Showing ${entries.length} live entries. Auto refresh resumes when the tab is visible again.`
+                : `Showing ${entries.length} snapshot entries. Older pages stay frozen until you refresh or return to page 1.`}
             </Text>
           </Stack>
           <Group gap="xs">
+            <Badge
+              color={pageIndex === 0 && isPageVisible ? "teal" : "gray"}
+              variant="light"
+            >
+              {pageIndex === 0
+                ? isPageVisible
+                  ? "live"
+                  : "paused"
+                : "snapshot"}
+            </Badge>
             <Button
               size="xs"
               variant="default"
@@ -286,6 +332,29 @@ export function ClientConnectionsPage() {
       </Card>
     </Stack>
   );
+}
+
+function usePageVisibility(): boolean {
+  const [isPageVisible, setIsPageVisible] = useState(() =>
+    typeof document === "undefined" ? true : document.visibilityState === "visible"
+  );
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    const handleVisibilityChange = () => {
+      setIsPageVisible(document.visibilityState === "visible");
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
+  return isPageVisible;
 }
 
 function clampLimit(value: string): number {

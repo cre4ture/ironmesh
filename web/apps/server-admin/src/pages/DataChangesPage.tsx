@@ -20,7 +20,7 @@ import {
   Text,
   TextInput
 } from "@mantine/core";
-import { useDeferredValue, useEffect, useState } from "react";
+import { useDeferredValue, useEffect, useRef, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatBytes, formatUnixTs } from "../lib/format";
 
@@ -51,10 +51,12 @@ export function DataChangesPage() {
   const [limit, setLimit] = useState("200");
   const [pageCursor, setPageCursor] = useState<DataChangeEventsCursor | null>(null);
   const [cursorHistory, setCursorHistory] = useState<Array<DataChangeEventsCursor | null>>([]);
+  const isPageVisible = usePageVisibility();
   const deferredPathFilter = useDeferredValue(pathFilter.trim());
   const deferredActorFilter = useDeferredValue(actorFilter.trim());
   const resolvedLimit = clampLimit(limit);
   const pageIndex = cursorHistory.length;
+  const shouldLiveRefresh = pageIndex === 0 && isPageVisible;
 
   useEffect(() => {
     setPageCursor(null);
@@ -84,8 +86,20 @@ export function DataChangesPage() {
         normalizedAdminTokenOverride || undefined
       ),
     enabled: canInspectDataChanges,
-    refetchInterval: DATA_CHANGE_POLL_INTERVAL_MS
+    refetchInterval: shouldLiveRefresh ? DATA_CHANGE_POLL_INTERVAL_MS : false,
+    refetchIntervalInBackground: false
   });
+  const previousPageVisibleRef = useRef(isPageVisible);
+
+  useEffect(() => {
+    const wasVisible = previousPageVisibleRef.current;
+    previousPageVisibleRef.current = isPageVisible;
+    if (!canInspectDataChanges || pageIndex !== 0 || !isPageVisible || wasVisible) {
+      return;
+    }
+
+    void eventsQuery.refetch();
+  }, [canInspectDataChanges, eventsQuery.refetch, isPageVisible, pageIndex]);
 
   const entries = canInspectDataChanges ? eventsQuery.data?.entries ?? [] : [];
   const nextCursor = eventsQuery.data?.next_cursor ?? null;
@@ -184,10 +198,24 @@ export function DataChangesPage() {
               Page {pageIndex + 1}
             </Text>
             <Text size="xs" c="dimmed">
-              Showing {entries.length} events with backend pagination.
+              {pageIndex === 0
+                ? isPageVisible
+                  ? `Showing ${entries.length} events with live refresh while this tab stays visible.`
+                  : `Showing ${entries.length} events. Live refresh resumes when the tab is visible again.`
+                : `Showing ${entries.length} events. Older pages stay frozen until you refresh or return to page 1.`}
             </Text>
           </Stack>
           <Group gap="xs">
+            <Badge
+              color={pageIndex === 0 && isPageVisible ? "teal" : "gray"}
+              variant="light"
+            >
+              {pageIndex === 0
+                ? isPageVisible
+                  ? "live"
+                  : "paused"
+                : "snapshot"}
+            </Badge>
             <Button
               size="xs"
               variant="default"
@@ -275,6 +303,29 @@ export function DataChangesPage() {
       </Card>
     </Stack>
   );
+}
+
+function usePageVisibility(): boolean {
+  const [isPageVisible, setIsPageVisible] = useState(() =>
+    typeof document === "undefined" ? true : document.visibilityState === "visible"
+  );
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    const handleVisibilityChange = () => {
+      setIsPageVisible(document.visibilityState === "visible");
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
+  return isPageVisible;
 }
 
 function clampLimit(value: string): number {

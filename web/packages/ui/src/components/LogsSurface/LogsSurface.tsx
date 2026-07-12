@@ -27,6 +27,7 @@ type LogsSurfaceProps = {
 };
 
 const LOGS_POLL_INTERVAL_MS = 3_000;
+const LOGS_SCROLL_PAUSED_POLL_INTERVAL_MS = 15_000;
 const LOGS_AUTO_FOLLOW_THRESHOLD_PX = 24;
 
 export function LogsSurface({
@@ -41,13 +42,20 @@ export function LogsSurface({
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [logsAutoFollow, setLogsAutoFollow] = useState(true);
+  const isPageVisible = usePageVisibility();
   const logsViewportRef = useRef<HTMLDivElement | null>(null);
   const logsScrollReadyRef = useRef(false);
+  const previousPageVisibleRef = useRef(isPageVisible);
   const logEntries = logs?.entries ?? [];
   const latestLogEntry = logEntries.length > 0 ? logEntries[logEntries.length - 1] : null;
   const renderedLogEntries = logEntries.map(
     (entry) => `${formatUnixTs(entry.captured_at_unix)} ${entry.line}`
   );
+  const autoRefreshIntervalMs = !isPageVisible
+    ? null
+    : logsAutoFollow
+      ? LOGS_POLL_INTERVAL_MS
+      : LOGS_SCROLL_PAUSED_POLL_INTERVAL_MS;
 
   const refresh = useCallback(async (options?: { background?: boolean }) => {
     const background = options?.background ?? false;
@@ -82,12 +90,26 @@ export function LogsSurface({
   }, [refresh]);
 
   useEffect(() => {
+    if (autoRefreshIntervalMs == null) {
+      return;
+    }
+
     const intervalId = window.setInterval(() => {
       void refresh({ background: true });
-    }, LOGS_POLL_INTERVAL_MS);
+    }, autoRefreshIntervalMs);
 
     return () => window.clearInterval(intervalId);
-  }, [refresh]);
+  }, [autoRefreshIntervalMs, refresh]);
+
+  useEffect(() => {
+    const wasVisible = previousPageVisibleRef.current;
+    previousPageVisibleRef.current = isPageVisible;
+    if (!isPageVisible || wasVisible) {
+      return;
+    }
+
+    void refresh({ background: logs !== null });
+  }, [isPageVisible, logs, refresh]);
 
   const handleLogsScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     if (!logsScrollReadyRef.current) {
@@ -151,8 +173,17 @@ export function LogsSurface({
               <Badge variant="light" color={logsAutoFollow ? "teal" : "gray"}>
                 {logsAutoFollow ? "live tail" : "scroll paused"}
               </Badge>
-              <Badge variant="light" color={refreshing ? "blue" : "gray"}>
-                {refreshing ? "updating" : "auto refresh"}
+              <Badge
+                variant="light"
+                color={refreshing ? "blue" : isPageVisible && logsAutoFollow ? "teal" : "gray"}
+              >
+                {refreshing
+                  ? "updating"
+                  : !isPageVisible
+                    ? "background paused"
+                    : logsAutoFollow
+                      ? "auto refresh"
+                      : "slow refresh"}
               </Badge>
             </Group>
           </Group>
@@ -188,4 +219,27 @@ function formatUnixTs(unixTs?: number | null): string {
   }
 
   return new Date(unixTs * 1000).toISOString();
+}
+
+function usePageVisibility(): boolean {
+  const [isPageVisible, setIsPageVisible] = useState(() =>
+    typeof document === "undefined" ? true : document.visibilityState === "visible"
+  );
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    const handleVisibilityChange = () => {
+      setIsPageVisible(document.visibilityState === "visible");
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
+  return isPageVisible;
 }
