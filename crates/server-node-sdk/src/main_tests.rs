@@ -708,6 +708,7 @@ async fn capture_mtls_presence_register(
         entry: transport_sdk::PresenceEntry {
             registration,
             updated_at_unix,
+            observed_source_addr: None,
         },
     })
 }
@@ -793,6 +794,7 @@ async fn https_presence_register(
         entry: transport_sdk::PresenceEntry {
             registration,
             updated_at_unix,
+            observed_source_addr: None,
         },
     })
 }
@@ -2121,7 +2123,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
         true,
         local_descriptor.as_ref(),
     );
-    rendezvous_state.presence.register(registration);
+    rendezvous_state.presence.register(registration, None);
 
     let endpoint = super::current_rendezvous_endpoint_clients(&state)
         .await
@@ -9628,6 +9630,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let descriptor = node_descriptor_from_presence_entry(&entry)
@@ -9803,6 +9806,7 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let descriptor = node_descriptor_from_presence_entry(&entry)
@@ -9837,6 +9841,7 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let discovered = super::apply_rendezvous_presence_entries(&state, &[entry]).await;
@@ -11301,6 +11306,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                         entry: transport_sdk::PresenceEntry {
                             registration,
                             updated_at_unix,
+                            observed_source_addr: None,
                         },
                     })
                 }
@@ -11362,6 +11368,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                         entry: transport_sdk::PresenceEntry {
                             registration,
                             updated_at_unix,
+                            observed_source_addr: None,
                         },
                     })
                 }

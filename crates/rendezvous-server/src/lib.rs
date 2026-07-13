@@ -1,5 +1,6 @@
 mod auth;
 
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -7,6 +8,7 @@ use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::http::Uri;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,18 +20,19 @@ use transport_sdk::rendezvous::{
     PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
 };
 use transport_sdk::{
-    BufferedTransportRequest, ClientBootstrapClaimRedeemRequest,
-    ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode, PresenceRegistry,
-    RelayTicket, RelayTicketRequest, RelayTunnelBroker, RelayTunnelControlMessage,
-    RelayTunnelFrame, RelayTunnelSessionKind, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
-    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
-    issue_relay_ticket as issue_runtime_relay_ticket, perform_transport_client_handshake,
-    read_buffered_transport_response, write_buffered_transport_request,
+    BufferedTransportRequest, CandidateKind, ClientBootstrapClaimRedeemRequest,
+    ClientBootstrapClaimRedeemResponse, ConnectionCandidate, MultiplexConfig, MultiplexMode,
+    PresenceRegistry, RelayTicket, RelayTicketRequest, RelayTunnelBroker,
+    RelayTunnelControlMessage, RelayTunnelFrame, RelayTunnelSessionKind,
+    TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamKind, issue_relay_ticket as issue_runtime_relay_ticket,
+    perform_transport_client_handshake, rank_candidates, read_buffered_transport_response,
+    write_buffered_transport_request,
 };
 
 use crate::auth::{
-    MaybeAuthenticatedPeer, MtlsAuthenticatedPeerAcceptor, build_mtls_rustls_config,
-    ensure_authenticated_peer_identity, require_authenticated_node,
+    MaybeAuthenticatedPeer, MaybeObservedPeerAddr, MtlsAuthenticatedPeerAcceptor,
+    build_mtls_rustls_config, ensure_authenticated_peer_identity, require_authenticated_node,
 };
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -117,7 +120,11 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
         Ok(())
     } else {
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -134,6 +141,7 @@ async fn health(State(state): State<RendezvousAppState>) -> Json<HealthResponse>
 async fn register_presence(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
+    observed_peer_addr: MaybeObservedPeerAddr,
     Json(request): Json<PresenceRegistration>,
 ) -> std::result::Result<Json<RegisterPresenceResponse>, (StatusCode, String)> {
     request
@@ -147,7 +155,10 @@ async fn register_presence(
     )
     .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
 
-    let entry = state.presence.register(request);
+    let entry = state
+        .presence
+        .register(request, observed_peer_addr.socket_addr());
+    let entry = response_presence_entry(entry);
     Ok(Json(RegisterPresenceResponse {
         accepted: true,
         software_version: Some(PACKAGE_VERSION.to_string()),
@@ -162,11 +173,77 @@ async fn list_presence(
 ) -> std::result::Result<Json<PresenceListResponse>, (StatusCode, String)> {
     require_authenticated_node(state.config.mtls.is_some(), &authenticated_peer)
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let entries = state.presence.list();
+    let entries = state
+        .presence
+        .list()
+        .into_iter()
+        .map(response_presence_entry)
+        .collect::<Vec<_>>();
     Ok(Json(PresenceListResponse {
         registered_endpoints: entries.len(),
         entries,
     }))
+}
+
+fn response_presence_entry(
+    mut entry: transport_sdk::PresenceEntry,
+) -> transport_sdk::PresenceEntry {
+    let Some(candidate) = synthesize_server_reflexive_candidate(&entry) else {
+        return entry;
+    };
+
+    if has_candidate_endpoint(&entry.registration.direct_candidates, &candidate.endpoint) {
+        return entry;
+    }
+
+    let mut candidates = entry.registration.direct_candidates.clone();
+    candidates.push(candidate);
+    entry.registration.direct_candidates = rank_candidates(&candidates);
+    entry
+}
+
+fn synthesize_server_reflexive_candidate(
+    entry: &transport_sdk::PresenceEntry,
+) -> Option<ConnectionCandidate> {
+    let observed_source_addr = entry.observed_source_addr?;
+    let port = entry
+        .registration
+        .peer_api_url
+        .as_deref()
+        .and_then(url_port)
+        .or_else(|| {
+            entry
+                .registration
+                .public_api_url
+                .as_deref()
+                .and_then(url_port)
+        })?;
+    Some(ConnectionCandidate {
+        kind: CandidateKind::ServerReflexive,
+        endpoint: server_reflexive_endpoint(observed_source_addr.ip(), port),
+        rtt_ms: None,
+    })
+}
+
+fn url_port(value: &str) -> Option<u16> {
+    value
+        .parse::<Uri>()
+        .ok()?
+        .authority()
+        .and_then(|authority| authority.port_u16())
+}
+
+fn server_reflexive_endpoint(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("https://{ip}:{port}"),
+        IpAddr::V6(ip) => format!("https://[{ip}]:{port}"),
+    }
+}
+
+fn has_candidate_endpoint(candidates: &[ConnectionCandidate], endpoint: &str) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| candidate.endpoint.trim_end_matches('/') == endpoint)
 }
 
 async fn issue_relay_ticket(
@@ -672,6 +749,10 @@ async fn send_relay_tunnel_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::NodeId;
+    use transport_sdk::{
+        RelayMode, RendezvousClientConfig, RendezvousControlClient, TransportCapability,
+    };
 
     #[test]
     fn relay_tunnel_log_context_captures_source_ticket_metadata() {
@@ -724,5 +805,130 @@ mod tests {
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
             })
         );
+    }
+
+    #[test]
+    fn synthesize_server_reflexive_candidate_uses_observed_ip_and_peer_api_port() {
+        let entry = transport_sdk::PresenceEntry {
+            registration: PresenceRegistration {
+                cluster_id: ClusterId::now_v7(),
+                identity: PeerIdentity::Node(NodeId::now_v7()),
+                public_api_url: Some("https://public.example:9443".to_string()),
+                peer_api_url: Some("https://node.internal:7443".to_string()),
+                direct_candidates: Vec::new(),
+                labels: Default::default(),
+                capacity_bytes: None,
+                free_bytes: None,
+                capabilities: vec![TransportCapability::DirectHttps],
+                relay_mode: RelayMode::Disabled,
+                connected_at_unix: 1,
+            },
+            updated_at_unix: 1,
+            observed_source_addr: Some("203.0.113.10:51000".parse().expect("socket addr")),
+        };
+
+        let candidate = synthesize_server_reflexive_candidate(&entry)
+            .expect("server reflexive candidate should be synthesized");
+        assert_eq!(candidate.kind, CandidateKind::ServerReflexive);
+        assert_eq!(candidate.endpoint, "https://203.0.113.10:7443");
+    }
+
+    #[test]
+    fn synthesize_server_reflexive_candidate_requires_explicit_port() {
+        let entry = transport_sdk::PresenceEntry {
+            registration: PresenceRegistration {
+                cluster_id: ClusterId::now_v7(),
+                identity: PeerIdentity::Node(NodeId::now_v7()),
+                public_api_url: Some("https://public.example".to_string()),
+                peer_api_url: Some("https://node.internal".to_string()),
+                direct_candidates: Vec::new(),
+                labels: Default::default(),
+                capacity_bytes: None,
+                free_bytes: None,
+                capabilities: vec![TransportCapability::DirectHttps],
+                relay_mode: RelayMode::Disabled,
+                connected_at_unix: 1,
+            },
+            updated_at_unix: 1,
+            observed_source_addr: Some("203.0.113.10:51000".parse().expect("socket addr")),
+        };
+
+        assert!(synthesize_server_reflexive_candidate(&entry).is_none());
+    }
+
+    #[tokio::test]
+    async fn plain_http_presence_registration_exposes_observed_source_and_reflexive_candidate() {
+        let cluster_id = ClusterId::now_v7();
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr,
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            mtls: None,
+        });
+        let router = build_router(state);
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("test rendezvous server should run");
+        });
+
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let registration = PresenceRegistration {
+            cluster_id,
+            identity: PeerIdentity::Node(NodeId::now_v7()),
+            public_api_url: Some("https://public.example:9443".to_string()),
+            peer_api_url: Some("https://node.internal:7443".to_string()),
+            direct_candidates: Vec::new(),
+            labels: Default::default(),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: vec![TransportCapability::DirectHttps],
+            relay_mode: RelayMode::Disabled,
+            connected_at_unix: 1,
+        };
+
+        let response = client
+            .register_presence(&registration)
+            .await
+            .expect("presence registration should succeed");
+        assert_eq!(
+            response.entry.observed_source_addr.map(|addr| addr.ip()),
+            Some("127.0.0.1".parse().expect("loopback ip"))
+        );
+        assert_eq!(
+            response.entry.registration.direct_candidates,
+            vec![ConnectionCandidate {
+                kind: CandidateKind::ServerReflexive,
+                endpoint: "https://127.0.0.1:7443".to_string(),
+                rtt_ms: None,
+            }]
+        );
+
+        let listed = client
+            .list_presence()
+            .await
+            .expect("presence listing should succeed");
+        assert_eq!(listed.registered_endpoints, 1);
+        assert_eq!(listed.entries[0], response.entry);
+
+        server.abort();
+        let _ = server.await;
     }
 }

@@ -1,10 +1,11 @@
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, connect_info::ConnectInfo};
 use common::NodeId;
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
@@ -32,6 +33,15 @@ impl MaybeAuthenticatedPeer {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MaybeObservedPeerAddr(pub(crate) Option<SocketAddr>);
+
+impl MaybeObservedPeerAddr {
+    pub(crate) fn socket_addr(&self) -> Option<SocketAddr> {
+        self.0
+    }
+}
+
 impl<S> FromRequestParts<S> for MaybeAuthenticatedPeer
 where
     S: Send + Sync,
@@ -44,6 +54,31 @@ where
     ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
         let authenticated = parts.extensions.get::<AuthenticatedPeer>().cloned();
         std::future::ready(Ok(Self(authenticated)))
+    }
+}
+
+impl<S> FromRequestParts<S> for MaybeObservedPeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
+        let observed = parts
+            .extensions
+            .get::<MaybeObservedPeerAddr>()
+            .copied()
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|connect_info| Self(Some(connect_info.0)))
+            })
+            .unwrap_or_default();
+        std::future::ready(Ok(observed))
     }
 }
 
@@ -91,13 +126,19 @@ pub(crate) fn ensure_authenticated_peer_identity(
 pub(crate) struct WithAuthenticatedPeer<S> {
     inner: S,
     authenticated_peer: Option<AuthenticatedPeer>,
+    observed_peer_addr: Option<SocketAddr>,
 }
 
 impl<S> WithAuthenticatedPeer<S> {
-    pub(crate) fn new(inner: S, authenticated_peer: Option<AuthenticatedPeer>) -> Self {
+    pub(crate) fn new(
+        inner: S,
+        authenticated_peer: Option<AuthenticatedPeer>,
+        observed_peer_addr: Option<SocketAddr>,
+    ) -> Self {
         Self {
             inner,
             authenticated_peer,
+            observed_peer_addr,
         }
     }
 }
@@ -120,6 +161,10 @@ where
     fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
         if let Some(authenticated_peer) = self.authenticated_peer.clone() {
             req.extensions_mut().insert(authenticated_peer);
+        }
+        if let Some(observed_peer_addr) = self.observed_peer_addr {
+            req.extensions_mut()
+                .insert(MaybeObservedPeerAddr(Some(observed_peer_addr)));
         }
         self.inner.call(req)
     }
@@ -165,6 +210,7 @@ where
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let observed_peer_addr = stream.peer_addr().ok();
         let fut = self.inner.accept(stream, service);
         Box::pin(async move {
             let (tls_stream, service) = fut.await?;
@@ -172,7 +218,7 @@ where
                 .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
             Ok((
                 tls_stream,
-                WithAuthenticatedPeer::new(service, authenticated_peer),
+                WithAuthenticatedPeer::new(service, authenticated_peer, observed_peer_addr),
             ))
         })
     }

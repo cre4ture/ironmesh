@@ -6,6 +6,7 @@ use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -65,6 +66,8 @@ pub struct PresenceRegistration {
 pub struct PresenceEntry {
     pub registration: PresenceRegistration,
     pub updated_at_unix: u64,
+    #[serde(default)]
+    pub observed_source_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
