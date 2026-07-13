@@ -7,14 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::folder_agent_state::{
     FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME, FolderAgentProfilePaths,
-    default_folder_agent_state_root, folder_agent_profile_paths,
-    migrate_legacy_folder_agent_profile_dir,
+    configure_folder_agent_sqlite_connection, default_folder_agent_state_root,
+    folder_agent_profile_paths, migrate_legacy_folder_agent_profile_dir,
 };
 use crate::{PathScope, StartupStateStore};
 
 const MODIFICATION_LOG_SCHEMA_VERSION_CURRENT: i64 = 1;
 const MODIFICATION_LOG_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const MODIFICATION_LOG_MAX_RECORDS: usize = 25_000;
+const MODIFICATION_LOG_PRUNE_INTERVAL_RECORDS: i64 = 128;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -226,7 +227,7 @@ impl ModificationLogStore {
     }
 
     pub fn append(&self, entry: &ModificationLogEntry) -> Result<i64> {
-        let connection = self.sqlite_connection()?;
+        let mut connection = self.sqlite_connection()?;
         let occurred_unix_ms =
             i64::try_from(now_unix_ms()).context("modification log timestamp overflow")?;
         let size_bytes = entry
@@ -235,43 +236,51 @@ impl ModificationLogStore {
             .transpose()
             .context("modification log size overflow")?;
 
-        connection
-            .execute(
-                "INSERT INTO modification_actions(
-                     occurred_unix_ms,
-                     operation,
-                     outcome,
-                     phase,
-                     trigger_source,
-                     local_relative_path,
-                     remote_key,
-                     size_bytes,
-                     content_hash,
-                     scope_label,
-                     root_dir,
-                     connection_target,
-                     error_text
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    occurred_unix_ms,
-                    entry.operation.as_str(),
-                    entry.outcome.as_str(),
-                    entry.phase.as_str(),
-                    entry.trigger_source.as_str(),
-                    entry.local_relative_path,
-                    entry.remote_key,
-                    size_bytes,
-                    entry.content_hash,
-                    self.scope_label,
-                    self.root_dir_label,
-                    self.connection_target,
-                    entry.error_text,
-                ],
-            )
-            .context("failed to append modification log row")?;
+        let tx = connection
+            .transaction()
+            .context("failed to start modification log append transaction")?;
+        tx.execute(
+            "INSERT INTO modification_actions(
+                 occurred_unix_ms,
+                 operation,
+                 outcome,
+                 phase,
+                 trigger_source,
+                 local_relative_path,
+                 remote_key,
+                 size_bytes,
+                 content_hash,
+                 scope_label,
+                 root_dir,
+                 connection_target,
+                 error_text
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                occurred_unix_ms,
+                entry.operation.as_str(),
+                entry.outcome.as_str(),
+                entry.phase.as_str(),
+                entry.trigger_source.as_str(),
+                entry.local_relative_path,
+                entry.remote_key,
+                size_bytes,
+                entry.content_hash,
+                self.scope_label,
+                self.root_dir_label,
+                self.connection_target,
+                entry.error_text,
+            ],
+        )
+        .context("failed to append modification log row")?;
 
-        self.prune_retained(&connection)?;
-        Ok(connection.last_insert_rowid())
+        let inserted_record_id = tx.last_insert_rowid();
+        if should_prune_after_append(inserted_record_id) {
+            self.prune_retained(&tx)?;
+        }
+
+        tx.commit()
+            .context("failed to commit modification log append transaction")?;
+        Ok(inserted_record_id)
     }
 
     pub fn list(
@@ -367,12 +376,7 @@ impl ModificationLogStore {
                 self.path.display()
             )
         })?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .context("failed to set modification log journal_mode")?;
-        connection
-            .pragma_update(None, "synchronous", "FULL")
-            .context("failed to set modification log synchronous mode")?;
+        configure_folder_agent_sqlite_connection(&connection, "modification log")?;
 
         self.ensure_schema(&connection)?;
         self.ensure_scope_fingerprint(&connection)?;
@@ -500,6 +504,10 @@ impl ModificationLogStore {
             .context("failed to prune modification log by row cap")?;
         Ok(())
     }
+}
+
+fn should_prune_after_append(inserted_record_id: i64) -> bool {
+    inserted_record_id > 0 && inserted_record_id % MODIFICATION_LOG_PRUNE_INTERVAL_RECORDS == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -736,6 +744,149 @@ mod tests {
         assert_eq!(uploads.records.len(), 1);
         assert_eq!(uploads.records[0].local_relative_path, "docs/one.txt");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modification_log_store_uses_wal_with_normal_synchronous() {
+        let root = test_root();
+        let state_root = root.join("state-root");
+        let identity_root = root.join("identity-root");
+        let scope = PathScope::new(Some("photos/camera".to_string()));
+        let store = ModificationLogStore::new_with_state_root(
+            &identity_root,
+            &root,
+            &scope,
+            "http://127.0.0.1:8080",
+            &state_root,
+        );
+
+        let connection = store.sqlite_connection().unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        assert_eq!(synchronous, 1);
+
+        drop(connection);
+        let _ = fs::remove_file(store.path());
+        let _ = fs::remove_file(PathBuf::from(format!("{}-wal", store.path().display())));
+        let _ = fs::remove_file(PathBuf::from(format!("{}-shm", store.path().display())));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modification_log_store_batches_pruning_until_interval_boundary() {
+        let root = test_root();
+        let state_root = root.join("state-root");
+        let identity_root = root.join("identity-root");
+        let scope = PathScope::new(Some("photos/camera".to_string()));
+        let store = ModificationLogStore::new_with_state_root(
+            &identity_root,
+            &root,
+            &scope,
+            "http://127.0.0.1:8080",
+            &state_root,
+        );
+
+        let connection = store.sqlite_connection().unwrap();
+        let stale_occurred_unix_ms =
+            i64::try_from(now_unix_ms().saturating_sub(MODIFICATION_LOG_RETENTION_MS + 1)).unwrap();
+        connection
+            .execute(
+                "INSERT INTO modification_actions(
+                     occurred_unix_ms,
+                     operation,
+                     outcome,
+                     phase,
+                     trigger_source,
+                     local_relative_path,
+                     remote_key,
+                     size_bytes,
+                     content_hash,
+                     scope_label,
+                     root_dir,
+                     connection_target,
+                     error_text
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    stale_occurred_unix_ms,
+                    "upload",
+                    "success",
+                    "startup",
+                    "startup-reconcile",
+                    "docs/stale.txt",
+                    "photos/camera/docs/stale.txt",
+                    1_i64,
+                    Option::<String>::None,
+                    "photos/camera",
+                    root.display().to_string(),
+                    "http://127.0.0.1:8080",
+                    Option::<String>::None,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        for index in 0..usize::try_from(MODIFICATION_LOG_PRUNE_INTERVAL_RECORDS - 2).unwrap() {
+            store
+                .append(&ModificationLogEntry {
+                    operation: ModificationOperation::Upload,
+                    outcome: ModificationOutcome::Success,
+                    phase: ModificationPhase::SteadyState,
+                    trigger_source: ModificationTriggerSource::LocalWatch,
+                    local_relative_path: format!("docs/{index}.txt"),
+                    remote_key: format!("photos/camera/docs/{index}.txt"),
+                    size_bytes: Some(1),
+                    content_hash: None,
+                    error_text: None,
+                })
+                .unwrap();
+        }
+
+        let connection = store.sqlite_connection().unwrap();
+        let stale_count_before_boundary: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM modification_actions WHERE local_relative_path = ?1",
+                ["docs/stale.txt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count_before_boundary, 1);
+        drop(connection);
+
+        store
+            .append(&ModificationLogEntry {
+                operation: ModificationOperation::Upload,
+                outcome: ModificationOutcome::Success,
+                phase: ModificationPhase::SteadyState,
+                trigger_source: ModificationTriggerSource::LocalWatch,
+                local_relative_path: "docs/final.txt".to_string(),
+                remote_key: "photos/camera/docs/final.txt".to_string(),
+                size_bytes: Some(1),
+                content_hash: None,
+                error_text: None,
+            })
+            .unwrap();
+
+        let connection = store.sqlite_connection().unwrap();
+        let stale_count_after_boundary: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM modification_actions WHERE local_relative_path = ?1",
+                ["docs/stale.txt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count_after_boundary, 0);
+
+        drop(connection);
+        let _ = fs::remove_file(store.path());
+        let _ = fs::remove_file(PathBuf::from(format!("{}-wal", store.path().display())));
+        let _ = fs::remove_file(PathBuf::from(format!("{}-shm", store.path().display())));
         fs::remove_dir_all(root).unwrap();
     }
 

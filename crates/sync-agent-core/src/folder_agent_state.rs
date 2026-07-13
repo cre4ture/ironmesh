@@ -302,6 +302,19 @@ fn xdg_state_home() -> Option<PathBuf> {
         .map(|home| home.join(".local").join("state"))
 }
 
+pub(crate) fn configure_folder_agent_sqlite_connection(
+    connection: &Connection,
+    store_label: &str,
+) -> Result<()> {
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;",
+        )
+        .with_context(|| format!("failed to configure sqlite {store_label} connection"))?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct StartupStateStore {
     pub path: PathBuf,
@@ -701,12 +714,7 @@ impl StartupStateStore {
         let mut connection = Connection::open(&self.path)
             .with_context(|| format!("failed to open sqlite baseline {}", self.path.display()))?;
 
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .context("failed to set sqlite journal_mode")?;
-        connection
-            .pragma_update(None, "synchronous", "FULL")
-            .context("failed to set sqlite synchronous mode")?;
+        configure_folder_agent_sqlite_connection(&connection, "baseline")?;
 
         self.ensure_schema(&mut connection)?;
         self.ensure_scope_fingerprint(&connection)?;
@@ -1234,6 +1242,28 @@ mod tests {
             .unwrap();
         assert_eq!(schema_version, BASELINE_SCHEMA_VERSION_CURRENT.to_string());
 
+        remove_sqlite_sidecars(&store.path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_state_store_uses_wal_with_normal_synchronous() {
+        let root = test_root();
+        let scope = PathScope::new(None);
+        let store = StartupStateStore::new(&root, &scope, "http://127.0.0.1:8080");
+
+        let connection = store.sqlite_connection().unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        assert_eq!(synchronous, 1);
+
+        drop(connection);
         remove_sqlite_sidecars(&store.path);
         fs::remove_dir_all(root).unwrap();
     }
