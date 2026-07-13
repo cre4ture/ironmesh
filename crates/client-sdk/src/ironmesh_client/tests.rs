@@ -289,6 +289,25 @@ struct RelayTestCapturedRequest {
     body: Vec<u8>,
 }
 
+fn capture_transport_request(
+    request: &transport_sdk::BufferedTransportRequest,
+) -> RelayTestCapturedRequest {
+    RelayTestCapturedRequest {
+        kind: Some(request.kind),
+        method: request.method.clone(),
+        path_and_query: request.path.clone(),
+        headers: request
+            .headers
+            .iter()
+            .map(|header| RelayHttpHeader {
+                name: header.name.clone(),
+                value: header.value.clone(),
+            })
+            .collect(),
+        body: request.body.clone(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DirectHttpRouteState {
     cluster_status_hits: Arc<AtomicUsize>,
@@ -1006,20 +1025,8 @@ async fn serve_direct_transport_hangs_after_first_success_socket(
         if request.path == "/api/v1/cluster/status" {
             let prior_hits = state.cluster_status_hits.fetch_add(1, Ordering::SeqCst);
             if prior_hits >= 1 {
-                *state.captured_stalled_request.lock().await = Some(RelayTestCapturedRequest {
-                    kind: Some(request.kind),
-                    method: request.method.clone(),
-                    path_and_query: request.path.clone(),
-                    headers: request
-                        .headers
-                        .iter()
-                        .map(|header| RelayHttpHeader {
-                            name: header.name.clone(),
-                            value: header.value.clone(),
-                        })
-                        .collect(),
-                    body: request.body.clone(),
-                });
+                *state.captured_stalled_request.lock().await =
+                    Some(capture_transport_request(&request));
                 state.stalled_request_count.fetch_add(1, Ordering::SeqCst);
                 std::future::pending::<()>().await;
             }
@@ -1130,20 +1137,8 @@ async fn serve_direct_transport_stalls_object_write_socket(
         }
 
         if prior_requests >= 1 {
-            *state.captured_stalled_request.lock().await = Some(RelayTestCapturedRequest {
-                kind: Some(request.kind),
-                method: request.method.clone(),
-                path_and_query: request.path.clone(),
-                headers: request
-                    .headers
-                    .iter()
-                    .map(|header| RelayHttpHeader {
-                        name: header.name.clone(),
-                        value: header.value.clone(),
-                    })
-                    .collect(),
-                body: request.body.clone(),
-            });
+            *state.captured_stalled_request.lock().await =
+                Some(capture_transport_request(&request));
             state.stalled_request_count.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<()>().await;
         }
@@ -1214,6 +1209,120 @@ async fn spawn_direct_transport_server_that_stalls_object_write() -> (
         axum::serve(listener, router)
             .await
             .expect("stalling direct object-write test server should run");
+    });
+    (state, server)
+}
+
+#[derive(Clone)]
+struct DirectTransportDelayedStoreIndexWaitState {
+    public_url: String,
+    paired_session_count: Arc<AtomicUsize>,
+    captured_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
+}
+
+async fn direct_transport_delays_store_index_wait_ws(
+    State(state): State<DirectTransportDelayedStoreIndexWaitState>,
+    websocket: WebSocketUpgrade,
+) -> impl IntoResponse {
+    websocket.on_upgrade(move |socket| async move {
+        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+        serve_direct_transport_delays_store_index_wait_socket(state, socket).await;
+    })
+}
+
+async fn serve_direct_transport_delays_store_index_wait_socket(
+    state: DirectTransportDelayedStoreIndexWaitState,
+    socket: WebSocket,
+) {
+    let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
+    let mut session =
+        MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
+            .expect("delayed store index wait session should spawn");
+
+    let hello = perform_transport_server_handshake(
+        &mut session,
+        TransportSessionControlMessage::Ready {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            session_id: format!("delayed-store-index-session-{}", uuid::Uuid::now_v7()),
+            max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .expect("delayed store index wait handshake should succeed");
+    assert!(matches!(
+        hello,
+        TransportSessionControlMessage::Hello {
+            role: TransportSessionRole::Client,
+            ..
+        }
+    ));
+
+    while let Some(mut stream) = session
+        .accept_stream()
+        .await
+        .expect("delayed store index wait stream accept should succeed")
+    {
+        let request = read_buffered_transport_request(&mut stream)
+            .await
+            .expect("delayed store index wait request should decode");
+        *state.captured_request.lock().await = Some(capture_transport_request(&request));
+        assert_eq!(
+            request.path,
+            "/api/v1/store/index/changes/wait?since=41&timeout_ms=2500"
+        );
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+        let response_body = serde_json::to_vec(&serde_json::json!({
+            "sequence": 41,
+            "changed": false,
+        }))
+        .expect("store index wait response should serialize");
+        write_buffered_transport_response(
+            &mut stream,
+            &MultiplexBufferedTransportResponse {
+                request_id: request.request_id,
+                status: StatusCode::OK.as_u16(),
+                headers: vec![
+                    TransportHeader {
+                        name: "content-type".to_string(),
+                        value: "application/json".to_string(),
+                    },
+                    TransportHeader {
+                        name: "content-length".to_string(),
+                        value: response_body.len().to_string(),
+                    },
+                ],
+                body: response_body,
+            },
+        )
+        .await
+        .expect("store index wait response should write");
+    }
+}
+
+async fn spawn_direct_transport_server_that_delays_store_index_wait() -> (
+    DirectTransportDelayedStoreIndexWaitState,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let state = DirectTransportDelayedStoreIndexWaitState {
+        public_url: format!("http://{addr}"),
+        paired_session_count: Arc::new(AtomicUsize::new(0)),
+        captured_request: Arc::new(Mutex::new(None)),
+    };
+    let router = Router::new()
+        .route(
+            "/transport/ws",
+            get(direct_transport_delays_store_index_wait_ws),
+        )
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("delayed store index wait test server should run");
     });
     (state, server)
 }
@@ -2231,7 +2340,7 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
     let (direct_state, direct_server) =
         spawn_direct_transport_server_that_hangs_after_first_success().await;
     let relay_body = br#"{"status":"ok","route":"relay"}"#.to_vec();
-    let (relay_state, relay_server) = spawn_relay_test_server(
+    let (relay_state, relay_server) = spawn_relay_test_server_with_delay(
         200,
         vec![
             RelayHttpHeader {
@@ -2244,6 +2353,7 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
             },
         ],
         relay_body,
+        500,
     )
     .await;
 
@@ -2308,6 +2418,58 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
     let _ = direct_server.await;
     relay_server.abort();
     let _ = relay_server.await;
+
+    test_result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_only_store_index_wait_can_run_longer_than_failover_timeout() {
+    let (direct_state, direct_server) =
+        spawn_direct_transport_server_that_delays_store_index_wait().await;
+
+    let test_result = async {
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-store-index-wait-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
+            .with_client_identity(identity);
+
+        let started_at = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.wait_for_store_index_change(41, 2_500),
+        )
+        .await
+        .expect("store index wait should not time out client-side")
+        .expect("store index wait should succeed");
+
+        assert!(started_at.elapsed() >= Duration::from_millis(2_400));
+        assert_eq!(response.sequence, 41);
+        assert!(!response.changed);
+
+        let captured = direct_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct request should be captured");
+        assert_eq!(captured.method, "GET");
+        assert_eq!(
+            captured.path_and_query,
+            "/api/v1/store/index/changes/wait?since=41&timeout_ms=2500"
+        );
+        assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    direct_server.abort();
+    let _ = direct_server.await;
 
     test_result.unwrap();
 }

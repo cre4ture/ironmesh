@@ -5640,6 +5640,61 @@ run_on_main_metadata_backends!(
     start_upload_session_prefills_existing_chunk_refs_turso
 );
 
+#[tokio::test]
+async fn client_mutation_operation_waiter_observes_completion_without_missing_signal() {
+    let store = Arc::new(std::sync::Mutex::new(
+        super::ClientMutationOperationStore::default(),
+    ));
+    let mut owner = match super::claim_client_mutation_operation(
+        &store,
+        "device-idempotent".to_string(),
+        "operation-complete".to_string(),
+        "fingerprint-complete",
+    ) {
+        super::ClientMutationOperationClaim::Owner(owner) => owner,
+        claim => panic!("expected owner claim, got {claim:?}"),
+    };
+    let mut waiter = match super::claim_client_mutation_operation(
+        &store,
+        "device-idempotent".to_string(),
+        "operation-complete".to_string(),
+        "fingerprint-complete",
+    ) {
+        super::ClientMutationOperationClaim::Wait(waiter) => waiter,
+        claim => panic!("expected waiter claim, got {claim:?}"),
+    };
+
+    owner.complete(super::ClientMutationRecordedResponse {
+        status: StatusCode::CREATED,
+        headers: Vec::new(),
+        body: Bytes::from_static(b"ok"),
+    });
+
+    tokio::time::timeout(Duration::from_millis(100), async {
+        if !*waiter.borrow() {
+            waiter
+                .changed()
+                .await
+                .expect("waiter should observe owner completion");
+        }
+    })
+    .await
+    .expect("waiter should not block after owner completion");
+
+    match super::claim_client_mutation_operation(
+        &store,
+        "device-idempotent".to_string(),
+        "operation-complete".to_string(),
+        "fingerprint-complete",
+    ) {
+        super::ClientMutationOperationClaim::Replay(response) => {
+            assert_eq!(response.status, StatusCode::CREATED);
+            assert_eq!(response.body, Bytes::from_static(b"ok"));
+        }
+        claim => panic!("expected replay claim after completion, got {claim:?}"),
+    }
+}
+
 async fn start_upload_session_replays_same_response_for_same_operation_id_impl(
     backend: MainTestBackend,
 ) {

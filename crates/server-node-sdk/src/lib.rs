@@ -879,7 +879,7 @@ struct ClientMutationRecordedResponse {
 #[derive(Debug)]
 enum ClientMutationOperationState {
     InProgress {
-        notify: Arc<Notify>,
+        completion_tx: watch::Sender<bool>,
     },
     Completed {
         response: ClientMutationRecordedResponse,
@@ -901,7 +901,7 @@ struct ClientMutationOperationStore {
 #[derive(Debug)]
 enum ClientMutationOperationClaim {
     Owner(ClientMutationOperationLease),
-    Wait(Arc<Notify>),
+    Wait(watch::Receiver<bool>),
     Replay(ClientMutationRecordedResponse),
     Conflict,
 }
@@ -973,16 +973,19 @@ impl ClientMutationOperationLease {
             return;
         };
 
-        let notify = match &entry.state {
-            ClientMutationOperationState::InProgress { notify } => Some(notify.clone()),
+        let completion_tx = match &entry.state {
+            ClientMutationOperationState::InProgress { completion_tx } => {
+                Some(completion_tx.clone())
+            }
             ClientMutationOperationState::Completed { .. } => None,
         };
         entry.updated_at_unix = now;
         entry.state = ClientMutationOperationState::Completed { response };
         self.completed = true;
+        drop(store);
 
-        if let Some(notify) = notify {
-            notify.notify_waiters();
+        if let Some(completion_tx) = completion_tx {
+            let _ = completion_tx.send(true);
         }
     }
 }
@@ -997,10 +1000,17 @@ impl Drop for ClientMutationOperationLease {
             Ok(store) => store,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(entry) = store.entries.remove(&self.key)
-            && let ClientMutationOperationState::InProgress { notify } = entry.state
-        {
-            notify.notify_waiters();
+        let completion_tx = match store.entries.remove(&self.key) {
+            Some(ClientMutationOperationEntry {
+                state: ClientMutationOperationState::InProgress { completion_tx },
+                ..
+            }) => Some(completion_tx),
+            _ => None,
+        };
+        drop(store);
+
+        if let Some(completion_tx) = completion_tx {
+            let _ = completion_tx.send(true);
         }
     }
 }
@@ -1201,8 +1211,8 @@ fn claim_client_mutation_operation(
             return ClientMutationOperationClaim::Conflict;
         }
         return match &entry.state {
-            ClientMutationOperationState::InProgress { notify } => {
-                ClientMutationOperationClaim::Wait(notify.clone())
+            ClientMutationOperationState::InProgress { completion_tx } => {
+                ClientMutationOperationClaim::Wait(completion_tx.subscribe())
             }
             ClientMutationOperationState::Completed { response } => {
                 ClientMutationOperationClaim::Replay(response.clone())
@@ -1210,14 +1220,13 @@ fn claim_client_mutation_operation(
         };
     }
 
+    let (completion_tx, _completion_rx) = watch::channel(false);
     operation_store.entries.insert(
         key.clone(),
         ClientMutationOperationEntry {
             request_fingerprint: request_fingerprint.to_string(),
             updated_at_unix: now,
-            state: ClientMutationOperationState::InProgress {
-                notify: Arc::new(Notify::new()),
-            },
+            state: ClientMutationOperationState::InProgress { completion_tx },
         },
     );
     ClientMutationOperationClaim::Owner(ClientMutationOperationLease {
@@ -1309,8 +1318,10 @@ where
                     }
                 }
             }
-            ClientMutationOperationClaim::Wait(notify) => {
-                notify.notified().await;
+            ClientMutationOperationClaim::Wait(mut completion_rx) => {
+                if !*completion_rx.borrow() {
+                    let _ = completion_rx.changed().await;
+                }
             }
             ClientMutationOperationClaim::Replay(response) => return response.into_response(),
             ClientMutationOperationClaim::Conflict => {
