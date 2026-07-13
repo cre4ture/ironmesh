@@ -2025,9 +2025,7 @@ impl PersistentStore {
         let (metadata_db_path, metadata_store): (PathBuf, Arc<dyn MetadataStore>) = match backend {
             MetadataBackendKind::Sqlite => (
                 state_dir.join("metadata.sqlite"),
-                Arc::new(SqliteMetadataStore::open(
-                    &state_dir.join("metadata.sqlite"),
-                )?),
+                Arc::new(SqliteMetadataStore::open(&state_dir.join("metadata.sqlite")).await?),
             ),
             #[cfg(feature = "turso-metadata")]
             MetadataBackendKind::Turso => {
