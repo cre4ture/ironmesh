@@ -140,11 +140,12 @@ pub(crate) struct DataScrubRunOutput {
 
 #[derive(Debug, Clone)]
 enum VerifiedChunkState {
-    Valid,
+    Present {
+        actual_size_bytes: u64,
+        actual_hash: String,
+    },
     Missing,
     ReadError(String),
-    SizeMismatch { actual_size_bytes: u64 },
-    HashMismatch { actual_hash: String },
 }
 
 #[derive(Debug, Clone)]
@@ -535,7 +536,39 @@ impl DataScrubber {
             };
 
             match verified_state {
-                VerifiedChunkState::Valid => {}
+                VerifiedChunkState::Present {
+                    actual_size_bytes,
+                    actual_hash,
+                } => {
+                    if actual_size_bytes != chunk.size_bytes as u64 {
+                        self.push_issue(
+                            output,
+                            contexts,
+                            DataScrubIssueKind::ChunkSizeMismatch,
+                            Some(manifest_hash.to_string()),
+                            Some(chunk.hash.clone()),
+                            format!(
+                                "chunk size mismatch expected={} actual={actual_size_bytes}",
+                                chunk.size_bytes,
+                            ),
+                        );
+                        continue;
+                    }
+
+                    if actual_hash != chunk.hash {
+                        self.push_issue(
+                            output,
+                            contexts,
+                            DataScrubIssueKind::ChunkHashMismatch,
+                            Some(manifest_hash.to_string()),
+                            Some(chunk.hash.clone()),
+                            format!(
+                                "chunk hash mismatch expected={} actual={actual_hash}",
+                                chunk.hash,
+                            ),
+                        );
+                    }
+                }
                 VerifiedChunkState::Missing => {
                     let issue_kind = if manifest_locally_owned {
                         DataScrubIssueKind::ChunkMissing
@@ -567,32 +600,6 @@ impl DataScrubber {
                         Some(manifest_hash.to_string()),
                         Some(chunk.hash.clone()),
                         read_error,
-                    );
-                }
-                VerifiedChunkState::SizeMismatch { actual_size_bytes } => {
-                    self.push_issue(
-                        output,
-                        contexts,
-                        DataScrubIssueKind::ChunkSizeMismatch,
-                        Some(manifest_hash.to_string()),
-                        Some(chunk.hash.clone()),
-                        format!(
-                            "chunk size mismatch expected={} actual={actual_size_bytes}",
-                            chunk.size_bytes,
-                        ),
-                    );
-                }
-                VerifiedChunkState::HashMismatch { actual_hash } => {
-                    self.push_issue(
-                        output,
-                        contexts,
-                        DataScrubIssueKind::ChunkHashMismatch,
-                        Some(manifest_hash.to_string()),
-                        Some(chunk.hash.clone()),
-                        format!(
-                            "chunk hash mismatch expected={} actual={actual_hash}",
-                            chunk.hash,
-                        ),
                     );
                 }
             }
@@ -645,16 +652,11 @@ impl DataScrubber {
                     hasher.update(&chunk_hash_buffer[..read]);
                 }
 
-                if actual_size_bytes != chunk.size_bytes as u64 {
-                    return VerifiedChunkState::SizeMismatch { actual_size_bytes };
-                }
-
                 let actual_hash = hasher.finalize().to_hex().to_string();
-                if actual_hash != chunk.hash {
-                    return VerifiedChunkState::HashMismatch { actual_hash };
+                VerifiedChunkState::Present {
+                    actual_size_bytes,
+                    actual_hash,
                 }
-
-                VerifiedChunkState::Valid
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => VerifiedChunkState::Missing,
             Err(err) => {

@@ -6606,3 +6606,94 @@ run_on_all_metadata_backends!(
     data_scrub_detects_missing_and_corrupt_chunks,
     data_scrub_detects_missing_and_corrupt_chunks_turso
 );
+
+async fn data_scrub_reports_chunk_size_mismatch_per_manifest_reference_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("data-scrub-cached-chunk-size-mismatch")
+        .await;
+    let payload = Bytes::from_static(b"shared-data-scrub-payload");
+
+    store
+        .put_object_versioned("docs/valid.bin", payload.clone(), PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .put_object_versioned("docs/invalid.bin", payload, PutOptions::default())
+        .await
+        .unwrap();
+
+    let valid_manifest_hash = store
+        .resolve_manifest_hash_for_key("docs/valid.bin", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    let invalid_manifest_hash = store
+        .resolve_manifest_hash_for_key("docs/invalid.bin", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    let valid_manifest = store
+        .load_manifest_by_hash(&valid_manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut invalid_manifest = store
+        .load_manifest_by_hash(&invalid_manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(valid_manifest.chunks.len(), 1);
+    assert_eq!(invalid_manifest.chunks.len(), 1);
+    assert_eq!(
+        valid_manifest.chunks[0].hash,
+        invalid_manifest.chunks[0].hash
+    );
+
+    invalid_manifest.chunks[0].size_bytes = invalid_manifest.chunks[0].size_bytes.saturating_add(1);
+    invalid_manifest.total_size_bytes = invalid_manifest.total_size_bytes.saturating_add(1);
+    let invalid_chunk_hash = invalid_manifest.chunks[0].hash.clone();
+    let invalid_manifest_bytes = serde_json::to_vec(&invalid_manifest).unwrap();
+    let mutated_manifest_hash = store
+        .replace_manifest_bytes_for_subject_for_test(
+            "docs/invalid.bin",
+            None,
+            &invalid_manifest_bytes,
+        )
+        .await
+        .unwrap();
+
+    let report = store.run_data_scrub().await.unwrap();
+    let size_mismatches = report
+        .issues
+        .iter()
+        .filter(|issue| issue.kind == DataScrubIssueKind::ChunkSizeMismatch)
+        .collect::<Vec<_>>();
+
+    assert_eq!(report.issue_count, 1, "issues={:?}", report.issues);
+    assert_eq!(size_mismatches.len(), 1, "issues={:?}", report.issues);
+    assert_eq!(
+        size_mismatches[0].manifest_hash.as_deref(),
+        Some(mutated_manifest_hash.as_str())
+    );
+    assert_eq!(
+        size_mismatches[0].chunk_hash.as_deref(),
+        Some(invalid_chunk_hash.as_str())
+    );
+    assert!(
+        !report.issues.iter().any(|issue| {
+            issue.kind == DataScrubIssueKind::ChunkSizeMismatch
+                && issue.manifest_hash.as_deref() == Some(valid_manifest_hash.as_str())
+        }),
+        "issues={:?}",
+        report.issues
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    data_scrub_reports_chunk_size_mismatch_per_manifest_reference_impl,
+    data_scrub_reports_chunk_size_mismatch_per_manifest_reference,
+    data_scrub_reports_chunk_size_mismatch_per_manifest_reference_turso
+);

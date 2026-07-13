@@ -1185,7 +1185,21 @@ trait MetadataStore: Send + Sync {
     async fn filter_locally_owned_manifests(
         &self,
         manifest_hashes: &[String],
-    ) -> Result<HashSet<String>>;
+    ) -> Result<HashSet<String>> {
+        if manifest_hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let locally_owned = self.list_locally_owned_manifests().await?;
+        let requested = manifest_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        Ok(locally_owned
+            .into_iter()
+            .filter(|manifest_hash| requested.contains(manifest_hash.as_str()))
+            .collect())
+    }
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>>;
     async fn list_storage_stats_history(
         &self,
