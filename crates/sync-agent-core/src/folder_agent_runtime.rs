@@ -2327,6 +2327,12 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                         suppressed_uploads.remove(path);
                         if let Some(local_state) = local_state.as_deref_mut() {
                             remove_local_state_path_and_descendants(local_state, path);
+                            sync_local_state_parent_directories(
+                                backend,
+                                options,
+                                local_state,
+                                path,
+                            )?;
                         }
                     }
                 }
@@ -3151,6 +3157,16 @@ mod tests {
             self.operations
                 .push(BackendOperation::RemoveLocalPath(relative_path.to_string()));
             remove_local_state_path_and_descendants(&mut self.local_entries, relative_path);
+            for parent in parent_directories(relative_path) {
+                self.local_entries.insert(
+                    parent,
+                    LocalEntryState {
+                        kind: LocalEntryKind::Directory,
+                        size_bytes: 0,
+                        modified_unix_ms: 17,
+                    },
+                );
+            }
             Ok(())
         }
 
@@ -3617,9 +3633,23 @@ mod tests {
                 "nested/child.txt".to_string()
             )]
         );
-        assert!(backend.local_entries.contains_key("nested"));
+        assert_eq!(
+            backend.local_entries.get("nested"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 17,
+            })
+        );
         assert!(!backend.local_entries.contains_key("nested/child.txt"));
-        assert!(local_state.contains_key("nested"));
+        assert_eq!(
+            local_state.get("nested"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 17,
+            })
+        );
         assert!(!local_state.contains_key("nested/child.txt"));
         assert!(remote_index.directories.is_empty());
         assert!(remote_index.files.is_empty());
