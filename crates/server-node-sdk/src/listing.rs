@@ -1,5 +1,7 @@
 use super::*;
 
+const KEY_LISTING_PREALLOC_LIMIT: usize = 1024;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum KeyListingPrefixMode {
@@ -72,7 +74,11 @@ pub(crate) fn paginate_sorted_keys(
         None
     };
 
-    let mut entries = Vec::with_capacity(max_keys.min(sorted_keys.len()));
+    let mut entries = Vec::with_capacity(
+        max_keys
+            .min(sorted_keys.len())
+            .min(KEY_LISTING_PREALLOC_LIMIT),
+    );
     let mut last_emitted_entry = None::<(String, KeyListingEntryKind)>;
     let mut has_more = false;
 
