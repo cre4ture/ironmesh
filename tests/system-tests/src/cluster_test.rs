@@ -5681,4 +5681,103 @@ mod tests {
 
         result
     }
+
+    #[tokio::test]
+    async fn rendezvous_mesh_reports_connected_peers_and_reflexive_candidates() -> Result<()> {
+        let rendezvous_bind_a = "127.0.0.1:19260";
+        let rendezvous_bind_b = "127.0.0.1:19261";
+        let bind = "127.0.0.1:19262";
+        let node_id = "00000000-0000-0000-0000-000000000962";
+        let rendezvous_url_a = format!("http://{rendezvous_bind_a}");
+        let rendezvous_url_b = format!("http://{rendezvous_bind_b}");
+        let data_dir = fresh_data_dir("rendezvous-mesh-reflexive-node");
+        let localhost_internal_url = localhost_internal_base_url_from_public_bind(bind)?;
+        let expected_reflexive_endpoint = internal_base_url_from_public_bind(bind)?;
+
+        let rendezvous_a_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_b.as_str())];
+        let rendezvous_b_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_a.as_str())];
+        let node_env = [
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url_a.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_INTERNAL_URL", localhost_internal_url.as_str()),
+        ];
+
+        let mut rendezvous_a =
+            start_rendezvous_service_with_env(rendezvous_bind_a, &rendezvous_a_env).await?;
+        let mut rendezvous_b =
+            start_rendezvous_service_with_env(rendezvous_bind_b, &rendezvous_b_env).await?;
+        let mut node = start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url_a, 1, 120).await?;
+            wait_for_rendezvous_mesh_peer_connected(&rendezvous_url_a, &rendezvous_url_b, 120)
+                .await?;
+            wait_for_rendezvous_candidate_endpoint(
+                &rendezvous_url_a,
+                &expected_reflexive_endpoint,
+                120,
+            )
+            .await?;
+
+            let mesh: serde_json::Value = http
+                .get(format!("{rendezvous_url_a}/control/mesh"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert!(
+                mesh.get("endpoint_statuses")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|statuses| {
+                        statuses.iter().any(|status| {
+                            status.get("url").and_then(|value| value.as_str())
+                                == Some(rendezvous_url_b.as_str())
+                                && status.get("status").and_then(|value| value.as_str())
+                                    == Some("connected")
+                        })
+                    }),
+                "expected mesh status to report {rendezvous_url_b} as connected: {mesh:#}"
+            );
+
+            let presence: serde_json::Value = http
+                .get(format!("{rendezvous_url_a}/control/presence"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let reflexive_candidate = presence
+                .get("entries")
+                .and_then(|value| value.as_array())
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("registration"))
+                .and_then(|registration| registration.get("direct_candidates"))
+                .and_then(|value| value.as_array())
+                .and_then(|candidates| {
+                    candidates.iter().find(|candidate| {
+                        candidate.get("endpoint").and_then(|value| value.as_str())
+                            == Some(expected_reflexive_endpoint.as_str())
+                    })
+                })
+                .context("reflexive candidate missing from presence payload")?;
+            assert_eq!(
+                reflexive_candidate
+                    .get("kind")
+                    .and_then(|value| value.as_str()),
+                Some("server_reflexive")
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous_a).await;
+        stop_server(&mut rendezvous_b).await;
+        stop_server(&mut node).await;
+        let _ = fs::remove_dir_all(&data_dir);
+
+        result
+    }
 }

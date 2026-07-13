@@ -30,7 +30,8 @@ mod tests {
     use bytes::Bytes;
     use client_sdk::{
         BootstrapEndpointUse, ClientNode, ConnectionBootstrap, ContentAddressedClientCache,
-        IronMeshClient, LatencyProbeConfig, UploadMode, enroll_connection_input_blocking,
+        IronMeshClient, LatencyProbeConfig, UploadMode,
+        build_http_client_with_identity_from_planned_targets, enroll_connection_input_blocking,
     };
     use serde_json::json;
     use time::OffsetDateTime;
@@ -42,9 +43,11 @@ mod tests {
     use crate::framework::{
         EnrolledTestClient, TEST_ADMIN_TOKEN, fresh_data_dir, issue_bootstrap_bundle,
         issue_bootstrap_bundle_and_enroll_client, issue_bootstrap_claim,
-        latest_snapshot_id_for_client, register_node, start_authenticated_server,
-        start_open_server_with_config, start_open_server_with_env, start_rendezvous_service,
-        stop_server, wait_for_online_nodes, wait_for_rendezvous_registered_endpoints,
+        latest_snapshot_id_for_client, localhost_internal_base_url_from_public_bind, register_node,
+        start_authenticated_server, start_open_server_with_config, start_open_server_with_env,
+        start_rendezvous_service, start_rendezvous_service_with_env, stop_server,
+        wait_for_online_nodes, wait_for_rendezvous_candidate_endpoint,
+        wait_for_rendezvous_mesh_peer_connected, wait_for_rendezvous_registered_endpoints,
     };
 
     async fn start_authenticated_test_client(
@@ -1483,6 +1486,114 @@ mod tests {
         stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&client_dir);
         let _ = fs::remove_dir_all(&server_data_dir);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn refresh_dynamic_targets_blocking_discovers_mesh_peers_and_reflexive_candidate()
+    -> Result<()> {
+        let rendezvous_bind_a = "127.0.0.1:19263";
+        let rendezvous_bind_b = "127.0.0.1:19264";
+        let bind = "127.0.0.1:19265";
+        let node_id = "00000000-0000-0000-0000-000000000965";
+        let rendezvous_url_a = format!("http://{rendezvous_bind_a}");
+        let rendezvous_url_b = format!("http://{rendezvous_bind_b}");
+        let base_url = format!("http://{bind}");
+        let data_dir = fresh_data_dir("dynamic-refresh-discovery-node");
+        let client_dir = fresh_data_dir("dynamic-refresh-discovery-client");
+        fs::create_dir_all(&client_dir)?;
+
+        let localhost_internal_url = localhost_internal_base_url_from_public_bind(bind)?;
+        let expected_reflexive_endpoint =
+            crate::framework::internal_base_url_from_public_bind(bind)?;
+        let expected_reflexive_target = format!("{expected_reflexive_endpoint}/");
+        let expected_localhost_target = format!("{localhost_internal_url}/");
+
+        let rendezvous_a_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_b.as_str())];
+        let rendezvous_b_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_a.as_str())];
+        let node_env = [
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url_a.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_INTERNAL_URL", localhost_internal_url.as_str()),
+        ];
+
+        let mut rendezvous_a =
+            start_rendezvous_service_with_env(rendezvous_bind_a, &rendezvous_a_env).await?;
+        let mut rendezvous_b =
+            start_rendezvous_service_with_env(rendezvous_bind_b, &rendezvous_b_env).await?;
+        let mut server =
+            start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url_a, 1, 120).await?;
+            wait_for_rendezvous_mesh_peer_connected(&rendezvous_url_a, &rendezvous_url_b, 120)
+                .await?;
+            wait_for_rendezvous_candidate_endpoint(
+                &rendezvous_url_a,
+                &expected_reflexive_endpoint,
+                120,
+            )
+            .await?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_url,
+                TEST_ADMIN_TOKEN,
+                &client_dir,
+                "dynamic-refresh.bootstrap.json",
+                Some("dynamic-refresh"),
+                Some(3600),
+            )
+            .await?;
+
+            let bootstrap = enrolled.bootstrap.clone();
+            let identity = enrolled.identity.clone();
+            let targets = tokio::task::spawn_blocking(move || {
+                bootstrap.refresh_dynamic_targets_blocking(Some(&identity))
+            })
+            .await
+            .context("dynamic refresh task panicked")??;
+
+            assert!(
+                targets.iter().any(|target| {
+                    target.server_base_url.as_deref() == Some(expected_localhost_target.as_str())
+                }),
+                "expected refreshed targets to include discovered localhost peer candidate: {targets:#?}"
+            );
+            assert!(
+                targets.iter().any(|target| {
+                    target.server_base_url.as_deref() == Some(expected_reflexive_target.as_str())
+                }),
+                "expected refreshed targets to include reflexive candidate: {targets:#?}"
+            );
+
+            let relay_target = targets
+                .iter()
+                .find(|target| target.path_kind == transport_sdk::TransportPathKind::RelayTunnel)
+                .context("expected refreshed targets to include a relay target")?;
+            assert_eq!(
+                relay_target.rendezvous_urls,
+                vec![
+                    format!("{rendezvous_url_a}/"),
+                    format!("{rendezvous_url_b}/"),
+                ]
+            );
+
+            let refreshed_client =
+                build_http_client_with_identity_from_planned_targets(&targets, &enrolled.identity)?;
+            refreshed_client.store_index(None, 1, None).await?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous_a).await;
+        stop_server(&mut rendezvous_b).await;
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
 
         result
     }

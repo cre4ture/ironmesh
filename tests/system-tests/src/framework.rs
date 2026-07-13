@@ -199,6 +199,18 @@ pub fn internal_base_url_from_public_bind(public_bind: &str) -> Result<String> {
     ))
 }
 
+#[allow(dead_code)]
+pub fn localhost_internal_base_url_from_public_bind(public_bind: &str) -> Result<String> {
+    let (_, port_str) = public_bind
+        .rsplit_once(':')
+        .context("invalid bind address (expected host:port)")?;
+    let port: u16 = port_str.parse().context("invalid bind port")?;
+    let internal_port = port
+        .checked_add(10_000)
+        .context("bind port too high to derive internal port")?;
+    Ok(format!("https://localhost:{internal_port}"))
+}
+
 pub fn mtls_client_from_data_dir(data_dir: &Path) -> Result<reqwest::Client> {
     let tls_dir = data_dir.join("tls");
     let ca_pem = fs::read(tls_dir.join("ca.pem")).context("failed reading ca.pem")?;
@@ -1305,6 +1317,79 @@ pub async fn wait_for_rendezvous_registered_endpoints(
     bail!(
         "rendezvous did not report registered_endpoints={} at {base_url}/control/presence",
         expected_registered_endpoints
+    );
+}
+
+#[allow(dead_code)]
+pub async fn wait_for_rendezvous_mesh_peer_connected(
+    base_url: &str,
+    peer_url: &str,
+    retries: usize,
+) -> Result<()> {
+    let http = reqwest::Client::new();
+
+    for _ in 0..retries {
+        if let Ok(resp) = http.get(format!("{base_url}/control/mesh")).send().await
+            && let Ok(ok_resp) = resp.error_for_status()
+            && let Ok(payload) = ok_resp.json::<serde_json::Value>().await
+            && payload
+                .get("endpoint_statuses")
+                .and_then(|value| value.as_array())
+                .is_some_and(|statuses| {
+                    statuses.iter().any(|status| {
+                        status.get("url").and_then(|value| value.as_str()) == Some(peer_url)
+                            && status.get("status").and_then(|value| value.as_str())
+                                == Some("connected")
+                    })
+                })
+        {
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    bail!("rendezvous mesh did not report connected peer {peer_url} at {base_url}/control/mesh");
+}
+
+#[allow(dead_code)]
+pub async fn wait_for_rendezvous_candidate_endpoint(
+    base_url: &str,
+    candidate_endpoint: &str,
+    retries: usize,
+) -> Result<()> {
+    let http = reqwest::Client::new();
+
+    for _ in 0..retries {
+        if let Ok(resp) = http.get(format!("{base_url}/control/presence")).send().await
+            && let Ok(ok_resp) = resp.error_for_status()
+            && let Ok(payload) = ok_resp.json::<serde_json::Value>().await
+            && payload
+                .get("entries")
+                .and_then(|value| value.as_array())
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry
+                            .get("registration")
+                            .and_then(|registration| registration.get("direct_candidates"))
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|candidates| {
+                                candidates.iter().any(|candidate| {
+                                    candidate.get("endpoint").and_then(|value| value.as_str())
+                                        == Some(candidate_endpoint)
+                                })
+                            })
+                    })
+                })
+        {
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    bail!(
+        "rendezvous presence did not expose candidate endpoint {candidate_endpoint} at {base_url}/control/presence"
     );
 }
 
