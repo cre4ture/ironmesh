@@ -1122,7 +1122,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
 
-    let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
+    let refresh_poller = RemoteSnapshotPoller::prefer_server_notifications(refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
     let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
     store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
@@ -1138,10 +1138,11 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_latest_metrics = latest_metrics.clone();
     let remote_last_success = last_success_shared.clone();
     let remote_idle_message = idle_watch_message.clone();
-    let remote_thread = refresh_poller.spawn_changed_paths_loop(
+    let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
         remote_running,
         Some(initial_snapshot),
-        move || {
+        refresh_fetcher,
+        move |refresh_fetcher| {
             fetch_remote_snapshot_with_status_progress(
                 &remote_options,
                 &remote_connection_target,
@@ -1152,7 +1153,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 "steady-state",
                 "checking-remote-snapshot",
                 "Checking remote snapshot for changes",
-                &refresh_fetcher,
+                refresh_fetcher,
                 latest_metrics_value(&remote_latest_metrics),
                 load_optional_unix_ms(&remote_last_success),
                 Some(remote_idle_message.as_str()),
