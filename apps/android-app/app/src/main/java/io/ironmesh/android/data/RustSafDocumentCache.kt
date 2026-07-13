@@ -20,6 +20,7 @@ internal class RustSafDocumentCache(
 ) {
     private val lock = Any()
     private val trees = mutableMapOf<String, TreeCacheState>()
+    private var nextTreeStateId = 1L
 
     fun invalidateTree(treeUriString: String) {
         synchronized(lock) {
@@ -51,16 +52,21 @@ internal class RustSafDocumentCache(
         parentDocumentId: String,
         loader: () -> List<RustSafChildDocument>,
     ): List<RustSafChildDocument> {
-        synchronized(lock) {
-            trees[treeUriString]?.childrenByParentDocumentId?.get(parentDocumentId)?.let { children ->
+        val expectedStateId = synchronized(lock) {
+            val state = treeState(treeUriString)
+            state.childrenByParentDocumentId[parentDocumentId]?.let { children ->
                 return children
             }
+            state.stateId
         }
 
         val loadedChildren = loader()
 
         synchronized(lock) {
-            val state = treeState(treeUriString)
+            val state = trees[treeUriString]
+            if (state == null || state.stateId != expectedStateId) {
+                return loadedChildren.toList()
+            }
             val existing = state.childrenByParentDocumentId[parentDocumentId]
             if (existing != null) {
                 return existing
@@ -75,6 +81,7 @@ internal class RustSafDocumentCache(
     private fun treeState(treeUriString: String): TreeCacheState {
         return trees.getOrPut(treeUriString) {
             TreeCacheState(
+                stateId = nextTreeStateId++,
                 documentsByPath = lruMap(maxCachedDocumentPaths),
                 childrenByParentDocumentId = lruMap(maxCachedChildLists),
             )
@@ -82,6 +89,7 @@ internal class RustSafDocumentCache(
     }
 
     private data class TreeCacheState(
+        val stateId: Long,
         val documentsByPath: LinkedHashMap<String, RustSafChildDocument>,
         val childrenByParentDocumentId: LinkedHashMap<String, List<RustSafChildDocument>>,
     )
