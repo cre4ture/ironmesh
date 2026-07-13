@@ -57,6 +57,24 @@ pub(super) fn normalize_public_api_v1_path_and_query(path_and_query: &str) -> Co
     }
 }
 
+pub(super) fn is_streamed_object_read_path(path_and_query: &str) -> bool {
+    let path_only = path_and_query
+        .trim()
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(path_and_query.trim());
+    let path_only = strip_public_api_v1_prefix(path_only);
+    let Some(tail) = path_only.strip_prefix("/store/") else {
+        return false;
+    };
+
+    !tail.is_empty()
+        && tail != "index"
+        && !tail.starts_with("index/")
+        && tail != "uploads"
+        && !tail.starts_with("uploads/")
+}
+
 pub(super) async fn execute_buffered_transport_request(
     state: &ServerState,
     scope: &TransportExecutionScope,
@@ -435,14 +453,17 @@ async fn buffered_response_from_axum_response(
     response: Response,
 ) -> Result<BufferedTransportResponse> {
     let (parts, body) = response.into_parts();
-    let body = to_bytes(body, usize::MAX)
-        .await
-        .context("failed buffering transport service response body")?;
+    let body = to_bytes(
+        body,
+        transport_sdk::MAX_BUFFERED_TRANSPORT_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .context("failed buffering transport service response body")?;
     Ok(BufferedTransportResponse {
         request_id,
         status: parts.status.as_u16(),
         headers: transport_headers_from_response(&parts.headers),
-        body: body.to_vec(),
+        body: body.into(),
     })
 }
 
@@ -668,4 +689,45 @@ fn build_internal_transport_router(state: ServerState) -> Router {
             state,
             require_internal_caller,
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+
+    use super::*;
+
+    #[test]
+    fn streamed_object_read_path_excludes_reserved_routes() {
+        assert!(is_streamed_object_read_path("/store/file.txt"));
+        assert!(is_streamed_object_read_path(
+            "/api/v1/store/folder%2Ffile.txt?version=test"
+        ));
+        assert!(!is_streamed_object_read_path("/store/index"));
+        assert!(!is_streamed_object_read_path(
+            "/store/index/changes/wait?since=1"
+        ));
+        assert!(!is_streamed_object_read_path("/store/uploads"));
+        assert!(!is_streamed_object_read_path("/store/uploads/session-1"));
+        assert!(!is_streamed_object_read_path("/cluster/status"));
+    }
+
+    #[tokio::test]
+    async fn buffered_response_from_axum_response_enforces_body_limit() {
+        let oversized = vec![b'X'; transport_sdk::MAX_BUFFERED_TRANSPORT_RESPONSE_BODY_BYTES + 1];
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(oversized))
+            .expect("response should build");
+
+        let err = buffered_response_from_axum_response("request-id".to_string(), response)
+            .await
+            .expect_err("oversized buffered transport response should fail");
+        assert!(
+            err.to_string()
+                .contains("failed buffering transport service response body")
+        );
+    }
 }

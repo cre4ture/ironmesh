@@ -10,6 +10,7 @@ use crate::transport_protocol::{
 };
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
+pub const MAX_BUFFERED_TRANSPORT_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BufferedTransportRequest {
@@ -337,15 +338,28 @@ pub async fn read_buffered_transport_response<R>(
 where
     R: AsyncRead + AsyncWrite + Unpin,
 {
+    read_buffered_transport_response_with_limit(reader, MAX_BUFFERED_TRANSPORT_RESPONSE_BODY_BYTES)
+        .await
+}
+
+pub async fn read_buffered_transport_response_with_limit<R>(
+    reader: &mut R,
+    max_body_bytes: usize,
+) -> Result<BufferedTransportResponse>
+where
+    R: AsyncRead + AsyncWrite + Unpin,
+{
     let head = read_transport_response_head(reader)
         .await
         .context("failed reading buffered transport response head")?;
 
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .await
-        .context("failed reading buffered transport response body")?;
+    let body = read_transport_body_with_limit(
+        reader,
+        max_body_bytes,
+        "failed reading buffered transport response body",
+        "buffered transport response body exceeded configured limit",
+    )
+    .await?;
     let response = BufferedTransportResponse {
         request_id: head.request_id,
         status: head.status,
@@ -354,6 +368,33 @@ where
     };
     response.validate()?;
     Ok(response)
+}
+
+async fn read_transport_body_with_limit<R>(
+    reader: &mut R,
+    max_body_bytes: usize,
+    read_error_context: &str,
+    limit_error_context: &str,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .with_context(|| read_error_context.to_string())?;
+        if read == 0 {
+            return Ok(body);
+        }
+        if body.len().saturating_add(read) > max_body_bytes {
+            bail!("{limit_error_context}: {max_body_bytes} bytes");
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
 }
 
 pub async fn write_transport_request_head<W>(
@@ -580,6 +621,38 @@ mod tests {
             .await
             .expect("request should decode");
         assert_eq!(decoded.body, body);
+
+        write_task.await.expect("write task should join");
+    }
+
+    #[tokio::test]
+    async fn buffered_transport_response_body_limit_is_enforced() {
+        let (left, right) = duplex(64 * 1024);
+        let mut left = left.compat();
+        let mut right = right.compat();
+        let oversized_body = vec![b'R'; MAX_BUFFERED_TRANSPORT_RESPONSE_BODY_BYTES + 1];
+
+        let write_task = tokio::spawn(async move {
+            write_buffered_transport_response(
+                &mut left,
+                &BufferedTransportResponse {
+                    request_id: "request-id".to_string(),
+                    status: 200,
+                    headers: Vec::new(),
+                    body: oversized_body,
+                },
+            )
+            .await
+            .expect("response should write");
+        });
+
+        let err = read_buffered_transport_response(&mut right)
+            .await
+            .expect_err("response body should exceed the buffered limit");
+        assert!(
+            err.to_string()
+                .contains("buffered transport response body exceeded configured limit")
+        );
 
         write_task.await.expect("write task should join");
     }
