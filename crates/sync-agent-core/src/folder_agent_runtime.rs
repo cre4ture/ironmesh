@@ -2522,7 +2522,6 @@ enum LocalScanTrigger {
 const LOCAL_SCAN_INTERVAL_FLOOR: Duration = Duration::from_millis(250);
 const WATCH_LOCAL_FALLBACK_SCAN_INTERVAL: Duration = Duration::from_secs(60);
 const IDLE_STOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-const REMOTE_NOTIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn watch_mode_label(
     options: &FolderAgentRuntimeOptions,
