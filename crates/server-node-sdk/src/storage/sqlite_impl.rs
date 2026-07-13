@@ -1696,11 +1696,11 @@ impl MetadataStore for SqliteMetadataStore {
         let db = self.metadata_conn()?;
         let mut records = Vec::new();
         if let Some(prefix) = ironmesh_key_prefix {
-            let like_pattern = format!("{prefix}%");
+            let like_pattern = super::sqlite_like_prefix_pattern(prefix);
             let mut stmt = db.prepare(
                 "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
                  FROM s3_object_versions
-                 WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2
+                 WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2 ESCAPE '\\'
                  ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
             )?;
             let rows = stmt.query_map(params![bucket_name, like_pattern], |row| {

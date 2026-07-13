@@ -20364,7 +20364,7 @@ async fn delete_s3_bucket(
         Err(status) => return status.into_response(),
     };
 
-    let root_prefix =
+    let (root_prefix, versioning_status) =
         {
             let control_plane = state.s3.control_plane.lock().await;
             let Some(bucket) = control_plane.buckets.iter().find(|bucket| {
@@ -20372,24 +20372,23 @@ async fn delete_s3_bucket(
             }) else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            bucket.root_prefix.clone()
+            (bucket.root_prefix.clone(), bucket.versioning_status)
         };
 
-    let bucket_not_empty = {
-        let store = read_store(&state, "s3_bucket_delete.inspect").await;
-        let inspector = match store.store_index_inspector().await {
-            Ok(inspector) => inspector,
-            Err(err) => {
-                warn!(error = %err, bucket_name = %bucket_name, "failed to inspect S3 bucket contents");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        inspector
-            .current_object_hashes()
-            .into_iter()
-            .any(|(key, manifest_hash)| {
-                key.starts_with(&root_prefix) && manifest_hash != TOMBSTONE_MANIFEST_HASH
-            })
+    let bucket_not_empty = match s3_bucket_contains_object_versions(
+        &state,
+        &bucket_name,
+        &root_prefix,
+        versioning_status,
+        "s3_bucket_delete.inspect",
+    )
+    .await
+    {
+        Ok(bucket_not_empty) => bucket_not_empty,
+        Err(err) => {
+            warn!(error = %err, bucket_name = %bucket_name, "failed to inspect S3 bucket contents");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     if bucket_not_empty {
         append_admin_audit(
@@ -20447,6 +20446,30 @@ async fn delete_s3_bucket(
     .await;
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn s3_bucket_contains_object_versions(
+    state: &ServerState,
+    bucket_name: &str,
+    root_prefix: &str,
+    versioning_status: S3BucketVersioningStatus,
+    read_context: &'static str,
+) -> Result<bool> {
+    let store = read_store(state, read_context).await;
+    if versioning_status == S3BucketVersioningStatus::Enabled {
+        let versions = store
+            .list_s3_object_versions(bucket_name, Some(root_prefix))
+            .await?;
+        Ok(!versions.is_empty())
+    } else {
+        let inspector = store.store_index_inspector().await?;
+        Ok(inspector
+            .current_object_hashes()
+            .into_iter()
+            .any(|(key, manifest_hash)| {
+                key.starts_with(root_prefix) && manifest_hash != TOMBSTONE_MANIFEST_HASH
+            }))
+    }
 }
 
 async fn list_s3_access_keys(

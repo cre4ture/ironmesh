@@ -280,8 +280,15 @@ mod tests {
                 .filter(|endpoint| endpoint.usage == Some(BootstrapEndpointUse::PublicApi))
                 .filter_map(|endpoint| endpoint.node_id.map(|node_id| node_id.to_string()))
                 .collect::<Vec<_>>();
-
-            assert_eq!(public_direct_node_ids, vec![node_id_a.to_string()]);
+            let mut public_direct_node_ids = public_direct_node_ids;
+            public_direct_node_ids.sort();
+            let mut expected_public_direct_node_ids =
+                vec![node_id_a.to_string(), node_id_b.to_string()];
+            expected_public_direct_node_ids.sort();
+            assert_eq!(
+                public_direct_node_ids,
+                expected_public_direct_node_ids
+            );
 
             let client_identity_json = enrolled
                 .client_identity_material()

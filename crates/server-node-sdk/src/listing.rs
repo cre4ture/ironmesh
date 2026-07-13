@@ -200,7 +200,7 @@ fn entry_for_key(
     let collapsed = segments[..collapse_after].concat();
     let path = if prefix.is_empty() {
         collapsed
-    } else if prefix.ends_with(delimiter) {
+    } else if prefix.ends_with(delimiter) || collapsed.starts_with(delimiter) {
         format!("{prefix}{collapsed}")
     } else {
         format!("{prefix}{delimiter}{collapsed}")

@@ -22,6 +22,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::process::Stdio;
     use std::time::Duration;
+    use time::OffsetDateTime;
     use tokio::process::Command;
     use tokio::time::sleep;
 
@@ -61,6 +62,22 @@ mod tests {
         let region_key = s3_test_hmac_sha256(&date_key, region.as_bytes());
         let service_key = s3_test_hmac_sha256(&region_key, service.as_bytes());
         s3_test_hmac_sha256(&service_key, b"aws4_request").to_vec()
+    }
+
+    fn sigv4_timestamp_components(unix_ts: i64) -> (String, String) {
+        let timestamp = OffsetDateTime::from_unix_timestamp(unix_ts)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            .to_offset(time::UtcOffset::UTC);
+        let year = timestamp.year();
+        let month = timestamp.month() as u8;
+        let day = timestamp.day();
+        let hour = timestamp.hour();
+        let minute = timestamp.minute();
+        let second = timestamp.second();
+        (
+            format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
+            format!("{year:04}{month:02}{day:02}"),
+        )
     }
 
     fn s3_canonical_query(url: &reqwest::Url) -> String {
@@ -117,7 +134,8 @@ mod tests {
             "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
             s3_test_sha256_hex(canonical_request.as_bytes())
         );
-        let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+        let signing_key =
+            s3_test_derive_signing_key(secret_material, &date_scope, region, service);
         let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
             &signing_key,
             string_to_sign.as_bytes(),
@@ -158,8 +176,8 @@ mod tests {
         let url = format!("{}{path_and_query}", s3_base_url.trim_end_matches('/'));
         let parsed_url = reqwest::Url::parse(&url)
             .with_context(|| format!("failed parsing presigned S3 request URL {url}"))?;
-        let amz_date = "20260706T120000Z";
-        let date_scope = "20260706";
+        let (amz_date, date_scope) =
+            sigv4_timestamp_components(OffsetDateTime::now_utc().unix_timestamp());
         let region = "us-east-1";
         let service = "s3";
         let expires = "900";
@@ -187,7 +205,7 @@ mod tests {
             "AWS4-HMAC-SHA256".to_string(),
         ));
         pairs.push(("X-Amz-Credential".to_string(), credential_value));
-        pairs.push(("X-Amz-Date".to_string(), amz_date.to_string()));
+        pairs.push(("X-Amz-Date".to_string(), amz_date.clone()));
         pairs.push(("X-Amz-Expires".to_string(), expires.to_string()));
         pairs.push((
             "X-Amz-SignedHeaders".to_string(),
@@ -210,7 +228,8 @@ mod tests {
             "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
             s3_test_sha256_hex(canonical_request.as_bytes())
         );
-        let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+        let signing_key =
+            s3_test_derive_signing_key(secret_material, &date_scope, region, service);
         let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
             &signing_key,
             string_to_sign.as_bytes(),

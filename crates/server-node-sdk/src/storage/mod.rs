@@ -751,6 +751,18 @@ pub struct S3ObjectVersionRecord {
     pub created_at_unix: u64,
 }
 
+pub(super) fn sqlite_like_prefix_pattern(prefix: &str) -> String {
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for ch in prefix.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectVersionInspection {
     pub version_id: String,
@@ -3396,11 +3408,30 @@ impl PersistentStore {
     }
 
     pub async fn list_versions(&self, key: &str) -> Result<Option<VersionGraphSummary>> {
+        let Some(object_id) = self.object_id_for_key(key).await? else {
+            return Ok(None);
+        };
+        self.version_graph_summary_for_object_id(key, &object_id)
+            .await
+    }
+
+    pub async fn list_versions_with_history(
+        &self,
+        key: &str,
+    ) -> Result<Option<VersionGraphSummary>> {
         let Some(object_id) = self.resolve_object_id_for_key_history(key).await? else {
             return Ok(None);
         };
+        self.version_graph_summary_for_object_id(key, &object_id)
+            .await
+    }
 
-        let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
+    async fn version_graph_summary_for_object_id(
+        &self,
+        key: &str,
+        object_id: &str,
+    ) -> Result<Option<VersionGraphSummary>> {
+        let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
             return Ok(None);
         };
 

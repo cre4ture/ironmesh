@@ -8,6 +8,7 @@ use hmac::{Hmac, Mac};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
+use time::{Date, Month, PrimitiveDateTime, Time};
 use tower::ServiceExt;
 
 const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -596,27 +597,25 @@ async fn delete_bucket(
         );
     }
 
-    let bucket_has_objects = {
-        let store = read_store(&state, "s3.delete_bucket.inspect_objects").await;
-        let inspector = match store.store_index_inspector().await {
-            Ok(inspector) => inspector,
-            Err(err) => {
-                return s3_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalError",
-                    &format!("failed to inspect bucket contents: {err:#}"),
-                    uri.path(),
-                    &request.request_id,
-                );
-            }
-        };
-        inspector
-            .current_object_hashes()
-            .iter()
-            .any(|(key, manifest_hash)| {
-                manifest_hash.as_str() != TOMBSTONE_MANIFEST_HASH
-                    && key.starts_with(&bucket.root_prefix)
-            })
+    let bucket_has_objects = match super::s3_bucket_contains_object_versions(
+        &state,
+        &bucket.bucket_name,
+        &bucket.root_prefix,
+        bucket.versioning_status,
+        "s3.delete_bucket.inspect_objects",
+    )
+    .await
+    {
+        Ok(bucket_has_objects) => bucket_has_objects,
+        Err(err) => {
+            return s3_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("failed to inspect bucket contents: {err:#}"),
+                uri.path(),
+                &request.request_id,
+            );
+        }
     };
     if bucket_has_objects {
         return s3_error_response(
@@ -1029,7 +1028,7 @@ async fn list_object_versions_response(
             continue;
         }
 
-        let version_graph = match store.list_versions(&full_key).await {
+        let version_graph = match store.list_versions_with_history(&full_key).await {
             Ok(graph) => graph,
             Err(err) => {
                 return s3_error_response(
@@ -1562,7 +1561,8 @@ async fn copy_object_response(
         Ok(version) => version,
         Err(response) => return response,
     };
-    let destination_head_before = match store.list_versions(destination_full_key).await {
+    let destination_head_before = match store.list_versions_with_history(destination_full_key).await
+    {
         Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
         Err(err) => {
             return s3_error_response(
@@ -1655,7 +1655,7 @@ async fn copy_object_response(
         }
     }
 
-    let destination_graph = match store.list_versions(destination_full_key).await {
+    let destination_graph = match store.list_versions_with_history(destination_full_key).await {
         Ok(Some(graph)) => graph,
         Ok(None) => {
             return s3_error_response(
@@ -3397,6 +3397,10 @@ fn parse_presigned_authorization(uri: &Uri) -> Result<ParsedS3QueryAuthorization
     if !(1..=604_800).contains(&expires) {
         return Err("X-Amz-Expires must be between 1 and 604800 seconds".to_string());
     }
+    let signed_at_unix = parse_sigv4_timestamp_unix(&amz_date)?;
+    if unix_ts() > signed_at_unix.saturating_add(expires) {
+        return Err("the presigned request has expired".to_string());
+    }
 
     let signed_headers = query_parameter_value(uri, "X-Amz-SignedHeaders")?
         .ok_or_else(|| "X-Amz-SignedHeaders is missing".to_string())?
@@ -3413,6 +3417,42 @@ fn parse_presigned_authorization(uri: &Uri) -> Result<ParsedS3QueryAuthorization
         amz_date,
         payload_hash: S3_UNSIGNED_PAYLOAD.to_string(),
     })
+}
+
+fn parse_sigv4_timestamp_unix(amz_date: &str) -> Result<u64, String> {
+    if amz_date.len() != 16 || &amz_date[8..9] != "T" || !amz_date.ends_with('Z') {
+        return Err("X-Amz-Date must be in SigV4 basic format YYYYMMDDTHHMMSSZ".to_string());
+    }
+
+    let year = amz_date[0..4]
+        .parse::<i32>()
+        .map_err(|_| "X-Amz-Date year is invalid".to_string())?;
+    let month = amz_date[4..6]
+        .parse::<u8>()
+        .map_err(|_| "X-Amz-Date month is invalid".to_string())?;
+    let day = amz_date[6..8]
+        .parse::<u8>()
+        .map_err(|_| "X-Amz-Date day is invalid".to_string())?;
+    let hour = amz_date[9..11]
+        .parse::<u8>()
+        .map_err(|_| "X-Amz-Date hour is invalid".to_string())?;
+    let minute = amz_date[11..13]
+        .parse::<u8>()
+        .map_err(|_| "X-Amz-Date minute is invalid".to_string())?;
+    let second = amz_date[13..15]
+        .parse::<u8>()
+        .map_err(|_| "X-Amz-Date second is invalid".to_string())?;
+
+    let month = Month::try_from(month).map_err(|_| "X-Amz-Date month is invalid".to_string())?;
+    let date = Date::from_calendar_date(year, month, day)
+        .map_err(|_| "X-Amz-Date calendar date is invalid".to_string())?;
+    let time = Time::from_hms(hour, minute, second)
+        .map_err(|_| "X-Amz-Date clock time is invalid".to_string())?;
+    let unix_timestamp = PrimitiveDateTime::new(date, time)
+        .assume_utc()
+        .unix_timestamp();
+    u64::try_from(unix_timestamp)
+        .map_err(|_| "X-Amz-Date must not be earlier than the Unix epoch".to_string())
 }
 
 fn parse_credential_scope(
@@ -3794,7 +3834,7 @@ async fn resolve_requested_version_id(
     }
 
     let store = read_store(state, "s3.get_object.list_versions").await;
-    let versions = match store.list_versions(full_key).await {
+    let versions = match store.list_versions_with_history(full_key).await {
         Ok(versions) => versions,
         Err(err) => {
             return Err(s3_error_response(
@@ -3822,7 +3862,7 @@ async fn resolve_current_head_version_id(
     request_id: &str,
 ) -> Result<Option<String>, Response> {
     let store = read_store(state, "s3.get_object.current_head_version").await;
-    let versions = match store.list_versions(full_key).await {
+    let versions = match store.list_versions_with_history(full_key).await {
         Ok(versions) => versions,
         Err(err) => {
             return Err(s3_error_response(
@@ -3902,7 +3942,7 @@ async fn resolve_copy_source_version(
         return Ok(version.version_id);
     }
 
-    let versions = match store.list_versions(full_key).await {
+    let versions = match store.list_versions_with_history(full_key).await {
         Ok(versions) => versions,
         Err(err) => {
             return Err(s3_error_response(

@@ -26,7 +26,10 @@ use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
-use super::storage::{DataScrubRunTestHook, PersistentStore, PutOptions, VersionConsistencyState};
+use super::storage::{
+    DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord,
+    VersionConsistencyState,
+};
 use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
@@ -44,6 +47,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::task::{Context, Poll};
+use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 use tower::{Service, ServiceExt};
 use uuid::Uuid;
@@ -1274,7 +1278,7 @@ fn s3_signed_request(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
         s3_test_sha256_hex(canonical_request.as_bytes())
     );
-    let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+    let signing_key = s3_test_derive_signing_key(secret_material, &date_scope, region, service);
     let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
         &signing_key,
         string_to_sign.as_bytes(),
@@ -1315,12 +1319,32 @@ fn s3_presigned_request(
     extra_headers: &[(&str, &str)],
     body: Bytes,
 ) -> Request<Body> {
+    s3_presigned_request_at(
+        method,
+        uri,
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+        super::unix_ts() as i64,
+        900,
+    )
+}
+
+fn s3_presigned_request_at(
+    method: Method,
+    uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+    signed_at_unix: i64,
+    expires_secs: u64,
+) -> Request<Body> {
     let host = "s3.local";
-    let amz_date = "20260705T120000Z";
-    let date_scope = "20260705";
+    let (amz_date, date_scope) = sigv4_timestamp_components(signed_at_unix);
     let region = "us-east-1";
     let service = "s3";
-    let expires = "900";
     let signed_headers = "host";
     let payload_hash = "UNSIGNED-PAYLOAD";
     let parsed_uri: Uri = uri.parse().unwrap();
@@ -1351,8 +1375,8 @@ fn s3_presigned_request(
         "AWS4-HMAC-SHA256".to_string(),
     ));
     pairs.push(("X-Amz-Credential".to_string(), credential_value));
-    pairs.push(("X-Amz-Date".to_string(), amz_date.to_string()));
-    pairs.push(("X-Amz-Expires".to_string(), expires.to_string()));
+    pairs.push(("X-Amz-Date".to_string(), amz_date.clone()));
+    pairs.push(("X-Amz-Expires".to_string(), expires_secs.to_string()));
     pairs.push((
         "X-Amz-SignedHeaders".to_string(),
         signed_headers.to_string(),
@@ -1374,7 +1398,7 @@ fn s3_presigned_request(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
         s3_test_sha256_hex(canonical_request.as_bytes())
     );
-    let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+    let signing_key = s3_test_derive_signing_key(secret_material, &date_scope, region, service);
     let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
         &signing_key,
         string_to_sign.as_bytes(),
@@ -1395,6 +1419,22 @@ fn s3_presigned_request(
         );
     }
     request
+}
+
+fn sigv4_timestamp_components(unix_ts: i64) -> (String, String) {
+    let timestamp = OffsetDateTime::from_unix_timestamp(unix_ts)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        .to_offset(time::UtcOffset::UTC);
+    let year = timestamp.year();
+    let month = timestamp.month() as u8;
+    let day = timestamp.day();
+    let hour = timestamp.hour();
+    let minute = timestamp.minute();
+    let second = timestamp.second();
+    (
+        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
+        format!("{year:04}{month:02}{day:02}"),
+    )
 }
 
 fn s3_transport_request(
@@ -1962,7 +2002,7 @@ async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
         Json(super::CreateS3BucketRequest {
             bucket_name: "photos.example".to_string(),
             root_prefix: Some("tenant/photos".to_string()),
-            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            versioning_status: Some(super::S3BucketVersioningStatus::Disabled),
             read_only: false,
         }),
     )
@@ -1977,7 +2017,7 @@ async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
     assert_eq!(created_bucket.root_prefix, "tenant/photos/");
     assert_eq!(
         created_bucket.versioning_status,
-        super::S3BucketVersioningStatus::Enabled
+        super::S3BucketVersioningStatus::Disabled
     );
     assert!(created_bucket.deleted_at_unix.is_none());
 
@@ -2153,6 +2193,101 @@ run_on_main_metadata_backends!(
     s3_control_plane_admin_lifecycle_impl,
     s3_control_plane_admin_lifecycle,
     s3_control_plane_admin_lifecycle_turso
+);
+
+async fn s3_control_plane_admin_delete_rejects_noncurrent_versions_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-admin-delete-versioned".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"hello"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let delete_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_current.status(), StatusCode::NO_CONTENT);
+
+    let delete_bucket = super::delete_s3_bucket(
+        State(state.clone()),
+        admin_headers,
+        Path("photos.example".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_bucket.status(), StatusCode::CONFLICT);
+    let delete_bucket_body = to_bytes(delete_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_bucket_json: serde_json::Value =
+        serde_json::from_slice(&delete_bucket_body).unwrap();
+    assert_eq!(delete_bucket_json["error"], "bucket is not empty");
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_admin_delete_rejects_noncurrent_versions_impl,
+    s3_control_plane_admin_delete_rejects_noncurrent_versions,
+    s3_control_plane_admin_delete_rejects_noncurrent_versions_turso
 );
 
 async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend: MainTestBackend) {
@@ -3344,6 +3479,28 @@ async fn s3_listener_supports_presigned_requests_impl(backend: MainTestBackend) 
     let tampered_get_object_xml = String::from_utf8(tampered_get_object_body.to_vec()).unwrap();
     assert!(tampered_get_object_xml.contains("<Code>SignatureDoesNotMatch</Code>"));
 
+    let expired_get_object = app
+        .clone()
+        .oneshot(s3_presigned_request_at(
+            Method::GET,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+            super::unix_ts() as i64 - 3_600,
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired_get_object.status(), StatusCode::FORBIDDEN);
+    let expired_get_object_body = to_bytes(expired_get_object.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let expired_get_object_xml = String::from_utf8(expired_get_object_body.to_vec()).unwrap();
+    assert!(expired_get_object_xml.contains("<Code>AuthorizationQueryParametersError</Code>"));
+    assert!(expired_get_object_xml.contains("expired"));
+
     let delete_object = app
         .clone()
         .oneshot(s3_presigned_request(
@@ -3442,6 +3599,7 @@ async fn s3_listener_lists_folder_marker_objects_and_common_prefixes_impl(
     }
 
     let list_response = app
+        .clone()
         .oneshot(s3_signed_request(
             Method::GET,
             "/photos.example?list-type=2&delimiter=/",
@@ -3459,6 +3617,30 @@ async fn s3_listener_lists_folder_marker_objects_and_common_prefixes_impl(
     let list_xml = String::from_utf8(list_body.to_vec()).unwrap();
     assert!(list_xml.contains("<Key>docs/</Key>"));
     assert!(list_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>"));
+
+    let prefix_without_trailing_delimiter = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2&prefix=docs&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prefix_without_trailing_delimiter.status(), StatusCode::OK);
+    let prefix_without_trailing_delimiter_body =
+        to_bytes(prefix_without_trailing_delimiter.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    let prefix_without_trailing_delimiter_xml =
+        String::from_utf8(prefix_without_trailing_delimiter_body.to_vec()).unwrap();
+    assert!(
+        prefix_without_trailing_delimiter_xml
+            .contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+    );
+    assert!(!prefix_without_trailing_delimiter_xml.contains("docs//"));
 
     cleanup_test_state(&state).await;
 }
@@ -4194,7 +4376,7 @@ async fn s3_versioning_surface_lists_versions_and_delete_markers_impl(backend: M
             allow_read: true,
             allow_write: true,
             allow_delete: true,
-            allow_manage: false,
+            allow_manage: true,
         }),
     )
     .await
@@ -4349,6 +4531,26 @@ async fn s3_versioning_surface_lists_versions_and_delete_markers_impl(backend: M
             .and_then(|value| value.to_str().ok()),
         Some("true")
     );
+
+    let delete_nonempty_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/versions.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_nonempty_bucket.status(), StatusCode::CONFLICT);
+    let delete_nonempty_bucket_body = to_bytes(delete_nonempty_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_nonempty_bucket_xml =
+        String::from_utf8(delete_nonempty_bucket_body.to_vec()).unwrap();
+    assert!(delete_nonempty_bucket_xml.contains("<Code>BucketNotEmpty</Code>"));
 
     let get_delete_marker_version = app
         .clone()
@@ -4618,6 +4820,88 @@ run_on_main_metadata_backends!(
     s3_versioning_surface_lists_versions_and_delete_markers_impl,
     s3_versioning_surface_lists_versions_and_delete_markers,
     s3_versioning_surface_lists_versions_and_delete_markers_turso
+);
+
+async fn s3_object_version_prefix_listing_treats_wildcards_literally_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+
+    {
+        let store = lock_store(&state, "tests.s3_versions.literal_prefixes").await;
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/100%/match.txt".to_string(),
+                version_id: "version-percent-match".to_string(),
+                etag: "etag-percent-match".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/100abc/other.txt".to_string(),
+                version_id: "version-percent-other".to_string(),
+                etag: "etag-percent-other".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 11,
+            })
+            .await
+            .unwrap();
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/a_b/match.txt".to_string(),
+                version_id: "version-underscore-match".to_string(),
+                etag: "etag-underscore-match".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 12,
+            })
+            .await
+            .unwrap();
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/acb/other.txt".to_string(),
+                version_id: "version-underscore-other".to_string(),
+                etag: "etag-underscore-other".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 13,
+            })
+            .await
+            .unwrap();
+    }
+
+    {
+        let store = lock_store(&state, "tests.s3_versions.literal_prefixes.verify").await;
+        let percent_versions = store
+            .list_s3_object_versions("photos.example", Some("tenant/photos/100%/"))
+            .await
+            .unwrap();
+        assert_eq!(percent_versions.len(), 1);
+        assert_eq!(percent_versions[0].version_id, "version-percent-match");
+
+        let underscore_versions = store
+            .list_s3_object_versions("photos.example", Some("tenant/photos/a_b/"))
+            .await
+            .unwrap();
+        assert_eq!(underscore_versions.len(), 1);
+        assert_eq!(
+            underscore_versions[0].version_id,
+            "version-underscore-match"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_object_version_prefix_listing_treats_wildcards_literally_impl,
+    s3_object_version_prefix_listing_treats_wildcards_literally,
+    s3_object_version_prefix_listing_treats_wildcards_literally_turso
 );
 
 async fn s3_version_listing_supports_delimiter_impl(backend: MainTestBackend) {

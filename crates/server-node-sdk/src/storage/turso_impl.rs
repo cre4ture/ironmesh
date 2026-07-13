@@ -1405,12 +1405,12 @@ impl MetadataStore for TursoMetadataStore {
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         let mut records = Vec::new();
         let mut rows = if let Some(prefix) = ironmesh_key_prefix {
-            let like_pattern = format!("{prefix}%");
+            let like_pattern = super::sqlite_like_prefix_pattern(prefix);
             self.connection
                 .query(
                     "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
                      FROM s3_object_versions
-                     WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2
+                     WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2 ESCAPE '\\'
                      ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
                     (bucket_name, like_pattern.as_str()),
                 )
