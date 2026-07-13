@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 pub enum CandidateKind {
     DirectHttps,
     DirectQuic,
-    ServerReflexiveQuic,
+    #[serde(rename = "server_reflexive", alias = "server_reflexive_quic")]
+    ServerReflexive,
     Relay,
 }
 
@@ -49,7 +50,7 @@ fn candidate_priority(kind: CandidateKind) -> u8 {
     match kind {
         CandidateKind::DirectQuic => 0,
         CandidateKind::DirectHttps => 1,
-        CandidateKind::ServerReflexiveQuic => 2,
+        CandidateKind::ServerReflexive => 2,
         CandidateKind::Relay => 3,
     }
 }
@@ -89,6 +90,31 @@ mod tests {
 
         assert_eq!(ranked[0].kind, CandidateKind::DirectQuic);
         assert_eq!(ranked[1].kind, CandidateKind::DirectHttps);
+        assert_eq!(ranked[2].kind, CandidateKind::Relay);
+    }
+
+    #[test]
+    fn ranks_server_reflexive_between_direct_and_relay() {
+        let ranked = rank_candidates(&[
+            ConnectionCandidate {
+                kind: CandidateKind::Relay,
+                endpoint: "https://relay.example/session/1".to_string(),
+                rtt_ms: Some(10),
+            },
+            ConnectionCandidate {
+                kind: CandidateKind::ServerReflexive,
+                endpoint: "https://203.0.113.10:7443".to_string(),
+                rtt_ms: Some(20),
+            },
+            ConnectionCandidate {
+                kind: CandidateKind::DirectHttps,
+                endpoint: "https://node.example".to_string(),
+                rtt_ms: Some(30),
+            },
+        ]);
+
+        assert_eq!(ranked[0].kind, CandidateKind::DirectHttps);
+        assert_eq!(ranked[1].kind, CandidateKind::ServerReflexive);
         assert_eq!(ranked[2].kind, CandidateKind::Relay);
     }
 }

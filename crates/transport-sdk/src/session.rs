@@ -73,10 +73,10 @@ pub fn select_session_plan(
 
 fn candidate_path_kind(kind: CandidateKind) -> TransportPathKind {
     match kind {
-        CandidateKind::DirectHttps => TransportPathKind::DirectHttps,
-        CandidateKind::DirectQuic | CandidateKind::ServerReflexiveQuic => {
-            TransportPathKind::DirectQuic
+        CandidateKind::DirectHttps | CandidateKind::ServerReflexive => {
+            TransportPathKind::DirectHttps
         }
+        CandidateKind::DirectQuic => TransportPathKind::DirectQuic,
         CandidateKind::Relay => TransportPathKind::RelayTunnel,
     }
 }
@@ -174,18 +174,18 @@ mod tests {
     }
 
     #[test]
-    fn select_session_plan_maps_quic_candidates_to_direct_quic_path() {
+    fn select_session_plan_maps_server_reflexive_candidates_to_direct_https_path() {
         let request = request(true, true);
         let plan = select_session_plan(
             &request,
             &[ConnectionCandidate {
-                kind: CandidateKind::ServerReflexiveQuic,
+                kind: CandidateKind::ServerReflexive,
                 endpoint: "https://reflexive.example:4433".to_string(),
                 rtt_ms: Some(10),
             }],
         )
-        .expect("a quic session plan should be selected");
+        .expect("a direct HTTPS session plan should be selected");
 
-        assert_eq!(plan.path_kind, TransportPathKind::DirectQuic);
+        assert_eq!(plan.path_kind, TransportPathKind::DirectHttps);
     }
 }

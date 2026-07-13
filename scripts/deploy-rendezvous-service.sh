@@ -93,6 +93,9 @@ Notes:
   script handles the backgrounding with nohup itself.
   If you provide a custom --remote-start-cmd, make it end in exec <binary> so
   the pid file tracks the service process rather than a wrapper shell.
+  Configure IRONMESH_RENDEZVOUS_PEER_URLS in the remote environment file when
+  deploying a multi-rendezvous mesh so /control/mesh and client discovery can
+  surface healthy peer rendezvous URLs.
 
 Example:
   scripts/deploy-rendezvous-service.sh \

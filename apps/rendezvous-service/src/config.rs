@@ -60,6 +60,7 @@ pub struct RendezvousServiceConfig {
     pub bind_addr: SocketAddr,
     pub public_url: String,
     pub relay_public_urls: Vec<String>,
+    pub peer_rendezvous_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
     pub allow_insecure_http: bool,
     pub failover_package: Option<LoadedRendezvousFailoverMetadata>,
@@ -155,6 +156,17 @@ impl RendezvousServiceConfig {
             })
             .filter(|urls| !urls.is_empty())
             .unwrap_or_else(|| vec![public_url.clone()]);
+        let peer_rendezvous_urls = lookup_env("IRONMESH_RENDEZVOUS_PEER_URLS")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|urls| !urls.is_empty())
+            .unwrap_or_default();
 
         let client_ca_cert_path = lookup_env("IRONMESH_RENDEZVOUS_CLIENT_CA_CERT");
         let cert_path = lookup_env("IRONMESH_RENDEZVOUS_TLS_CERT");
@@ -174,6 +186,7 @@ impl RendezvousServiceConfig {
             bind_addr,
             public_url,
             relay_public_urls,
+            peer_rendezvous_urls,
             mtls,
             allow_insecure_http,
             failover_package: failover_package.as_ref().map(|package| {
@@ -204,6 +217,7 @@ impl RendezvousServiceConfig {
             bind_addr: self.bind_addr,
             public_url: self.public_url.clone(),
             relay_public_urls: self.relay_public_urls.clone(),
+            peer_rendezvous_urls: self.peer_rendezvous_urls.clone(),
             mtls: self.mtls.clone(),
         }
     }
@@ -292,6 +306,7 @@ mod tests {
             bind_addr: "127.0.0.1:19090".parse().expect("bind addr should parse"),
             public_url: "http://127.0.0.1:19090".to_string(),
             relay_public_urls: vec!["http://127.0.0.1:19090".to_string()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
             allow_insecure_http: false,
             failover_package: None,
@@ -309,6 +324,7 @@ mod tests {
             bind_addr: "127.0.0.1:19090".parse().expect("bind addr should parse"),
             public_url: "http://127.0.0.1:19090".to_string(),
             relay_public_urls: vec!["http://127.0.0.1:19090".to_string()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
             allow_insecure_http: true,
             failover_package: None,
@@ -376,6 +392,7 @@ mod tests {
             config.relay_public_urls,
             vec!["https://creax.de:44042".to_string()]
         );
+        assert!(config.peer_rendezvous_urls.is_empty());
         assert_eq!(
             config
                 .failover_package
@@ -439,6 +456,7 @@ mod tests {
             config.relay_public_urls,
             vec!["https://creax.de:44042".to_string()]
         );
+        assert!(config.peer_rendezvous_urls.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -527,5 +545,31 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn from_lookup_parses_peer_rendezvous_urls() {
+        let cli = RendezvousServiceCliConfig::default();
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_PEER_URLS".to_string(),
+                " https://peer-a.example ,https://peer-b.example/ ".to_string(),
+            ),
+        ]);
+
+        let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect("peer rendezvous URLs should parse");
+
+        assert_eq!(
+            config.peer_rendezvous_urls,
+            vec![
+                "https://peer-a.example".to_string(),
+                "https://peer-b.example/".to_string()
+            ]
+        );
     }
 }

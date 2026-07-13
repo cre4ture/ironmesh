@@ -191,7 +191,7 @@ pub fn build_http_client_with_identity_from_planned_target(
     )
 }
 
-pub(crate) fn build_http_client_with_identity_from_planned_targets(
+pub fn build_http_client_with_identity_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
@@ -223,7 +223,7 @@ pub(crate) fn build_http_client_with_identity_from_planned_targets(
     IronMeshClient::combine(ordered)
 }
 
-pub(crate) fn build_http_client_from_planned_targets(
+pub fn build_http_client_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
 ) -> Result<IronMeshClient> {
     let mut clients = Vec::new();

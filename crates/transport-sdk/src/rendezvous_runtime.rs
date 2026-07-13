@@ -32,10 +32,15 @@ impl PresenceRegistry {
         Self::default()
     }
 
-    pub fn register(&self, registration: PresenceRegistration) -> PresenceEntry {
+    pub fn register(
+        &self,
+        registration: PresenceRegistration,
+        observed_source_addr: Option<std::net::SocketAddr>,
+    ) -> PresenceEntry {
         let entry = PresenceEntry {
             updated_at_unix: registration.connected_at_unix,
             registration,
+            observed_source_addr,
         };
         let key = entry.registration.identity.to_string();
         let mut entries = self

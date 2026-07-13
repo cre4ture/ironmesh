@@ -1398,6 +1398,45 @@ impl MetadataStore for TursoMetadataStore {
         Ok(manifests)
     }
 
+    async fn filter_locally_owned_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        const TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE: usize = 500;
+
+        let mut owned = std::collections::HashSet::with_capacity(manifest_hashes.len());
+        for chunk in manifest_hashes.chunks(TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT manifest_hash
+                         FROM locally_owned_manifests
+                         WHERE manifest_hash IN ({placeholders})"
+                    ),
+                    params_from_iter(chunk.iter().cloned()),
+                )
+                .await?;
+
+            while let Some(row) = rows.next().await? {
+                owned.insert(row_string(
+                    &row,
+                    0,
+                    "locally_owned_manifests.manifest_hash",
+                )?);
+            }
+        }
+
+        Ok(owned)
+    }
+
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
         let mut rows = self
             .connection

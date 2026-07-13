@@ -28,6 +28,7 @@ object RustSafBridge {
     private var appContext: Context? = null
     private val observerLock = Any()
     private val scanProgressLock = Any()
+    private val treeDocumentCache = RustSafDocumentCache()
     private val treeObservers = mutableMapOf<String, TreeObserverState>()
     private val treeScanProgress = mutableMapOf<String, TreeScanProgressState>()
 
@@ -43,6 +44,7 @@ object RustSafBridge {
         val rootDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
         val entries = JSONArray()
         val observedChildrenUris = linkedSetOf<Uri>()
+        invalidateTreeCache(treeUriString)
         beginTreeScanProgress(treeUriString)
         try {
             collectEntries(
@@ -55,6 +57,9 @@ object RustSafBridge {
                 observedChildrenUris = observedChildrenUris,
                 output = entries,
             )
+        } catch (error: Throwable) {
+            invalidateTreeCache(treeUriString)
+            throw error
         } finally {
             finishTreeScanProgress(treeUriString)
         }
@@ -97,7 +102,7 @@ object RustSafBridge {
     fun openTreeFileInput(treeUriString: String, relativePath: String): InputStream {
         val resolver = requireResolver()
         val treeUri = Uri.parse(treeUriString)
-        val documentUri = resolveExistingDocumentUri(resolver, treeUri, relativePath)
+        val documentUri = resolveExistingDocumentUri(resolver, treeUriString, treeUri, relativePath)
             ?: error("No SAF document found for $relativePath")
         val preferredStream = tryOpenOriginalPhotoInput(
             resolver = resolver,
@@ -120,7 +125,8 @@ object RustSafBridge {
     fun openTreeFileOutput(treeUriString: String, relativePath: String): OutputStream {
         val resolver = requireResolver()
         val treeUri = Uri.parse(treeUriString)
-        val documentUri = resolveOrCreateFileDocumentUri(resolver, treeUri, relativePath)
+        val documentUri = resolveOrCreateFileDocumentUri(resolver, treeUriString, treeUri, relativePath)
+        invalidateTreeCache(treeUriString)
         return resolver.openOutputStream(documentUri, "wt")
             ?: error("Failed to open SAF output stream for $relativePath")
     }
@@ -129,22 +135,36 @@ object RustSafBridge {
     fun ensureTreeDirectory(treeUriString: String, relativePath: String) {
         val resolver = requireResolver()
         val treeUri = Uri.parse(treeUriString)
-        ensureDirectoryUri(resolver, treeUri, relativePath)
+        val resolution = ensureDirectoryUri(resolver, treeUriString, treeUri, relativePath)
+        if (resolution.createdAny) {
+            invalidateTreeCache(treeUriString)
+        }
     }
 
     @JvmStatic
     fun deleteTreePath(treeUriString: String, relativePath: String): Boolean {
         val resolver = requireResolver()
         val treeUri = Uri.parse(treeUriString)
-        val documentUri = resolveExistingDocumentUri(resolver, treeUri, relativePath) ?: return false
-        return DocumentsContract.deleteDocument(resolver, documentUri)
+        val documentUri = resolveExistingDocumentUri(resolver, treeUriString, treeUri, relativePath)
+            ?: return false
+        val deleted = DocumentsContract.deleteDocument(resolver, documentUri)
+        if (deleted) {
+            invalidateTreeCache(treeUriString)
+        }
+        return deleted
     }
 
     @JvmStatic
     fun statTreePath(treeUriString: String, relativePath: String): String? {
         val resolver = requireResolver()
         val treeUri = Uri.parse(treeUriString)
-        val documentUri = resolveExistingDocumentUri(resolver, treeUri, relativePath) ?: return null
+        val normalizedPath = normalizeRelativePath(relativePath)
+        treeDocumentCache.cachedDocument(treeUriString, normalizedPath)?.let { document ->
+            return treeStatJson(normalizedPath, document)
+        }
+
+        val documentUri = resolveExistingDocumentUri(resolver, treeUriString, treeUri, normalizedPath)
+            ?: return null
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_MIME_TYPE,
             DocumentsContract.Document.COLUMN_SIZE,
@@ -163,15 +183,18 @@ object RustSafBridge {
             val sizeBytes = cursor.getLong(sizeIndex).coerceAtLeast(0L)
             val modifiedUnixMs = cursor.getLong(modifiedIndex).coerceAtLeast(0L)
 
-            return JSONObject()
-                .put("path", normalizeRelativePath(relativePath))
-                .put(
-                    "kind",
-                    if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) "directory" else "file",
-                )
-                .put("sizeBytes", sizeBytes)
-                .put("modifiedUnixMs", modifiedUnixMs)
-                .toString()
+            val document = RustSafChildDocument(
+                documentId = DocumentsContract.getDocumentId(documentUri),
+                displayName = normalizedPath.substringAfterLast('/', ""),
+                mimeType = mimeType,
+                sizeBytes = sizeBytes,
+                modifiedUnixMs = modifiedUnixMs,
+            )
+            treeDocumentCache.recordDocument(treeUriString, normalizedPath, document)
+            return treeStatJson(
+                normalizedPath,
+                document,
+            )
         }
 
         return null
@@ -418,7 +441,7 @@ object RustSafBridge {
 
         observedChildrenUris += DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
 
-        for (child in queryChildren(resolver, treeUri, parentDocumentId)) {
+        for (child in queryChildren(resolver, treeUriString, treeUri, parentDocumentId)) {
             val relativePath = if (prefix.isBlank()) {
                 child.displayName
             } else {
@@ -428,7 +451,9 @@ object RustSafBridge {
                 continue
             }
 
-             recordTreeScanEntry(
+            treeDocumentCache.recordDocument(treeUriString, relativePath, child)
+
+            recordTreeScanEntry(
                 treeUriString = treeUriString,
                 currentPath = relativePath,
                 discoveredDirectory = child.isDirectory,
@@ -519,6 +544,7 @@ object RustSafBridge {
 
     private fun resolveExistingDocumentUri(
         resolver: ContentResolver,
+        treeUriString: String,
         treeUri: Uri,
         relativePath: String,
     ): Uri? {
@@ -529,9 +555,17 @@ object RustSafBridge {
             return currentDocumentUri
         }
 
+        treeDocumentCache.cachedDocument(treeUriString, normalized)?.let { cached ->
+            return DocumentsContract.buildDocumentUriUsingTree(treeUri, cached.documentId)
+        }
+
+        var currentPath = ""
         normalized.split('/').forEach { segment ->
-            val child = queryChildren(resolver, treeUri, currentDocumentId)
+            currentPath = if (currentPath.isBlank()) segment else "$currentPath/$segment"
+            val child = treeDocumentCache.cachedDocument(treeUriString, currentPath)
+                ?: queryChildren(resolver, treeUriString, treeUri, currentDocumentId)
                 .firstOrNull { it.displayName == segment }
+                ?.also { treeDocumentCache.recordDocument(treeUriString, currentPath, it) }
                 ?: return null
             currentDocumentId = child.documentId
             currentDocumentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocumentId)
@@ -542,19 +576,25 @@ object RustSafBridge {
 
     private fun ensureDirectoryUri(
         resolver: ContentResolver,
+        treeUriString: String,
         treeUri: Uri,
         relativePath: String,
-    ): Uri {
+    ): DirectoryResolution {
         val normalized = normalizeRelativePath(relativePath)
         var currentDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
         var currentDocumentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocumentId)
+        var createdAny = false
         if (normalized.isBlank()) {
-            return currentDocumentUri
+            return DirectoryResolution(currentDocumentUri, createdAny = false)
         }
 
+        var currentPath = ""
         normalized.split('/').forEach { segment ->
-            val existing = queryChildren(resolver, treeUri, currentDocumentId)
+            currentPath = if (currentPath.isBlank()) segment else "$currentPath/$segment"
+            val existing = treeDocumentCache.cachedDocument(treeUriString, currentPath)
+                ?: queryChildren(resolver, treeUriString, treeUri, currentDocumentId)
                 .firstOrNull { it.displayName == segment }
+                ?.also { treeDocumentCache.recordDocument(treeUriString, currentPath, it) }
             if (existing != null) {
                 check(existing.isDirectory) { "Expected directory at $segment inside $relativePath" }
                 currentDocumentId = existing.documentId
@@ -568,14 +608,16 @@ object RustSafBridge {
                 ) ?: error("Failed to create SAF directory $segment inside $relativePath")
                 currentDocumentId = DocumentsContract.getDocumentId(createdUri)
                 currentDocumentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocumentId)
+                createdAny = true
             }
         }
 
-        return currentDocumentUri
+        return DirectoryResolution(currentDocumentUri, createdAny)
     }
 
     private fun resolveOrCreateFileDocumentUri(
         resolver: ContentResolver,
+        treeUriString: String,
         treeUri: Uri,
         relativePath: String,
     ): Uri {
@@ -584,10 +626,12 @@ object RustSafBridge {
 
         val fileName = normalized.substringAfterLast('/')
         val parentPath = normalized.substringBeforeLast('/', "")
-        val parentUri = ensureDirectoryUri(resolver, treeUri, parentPath)
+        val parentUri = ensureDirectoryUri(resolver, treeUriString, treeUri, parentPath).documentUri
         val parentDocumentId = DocumentsContract.getDocumentId(parentUri)
-        val existing = queryChildren(resolver, treeUri, parentDocumentId)
+        val existing = treeDocumentCache.cachedDocument(treeUriString, normalized)
+            ?: queryChildren(resolver, treeUriString, treeUri, parentDocumentId)
             .firstOrNull { it.displayName == fileName }
+            ?.also { treeDocumentCache.recordDocument(treeUriString, normalized, it) }
 
         if (existing != null) {
             check(!existing.isDirectory) { "Expected file at $normalized but found directory" }
@@ -604,36 +648,39 @@ object RustSafBridge {
 
     private fun queryChildren(
         resolver: ContentResolver,
+        treeUriString: String,
         treeUri: Uri,
         parentDocumentId: String,
-    ): List<ChildDocument> {
-        val children = mutableListOf<ChildDocument>()
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_SIZE,
-            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-        )
-        resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-            val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-            val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-            val sizeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
-            val modifiedIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-            while (cursor.moveToNext()) {
-                val displayName = cursor.getString(nameIndex) ?: continue
-                children += ChildDocument(
-                    documentId = cursor.getString(idIndex),
-                    displayName = displayName,
-                    mimeType = cursor.getString(mimeIndex),
-                    sizeBytes = cursor.getLong(sizeIndex).coerceAtLeast(0L),
-                    modifiedUnixMs = cursor.getLong(modifiedIndex).coerceAtLeast(0L),
-                )
+    ): List<RustSafChildDocument> {
+        return treeDocumentCache.children(treeUriString, parentDocumentId) {
+            val children = mutableListOf<RustSafChildDocument>()
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+            )
+            resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
+                val modifiedIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                while (cursor.moveToNext()) {
+                    val displayName = cursor.getString(nameIndex) ?: continue
+                    children += RustSafChildDocument(
+                        documentId = cursor.getString(idIndex),
+                        displayName = displayName,
+                        mimeType = cursor.getString(mimeIndex),
+                        sizeBytes = cursor.getLong(sizeIndex).coerceAtLeast(0L),
+                        modifiedUnixMs = cursor.getLong(modifiedIndex).coerceAtLeast(0L),
+                    )
+                }
             }
+            children
         }
-        return children
     }
 
     private fun normalizeRelativePath(relativePath: String): String {
@@ -650,16 +697,26 @@ object RustSafBridge {
             ?: "application/octet-stream"
     }
 
-    private data class ChildDocument(
-        val documentId: String,
-        val displayName: String,
-        val mimeType: String?,
-        val sizeBytes: Long,
-        val modifiedUnixMs: Long,
-    ) {
-        val isDirectory: Boolean
-            get() = mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+    private fun treeStatJson(
+        relativePath: String,
+        document: RustSafChildDocument,
+    ): String {
+        return JSONObject()
+            .put("path", relativePath)
+            .put("kind", if (document.isDirectory) "directory" else "file")
+            .put("sizeBytes", document.sizeBytes)
+            .put("modifiedUnixMs", document.modifiedUnixMs)
+            .toString()
     }
+
+    private fun invalidateTreeCache(treeUriString: String) {
+        treeDocumentCache.invalidateTree(treeUriString)
+    }
+
+    private data class DirectoryResolution(
+        val documentUri: Uri,
+        val createdAny: Boolean,
+    )
 
     private data class TreeScanProgressState(
         var scannedEntryCount: Long = 0L,
@@ -700,10 +757,12 @@ object RustSafBridge {
                 val observer = object : ContentObserver(handler) {
                     override fun onChange(selfChange: Boolean) {
                         version.incrementAndGet()
+                        invalidateTreeCache(treeUriString)
                     }
 
                     override fun onChange(selfChange: Boolean, uri: Uri?) {
                         version.incrementAndGet()
+                        invalidateTreeCache(treeUriString)
                     }
                 }
                 resolver.registerContentObserver(uri, false, observer)
