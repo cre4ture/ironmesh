@@ -9,6 +9,23 @@ nodes and native access paths.
 
 Ironmesh is building toward a private, self-hosted storage system that makes clustered files, folders, and media feel as approachable as a consumer cloud drive, while keeping deployment, trust, and data ownership in your hands. The project combines secure multi-node storage, offline-friendly sync and conflict handling, and native filesystem access paths so the same data can surface cleanly in web, mobile, and OS file-manager workflows.
 
+## Project Status
+
+Ironmesh is experimental software under active development. Versioned packages
+and tagged releases exist so deployments and upgrades can be tested, but they
+do not mean the project is production-ready yet.
+
+- Maturity: experimental. APIs, storage details, replication behavior, and
+  operational workflows may still change between releases.
+- Guarantees: Ironmesh does not currently offer availability, durability,
+  support, or backward-compatibility guarantees for use as a live primary
+  storage system.
+- Data safety: do not use Ironmesh as the only copy of important data. Keep
+  independent backups and recovery procedures outside Ironmesh.
+- Security reporting: report vulnerabilities privately as described in
+  [SECURITY.md](SECURITY.md).
+- License: MIT. See [LICENSE](LICENSE).
+
 Current direction highlights:
 
 - Cluster-aware storage with deterministic placement, asynchronous replication and repair, and a no-loss version model for offline or concurrent edits.
@@ -43,6 +60,9 @@ Ironmesh Ubuntu packages are published from the signed apt repository at:
 ```text
 https://creax.de/apt/ironmesh
 ```
+
+These packages follow the experimental status above and are intended for
+evaluation and controlled self-hosted testing.
 
 The current package build targets Ubuntu 24.04 LTS (`noble`) on `amd64`.
 

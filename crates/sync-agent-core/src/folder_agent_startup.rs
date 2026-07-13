@@ -34,6 +34,7 @@ pub fn local_paths_to_preserve_on_startup(
     local_paths_to_preserve_on_startup_with_hash(
         local_state,
         baseline,
+        &BTreeMap::new(),
         remote_hashes,
         "local file",
         |path| local_file_content_fingerprint(root_dir, path),
@@ -43,6 +44,7 @@ pub fn local_paths_to_preserve_on_startup(
 pub fn local_paths_to_preserve_on_startup_with_hash<F>(
     local_state: &LocalTreeState,
     baseline: Option<&LocalTreeState>,
+    baseline_hashes: &BTreeMap<String, String>,
     remote_hashes: &BTreeMap<String, String>,
     path_kind_label: &str,
     mut content_hash_for_path: F,
@@ -77,6 +79,13 @@ where
             if let Some(remote_hash) = remote_hashes.get(path) {
                 match content_hash_for_path(path) {
                     Ok(local_hash) if local_hash == *remote_hash => continue,
+                    Ok(local_hash)
+                        if baseline_hashes
+                            .get(path)
+                            .is_some_and(|baseline_hash| local_hash == *baseline_hash) =>
+                    {
+                        continue;
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         tracing::warn!(
@@ -761,6 +770,51 @@ mod tests {
 
         assert_eq!(preserve.len(), 1);
         assert!(preserve.contains("docs/readme.txt"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_preserve_skips_metadata_only_change_when_local_hash_matches_baseline() {
+        let root = test_root();
+        write_file(&root, "docs/readme.txt", b"hello");
+
+        let entry = local_entry_state_for_path(&root, "docs/readme.txt")
+            .unwrap()
+            .unwrap();
+        let mut local = LocalTreeState::new();
+        local.insert("docs/readme.txt".to_string(), entry.clone());
+
+        let mut baseline = LocalTreeState::new();
+        baseline.insert(
+            "docs/readme.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: entry.size_bytes,
+                modified_unix_ms: entry.modified_unix_ms.saturating_add(1),
+            },
+        );
+
+        let local_hash = local_file_content_fingerprint(&root, "docs/readme.txt").unwrap();
+        let mut baseline_hashes = BTreeMap::new();
+        baseline_hashes.insert("docs/readme.txt".to_string(), local_hash);
+
+        let mut remote_hashes = BTreeMap::new();
+        remote_hashes.insert("docs/readme.txt".to_string(), "remote-hash".to_string());
+
+        let preserve = local_paths_to_preserve_on_startup_with_hash(
+            &local,
+            Some(&baseline),
+            &baseline_hashes,
+            &remote_hashes,
+            "local file",
+            |path| local_file_content_fingerprint(&root, path),
+        );
+
+        assert!(
+            !preserve.contains("docs/readme.txt"),
+            "metadata-only drift should not preserve unchanged baseline bytes"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

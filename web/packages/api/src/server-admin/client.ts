@@ -33,11 +33,14 @@ import type {
   ManualRepairActionHistoryResponse,
   ManualRepairActionListResponse,
   ManualRepairActionTriggerResponse,
+  MemoryAttributionSample,
   MetadataDbLogicalDistributionStatusResponse,
   MetadataDbLogicalDistributionTriggerResponse,
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
+  ProcessStatsCurrentResponse,
+  ProcessStatsSample,
   RepairActivityStatusResponse,
   RepairHistoryResponse,
   RendezvousConfigView,
@@ -695,6 +698,38 @@ export async function getStorageStatsHistory(
   );
 }
 
+export async function getProcessStatsCurrent(
+  adminTokenOverride?: string
+): Promise<ProcessStatsCurrentResponse> {
+  return fetchAdminJson<ProcessStatsCurrentResponse>(apiV1("/process/stats/current"), {
+    adminTokenOverride
+  });
+}
+
+export async function getProcessStatsHistory(
+  limit?: number,
+  adminTokenOverride?: string
+): Promise<ProcessStatsSample[]> {
+  const query = new URLSearchParams();
+  if (typeof limit === "number" && Number.isFinite(limit)) {
+    query.set("limit", String(Math.max(1, Math.trunc(limit))));
+  }
+  const suffix = query.toString();
+
+  return fetchAdminJson<ProcessStatsSample[]>(
+    `${apiV1("/process/stats/history")}${suffix ? `?${suffix}` : ""}`,
+    { adminTokenOverride }
+  );
+}
+
+export async function getProcessStatsMemory(
+  adminTokenOverride?: string
+): Promise<MemoryAttributionSample> {
+  return fetchAdminJson<MemoryAttributionSample>(apiV1("/process/stats/memory"), {
+    adminTokenOverride
+  });
+}
+
 export async function getMetadataDbLogicalDistributionStatus(
   adminTokenOverride?: string
 ): Promise<MetadataDbLogicalDistributionStatusResponse> {
@@ -748,6 +783,9 @@ export async function generateSetupJoinRequest(request: {
   });
 }
 
+// Initializes the joining node's local admin credential during setup import.
+// The password is stored on this node and is not verified against another
+// cluster member.
 export async function importSetupEnrollmentPackage(request: {
   admin_password: string;
   package_json: string;

@@ -23,18 +23,24 @@ members = [
     "apps/android-server-node-app",
     "apps/ios-app",
     "apps/os-integration",
+    "apps/tiny-display-status",
 ]
 exclude = ["tests/system-tests"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.31"
+version = "1.0.33"
 edition = "2024"
 license = "MIT"
 authors = ["ironmesh contributors"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
 
 [workspace.dependencies]
 anyhow = "1"

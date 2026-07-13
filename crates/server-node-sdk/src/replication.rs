@@ -932,6 +932,14 @@ async fn execute_replication_repair_plan(
             continue;
         };
 
+        if item.missing_nodes.is_empty() {
+            // Nothing under-replicated here, only extra/deferred replicas, which
+            // extra-node cleanup (a separate endpoint) handles, not this pass.
+            // Skip before export_replication_bundle() so over-replicated-only
+            // items don't pay for a manifest export/parse they never use.
+            continue;
+        }
+
         let local_missing = item.missing_nodes.contains(&state.node_id);
         let remote_target_count = item
             .missing_nodes
@@ -2378,7 +2386,7 @@ async fn pull_bundle_from_source(
 async fn verify_local_repair_subject(state: &ServerState, subject: &str) -> Result<()> {
     let scrubber = {
         let store = read_store(state, "replication_repair.verify_subject").await;
-        store.data_scrubber()
+        store.data_scrubber().await?
     };
     let subjects = BTreeSet::from([subject.to_string()]);
     let report = scrubber.run_for_subjects(&subjects).await?;

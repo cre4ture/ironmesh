@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail};
 use common::NodeId;
 use futures_util::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::bootstrap::ClientBootstrap;
@@ -417,6 +417,8 @@ pub struct RelayTunnelBroker {
 struct RelayTunnelBrokerState {
     pending_sources_by_target: HashMap<String, VecDeque<PendingRelayTunnelSource>>,
     waiting_targets_by_key: HashMap<String, VecDeque<WaitingRelayTunnelTarget>>,
+    wake_channels_by_target: HashMap<String, WakeRegistration>,
+    next_wake_connection_id: u64,
 }
 
 struct PendingRelayTunnelSource {
@@ -428,9 +430,70 @@ struct WaitingRelayTunnelTarget {
     waiter: oneshot::Sender<RelayTunnelEndpoint>,
 }
 
+struct WakeRegistration {
+    connection_id: u64,
+    notify: Arc<Notify>,
+}
+
+/// A live registration on the relay "wake" channel for a given target key. Holding
+/// this lets the owning connection unregister itself (via `connection_id`, which
+/// guards against a late unregister from a stale connection clobbering a newer one
+/// that already replaced it, e.g. across a reconnect) and lets it be notified the
+/// instant a source registers for that target with nobody already waiting.
+#[derive(Clone)]
+pub struct WakeRegistrationHandle {
+    pub target_key: String,
+    connection_id: u64,
+    pub notify: Arc<Notify>,
+}
+
 impl RelayTunnelBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Registers a long-lived "wake" listener for `target`: whenever `connect_source`
+    /// registers a new pending source for this target with nobody already waiting via
+    /// `accept_target`, the returned handle's `notify` is triggered so the caller can
+    /// react immediately instead of polling on a timer.
+    pub async fn register_wake(
+        &self,
+        cluster_id: Uuid,
+        target: &PeerIdentity,
+        session_kind: RelayTunnelSessionKind,
+    ) -> WakeRegistrationHandle {
+        let target_key = relay_target_key(cluster_id, target, session_kind);
+        let notify = Arc::new(Notify::new());
+        let mut state = self.inner.lock().await;
+        state.next_wake_connection_id += 1;
+        let connection_id = state.next_wake_connection_id;
+        state.wake_channels_by_target.insert(
+            target_key.clone(),
+            WakeRegistration {
+                connection_id,
+                notify: notify.clone(),
+            },
+        );
+        WakeRegistrationHandle {
+            target_key,
+            connection_id,
+            notify,
+        }
+    }
+
+    /// Removes a wake registration, but only if it is still the current one for that
+    /// target key. This guards against a stale connection's teardown (e.g. after a
+    /// reconnect races ahead of the old connection noticing it's dead) clobbering a
+    /// newer, still-live registration for the same target.
+    pub async fn unregister_wake(&self, handle: &WakeRegistrationHandle) {
+        let mut state = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Occupied(entry) = state
+            .wake_channels_by_target
+            .entry(handle.target_key.clone())
+            && entry.get().connection_id == handle.connection_id
+        {
+            entry.remove();
+        }
     }
 
     pub async fn connect_source(&self, ticket: RelayTicket) -> Result<RelayTunnelEndpoint> {
@@ -455,7 +518,7 @@ impl RelayTunnelBroker {
             waiter: waiter_tx,
         };
 
-        let paired = {
+        let (paired, wake_to_notify) = {
             let mut state = self.inner.lock().await;
             let mut paired = None;
             while let Some(waiting) =
@@ -467,15 +530,27 @@ impl RelayTunnelBroker {
                     break;
                 }
             }
-            if paired.is_none() {
+            let wake_to_notify = if paired.is_none() {
                 state
                     .pending_sources_by_target
                     .entry(target_key.clone())
                     .or_default()
                     .push_back(source);
-            }
-            paired
+                state
+                    .wake_channels_by_target
+                    .get(&target_key)
+                    .map(|wake| wake.notify.clone())
+            } else {
+                None
+            };
+            (paired, wake_to_notify)
         };
+
+        // Notify only after releasing the broker lock, so the woken listener's
+        // immediate `accept_target` call never has to contend with it.
+        if let Some(notify) = wake_to_notify {
+            notify.notify_one();
+        }
 
         if let Some(endpoint) = paired {
             return Ok(endpoint);
@@ -866,5 +941,174 @@ mod tests {
 
         session.close().await.expect("target session should close");
         source_task.await.expect("source task should join");
+    }
+
+    #[tokio::test]
+    async fn relay_tunnel_broker_wakes_registered_target_when_source_registers() {
+        let broker = RelayTunnelBroker::new();
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Device(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+
+        let handle = broker
+            .register_wake(
+                cluster_id,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
+            .await;
+
+        let ticket = issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id,
+                source: source.clone(),
+                target: target.clone(),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                requested_expires_in_secs: Some(60),
+            },
+            &["https://relay.example".to_string()],
+        );
+
+        let broker_for_source = broker.clone();
+        let source_task = tokio::spawn(async move {
+            broker_for_source
+                .connect_source(ticket)
+                .await
+                .expect("source should eventually pair")
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), handle.notify.notified())
+            .await
+            .expect("wake registration should be notified promptly when the source registers");
+
+        let target_endpoint = broker
+            .accept_target(RelayTunnelAcceptRequest {
+                cluster_id,
+                target,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(2_000),
+            })
+            .await
+            .expect("target should pair after being woken");
+        assert_eq!(target_endpoint.session().source, source);
+
+        source_task.await.expect("source task should join");
+    }
+
+    #[tokio::test]
+    async fn relay_tunnel_broker_wake_registration_replacement_is_generation_safe() {
+        let broker = RelayTunnelBroker::new();
+        let cluster_id = uuid::Uuid::now_v7();
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+
+        let stale_handle = broker
+            .register_wake(
+                cluster_id,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
+            .await;
+        let live_handle = broker
+            .register_wake(
+                cluster_id,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
+            .await;
+        assert_ne!(stale_handle.connection_id, live_handle.connection_id);
+
+        // Unregistering with the stale (superseded) handle must not remove the live one.
+        broker.unregister_wake(&stale_handle).await;
+
+        let source = PeerIdentity::Device(uuid::Uuid::now_v7());
+        // Built directly (bypassing `issue_relay_ticket`'s 60s expiry floor) with a
+        // short expiry so this test's final, deliberately-unpaired `connect_source`
+        // call times out quickly instead of waiting the usual up-to-60s window.
+        let ticket = RelayTicket {
+            cluster_id,
+            session_id: Uuid::now_v7().to_string(),
+            source,
+            target: target.clone(),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            relay_urls: vec!["https://relay.example".to_string()],
+            issued_at_unix: unix_ts(),
+            expires_at_unix: unix_ts() + 3,
+        };
+        let broker_for_source = broker.clone();
+        let source_task =
+            tokio::spawn(async move { broker_for_source.connect_source(ticket).await });
+
+        tokio::time::timeout(Duration::from_secs(2), live_handle.notify.notified())
+            .await
+            .expect("the still-current wake registration should still be notified");
+
+        // Now unregister with the correct (current) handle and confirm it's actually removed:
+        // a subsequent source registration should not notify a stale/absent handle.
+        broker.unregister_wake(&live_handle).await;
+        {
+            let state = broker.inner.lock().await;
+            assert!(
+                !state
+                    .wake_channels_by_target
+                    .contains_key(&live_handle.target_key),
+                "wake registration should have been removed"
+            );
+        }
+
+        let source_result = source_task.await.expect("source task should join");
+        assert!(
+            source_result.is_err(),
+            "no target ever accepted, source should time out"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_tunnel_broker_immediate_pairing_via_waiting_target_does_not_require_a_wake_registration()
+     {
+        let broker = RelayTunnelBroker::new();
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Device(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+
+        // No wake registration at all -- the target starts waiting first, exactly like
+        // today's `accept_target` poll loop, and pairing must still work unchanged.
+        let broker_for_target = broker.clone();
+        let target_for_task = target.clone();
+        let target_task = tokio::spawn(async move {
+            broker_for_target
+                .accept_target(RelayTunnelAcceptRequest {
+                    cluster_id,
+                    target: target_for_task,
+                    session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                    wait_timeout_ms: Some(2_000),
+                })
+                .await
+        });
+
+        // Give the target a moment to register itself as waiting before the source arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let ticket = issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id,
+                source: source.clone(),
+                target: target.clone(),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                requested_expires_in_secs: Some(60),
+            },
+            &["https://relay.example".to_string()],
+        );
+
+        let source_endpoint = broker
+            .connect_source(ticket)
+            .await
+            .expect("source should pair immediately via the waiting target");
+        assert_eq!(source_endpoint.session().target, target);
+
+        let target_endpoint = target_task
+            .await
+            .expect("target task should join")
+            .expect("target should pair immediately, with no wake registration involved");
+        assert_eq!(target_endpoint.session().source, source);
     }
 }

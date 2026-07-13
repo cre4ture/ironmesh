@@ -36,13 +36,14 @@ async fn persist_snapshot_fixture(
     snapshot_id: &str,
     created_at_unix: u64,
 ) {
+    let current_state = store.metadata_store.load_current_state().await.unwrap();
     store
         .metadata_store
         .persist_snapshot_manifest(&SnapshotManifest {
             id: snapshot_id.to_string(),
             created_at_unix,
-            objects: store.current_state.objects.clone(),
-            object_ids: store.current_state.object_ids.clone(),
+            objects: current_state.objects,
+            object_ids: current_state.object_ids,
         })
         .await
         .unwrap();
@@ -65,6 +66,16 @@ fn sample_png_bytes() -> Vec<u8> {
         .write_to(&mut cursor, image::ImageFormat::Png)
         .unwrap();
     cursor.into_inner()
+}
+
+#[test]
+fn chunk_path_for_hash_rejects_non_blake3_hex_lengths() {
+    let chunks_dir = Path::new("chunks");
+
+    assert!(chunk_path_for_hash(chunks_dir, "a").is_err());
+    assert!(chunk_path_for_hash(chunks_dir, "ab").is_err());
+    assert!(chunk_path_for_hash(chunks_dir, &"a".repeat((blake3::OUT_LEN * 2) - 1)).is_err());
+    assert!(chunk_path_for_hash(chunks_dir, &"a".repeat(blake3::OUT_LEN * 2)).is_ok());
 }
 
 fn sample_oriented_jpeg_bytes(orientation: u16) -> Vec<u8> {
@@ -1004,6 +1015,50 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_deletes_orphan_manifest_and_chunk_turso
 );
 
+async fn cleanup_unreferenced_processes_retained_manifests_across_batches_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("cleanup-gc-batching").await;
+    // Force a batch size far smaller than the number of live objects below so the
+    // retained-manifest loop in cleanup_unreferenced must span multiple batches;
+    // a bug that only processed the first batch would wrongly treat later objects'
+    // chunks as unreferenced and delete them.
+    store.set_gc_manifest_load_batch_size_for_test(2);
+
+    let keys: Vec<String> = (0..5).map(|i| format!("docs/live-{i}.txt")).collect();
+    for key in &keys {
+        store
+            .put_object_versioned(
+                key,
+                Bytes::from(format!("payload-{key}")),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let report = store.cleanup_unreferenced(0, false).await.unwrap();
+    assert_eq!(report.deleted_manifests, 0);
+    assert_eq!(report.deleted_chunks, 0);
+    assert_eq!(report.protected_manifests, keys.len());
+
+    for key in &keys {
+        let payload = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(payload.as_ref(), format!("payload-{key}").as_bytes());
+    }
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_processes_retained_manifests_across_batches_impl,
+    cleanup_unreferenced_processes_retained_manifests_across_batches,
+    cleanup_unreferenced_processes_retained_manifests_across_batches_turso
+);
+
 async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index_impl(
     backend: StorageTestBackend,
 ) {
@@ -1547,6 +1602,154 @@ run_on_all_metadata_backends!(
     list_replication_subjects_includes_all_heads_for_divergent_versions_turso
 );
 
+// Regression test: a corrupt manifest (0-byte or invalid JSON) used to make
+// `list_replication_subjects` bubble up a hard `Err`, which callers treated as
+// "trust every locally indexed key" (see `recompute_local_cluster_available_subjects`
+// in lib.rs). That meant a single bad manifest anywhere on the node silently
+// disabled replication-gap detection for every object. The scan must instead
+// evaluate each manifest independently, excluding only the corrupt ones.
+async fn list_replication_subjects_excludes_only_corrupt_manifests_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("replication-subjects-corrupt-manifests")
+        .await;
+
+    let mut valid_keys = Vec::new();
+    for i in 0..5 {
+        let key = format!("docs/valid-{i}.txt");
+        store
+            .put_object_versioned(
+                &key,
+                Bytes::from(format!("valid-payload-{i}").into_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        valid_keys.push(key);
+    }
+
+    let mut corrupt_keys = Vec::new();
+    for i in 0..2 {
+        let key = format!("docs/corrupt-empty-{i}.txt");
+        store
+            .put_object_versioned(
+                &key,
+                Bytes::from(format!("corrupt-payload-{i}").into_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        // 0-byte manifest file: fails to parse as JSON.
+        store
+            .replace_manifest_bytes_for_subject_for_test(&key, None, b"")
+            .await
+            .unwrap();
+        corrupt_keys.push(key);
+    }
+    for i in 0..2 {
+        let key = format!("docs/corrupt-invalid-json-{i}.txt");
+        store
+            .put_object_versioned(
+                &key,
+                Bytes::from(format!("corrupt-payload-json-{i}").into_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .replace_manifest_bytes_for_subject_for_test(&key, None, br#"{not-valid-json"#)
+            .await
+            .unwrap();
+        corrupt_keys.push(key);
+    }
+
+    let orphan_corrupt_key = "docs/corrupt-orphan-head.txt";
+    let orphan_head = store
+        .put_object_versioned(
+            orphan_corrupt_key,
+            Bytes::from_static(b"orphan-corrupt-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let orphan_object_id = store
+        .object_id_for_key(orphan_corrupt_key)
+        .await
+        .unwrap()
+        .expect("orphan corrupt subject should have a current object id before detaching");
+    store
+        .replace_manifest_bytes_for_subject_for_test(
+            orphan_corrupt_key,
+            Some(&orphan_head.version_id),
+            br#"{not-valid-json"#,
+        )
+        .await
+        .unwrap();
+    let mut orphan_index = store
+        .load_version_index_by_object_id(&orphan_object_id)
+        .await
+        .unwrap()
+        .expect("orphan corrupt subject should retain its version index");
+    orphan_index
+        .versions
+        .get_mut(&orphan_head.version_id)
+        .expect("orphan corrupt subject should retain its head record")
+        .logical_path = None;
+    store
+        .persist_version_index_by_object_id(&orphan_object_id, &orphan_index)
+        .await
+        .unwrap();
+    store
+        .remove_current_object(orphan_corrupt_key)
+        .await
+        .unwrap();
+    let current_state = store.metadata_store.load_current_state().await.unwrap();
+    assert!(
+        !current_state.object_ids.contains_key(orphan_corrupt_key),
+        "orphan corrupt subject should be detached from current_state.object_ids"
+    );
+    assert!(
+        !current_state.objects.contains_key(orphan_corrupt_key),
+        "orphan corrupt subject should be detached from current_state.objects"
+    );
+
+    let inspector = store.replication_subject_inspector().await.unwrap();
+    let subjects = inspector
+        .list_replication_subjects()
+        .await
+        .expect("a corrupt manifest must not abort the whole replication-subject scan");
+
+    for key in &valid_keys {
+        assert!(
+            subjects.contains(key),
+            "expected valid key {key} to be reported available, subjects={subjects:?}"
+        );
+    }
+    for key in &corrupt_keys {
+        assert!(
+            !subjects
+                .iter()
+                .any(|subject| subject == key || subject.starts_with(&format!("{key}@"))),
+            "expected corrupt key {key} to be excluded from available subjects, subjects={subjects:?}"
+        );
+    }
+    assert!(
+        !subjects.iter().any(|subject| {
+            subject == orphan_corrupt_key || subject.starts_with(&format!("{orphan_corrupt_key}@"))
+        }),
+        "expected orphan corrupt key {orphan_corrupt_key} to be excluded from available subjects, subjects={subjects:?}"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    list_replication_subjects_excludes_only_corrupt_manifests_impl,
+    list_replication_subjects_excludes_only_corrupt_manifests,
+    list_replication_subjects_excludes_only_corrupt_manifests_turso
+);
+
 async fn tombstone_creates_tombstone_version_and_removes_current_key_impl(
     backend: StorageTestBackend,
 ) {
@@ -1578,7 +1781,7 @@ async fn tombstone_creates_tombstone_version_and_removes_current_key_impl(
     assert!(store.list_versions("will-delete").await.unwrap().is_none());
 
     // current keys should not include the key after tombstone
-    let keys = store.current_keys();
+    let keys = store.current_keys().await.unwrap();
     assert!(!keys.contains(&"will-delete".to_string()));
 
     // reading the object via store should return NotFound
@@ -1667,7 +1870,7 @@ async fn recursive_tombstone_removes_directory_marker_and_descendants_impl(
         ])
     );
 
-    let current_keys = store.current_keys();
+    let current_keys = store.current_keys().await.unwrap();
     assert!(
         !current_keys
             .iter()
@@ -2011,11 +2214,12 @@ async fn cleanup_duplicate_delete_recreate_loop_metadata_removes_redundant_histo
         })
         .collect::<Vec<_>>();
     assert_eq!(remaining_histories.len(), 1);
+    let current_state = store.metadata_store.load_current_state().await.unwrap();
     assert!(
-        !store.current_state.object_ids.contains_key(key),
+        !current_state.object_ids.contains_key(key),
         "tombstoned loop cleanup must not resurrect the deleted key"
     );
-    assert!(!store.current_state.objects.contains_key(key));
+    assert!(!current_state.objects.contains_key(key));
 
     let _ = fs::remove_dir_all(root).await;
 }
@@ -2534,10 +2738,9 @@ async fn reconcile_legacy_rename_logical_paths_repairs_old_rename_metadata_impl(
     assert_eq!(mutation, PathMutationResult::Applied);
 
     let object_id = store
-        .current_state
-        .object_ids
-        .get("docs/b.txt")
-        .cloned()
+        .object_id_for_key("docs/b.txt")
+        .await
+        .unwrap()
         .expect("renamed object should be current at destination");
     let mut index = store
         .load_version_index_by_object_id(&object_id)
@@ -2643,10 +2846,9 @@ async fn reconcile_legacy_rename_logical_paths_repairs_intermediate_stale_paths_
     assert_eq!(mutation, PathMutationResult::Applied);
 
     let object_id = store
-        .current_state
-        .object_ids
-        .get("docs/b.txt")
-        .cloned()
+        .object_id_for_key("docs/b.txt")
+        .await
+        .unwrap()
         .expect("renamed object should be current at destination");
 
     // Simulate legacy rename behavior: the original put version's logical_path was incorrectly
@@ -3286,10 +3488,9 @@ async fn rename_replication_subjects_use_each_heads_own_logical_path_impl(
     assert_eq!(mutation, PathMutationResult::Applied);
 
     let renamed_object_id = store
-        .current_state
-        .object_ids
-        .get("docs/b.txt")
-        .cloned()
+        .object_id_for_key("docs/b.txt")
+        .await
+        .unwrap()
         .expect("renamed destination path should remain current");
     let renamed_index = store
         .load_version_index_by_object_id(&renamed_object_id)
@@ -4084,6 +4285,21 @@ run_on_all_metadata_backends!(
     load_cluster_replicas_returns_empty_when_file_missing_turso
 );
 
+async fn load_cluster_nodes_returns_empty_when_file_missing_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-nodes-empty").await;
+
+    let nodes = store.load_cluster_nodes().await.unwrap();
+    assert!(nodes.is_empty());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    load_cluster_nodes_returns_empty_when_file_missing_impl,
+    load_cluster_nodes_returns_empty_when_file_missing,
+    load_cluster_nodes_returns_empty_when_file_missing_turso
+);
+
 async fn explicit_version_id_is_idempotent_for_matching_manifest_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("explicit-version-id-idempotent").await;
 
@@ -4199,6 +4415,51 @@ run_on_all_metadata_backends!(
     persist_and_load_cluster_replicas_roundtrip_impl,
     persist_and_load_cluster_replicas_roundtrip,
     persist_and_load_cluster_replicas_roundtrip_turso
+);
+
+async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-nodes-roundtrip").await;
+    let remote_node_id = NodeId::new_v4();
+    let nodes = vec![crate::cluster::NodeDescriptor {
+        node_id: remote_node_id,
+        reachability: crate::cluster::NodeReachability {
+            public_api_url: Some("https://remote.example".to_string()),
+            peer_api_url: Some("https://remote-internal.example".to_string()),
+            relay_required: true,
+        },
+        capabilities: crate::cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
+        labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+        capacity_bytes: 100,
+        free_bytes: 40,
+        storage_stats: None,
+        last_heartbeat_unix: 123,
+        status: crate::cluster::NodeStatus::Offline,
+    }];
+
+    store.persist_cluster_nodes(&nodes).await.unwrap();
+    let loaded = store.load_cluster_nodes().await.unwrap();
+
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].node_id, remote_node_id);
+    assert_eq!(loaded[0].public_api_url(), Some("https://remote.example"));
+    assert_eq!(
+        loaded[0].peer_api_url(),
+        Some("https://remote-internal.example")
+    );
+    assert!(loaded[0].relay_required());
+    assert!(loaded[0].relay_capable());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    persist_and_load_cluster_nodes_roundtrip_impl,
+    persist_and_load_cluster_nodes_roundtrip,
+    persist_and_load_cluster_nodes_roundtrip_turso
 );
 
 async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
@@ -4878,7 +5139,7 @@ async fn lookup_media_cache_many_preserves_valid_entries_and_cleans_invalid_rows
     )
     .await;
 
-    let inspector = store.store_index_inspector();
+    let inspector = store.store_index_inspector().await.unwrap();
     let lookups = inspector
         .lookup_media_cache_many_by_content_fingerprint(&[
             first_metadata.content_fingerprint.clone(),
@@ -5091,8 +5352,11 @@ async fn metadata_roundtrips_current_state_version_indexes_and_snapshots_impl(
     drop(store);
 
     let reopened = backend.open_store(root.clone()).await;
-    assert_eq!(reopened.object_count(), 1);
-    assert_eq!(reopened.current_keys(), vec!["docs/hello.txt".to_string()]);
+    assert_eq!(reopened.object_count().await.unwrap(), 1);
+    assert_eq!(
+        reopened.current_keys().await.unwrap(),
+        vec!["docs/hello.txt".to_string()]
+    );
 
     let payload = reopened
         .get_object("docs/hello.txt", None, None, ObjectReadMode::Preferred)
@@ -5119,6 +5383,45 @@ run_on_all_metadata_backends!(
     metadata_roundtrips_current_state_version_indexes_and_snapshots_impl,
     metadata_roundtrips_current_state_version_indexes_and_snapshots,
     metadata_roundtrips_current_state_version_indexes_and_snapshots_turso
+);
+
+async fn current_objects_cache_stays_bounded_while_lookups_stay_correct_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("current-objects-cache-bound").await;
+    store.set_current_objects_cache_capacity_for_test(2);
+
+    let keys: Vec<String> = (0..5).map(|i| format!("docs/file-{i}.txt")).collect();
+    for key in &keys {
+        store
+            .put_object_versioned(key, Bytes::from_static(b"payload"), PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    // The cache can only hold 2 entries, so most of these lookups must fall back
+    // to sqlite rather than being served from the resident cache.
+    for key in &keys {
+        assert!(
+            store.object_id_for_key(key).await.unwrap().is_some(),
+            "expected {key} to resolve even though it was evicted from the bounded cache"
+        );
+    }
+
+    assert_eq!(store.object_count().await.unwrap(), keys.len());
+    let mut current_keys = store.current_keys().await.unwrap();
+    current_keys.sort();
+    let mut expected_keys = keys.clone();
+    expected_keys.sort();
+    assert_eq!(current_keys, expected_keys);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    current_objects_cache_stays_bounded_while_lookups_stay_correct_impl,
+    current_objects_cache_stays_bounded_while_lookups_stay_correct,
+    current_objects_cache_stays_bounded_while_lookups_stay_correct_turso
 );
 
 async fn metadata_roundtrips_media_cache_metadata_impl(backend: StorageTestBackend) {
@@ -5770,6 +6073,8 @@ async fn store_index_uses_persisted_manifest_summary_when_manifest_file_is_missi
         .collect::<std::collections::HashMap<_, _>>();
     let (sizes, content_fingerprints) = store
         .store_index_inspector()
+        .await
+        .unwrap()
         .object_sizes_and_content_fingerprints_by_key(&object_hashes)
         .await
         .unwrap();

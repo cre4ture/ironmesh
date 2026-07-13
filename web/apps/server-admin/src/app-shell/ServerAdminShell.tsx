@@ -67,6 +67,7 @@ export function ServerAdminShell() {
         headerActions={
           <>
             <Badge
+              data-testid="server-admin-session-badge"
               color={
                 surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? "teal" : "gray"
               }

@@ -83,11 +83,11 @@ use transport_sdk::{
     NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
     RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelSession, RelayTunnelSessionKind,
-    RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
-    TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader, TransportPathKind,
-    TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, credential_fingerprint,
-    perform_transport_client_handshake, perform_transport_server_handshake,
+    RelayWakeClient, RelayWakeEvent, RelayWakeRegistration, RendezvousClientConfig,
+    RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
+    TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
+    credential_fingerprint, perform_transport_client_handshake, perform_transport_server_handshake,
     read_buffered_transport_response, read_transport_request_head, verify_signed_request_headers,
     write_buffered_transport_request, write_buffered_transport_response,
     write_transport_response_head,
@@ -101,6 +101,8 @@ const BUILD_REVISION: &str = git_version::git_version!(
 );
 const STORAGE_STATS_REFRESH_INTERVAL_SECS: u64 = 300;
 const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
+const PROCESS_STATS_SAMPLE_INTERVAL_SECS: u64 = 2;
+const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
@@ -146,6 +148,22 @@ const UPLOAD_SESSION_PERSIST_COALESCE_SECS: u64 = 5;
 const RENDEZVOUS_RELAY_ACCEPT_IDLE_LOOP_DELAY_MS: u64 = 50;
 const RENDEZVOUS_RELAY_ACCEPT_INITIAL_RETRY_MS: u64 = 250;
 const RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS: u64 = 30;
+/// Short timeout for the on-demand `AcceptTarget` dial made in reaction to a wake push
+/// (or the fallback tick): by the time we dial, we were just told a source is likely
+/// waiting, so there's no reason to hold the connection open for the old 15s poll
+/// window.
+const RENDEZVOUS_RELAY_WAKE_DRAIN_TIMEOUT_MS: u64 = 3_000;
+/// Eventual-correctness safety net: even with the wake channel healthy and connected,
+/// poll at this (much lower) frequency in case a push was somehow lost, without
+/// reintroducing the old tight poll cycle.
+const RENDEZVOUS_RELAY_WAKE_FALLBACK_POLL_SECS: u64 = 45;
+/// Bounds how many pending sources we drain in one reaction to a single wake/fallback
+/// tick, so a pathological flood of sources can't hold this loop hostage.
+const RENDEZVOUS_RELAY_WAKE_DRAIN_MAX_ITERATIONS: usize = 64;
+/// Keeps the wake connection's keepalive traffic comfortably below typical
+/// NAT/firewall idle-connection timeouts.
+const RENDEZVOUS_RELAY_WAKE_PING_INTERVAL_SECS: u64 = 20;
+const RENDEZVOUS_RELAY_WAKE_IDLE_TIMEOUT_SECS: u64 = 60;
 const EMBEDDED_RENDEZVOUS_RESTART_INITIAL_DELAY_SECS: u64 = 1;
 
 fn ensure_rustls_crypto_provider_installed() {
@@ -171,6 +189,8 @@ const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thum
 const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
 const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
+const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
+    "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
@@ -192,19 +212,20 @@ use setup::{
     managed_rendezvous_key_path, managed_signer_ca_cert_path,
 };
 use storage::{
-    AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, ClientBootstrapClaimRecord,
-    ClientCredentialRecord, ClientCredentialState, DataChangeAction, DataChangeActorKind,
-    DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery, DataChangeUploadMode,
-    DataScrubReport, HostDependencyReport, HostDependencyStatus, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
-    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
-    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
-    ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
-    S3ControlPlaneState, SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError,
-    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, media_cache_retry_due,
-    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
+    AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, CleanupReport, ClientBootstrapClaimRecord,
+    ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
+    DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
+    DataChangeUploadMode, DataScrubReport, HostDependencyReport, HostDependencyStatus,
+    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
+    MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
+    ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult, PersistentStore,
+    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
+    StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
+    VersionConsistencyState, media_cache_retry_due, metadata_db_logical_table_count,
+    promote_cached_media_metadata_to_incomplete,
 };
 
 tokio::task_local! {
@@ -231,6 +252,7 @@ struct ServerState {
     repair_config: RepairConfig,
     log_buffer: Arc<LogBuffer>,
     runtime_log_control: RuntimeLogControl,
+    process_stats_runtime: Arc<StdMutex<ProcessStatsRuntime>>,
 }
 
 #[derive(Clone)]
@@ -247,6 +269,7 @@ struct ServerStorageRuntime {
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
+    last_gc_pass: Arc<StdMutex<Option<GcPassSummary>>>,
 }
 
 #[derive(Clone)]
@@ -488,6 +511,45 @@ fn new_store_rwlock(store: PersistentStore) -> Arc<TracedRwLock<PersistentStore>
     ))
 }
 
+fn placeholder_cluster_node_descriptor(node_id: NodeId) -> NodeDescriptor {
+    NodeDescriptor {
+        node_id,
+        reachability: NodeReachability::default(),
+        capabilities: NodeCapabilities::default(),
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Offline,
+    }
+}
+
+fn backfill_cluster_nodes_from_replica_rows(
+    mut persisted_cluster_nodes: Vec<NodeDescriptor>,
+    persisted_cluster_replicas: &HashMap<String, Vec<NodeId>>,
+) -> Vec<NodeDescriptor> {
+    let known_node_ids = persisted_cluster_nodes
+        .iter()
+        .map(|node| node.node_id)
+        .collect::<HashSet<_>>();
+    let mut missing_node_ids = persisted_cluster_replicas
+        .values()
+        .flat_map(|nodes| nodes.iter().copied())
+        .filter(|node_id| !known_node_ids.contains(node_id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    missing_node_ids.sort();
+
+    for node_id in missing_node_ids {
+        persisted_cluster_nodes.push(placeholder_cluster_node_descriptor(node_id));
+    }
+
+    persisted_cluster_nodes.sort_by_key(|node| node.node_id);
+    persisted_cluster_nodes
+}
+
 async fn lock_store<'a>(
     state: &'a ServerState,
     operation: &'static str,
@@ -521,7 +583,6 @@ async fn write_upload_sessions<'a>(
     state.storage.upload_sessions.write(operation).await
 }
 
-#[cfg(test)]
 async fn read_upload_sessions<'a>(
     state: &'a ServerState,
     operation: &'static str,
@@ -823,6 +884,8 @@ struct UploadSessionStartRequest {
     #[serde(default)]
     parent: Vec<String>,
     version_id: Option<String>,
+    #[serde(default)]
+    chunk_refs: Vec<UploadChunkRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1937,6 +2000,241 @@ impl LogBuffer {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ChildProcessStat {
+    pid: u32,
+    name: String,
+    cpu_percent: f32,
+    memory_bytes: u64,
+    disk_read_bytes_per_sec: u64,
+    disk_write_bytes_per_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TemperatureComponentStat {
+    label: String,
+    temperature_celsius: Option<f32>,
+    max_celsius: Option<f32>,
+    critical_celsius: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProcessStatsSample {
+    collected_at_unix: u64,
+    main_cpu_percent: f32,
+    main_memory_bytes: u64,
+    main_disk_read_bytes_per_sec: u64,
+    main_disk_write_bytes_per_sec: u64,
+    children_cpu_percent: f32,
+    children_memory_bytes: u64,
+    children_disk_read_bytes_per_sec: u64,
+    children_disk_write_bytes_per_sec: u64,
+    children_count: u32,
+    temperature_component_count: u32,
+    temperature_reporting_component_count: u32,
+    hottest_temperature_celsius: Option<f32>,
+    average_temperature_celsius: Option<f32>,
+}
+
+#[derive(Default)]
+struct ProcessStatsRuntime {
+    history: VecDeque<ProcessStatsSample>,
+    latest_children: Vec<ChildProcessStat>,
+    latest_temperature_components: Vec<TemperatureComponentStat>,
+    logical_cpu_count: usize,
+}
+
+impl ProcessStatsRuntime {
+    fn push(
+        &mut self,
+        sample: ProcessStatsSample,
+        children: Vec<ChildProcessStat>,
+        temperature_components: Vec<TemperatureComponentStat>,
+        logical_cpu_count: usize,
+    ) {
+        self.history.push_back(sample);
+        while self.history.len() > PROCESS_STATS_HISTORY_MAX_SAMPLES {
+            self.history.pop_front();
+        }
+        self.latest_children = children;
+        self.latest_temperature_components = temperature_components;
+        self.logical_cpu_count = logical_cpu_count;
+    }
+
+    fn recent(&self, limit: usize) -> Vec<ProcessStatsSample> {
+        let keep = limit.max(1);
+        let skip = self.history.len().saturating_sub(keep);
+        self.history.iter().skip(skip).cloned().collect()
+    }
+}
+
+fn seed_process_temperature_stats_for_tests(state: &ServerState) {
+    if !env_flag_is_truthy(TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV) {
+        return;
+    }
+
+    let temperature_components = vec![TemperatureComponentStat {
+        label: "Seeded runtime sensor".to_string(),
+        temperature_celsius: Some(42.5),
+        max_celsius: Some(85.0),
+        critical_celsius: Some(100.0),
+    }];
+    let temperature_summary = summarize_temperature_components(&temperature_components);
+    let logical_cpu_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let sample = ProcessStatsSample {
+        collected_at_unix: unix_ts(),
+        main_cpu_percent: 0.0,
+        main_memory_bytes: 0,
+        main_disk_read_bytes_per_sec: 0,
+        main_disk_write_bytes_per_sec: 0,
+        children_cpu_percent: 0.0,
+        children_memory_bytes: 0,
+        children_disk_read_bytes_per_sec: 0,
+        children_disk_write_bytes_per_sec: 0,
+        children_count: 0,
+        temperature_component_count: temperature_summary.component_count,
+        temperature_reporting_component_count: temperature_summary.reporting_component_count,
+        hottest_temperature_celsius: temperature_summary.hottest_temperature_celsius,
+        average_temperature_celsius: temperature_summary.average_temperature_celsius,
+    };
+
+    let mut runtime = match state.process_stats_runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if runtime.history.is_empty() {
+        runtime.push(
+            sample,
+            Vec::new(),
+            temperature_components,
+            logical_cpu_count,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TemperatureSummary {
+    component_count: u32,
+    reporting_component_count: u32,
+    hottest_temperature_celsius: Option<f32>,
+    average_temperature_celsius: Option<f32>,
+}
+
+fn sanitize_temperature_reading(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| value.is_finite())
+}
+
+fn collect_temperature_components(
+    components: &sysinfo::Components,
+) -> Vec<TemperatureComponentStat> {
+    let mut stats = components
+        .iter()
+        .filter_map(|component: &sysinfo::Component| {
+            let temperature_celsius = sanitize_temperature_reading(component.temperature());
+            let max_celsius = sanitize_temperature_reading(component.max());
+            let critical_celsius = sanitize_temperature_reading(component.critical());
+            if temperature_celsius.is_none() && max_celsius.is_none() && critical_celsius.is_none()
+            {
+                return None;
+            }
+
+            let label = component.label().trim();
+            let label = if label.is_empty() {
+                component.id().unwrap_or("unnamed component")
+            } else {
+                label
+            };
+
+            Some(TemperatureComponentStat {
+                label: label.to_string(),
+                temperature_celsius,
+                max_celsius,
+                critical_celsius,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    stats.sort_by(|left, right| {
+        let left_temp = left.temperature_celsius.unwrap_or(f32::NEG_INFINITY);
+        let right_temp = right.temperature_celsius.unwrap_or(f32::NEG_INFINITY);
+        right_temp
+            .partial_cmp(&left_temp)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    stats
+}
+
+fn summarize_temperature_components(components: &[TemperatureComponentStat]) -> TemperatureSummary {
+    let mut summary = TemperatureSummary {
+        component_count: components.len() as u32,
+        ..TemperatureSummary::default()
+    };
+    let mut total_temperature = 0.0_f32;
+
+    for component in components {
+        let Some(temperature_celsius) = component.temperature_celsius else {
+            continue;
+        };
+        summary.reporting_component_count += 1;
+        total_temperature += temperature_celsius;
+        summary.hottest_temperature_celsius = Some(
+            summary
+                .hottest_temperature_celsius
+                .map(|current| current.max(temperature_celsius))
+                .unwrap_or(temperature_celsius),
+        );
+    }
+
+    if summary.reporting_component_count > 0 {
+        summary.average_temperature_celsius =
+            Some(total_temperature / summary.reporting_component_count as f32);
+    }
+
+    summary
+}
+
+/// Snapshot of the most recent `cleanup_unreferenced` (GC) pass, kept for dashboard
+/// attribution. Captured on every run (dry or not) so operators can see it without
+/// having to trigger a real cleanup first.
+#[derive(Debug, Clone, Serialize)]
+struct GcPassSummary {
+    collected_at_unix: u64,
+    dry_run: bool,
+    retained_manifests_processed: usize,
+    peak_manifest_batch_size: usize,
+    deleted_manifests: usize,
+    deleted_chunks: usize,
+}
+
+impl GcPassSummary {
+    fn from_report(report: &CleanupReport) -> Self {
+        Self {
+            collected_at_unix: unix_ts(),
+            dry_run: report.dry_run,
+            retained_manifests_processed: report.retained_manifests_processed,
+            peak_manifest_batch_size: report.peak_manifest_batch_size,
+            deleted_manifests: report.deleted_manifests,
+            deleted_chunks: report.deleted_chunks,
+        }
+    }
+}
+
+/// Attribution for the confirmed RAM hotspots in
+/// docs/node-memory-footprint-reduction-plan.md, next to the whole-process RSS gauge:
+/// what's resident and why, not just how big the process is.
+#[derive(Debug, Clone, Serialize)]
+struct MemoryAttributionSample {
+    collected_at_unix: u64,
+    current_objects_cache: CurrentObjectsCacheStats,
+    current_objects_total_count: usize,
+    in_flight_upload_session_count: usize,
+    in_flight_upload_bytes: u64,
+    last_gc_pass: Option<GcPassSummary>,
+}
+
 #[derive(Clone)]
 struct LogCaptureLayer {
     buffer: Arc<LogBuffer>,
@@ -2294,6 +2592,7 @@ pub struct ServerNodeConfig {
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
     pub internal_ca_key_path: Option<PathBuf>,
+    pub local_status_bind_addr: Option<SocketAddr>,
     pub rendezvous_ca_cert_path: Option<PathBuf>,
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
@@ -2367,6 +2666,27 @@ fn parse_require_client_auth_env(allow_unauthenticated_clients: bool) -> bool {
         .ok()
         .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
         .unwrap_or(!allow_unauthenticated_clients)
+}
+
+/// Parses the optional plain-HTTP, loopback-only status listener bind address.
+/// Unset by default; when set, must be a loopback address since the listener
+/// serves `/health` and cluster status without any authentication.
+fn parse_local_status_bind_addr() -> Result<Option<SocketAddr>> {
+    let Some(raw) = std::env::var("IRONMESH_LOCAL_STATUS_BIND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let addr: SocketAddr = raw.parse().context("invalid IRONMESH_LOCAL_STATUS_BIND")?;
+    if !addr.ip().is_loopback() {
+        bail!(
+            "IRONMESH_LOCAL_STATUS_BIND must bind to a loopback address (127.0.0.1 or ::1) \
+             since it serves health/cluster status without authentication; got {addr}"
+        );
+    }
+    Ok(Some(addr))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4162,6 +4482,7 @@ impl ServerNodeConfig {
             public_peer_api_enabled: bootstrap.public_peer_api_enabled,
             internal_tls,
             internal_ca_key_path: None,
+            local_status_bind_addr: parse_local_status_bind_addr()?,
             rendezvous_ca_cert_path: None,
             rendezvous_urls: bootstrap.rendezvous_urls,
             rendezvous_registration_enabled: rendezvous_configured,
@@ -4450,6 +4771,7 @@ impl ServerNodeConfig {
             internal_ca_key_path: std::env::var("IRONMESH_INTERNAL_TLS_CA_KEY")
                 .ok()
                 .map(PathBuf::from),
+            local_status_bind_addr: parse_local_status_bind_addr()?,
             rendezvous_ca_cert_path,
             rendezvous_urls,
             rendezvous_registration_enabled,
@@ -5086,26 +5408,6 @@ async fn run_inner(
     };
 
     let mut cluster = ClusterService::new(config.node_id, policy, config.heartbeat_timeout_secs);
-    cluster.register_node(NodeDescriptor {
-        node_id: config.node_id,
-        reachability: NodeReachability {
-            public_api_url: Some(public_url.clone()),
-            peer_api_url: Some(internal_url),
-            relay_required: config.relay_mode == RelayMode::Required,
-        },
-        capabilities: NodeCapabilities {
-            public_api: true,
-            peer_api: true,
-            relay_tunnel: config.rendezvous_registration_enabled
-                && config.relay_mode != RelayMode::Disabled,
-        },
-        labels: config.labels.clone(),
-        capacity_bytes: 0,
-        free_bytes: 0,
-        storage_stats: None,
-        last_heartbeat_unix: 0,
-        status: cluster::NodeStatus::Online,
-    });
 
     let store = new_store_rwlock(
         PersistentStore::init_with_metadata_backend(
@@ -5136,6 +5438,24 @@ async fn run_inner(
         reqwest::Client::new()
     };
 
+    let load_cluster_nodes_phase_started_at =
+        log_server_startup_phase_begin("load_cluster_nodes", startup_phase_anchor);
+    let persisted_cluster_nodes = {
+        let store_guard = store.read("server.init.load_cluster_nodes").await;
+        match store_guard.load_cluster_nodes().await {
+            Ok(nodes) => nodes,
+            Err(err) => {
+                warn!(error = %err, "failed to load cluster node state; starting empty");
+                Vec::new()
+            }
+        }
+    };
+    log_server_startup_phase_end(
+        "load_cluster_nodes",
+        startup_phase_anchor,
+        load_cluster_nodes_phase_started_at,
+    );
+
     let load_cluster_replicas_phase_started_at =
         log_server_startup_phase_begin("load_cluster_replicas", startup_phase_anchor);
     let persisted_cluster_replicas = {
@@ -5153,7 +5473,49 @@ async fn run_inner(
         startup_phase_anchor,
         load_cluster_replicas_phase_started_at,
     );
-    cluster.import_replicas_by_key(persisted_cluster_replicas);
+    let persisted_cluster_nodes = backfill_cluster_nodes_from_replica_rows(
+        persisted_cluster_nodes,
+        &persisted_cluster_replicas,
+    );
+    cluster.import_nodes(persisted_cluster_nodes);
+
+    let _ = cluster.register_node(NodeDescriptor {
+        node_id: config.node_id,
+        reachability: NodeReachability {
+            public_api_url: Some(public_url.clone()),
+            peer_api_url: Some(internal_url),
+            relay_required: config.relay_mode == RelayMode::Required,
+        },
+        capabilities: NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: config.rendezvous_registration_enabled
+                && config.relay_mode != RelayMode::Disabled,
+        },
+        labels: config.labels.clone(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    });
+
+    let known_node_ids = cluster
+        .list_nodes()
+        .into_iter()
+        .map(|node| node.node_id)
+        .collect::<HashSet<_>>();
+    let filtered_cluster_replicas = persisted_cluster_replicas
+        .into_iter()
+        .filter_map(|(subject, nodes)| {
+            let nodes = nodes
+                .into_iter()
+                .filter(|node_id| known_node_ids.contains(node_id))
+                .collect::<Vec<_>>();
+            (!nodes.is_empty()).then_some((subject, nodes))
+        })
+        .collect::<HashMap<_, _>>();
+    cluster.import_replicas_by_key(filtered_cluster_replicas);
 
     let load_client_credentials_phase_started_at =
         log_server_startup_phase_begin("load_client_credentials", startup_phase_anchor);
@@ -5408,6 +5770,7 @@ async fn run_inner(
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
+            last_gc_pass: Arc::new(StdMutex::new(None)),
         },
         access: ServerAccessRuntime {
             client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
@@ -5490,7 +5853,9 @@ async fn run_inner(
         repair_config,
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
         runtime_log_control,
+        process_stats_runtime: Arc::new(StdMutex::new(ProcessStatsRuntime::default())),
     };
+    seed_process_temperature_stats_for_tests(&state);
 
     let internal_peer_url = config
         .internal_tls
@@ -5521,6 +5886,7 @@ struct ServerApps {
     public_app: Router,
     internal_app: Router,
     s3_app: Router,
+    local_status_app: Router,
 }
 
 async fn start_background_runtimes(
@@ -5546,6 +5912,7 @@ async fn start_background_runtimes(
     );
     spawn_local_availability_refresher(state.clone(), startup_phase_anchor);
     spawn_storage_stats_refresher(state.clone());
+    spawn_process_stats_sampler(state.clone());
     spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
 
@@ -5820,6 +6187,9 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5886,6 +6256,9 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -5968,6 +6341,9 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/cluster/scrub/run", post(trigger_data_scrub_peer))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
+        .route("/process/stats/memory", get(process_stats_memory))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
@@ -6023,10 +6399,16 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             track_inflight_requests,
         ));
 
+    let local_status_app = Router::new()
+        .route("/health", get(health))
+        .route("/api/v1/cluster/status", get(cluster_status))
+        .with_state(state.clone());
+
     ServerApps {
         public_app,
         internal_app,
         s3_app,
+        local_status_app,
     }
 }
 
@@ -6039,6 +6421,7 @@ async fn run_server_listeners(
         public_app,
         internal_app,
         s3_app,
+        local_status_app,
     } = apps;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut internal_server_handle = None;
@@ -6046,6 +6429,23 @@ async fn run_server_listeners(
     let mut s3_server_handle = None;
     let mut s3_server_task = None;
     let mut embedded_rendezvous_task = None;
+    let mut local_status_server_task = None;
+
+    if let Some(local_status_bind_addr) = config.local_status_bind_addr {
+        let shutdown_rx = shutdown_rx.clone();
+        local_status_server_task = Some(tokio::spawn(async move {
+            info!(
+                bind_addr = %local_status_bind_addr,
+                "server node local status (unauthenticated, loopback-only) listener"
+            );
+
+            let listener = tokio::net::TcpListener::bind(local_status_bind_addr).await?;
+            axum::serve(listener, local_status_app)
+                .with_graceful_shutdown(wait_for_shutdown_trigger(shutdown_rx))
+                .await
+                .context("local status server listener stopped")
+        }));
+    }
 
     if let Some(internal_tls) = config.internal_tls.as_ref() {
         let internal_bind_addr = internal_tls.bind_addr;
@@ -6198,6 +6598,9 @@ async fn run_server_listeners(
             if let Some(task) = internal_server_task.take() {
                 task.await.context("internal server task join failure")??;
             }
+            if let Some(task) = local_status_server_task.take() {
+                task.await.context("local status server task join failure")??;
+            }
             if let Some(task) = embedded_rendezvous_task.take() {
                 task.await.context("embedded rendezvous supervisor task join failure")?;
             }
@@ -6220,6 +6623,10 @@ async fn run_server_listeners(
     }
     if let Some(task) = internal_server_task {
         task.await.context("internal server task join failure")??;
+    }
+    if let Some(task) = local_status_server_task {
+        task.await
+            .context("local status server task join failure")??;
     }
     if let Some(task) = embedded_rendezvous_task {
         task.abort();
@@ -6373,6 +6780,91 @@ fn spawn_storage_stats_refresher(state: ServerState) {
                     refresh_storage_stats_once(&state).await;
                 }
             }
+        }
+    });
+}
+
+fn spawn_process_stats_sampler(state: ServerState) {
+    tokio::spawn(async move {
+        let mut system = sysinfo::System::new();
+        let mut temperature_components = sysinfo::Components::new_with_refreshed_list();
+        let main_pid = sysinfo::Pid::from_u32(std::process::id());
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(PROCESS_STATS_SAMPLE_INTERVAL_SECS));
+
+        loop {
+            ticker.tick().await;
+            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            temperature_components.refresh(true);
+
+            let main_process = system.process(main_pid);
+            let main_cpu_percent = main_process.map(|p| p.cpu_usage()).unwrap_or(0.0);
+            let main_memory_bytes = main_process.map(|p| p.memory()).unwrap_or(0);
+            let main_disk_usage = main_process.map(|p| p.disk_usage()).unwrap_or_default();
+
+            let mut children = Vec::new();
+            for (pid, process) in system.processes() {
+                if *pid == main_pid
+                    || process.parent() != Some(main_pid)
+                    || process.thread_kind().is_some()
+                {
+                    // Linux exposes OS threads (e.g. tokio workers) as entries with the
+                    // same parent pid; thread_kind() distinguishes them from real children.
+                    continue;
+                }
+                let disk_usage = process.disk_usage();
+                children.push(ChildProcessStat {
+                    pid: pid.as_u32(),
+                    name: process.name().to_string_lossy().into_owned(),
+                    cpu_percent: process.cpu_usage(),
+                    memory_bytes: process.memory(),
+                    disk_read_bytes_per_sec: disk_usage.read_bytes
+                        / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                    disk_write_bytes_per_sec: disk_usage.written_bytes
+                        / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                });
+            }
+
+            let children_cpu_percent = children.iter().map(|child| child.cpu_percent).sum();
+            let children_memory_bytes = children.iter().map(|child| child.memory_bytes).sum();
+            let children_disk_read_bytes_per_sec = children
+                .iter()
+                .map(|child| child.disk_read_bytes_per_sec)
+                .sum();
+            let children_disk_write_bytes_per_sec = children
+                .iter()
+                .map(|child| child.disk_write_bytes_per_sec)
+                .sum();
+            let children_count = children.len() as u32;
+            let temperature_components = collect_temperature_components(&temperature_components);
+            let temperature_summary = summarize_temperature_components(&temperature_components);
+
+            let sample = ProcessStatsSample {
+                collected_at_unix: unix_ts(),
+                main_cpu_percent,
+                main_memory_bytes,
+                main_disk_read_bytes_per_sec: main_disk_usage.read_bytes
+                    / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                main_disk_write_bytes_per_sec: main_disk_usage.written_bytes
+                    / PROCESS_STATS_SAMPLE_INTERVAL_SECS.max(1),
+                children_cpu_percent,
+                children_memory_bytes,
+                children_disk_read_bytes_per_sec,
+                children_disk_write_bytes_per_sec,
+                children_count,
+                temperature_component_count: temperature_summary.component_count,
+                temperature_reporting_component_count: temperature_summary
+                    .reporting_component_count,
+                hottest_temperature_celsius: temperature_summary.hottest_temperature_celsius,
+                average_temperature_celsius: temperature_summary.average_temperature_celsius,
+            };
+
+            let logical_cpu_count = system.cpus().len();
+            let mut runtime = match state.process_stats_runtime.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            runtime.push(sample, children, temperature_components, logical_cpu_count);
         }
     });
 }
@@ -6669,27 +7161,41 @@ async fn apply_rendezvous_presence_entries(
     state: &ServerState,
     entries: &[transport_sdk::PresenceEntry],
 ) -> usize {
-    let mut discovered = 0usize;
-    let mut cluster = state.cluster.lock().await;
+    let discovered = {
+        let mut discovered = 0usize;
+        let mut cluster = state.cluster.lock().await;
 
-    for entry in entries {
-        let transport_sdk::PeerIdentity::Node(node_id) = &entry.registration.identity else {
-            continue;
-        };
-        if *node_id == state.node_id {
-            continue;
+        for entry in entries {
+            let transport_sdk::PeerIdentity::Node(node_id) = &entry.registration.identity else {
+                continue;
+            };
+            if *node_id == state.node_id {
+                continue;
+            }
+
+            let Some(descriptor) = node_descriptor_from_presence_entry(entry) else {
+                tracing::debug!(
+                    node_id = %node_id,
+                    "skipping rendezvous peer without a usable transport path"
+                );
+                continue;
+            };
+
+            if cluster.register_node(descriptor) {
+                discovered += 1;
+            }
         }
+        discovered
+    };
 
-        let Some(descriptor) = node_descriptor_from_presence_entry(entry) else {
-            tracing::debug!(
-                node_id = %node_id,
-                "skipping rendezvous peer without a usable transport path"
-            );
-            continue;
-        };
-
-        cluster.register_node(descriptor);
-        discovered += 1;
+    if discovered > 0
+        && let Err(err) = persist_cluster_nodes_state(state).await
+    {
+        warn!(
+            error = %err,
+            discovered_nodes = discovered,
+            "failed to persist rendezvous-discovered cluster nodes"
+        );
     }
 
     discovered
@@ -8048,48 +8554,157 @@ fn spawn_rendezvous_relay_multiplex_session_task(
     });
 }
 
-fn spawn_rendezvous_relay_multiplex_accept_task(
+/// Drains any relay sources currently pending for this node against `endpoint`, in
+/// reaction to either a wake push or the periodic fallback tick. Each dial uses a
+/// short timeout since, by construction, we only call this when a source is believed
+/// to be waiting right now -- unlike the old poll loop, this is not a "wait and see"
+/// call.
+async fn drain_pending_relay_multiplex_targets(
+    state: &ServerState,
+    endpoint: &RendezvousEndpointClient,
+) {
+    let cluster_id = state.cluster_id;
+    let node_id = state.node_id;
+
+    for _ in 0..RENDEZVOUS_RELAY_WAKE_DRAIN_MAX_ITERATIONS {
+        let result = endpoint
+            .control
+            .accept_relay_multiplex_target(
+                &RelayTunnelAcceptRequest {
+                    cluster_id,
+                    target: PeerIdentity::Node(node_id),
+                    session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                    wait_timeout_ms: Some(RENDEZVOUS_RELAY_WAKE_DRAIN_TIMEOUT_MS),
+                },
+                MultiplexConfig::default(),
+            )
+            .await;
+
+        match result {
+            Ok((relay_session, multiplexed)) => {
+                spawn_rendezvous_relay_multiplex_session_task(
+                    state.clone(),
+                    endpoint.url.clone(),
+                    relay_session,
+                    multiplexed,
+                );
+                // Keep draining: a burst of several sources may have arrived together.
+            }
+            Err(err)
+                if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
+                    &err.to_string(),
+                ) =>
+            {
+                // Queue empty -- done until the next wake or fallback tick.
+                return;
+            }
+            Err(err) => {
+                let error_text = err.to_string();
+                let failures =
+                    record_rendezvous_registration_failure(state, &endpoint.url, &error_text).await;
+                warn!(
+                    error = %err,
+                    rendezvous_url = %endpoint.url,
+                    consecutive_failures = failures,
+                    "multiplex relay drain failed"
+                );
+                // Don't hot-loop on a genuine error; the next wake/fallback tick retries.
+                return;
+            }
+        }
+    }
+}
+
+/// Runs one connected relay wake session to completion: reacts to `Wake` pushes and a
+/// low-frequency fallback tick by draining pending sources, and pings periodically to
+/// keep the connection alive through NAT/firewall idle timeouts. Returns when the
+/// connection ends for any reason (clean close, read error, or receive-idle timeout),
+/// so the caller can reconnect.
+async fn run_rendezvous_relay_wake_session(
+    state: &ServerState,
+    endpoint: &RendezvousEndpointClient,
+    wake_client: &mut RelayWakeClient,
+) {
+    let mut fallback_ticker = tokio::time::interval(Duration::from_secs(
+        RENDEZVOUS_RELAY_WAKE_FALLBACK_POLL_SECS,
+    ));
+    fallback_ticker.tick().await; // consume the immediate first tick; we already drained on connect
+    let mut ping_ticker = tokio::time::interval(Duration::from_secs(
+        RENDEZVOUS_RELAY_WAKE_PING_INTERVAL_SECS,
+    ));
+    ping_ticker.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            event = tokio::time::timeout(
+                Duration::from_secs(RENDEZVOUS_RELAY_WAKE_IDLE_TIMEOUT_SECS),
+                wake_client.next_event(),
+            ) => {
+                match event {
+                    Ok(Ok(RelayWakeEvent::Wake)) => {
+                        drain_pending_relay_multiplex_targets(state, endpoint).await;
+                    }
+                    Ok(Ok(RelayWakeEvent::Closed)) => return,
+                    Ok(Err(err)) => {
+                        tracing::debug!(
+                            error = %err,
+                            rendezvous_url = %endpoint.url,
+                            "relay wake channel read failed"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            rendezvous_url = %endpoint.url,
+                            "relay wake channel idle timeout, reconnecting"
+                        );
+                        return;
+                    }
+                }
+            }
+            _ = fallback_ticker.tick() => {
+                drain_pending_relay_multiplex_targets(state, endpoint).await;
+            }
+            _ = ping_ticker.tick() => {
+                if wake_client.send_ping().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Maintains the long-lived relay wake channel for one rendezvous endpoint: connects,
+/// registers as the target identity, drains anything already pending, then runs the
+/// session until it ends, and reconnects immediately (no delay) since a healthy
+/// disconnect-and-retry is the normal way this loop turns over. Only a genuine
+/// connect failure backs off, using the same backoff as before.
+fn spawn_rendezvous_relay_wake_task(
     state: ServerState,
     endpoint: RendezvousEndpointClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let cluster_id = state.cluster_id;
-        let node_id = state.node_id;
+        let registration = RelayWakeRegistration {
+            cluster_id: state.cluster_id,
+            target: PeerIdentity::Node(state.node_id),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
+        };
 
         loop {
-            let result = endpoint
-                .control
-                .accept_relay_multiplex_target(
-                    &RelayTunnelAcceptRequest {
-                        cluster_id,
-                        target: PeerIdentity::Node(node_id),
-                        session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                        wait_timeout_ms: Some(15_000),
-                    },
-                    MultiplexConfig::default(),
-                )
-                .await;
-
-            match result {
-                Ok((relay_session, multiplexed)) => {
-                    spawn_rendezvous_relay_multiplex_session_task(
-                        state.clone(),
-                        endpoint.url.clone(),
-                        relay_session,
-                        multiplexed,
-                    );
+            match endpoint.control.connect_relay_wake(&registration).await {
+                Ok(mut wake_client) => {
+                    let _ = record_rendezvous_registration_success(
+                        &state,
+                        &endpoint.url,
+                        RendezvousRegistrationSuccessVersionUpdate::Preserve,
+                    )
+                    .await;
+                    drain_pending_relay_multiplex_targets(&state, &endpoint).await;
+                    run_rendezvous_relay_wake_session(&state, &endpoint, &mut wake_client).await;
+                    // Falls through here on any disconnect; loop back and reconnect
+                    // immediately below, with no sleep.
                 }
                 Err(err) => {
-                    if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(&err.to_string())
-                    {
-                        tracing::debug!(
-                            error = %err,
-                            rendezvous_url = %endpoint.url,
-                            "multiplex relay accept timed out without a source connection"
-                        );
-                        continue;
-                    }
-
                     let error_text = err.to_string();
                     let failures =
                         record_rendezvous_registration_failure(&state, &endpoint.url, &error_text)
@@ -8101,7 +8716,7 @@ fn spawn_rendezvous_relay_multiplex_accept_task(
                             rendezvous_url = %endpoint.url,
                             consecutive_failures = failures,
                             next_retry_ms = retry_delay.as_millis(),
-                            "multiplex relay accept failed"
+                            "relay wake channel connect failed"
                         );
                     } else {
                         tracing::debug!(
@@ -8109,7 +8724,7 @@ fn spawn_rendezvous_relay_multiplex_accept_task(
                             rendezvous_url = %endpoint.url,
                             consecutive_failures = failures,
                             next_retry_ms = retry_delay.as_millis(),
-                            "multiplex relay accept failed"
+                            "relay wake channel connect failed"
                         );
                     }
                     tokio::time::sleep(retry_delay).await;
@@ -8152,7 +8767,7 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                 }
                 accept_tasks.insert(
                     endpoint.url.clone(),
-                    spawn_rendezvous_relay_multiplex_accept_task(state.clone(), endpoint),
+                    spawn_rendezvous_relay_wake_task(state.clone(), endpoint),
                 );
             }
 
@@ -8358,12 +8973,11 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
 pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
     let mut local_metadata_subjects = {
         let store = read_store(state, "cluster_metadata.list_local_subjects").await;
-        store
-            .list_metadata_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-            .into_iter()
-            .collect::<HashSet<_>>()
+        let subjects = match store.list_metadata_subjects().await {
+            Ok(subjects) => subjects,
+            Err(_) => store.current_keys().await.unwrap_or_default(),
+        };
+        subjects.into_iter().collect::<HashSet<_>>()
     };
 
     let peers = {
@@ -8643,12 +9257,31 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
 async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
     let inspector = {
         let store = read_store(state, "availability.recompute_local_subjects.snapshot").await;
-        store.replication_subject_inspector()
+        match store.replication_subject_inspector().await {
+            Ok(inspector) => inspector,
+            Err(err) => {
+                warn!(error = %err, "failed to snapshot current state for replication subjects");
+                return Vec::new();
+            }
+        }
     };
-    let mut subjects = inspector
-        .list_replication_subjects()
-        .await
-        .unwrap_or_else(|_| inspector.current_keys());
+    // Per-manifest corruption is already handled inside `list_replication_subjects`
+    // (a single unreadable/invalid manifest is excluded from the result rather than
+    // aborting the scan), so an `Err` here reflects a genuinely unexpected failure
+    // unrelated to any specific manifest (e.g. the metadata store itself being
+    // unreachable). Falling back to `current_keys()` in that case still risks
+    // over-trusting local data, but it's the best information available; log it so
+    // the fallback is visible instead of silent.
+    let mut subjects = match inspector.list_replication_subjects().await {
+        Ok(subjects) => subjects,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to compute replication subjects; falling back to current keys"
+            );
+            inspector.current_keys()
+        }
+    };
     subjects.sort();
     subjects
 }
@@ -9069,9 +9702,12 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
     info!(run_id = %tracker.run_id, trigger = ?tracker.trigger, "data scrub run started");
     let scrubber = {
         let store = read_store(&state, "data_scrub.clone_worker").await;
-        store.data_scrubber()
+        store.data_scrubber().await
     };
-    let result = scrubber.run_with_repair_subjects().await;
+    let result = match scrubber {
+        Ok(scrubber) => scrubber.run_with_repair_subjects().await,
+        Err(err) => Err(err),
+    };
 
     match result {
         Ok(output) => {
@@ -10124,7 +10760,13 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
     tokio::spawn(async move {
         let targets = {
             let store = read_store(&state, "media_metadata_backfill.snapshot").await;
-            let inspector = store.store_index_inspector();
+            let inspector = match store.store_index_inspector().await {
+                Ok(inspector) => inspector,
+                Err(err) => {
+                    warn!(error = %err, "failed to snapshot current state for media metadata backfill");
+                    return;
+                }
+            };
             let mut targets = BTreeMap::new();
             for (key, manifest_hash) in inspector.current_object_hashes() {
                 if looks_like_media_path(&key) && manifest_hash != TOMBSTONE_MANIFEST_HASH {
@@ -10729,6 +11371,44 @@ async fn start_upload_session(
     } else {
         ((request.total_size_bytes - 1) / chunk_size_bytes as u64 + 1) as usize
     };
+    if !request.chunk_refs.is_empty() && request.chunk_refs.len() != chunk_count {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    for (index, chunk_ref) in request.chunk_refs.iter().enumerate() {
+        let Some(expected_size) = expected_upload_chunk_size(
+            request.total_size_bytes,
+            chunk_size_bytes,
+            chunk_count,
+            index,
+        ) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if chunk_ref.size_bytes != expected_size {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
+
+    let received_chunks = if request.chunk_refs.is_empty() {
+        vec![None; chunk_count]
+    } else {
+        match state
+            .storage
+            .upload_chunk_ingestor
+            .available_upload_chunk_refs(&request.chunk_refs)
+            .await
+        {
+            Ok(received_chunks) => received_chunks,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = %key,
+                    chunk_count = request.chunk_refs.len(),
+                    "rejected upload session start with invalid chunk refs"
+                );
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+    };
     let now = unix_ts();
 
     let mut sessions = write_upload_sessions(&state, "upload_sessions.start").await;
@@ -10745,7 +11425,7 @@ async fn start_upload_session(
         parent_version_ids: request.parent,
         explicit_version_id: request.version_id,
         assembly_mode: UploadAssemblyMode::FixedSequence,
-        received_chunks: vec![None; chunk_count],
+        received_chunks,
         multipart_parts: BTreeMap::new(),
         multipart_bucket_name: None,
         multipart_object_metadata: None,
@@ -10764,6 +11444,7 @@ async fn start_upload_session(
         total_size_bytes = request.total_size_bytes,
         chunk_count,
         chunk_size_bytes,
+        reused_chunks = response.received_indexes.len(),
         state = ?session.state,
         "started upload session"
     );
@@ -11437,7 +12118,14 @@ async fn list_store_index_response(
     let snapshot_scan_started_at = Instant::now();
     let (store_index_inspector, snapshot_scan_waited_ms) = {
         let store = read_store(state, "store_index.clone_worker").await;
-        (store.store_index_inspector(), store.waited_ms())
+        let waited_ms = store.waited_ms();
+        match store.store_index_inspector().await {
+            Ok(inspector) => (inspector, waited_ms),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to snapshot current state for store index");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
     };
     let (keys, key_hashes, object_ids, snapshot_created_at_limit): StoreIndexSnapshotScan =
         if let Some(snapshot_id) = query.snapshot.as_deref() {
@@ -13046,7 +13734,9 @@ async fn ensure_media_artifact_with_remote_import(
     let now_unix = unix_ts();
     let (media_cache_worker, store_index_inspector) = {
         let store = read_store(state, "media_cache.remote_import.clone_worker").await;
-        (store.media_cache_worker(), store.store_index_inspector())
+        let media_cache_worker = store.media_cache_worker();
+        let store_index_inspector = store.store_index_inspector().await?;
+        (media_cache_worker, store_index_inspector)
     };
 
     let existing_lookup = store_index_inspector
@@ -13938,6 +14628,13 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
     let store = read_store(state, "versions.list").await;
     match store.list_versions(key).await {
         Ok(Some(summary)) => {
+            let store_index_inspector = match store.store_index_inspector().await {
+                Ok(inspector) => inspector,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to snapshot current state for version media lookups");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
             let mut versions = Vec::with_capacity(summary.versions.len());
             for version in summary.versions {
                 let is_tombstone = version.manifest_hash == TOMBSTONE_MANIFEST_HASH;
@@ -13973,8 +14670,7 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
                         }
                     }
 
-                    match store
-                        .store_index_inspector()
+                    match store_index_inspector
                         .lookup_media_cache(&version.manifest_hash)
                         .await
                     {
@@ -19681,7 +20377,13 @@ async fn delete_s3_bucket(
 
     let bucket_not_empty = {
         let store = read_store(&state, "s3_bucket_delete.inspect").await;
-        let inspector = store.store_index_inspector();
+        let inspector = match store.store_index_inspector().await {
+            Ok(inspector) => inspector,
+            Err(err) => {
+                warn!(error = %err, bucket_name = %bucket_name, "failed to inspect S3 bucket contents");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
         inspector
             .current_object_hashes()
             .into_iter()
@@ -20176,6 +20878,138 @@ async fn storage_stats_history(
     let samples = downsample_storage_stats_samples(samples, max_points);
 
     (StatusCode::OK, Json(samples)).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessStatsCurrentResponse {
+    sample: Option<ProcessStatsSample>,
+    children: Vec<ChildProcessStat>,
+    temperature_components: Vec<TemperatureComponentStat>,
+    logical_cpu_count: usize,
+}
+
+async fn process_stats_current(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "process_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let runtime = match state.process_stats_runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let response = ProcessStatsCurrentResponse {
+        sample: runtime.history.back().cloned(),
+        children: runtime.latest_children.clone(),
+        temperature_components: runtime.latest_temperature_components.clone(),
+        logical_cpu_count: runtime.logical_cpu_count,
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessStatsHistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn process_stats_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ProcessStatsHistoryQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "process_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let limit = query
+        .limit
+        .map(|limit| limit.clamp(1, PROCESS_STATS_HISTORY_MAX_SAMPLES))
+        .unwrap_or(PROCESS_STATS_HISTORY_MAX_SAMPLES);
+    let samples = {
+        let runtime = match state.process_stats_runtime.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        runtime.recent(limit)
+    };
+
+    (StatusCode::OK, Json(samples)).into_response()
+}
+
+async fn process_stats_memory(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "process_stats_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let (current_objects_cache, current_objects_total_count) = {
+        let store = read_store(&state, "process_stats.memory").await;
+        let cache_stats = store.current_objects_cache_stats();
+        let total_count = store.object_count().await.unwrap_or(0);
+        (cache_stats, total_count)
+    };
+
+    let (in_flight_upload_session_count, in_flight_upload_bytes) = {
+        let sessions = read_upload_sessions(&state, "process_stats.memory").await;
+        let count = sessions.sessions.len();
+        let bytes = sessions
+            .sessions
+            .values()
+            .map(|session| session.chunk_count as u64 * session.chunk_size_bytes as u64)
+            .sum();
+        (count, bytes)
+    };
+
+    let last_gc_pass = {
+        let guard = match state.storage.last_gc_pass.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+
+    let sample = MemoryAttributionSample {
+        collected_at_unix: unix_ts(),
+        current_objects_cache,
+        current_objects_total_count,
+        in_flight_upload_session_count,
+        in_flight_upload_bytes,
+        last_gc_pass,
+    };
+
+    (StatusCode::OK, Json(sample)).into_response()
 }
 
 fn metadata_db_logical_distribution_status_response(
@@ -21469,18 +22303,29 @@ async fn register_node(
         relay_tunnel: requested_capabilities.relay_tunnel || reachability.relay_required,
     };
 
-    let mut cluster = state.cluster.lock().await;
-    cluster.register_node(NodeDescriptor {
-        node_id,
-        reachability,
-        capabilities,
-        labels: request.labels,
-        capacity_bytes: request.capacity_bytes.unwrap_or(0),
-        free_bytes: request.free_bytes.unwrap_or(0),
-        storage_stats: request.storage_stats,
-        last_heartbeat_unix: 0,
-        status: cluster::NodeStatus::Online,
-    });
+    let changed = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.register_node(NodeDescriptor {
+            node_id,
+            reachability,
+            capabilities,
+            labels: request.labels,
+            capacity_bytes: request.capacity_bytes.unwrap_or(0),
+            free_bytes: request.free_bytes.unwrap_or(0),
+            storage_stats: request.storage_stats,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        })
+    };
+
+    if changed && let Err(err) = persist_cluster_nodes_state(&state).await {
+        warn!(
+            error = %err,
+            node_id = %node_id,
+            "failed to persist cluster nodes after node registration"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -21521,11 +22366,11 @@ async fn remove_node(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    if let Err(err) = persist_cluster_replicas_state(&state).await {
+    if let Err(err) = persist_cluster_topology_state(&state).await {
         warn!(
             error = %err,
             node_id = %node_id,
-            "failed to persist cluster replicas after node removal"
+            "failed to persist cluster topology after node removal"
         );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -21626,10 +22471,10 @@ async fn local_available_subjects(State(state): State<ServerState>) -> impl Into
 async fn local_metadata_subjects(State(state): State<ServerState>) -> impl IntoResponse {
     let mut subjects = {
         let store = read_store(&state, "metadata_subjects.list").await;
-        store
-            .list_metadata_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
+        match store.list_metadata_subjects().await {
+            Ok(subjects) => subjects,
+            Err(_) => store.current_keys().await.unwrap_or_default(),
+        }
     };
     subjects.sort();
 
@@ -22117,6 +22962,36 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
         store.cluster_replicas_persister()
     };
     persister.persist_cluster_replicas(&replicas).await
+}
+
+async fn persist_cluster_nodes_state(state: &ServerState) -> Result<()> {
+    let nodes = {
+        let cluster = state.cluster.lock().await;
+        cluster.export_nodes()
+    };
+
+    let persister = {
+        let store = read_store(state, "cluster_nodes.clone_persister").await;
+        store.cluster_nodes_persister()
+    };
+    persister.persist_cluster_nodes(&nodes).await
+}
+
+async fn persist_cluster_topology_state(state: &ServerState) -> Result<()> {
+    let (nodes, replicas) = {
+        let cluster = state.cluster.lock().await;
+        (cluster.export_nodes(), cluster.export_replicas_by_key())
+    };
+
+    let (node_persister, replica_persister) = {
+        let store = read_store(state, "cluster_topology.clone_persisters").await;
+        (
+            store.cluster_nodes_persister(),
+            store.cluster_replicas_persister(),
+        )
+    };
+    node_persister.persist_cluster_nodes(&nodes).await?;
+    replica_persister.persist_cluster_replicas(&replicas).await
 }
 
 #[cfg(test)]
@@ -23130,6 +24005,13 @@ async fn run_cleanup(
         Ok(report) => {
             if !dry_run {
                 request_local_availability_refresh(&state);
+            }
+            {
+                let mut last_gc_pass = match state.storage.last_gc_pass.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *last_gc_pass = Some(GcPassSummary::from_report(&report));
             }
             append_admin_audit(
                 &state,

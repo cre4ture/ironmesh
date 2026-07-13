@@ -263,6 +263,7 @@ struct AndroidSafBackend {
     observer_guard: Option<AndroidSafObserverGuard>,
     last_observed_tree_change_version: u64,
     pending_tree_change_version: Option<u64>,
+    cached_tree_state: Option<LocalTreeState>,
 }
 
 impl AndroidSafBackend {
@@ -270,6 +271,40 @@ impl AndroidSafBackend {
         self.tree_uri
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("SAF backend has not been prepared"))
+    }
+
+    fn cached_entry_state(&self, relative_path: &str) -> Option<LocalEntryState> {
+        self.cached_tree_state
+            .as_ref()
+            .and_then(|state| state.get(relative_path))
+            .cloned()
+    }
+
+    fn replace_cached_tree_state(&mut self, tree_state: LocalTreeState) {
+        self.cached_tree_state = Some(tree_state);
+    }
+
+    fn clear_cached_tree_state(&mut self) {
+        self.cached_tree_state = None;
+    }
+
+    fn forget_cached_path(&mut self, relative_path: &str) {
+        let Some(state) = self.cached_tree_state.as_mut() else {
+            return;
+        };
+        if relative_path.is_empty() {
+            state.clear();
+            return;
+        }
+
+        let prefix = format!("{relative_path}/");
+        state.retain(|path, _| path != relative_path && !path.starts_with(&prefix));
+    }
+
+    fn remember_cached_entry_state(&mut self, relative_path: &str, entry_state: &LocalEntryState) {
+        if let Some(state) = self.cached_tree_state.as_mut() {
+            state.insert(relative_path.to_string(), entry_state.clone());
+        }
     }
 }
 
@@ -316,6 +351,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         self.tree_uri = Some(tree_uri);
         self.last_observed_tree_change_version = 0;
         self.pending_tree_change_version = None;
+        self.clear_cached_tree_state();
         Ok(())
     }
 
@@ -324,6 +360,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         _options: &FolderAgentRuntimeOptions,
         on_progress: &mut dyn FnMut(&LocalTreeScanProgress),
     ) -> Result<LocalTreeState> {
+        self.clear_cached_tree_state();
         let poll_tree_uri = self.tree_uri()?.to_string();
         let operation_tree_uri = poll_tree_uri.clone();
         let (result_tx, result_rx) = mpsc::sync_channel::<Result<LocalTreeState>>(1);
@@ -341,7 +378,9 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
             match result_rx.recv_timeout(SAF_SCAN_PROGRESS_POLL_INTERVAL) {
                 Ok(result) => {
                     let _ = worker.join();
-                    return result;
+                    let tree_state = result?;
+                    self.replace_cached_tree_state(tree_state.clone());
+                    return Ok(tree_state);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let Ok(Some(progress)) = tree_scan_progress(&poll_tree_uri) else {
@@ -377,7 +416,15 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         _options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<Option<LocalEntryState>> {
-        stat_tree_entry(self.tree_uri()?, relative_path)
+        if let Some(entry_state) = self.cached_entry_state(relative_path) {
+            return Ok(Some(entry_state));
+        }
+
+        let entry_state = stat_tree_entry(self.tree_uri()?, relative_path)?;
+        if let Some(entry_state_ref) = entry_state.as_ref() {
+            self.remember_cached_entry_state(relative_path, entry_state_ref);
+        }
+        Ok(entry_state)
     }
 
     fn file_content_fingerprint(
@@ -385,7 +432,18 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         _options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<String> {
-        saf_file_content_fingerprint(self.tree_uri()?, relative_path)
+        let entry_state = match self.cached_entry_state(relative_path) {
+            Some(entry_state) => entry_state,
+            None => self
+                .local_entry_state(_options, relative_path)?
+                .ok_or_else(|| anyhow::anyhow!("missing SAF file {relative_path}"))?,
+        };
+        anyhow::ensure!(
+            entry_state.kind == LocalEntryKind::File,
+            "refusing to fingerprint non-file SAF path {relative_path}"
+        );
+
+        saf_file_content_fingerprint(self.tree_uri()?, relative_path, entry_state.size_bytes)
     }
 
     fn ensure_local_directory(
@@ -393,6 +451,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         _options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<()> {
+        self.forget_cached_path(relative_path);
         ensure_tree_directory(self.tree_uri()?, relative_path)
     }
 
@@ -414,6 +473,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         local_relative_path: &str,
         remote_key: &str,
     ) -> Result<()> {
+        self.forget_cached_path(local_relative_path);
         download_remote_file_to_saf(self.tree_uri()?, client, local_relative_path, remote_key)
     }
 
@@ -422,6 +482,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         _options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<()> {
+        self.forget_cached_path(relative_path);
         delete_tree_path(self.tree_uri()?, relative_path).map(|_| ())
     }
 
@@ -429,6 +490,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         if options.run_once {
             self.last_observed_tree_change_version = 0;
             self.pending_tree_change_version = None;
+            self.clear_cached_tree_state();
             return Ok(());
         }
 
@@ -446,6 +508,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
             tree_change_version(self.tree_uri()?).unwrap_or(self.last_observed_tree_change_version);
         if current_version != self.last_observed_tree_change_version {
             self.pending_tree_change_version = Some(current_version);
+            self.clear_cached_tree_state();
             Ok(true)
         } else {
             Ok(false)
@@ -777,18 +840,15 @@ fn upload_saf_file(
     })
 }
 
-fn saf_file_content_fingerprint(tree_uri: &str, relative_path: &str) -> Result<String> {
-    let entry = stat_tree_entry(tree_uri, relative_path)?
-        .ok_or_else(|| anyhow::anyhow!("missing SAF file {relative_path}"))?;
-    anyhow::ensure!(
-        entry.kind == LocalEntryKind::File,
-        "refusing to fingerprint non-file SAF path {relative_path}"
-    );
-
+fn saf_file_content_fingerprint(
+    tree_uri: &str,
+    relative_path: &str,
+    size_bytes: u64,
+) -> Result<String> {
     with_bridge_env(|env, class| {
         let input_stream = open_tree_input_stream(env, &class, tree_uri, relative_path)?;
         let mut reader = JavaInputStreamReader::new(env, input_stream)?;
-        let mut fingerprinting_reader = FingerprintingReader::new(&mut reader, entry.size_bytes);
+        let mut fingerprinting_reader = FingerprintingReader::new(&mut reader, size_bytes);
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let read = fingerprinting_reader.read(&mut buffer).with_context(|| {
@@ -820,4 +880,54 @@ fn download_remote_file_to_saf(
         })?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_entry(size_bytes: u64) -> LocalEntryState {
+        LocalEntryState {
+            kind: LocalEntryKind::File,
+            size_bytes,
+            modified_unix_ms: 42,
+        }
+    }
+
+    #[test]
+    fn forget_cached_path_removes_target_and_descendants_only() {
+        let mut state = LocalTreeState::new();
+        state.insert("albums".to_string(), file_entry(1));
+        state.insert("albums/cover.jpg".to_string(), file_entry(2));
+        state.insert("albums/live/set.txt".to_string(), file_entry(3));
+        state.insert("docs/readme.txt".to_string(), file_entry(4));
+
+        let mut backend = AndroidSafBackend {
+            cached_tree_state: Some(state),
+            ..AndroidSafBackend::default()
+        };
+
+        backend.forget_cached_path("albums");
+
+        assert_eq!(backend.cached_entry_state("albums"), None);
+        assert_eq!(backend.cached_entry_state("albums/cover.jpg"), None);
+        assert_eq!(backend.cached_entry_state("albums/live/set.txt"), None);
+        assert_eq!(
+            backend.cached_entry_state("docs/readme.txt"),
+            Some(file_entry(4))
+        );
+    }
+
+    #[test]
+    fn remember_cached_entry_state_updates_existing_snapshot_cache() {
+        let mut backend = AndroidSafBackend {
+            cached_tree_state: Some(LocalTreeState::new()),
+            ..AndroidSafBackend::default()
+        };
+        let entry = file_entry(9);
+
+        backend.remember_cached_entry_state("notes/todo.txt", &entry);
+
+        assert_eq!(backend.cached_entry_state("notes/todo.txt"), Some(entry));
+    }
 }

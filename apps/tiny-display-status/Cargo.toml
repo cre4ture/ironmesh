@@ -1,0 +1,24 @@
+[package]
+name = "tiny-display-status"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+autobins = false
+
+[[bin]]
+name = "ironmesh-tiny-display-status"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+embedded-graphics = "0.8"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+
+[lints]
+workspace = true

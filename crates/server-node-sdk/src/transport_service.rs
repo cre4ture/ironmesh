@@ -21,14 +21,15 @@ use crate::{
     get_media_thumbnail_response, get_object, get_object_response, get_upload_session, head_object,
     health, latency_diagnostic, list_nodes, list_snapshots, list_store_index,
     list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
-    placement_for_key, put_object, reconcile_from_node, redeem_client_bootstrap_claim,
-    rename_object_path, renew_device_rendezvous_identity, replication, replication_plan,
-    request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
-    require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
-    run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
-    s3_frontend, start_upload_session, storage_stats_current, storage_stats_history,
-    transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
-    validate_client_auth_request, wait_for_store_index_change,
+    placement_for_key, process_stats_current, process_stats_history, put_object,
+    reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
+    renew_device_rendezvous_identity, replication, replication_plan, request_has_admin_auth,
+    require_client_auth, require_client_or_admin_auth, require_internal_caller,
+    restore_snapshot_path, restore_version_path, run_cleanup, run_tombstone_archive_purge,
+    run_tombstone_archive_restore, run_tombstone_compaction, s3_frontend, start_upload_session,
+    storage_stats_current, storage_stats_history, transport_headers_from_response,
+    trigger_replication_audit, upload_session_chunk, validate_client_auth_request,
+    wait_for_store_index_change,
 };
 
 #[derive(Clone)]
@@ -547,6 +548,8 @@ fn build_public_transport_router(state: ServerState) -> Router {
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route(
             "/cluster/replication/audit",
@@ -590,6 +593,8 @@ fn build_public_transport_router(state: ServerState) -> Router {
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route(
             "/cluster/replication/audit",
@@ -643,6 +648,8 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/cluster/nodes", get(list_nodes))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
+        .route("/process/stats/current", get(process_stats_current))
+        .route("/process/stats/history", get(process_stats_history))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))

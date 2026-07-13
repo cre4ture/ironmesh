@@ -320,6 +320,7 @@ fn test_cluster_config_without_internal_tls(
         public_peer_api_enabled: false,
         internal_tls: None,
         internal_ca_key_path: None,
+        local_status_bind_addr: None,
         rendezvous_ca_cert_path: None,
         rendezvous_urls: vec![format!("http://{bind_addr}")],
         rendezvous_registration_enabled: false,
@@ -5260,14 +5261,9 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
             .iter()
             .any(|endpoint| endpoint.node_id == Some(source.node_id))
     );
-    assert!(
-        bootstrap
-            .direct_endpoints
-            .iter()
-            .any(|endpoint| {
-                endpoint.node_id == Some(target.node_id) && endpoint.url == public_url
-            })
-    );
+    assert!(bootstrap.direct_endpoints.iter().any(|endpoint| {
+        endpoint.node_id == Some(target.node_id) && endpoint.url == public_url
+    }));
 
     let mut identity = transport_sdk::ClientIdentityMaterial::generate(
         source.cluster_id,
@@ -5313,7 +5309,9 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
     let client = bootstrap.build_client_with_identity(&identity).unwrap();
     let response = client.get_json_path("/cluster/status").await.unwrap();
     assert_eq!(
-        response.get("local_node_id").and_then(|value| value.as_str()),
+        response
+            .get("local_node_id")
+            .and_then(|value| value.as_str()),
         Some(target.node_id.to_string().as_str())
     );
 
@@ -9425,6 +9423,68 @@ run_on_main_metadata_backends!(
     multiplex_transport_get_upload_session_routes_to_handler_turso
 );
 
+async fn start_upload_session_prefills_existing_chunk_refs_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let first_chunk = vec![b'P'; 1024 * 1024];
+    let first_chunk_hash = blake3::hash(&first_chunk).to_hex().to_string();
+
+    state
+        .storage
+        .upload_chunk_ingestor
+        .ingest_chunk(&first_chunk_hash, &first_chunk)
+        .await
+        .expect("seed chunk should ingest");
+
+    let response = super::start_upload_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::UploadSessionStartRequest {
+            key: "uploads/reused.bin".to_string(),
+            total_size_bytes: (first_chunk.len() + 5) as u64,
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+            chunk_refs: vec![
+                super::UploadChunkRef {
+                    hash: first_chunk_hash,
+                    size_bytes: first_chunk.len(),
+                },
+                super::UploadChunkRef {
+                    hash: blake3::hash(b"tail!").to_hex().to_string(),
+                    size_bytes: 5,
+                },
+            ],
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let payload = serde_json::from_slice::<super::UploadSessionView>(&body)
+        .expect("upload session view should parse");
+    assert_eq!(payload.received_indexes, vec![0]);
+
+    let sessions = super::read_upload_sessions(&state, "tests.upload_sessions.assert").await;
+    let session = sessions
+        .sessions
+        .get(&payload.upload_id)
+        .expect("upload session should be persisted");
+    assert!(session.received_chunks[0].is_some());
+    assert!(session.received_chunks[1].is_none());
+    drop(sessions);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    start_upload_session_prefills_existing_chunk_refs_impl,
+    start_upload_session_prefills_existing_chunk_refs,
+    start_upload_session_prefills_existing_chunk_refs_turso
+);
+
 #[test]
 fn store_index_depth_groups_prefixes() {
     let keys = vec![
@@ -9794,6 +9854,82 @@ run_on_main_metadata_backends!(
     startup_repair_runs_when_gaps_exist_turso
 );
 
+// Regression test for the availability computation that backs gap detection
+// (`spawn_local_availability_refresher` / `spawn_startup_replication_repair` /
+// `spawn_replication_auditor` all rely on this). A node with a mix of healthy and
+// corrupt (0-byte / invalid-JSON) manifests must still report the healthy objects
+// as available and the corrupt ones as not, rather than erroring out and falling
+// back to trusting every locally indexed key.
+async fn recompute_local_cluster_available_subjects_excludes_corrupt_manifests_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+
+    let mut valid_keys = Vec::new();
+    for i in 0..5 {
+        let key = format!("gap-detect-valid-{i}.bin");
+        {
+            let mut store = lock_store(&state, "tests.availability.put_valid").await;
+            store
+                .put_object_versioned(
+                    &key,
+                    Bytes::from(format!("valid-payload-{i}").into_bytes()),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+        valid_keys.push(key);
+    }
+
+    let mut corrupt_keys = Vec::new();
+    for i in 0..2 {
+        let key = format!("gap-detect-corrupt-{i}.bin");
+        {
+            let mut store = lock_store(&state, "tests.availability.put_corrupt").await;
+            store
+                .put_object_versioned(
+                    &key,
+                    Bytes::from(format!("corrupt-payload-{i}").into_bytes()),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+            // 0-byte manifest file: fails to parse as JSON.
+            store
+                .replace_manifest_bytes_for_subject_for_test(&key, None, b"")
+                .await
+                .unwrap();
+        }
+        corrupt_keys.push(key);
+    }
+
+    let subjects = super::recompute_local_cluster_available_subjects(&state).await;
+
+    for key in &valid_keys {
+        assert!(
+            subjects.contains(key),
+            "expected valid key {key} to be reported available, subjects={subjects:?}"
+        );
+    }
+    for key in &corrupt_keys {
+        assert!(
+            !subjects
+                .iter()
+                .any(|subject| subject == key || subject.starts_with(&format!("{key}@"))),
+            "expected corrupt key {key} to be excluded from available subjects, subjects={subjects:?}"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    recompute_local_cluster_available_subjects_excludes_corrupt_manifests_impl,
+    recompute_local_cluster_available_subjects_excludes_corrupt_manifests,
+    recompute_local_cluster_available_subjects_excludes_corrupt_manifests_turso
+);
+
 async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTestBackend) {
     let state = build_test_state(2, true, backend).await;
 
@@ -10142,7 +10278,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     // ensure underlying store current keys no longer include the key
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&key));
 
@@ -10197,7 +10333,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(
         !keys
@@ -10253,7 +10389,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
 
     let keys = {
         let store = lock_store(&state, "tests.state.store").await;
-        store.current_keys()
+        store.current_keys().await.unwrap()
     };
     assert!(!keys.contains(&"docs/".to_string()));
 
@@ -11074,6 +11210,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
 
         let replica_subjects = locked
             .replication_subject_inspector()
+            .await
+            .unwrap()
             .list_replication_subjects()
             .await
             .unwrap();
@@ -12324,6 +12462,7 @@ async fn build_test_state(
                 String,
                 Arc<super::web_maps::LogicalMbtilesSource>,
             >::new())),
+            last_gc_pass: Arc::new(std::sync::Mutex::new(None)),
         },
         access: super::ServerAccessRuntime {
             client_credentials: Arc::new(Mutex::new(
@@ -12418,6 +12557,9 @@ async fn build_test_state(
         },
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         runtime_log_control: super::RuntimeLogControl::disabled("info"),
+        process_stats_runtime: Arc::new(std::sync::Mutex::new(
+            super::ProcessStatsRuntime::default(),
+        )),
     };
 
     if seed_gap {
@@ -12524,6 +12666,193 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
     assert_eq!(
         state.storage.upload_sessions_dirty.load(Ordering::SeqCst),
         0
+    );
+}
+
+#[tokio::test]
+async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut store = lock_store(&state, "tests.process_stats_memory.seed").await;
+        store
+            .put_object_versioned(
+                "docs/live.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let now = super::unix_ts();
+    {
+        let mut sessions =
+            super::write_upload_sessions(&state, "tests.process_stats_memory.seed").await;
+        sessions.sessions.insert(
+            "upload-in-flight".to_string(),
+            super::UploadSessionRecord {
+                upload_id: "upload-in-flight".to_string(),
+                owner_device_id: None,
+                key: "uploads/in-flight.bin".to_string(),
+                total_size_bytes: 4096,
+                chunk_size_bytes: 4096,
+                chunk_count: 1,
+                state: VersionConsistencyState::Confirmed,
+                parent_version_ids: Vec::new(),
+                explicit_version_id: None,
+                assembly_mode: super::UploadAssemblyMode::FixedSequence,
+                received_chunks: vec![None],
+                multipart_parts: std::collections::BTreeMap::new(),
+                multipart_bucket_name: None,
+                multipart_object_metadata: None,
+                multipart_completed_result: None,
+                created_at_unix: now,
+                updated_at_unix: now,
+                expires_at_unix: now + 300,
+                finalizing: false,
+                completed: false,
+                completed_result: None,
+            },
+        );
+    }
+
+    let cleanup_response = super::run_cleanup(
+        State(state.clone()),
+        headers.clone(),
+        Query(super::CleanupQuery {
+            retention_secs: Some(0),
+            dry_run: Some(true),
+            approve: Some(false),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cleanup_response.status(), StatusCode::OK);
+
+    let memory_response = super::process_stats_memory(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(memory_response.status(), StatusCode::OK);
+
+    let body = to_bytes(memory_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let sample: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(sample["current_objects_total_count"], 1);
+    assert_eq!(sample["in_flight_upload_session_count"], 1);
+    assert_eq!(sample["in_flight_upload_bytes"], 4096);
+    assert!(
+        sample["current_objects_cache"]["resident_entries"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        sample["current_objects_cache"]["capacity"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let last_gc_pass = &sample["last_gc_pass"];
+    assert_eq!(last_gc_pass["dry_run"], true);
+    assert_eq!(last_gc_pass["retained_manifests_processed"], 1);
+    assert!(last_gc_pass["peak_manifest_batch_size"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn process_stats_current_reports_temperature_snapshot() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut runtime = state
+            .process_stats_runtime
+            .lock()
+            .expect("process stats runtime lock should not be poisoned");
+        runtime.push(
+            super::ProcessStatsSample {
+                collected_at_unix: 1_720_000_000,
+                main_cpu_percent: 12.5,
+                main_memory_bytes: 512 * 1024 * 1024,
+                main_disk_read_bytes_per_sec: 4096,
+                main_disk_write_bytes_per_sec: 2048,
+                children_cpu_percent: 6.25,
+                children_memory_bytes: 128 * 1024 * 1024,
+                children_disk_read_bytes_per_sec: 1024,
+                children_disk_write_bytes_per_sec: 512,
+                children_count: 1,
+                temperature_component_count: 2,
+                temperature_reporting_component_count: 1,
+                hottest_temperature_celsius: Some(68.25),
+                average_temperature_celsius: Some(68.25),
+            },
+            vec![super::ChildProcessStat {
+                pid: 4242,
+                name: "ffmpeg".to_string(),
+                cpu_percent: 6.25,
+                memory_bytes: 128 * 1024 * 1024,
+                disk_read_bytes_per_sec: 1024,
+                disk_write_bytes_per_sec: 512,
+            }],
+            vec![
+                super::TemperatureComponentStat {
+                    label: "CPU package".to_string(),
+                    temperature_celsius: Some(68.25),
+                    max_celsius: Some(85.0),
+                    critical_celsius: Some(100.0),
+                },
+                super::TemperatureComponentStat {
+                    label: "NVMe".to_string(),
+                    temperature_celsius: None,
+                    max_celsius: Some(72.0),
+                    critical_celsius: Some(84.0),
+                },
+            ],
+            16,
+        );
+    }
+
+    let response = super::process_stats_current(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(payload["logical_cpu_count"], 16);
+    assert_eq!(payload["children"][0]["name"], "ffmpeg");
+    assert_eq!(payload["sample"]["temperature_component_count"], 2);
+    assert_eq!(
+        payload["sample"]["temperature_reporting_component_count"],
+        1
+    );
+    assert_eq!(
+        payload["sample"]["hottest_temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(payload["temperature_components"][0]["label"], "CPU package");
+    assert_eq!(
+        payload["temperature_components"][0]["temperature_celsius"]
+            .as_f64()
+            .unwrap(),
+        68.25
+    );
+    assert_eq!(
+        payload["temperature_components"][1]["critical_celsius"]
+            .as_f64()
+            .unwrap(),
+        84.0
     );
 }
 
@@ -13441,6 +13770,72 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
 }
 
 #[tokio::test]
+async fn backfill_cluster_nodes_from_replica_rows_adds_placeholders_for_legacy_replicas() {
+    let remote_a = NodeId::new_v4();
+    let remote_b = NodeId::new_v4();
+    let replicas = HashMap::from([("subject-a".to_string(), vec![remote_b, remote_a])]);
+
+    let nodes = super::backfill_cluster_nodes_from_replica_rows(Vec::new(), &replicas);
+
+    assert_eq!(nodes.len(), 2);
+    assert!(nodes.iter().any(|node| node.node_id == remote_a));
+    assert!(nodes.iter().any(|node| node.node_id == remote_b));
+    for node in nodes {
+        assert_eq!(node.status, cluster::NodeStatus::Offline);
+        assert_eq!(node.public_api_url(), None);
+        assert_eq!(node.peer_api_url(), None);
+        assert!(!node.relay_required());
+        assert!(!node.relay_capable());
+    }
+}
+
+#[tokio::test]
+async fn backfill_cluster_nodes_from_replica_rows_preserves_existing_descriptors() {
+    let remote_a = NodeId::new_v4();
+    let remote_b = NodeId::new_v4();
+    let existing = cluster::NodeDescriptor {
+        node_id: remote_a,
+        reachability: cluster::NodeReachability {
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            relay_required: true,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
+        labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+        capacity_bytes: 100,
+        free_bytes: 40,
+        storage_stats: None,
+        last_heartbeat_unix: 123,
+        status: cluster::NodeStatus::Offline,
+    };
+    let replicas = HashMap::from([("subject-a".to_string(), vec![remote_a, remote_b])]);
+
+    let nodes = super::backfill_cluster_nodes_from_replica_rows(vec![existing.clone()], &replicas);
+
+    assert_eq!(nodes.len(), 2);
+    let preserved = nodes
+        .iter()
+        .find(|node| node.node_id == remote_a)
+        .expect("existing node descriptor should remain");
+    assert_eq!(preserved.public_api_url(), Some("https://public.example"));
+    assert_eq!(preserved.peer_api_url(), Some("https://internal.example"));
+    assert!(preserved.relay_required());
+    assert!(preserved.relay_capable());
+
+    let placeholder = nodes
+        .iter()
+        .find(|node| node.node_id == remote_b)
+        .expect("missing replica owner should be backfilled");
+    assert_eq!(placeholder.public_api_url(), None);
+    assert_eq!(placeholder.peer_api_url(), None);
+    assert_eq!(placeholder.status, cluster::NodeStatus::Offline);
+}
+
+#[tokio::test]
 async fn register_node_uses_structured_reachability_payload() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
@@ -13491,6 +13886,18 @@ async fn register_node_uses_structured_reachability_payload() {
     assert_eq!(node.capacity_bytes, 100);
     assert_eq!(node.free_bytes, 40);
 
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_register").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    let persisted = persisted_nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("registered node should be persisted");
+    assert_eq!(persisted.public_api_url(), Some("https://public.example"));
+    assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+    assert!(persisted.relay_required());
+
     cleanup_test_state(&state).await;
 }
 
@@ -13521,6 +13928,111 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
     assert_eq!(descriptor.public_api_url(), None);
     assert_eq!(descriptor.peer_api_url(), None);
     assert!(descriptor.relay_capable());
+}
+
+#[tokio::test]
+async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let node_id = NodeId::new_v4();
+    let entry = transport_sdk::PresenceEntry {
+        registration: transport_sdk::PresenceRegistration {
+            cluster_id: state.cluster_id,
+            identity: transport_sdk::PeerIdentity::Node(node_id),
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectHttps,
+                endpoint: "https://internal.example".to_string(),
+                rtt_ms: None,
+            }],
+            labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+            capacity_bytes: Some(100),
+            free_bytes: Some(40),
+            capabilities: vec![transport_sdk::TransportCapability::RelayTunnel],
+            relay_mode: transport_sdk::RelayMode::Fallback,
+            connected_at_unix: 123,
+        },
+        updated_at_unix: 456,
+    };
+
+    let discovered = super::apply_rendezvous_presence_entries(&state, &[entry]).await;
+    assert_eq!(discovered, 1);
+
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_discovery").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    let persisted = persisted_nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("discovered node should be persisted");
+    assert_eq!(persisted.public_api_url(), Some("https://public.example"));
+    assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn remove_node_persists_forget_to_cluster_state() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let node_id = NodeId::new_v4();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        let _ = cluster.register_node(cluster::NodeDescriptor {
+            node_id,
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://public.example".to_string()),
+                peer_api_url: Some("https://internal.example".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 100,
+            free_bytes: 40,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+        cluster.note_replica("subject-a", node_id);
+    }
+    super::persist_cluster_topology_state(&state).await.unwrap();
+
+    let response = axum::response::IntoResponse::into_response(
+        super::remove_node(State(state.clone()), headers, Path(node_id.to_string())).await,
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let persisted_nodes = {
+        let store = read_store(&state, "tests.load_cluster_nodes_after_remove").await;
+        store.load_cluster_nodes().await.unwrap()
+    };
+    assert!(
+        persisted_nodes
+            .into_iter()
+            .all(|node| node.node_id != node_id),
+        "removed node should be forgotten from persisted node state"
+    );
+
+    let persisted_replicas = {
+        let store = read_store(&state, "tests.load_cluster_replicas_after_remove").await;
+        store.load_cluster_replicas().await.unwrap()
+    };
+    assert!(
+        persisted_replicas
+            .values()
+            .all(|nodes| !nodes.contains(&node_id)),
+        "removed node should be forgotten from persisted replica state"
+    );
+
+    cleanup_test_state(&state).await;
 }
 
 #[tokio::test]

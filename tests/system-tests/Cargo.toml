@@ -11,6 +11,7 @@ aws-credential-types = "1"
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 aws-types = "1"
 axum = "0.8"
+blake3 = "1"
 bytes = "1"
 client-sdk = { path = "../../crates/client-sdk" }
 hmac = "0.12"
@@ -31,7 +32,6 @@ web-ui-backend = { path = "../../crates/web-ui-backend" }
 
 [target.'cfg(windows)'.dependencies]
 adapter-windows-cfapi = { path = "../../crates/adapter-windows-cfapi" }
-blake3 = "1"
 windows-thumbnail-provider = { path = "../../crates/windows-thumbnail-provider" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

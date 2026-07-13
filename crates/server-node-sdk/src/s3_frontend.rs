@@ -598,7 +598,18 @@ async fn delete_bucket(
 
     let bucket_has_objects = {
         let store = read_store(&state, "s3.delete_bucket.inspect_objects").await;
-        let inspector = store.store_index_inspector();
+        let inspector = match store.store_index_inspector().await {
+            Ok(inspector) => inspector,
+            Err(err) => {
+                return s3_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    &format!("failed to inspect bucket contents: {err:#}"),
+                    uri.path(),
+                    &request.request_id,
+                );
+            }
+        };
         inspector
             .current_object_hashes()
             .iter()
@@ -670,7 +681,18 @@ async fn list_objects_v2_response(
 
     let inspector = {
         let store = read_store(&state, "s3.list.clone_inspector").await;
-        store.store_index_inspector()
+        match store.store_index_inspector().await {
+            Ok(inspector) => inspector,
+            Err(err) => {
+                return s3_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    &format!("failed to inspect bucket objects: {err:#}"),
+                    uri.path(),
+                    &request.request_id,
+                );
+            }
+        }
     };
     let object_hashes = inspector.current_object_hashes();
     let object_ids = inspector.current_object_ids();

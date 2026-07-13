@@ -87,7 +87,8 @@ mod tests {
 }
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    IronMeshClient, build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    IronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
+    StoreIndexView, build_http_client_from_pem, build_http_client_with_identity_from_pem,
     enroll_connection_input_blocking,
 };
 use jni::JNIEnv;
@@ -108,6 +109,8 @@ use sync_agent_core::{
     run_folder_agent_with_control,
 };
 use tokio::task::JoinHandle;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -115,7 +118,7 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
         return Ok(rt);
     }
 
-    common::logging::init_compact_tracing_default("info");
+    init_android_tracing();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -126,6 +129,25 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     RUNTIME
         .get()
         .ok_or_else(|| anyhow::anyhow!("runtime initialization race"))
+}
+
+fn init_android_tracing() {
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+    TRACING_INIT.call_once(|| {
+        let env_filter = common::logging::env_filter_from_default_env("info");
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(common::logging::compact_fmt_layer())
+            .with(common::logging::LogCaptureLayer::new(
+                android_web_log_buffer(),
+            ))
+            .try_init();
+    });
+}
+
+fn android_web_log_buffer() -> Arc<common::logging::LogBuffer> {
+    static LOG_BUFFER: OnceLock<Arc<common::logging::LogBuffer>> = OnceLock::new();
+    Arc::clone(LOG_BUFFER.get_or_init(|| Arc::new(common::logging::LogBuffer::new(500))))
 }
 
 struct WebUiServer {
@@ -451,6 +473,8 @@ impl AndroidFolderSyncManager {
         label: String,
         options: FolderAgentRuntimeOptions,
     ) -> Result<()> {
+        init_android_tracing();
+
         let previous = self.runs.remove(&profile_id);
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
@@ -807,7 +831,7 @@ fn start_embedded_web_ui(
     if let Some(identity) = configured.client_identity {
         web_ui_config = web_ui_config.with_client_identity(identity);
     }
-    let app = web_ui_backend::router(web_ui_config);
+    let app = web_ui_backend::router(web_ui_config.with_log_buffer(android_web_log_buffer()));
 
     let task = rt.spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -1141,6 +1165,103 @@ fn configured_client_node(
     )?))
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct AndroidClientCacheKey {
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+}
+
+struct AndroidClientCacheEntry {
+    key: AndroidClientCacheKey,
+    client: IronMeshClient,
+}
+
+/// Building an `IronMeshClient` from scratch runs a network connection-quality
+/// probe (see `order_clients_by_startup_probe` in client-sdk), so every JNI
+/// call on the Android data plane (thumbnail streaming in particular) shares
+/// one cached client per distinct connection identity instead of rebuilding
+/// it - and re-probing targets - on every call.
+fn android_client_cache() -> &'static Mutex<Option<AndroidClientCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<AndroidClientCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_configured_sdk(
+    connection_input: impl Into<String>,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<IronMeshClient> {
+    let key = AndroidClientCacheKey {
+        connection_input: connection_input.into(),
+        server_ca_pem,
+        client_identity_json,
+    };
+
+    // Recover from poisoning rather than propagating it: a panic while building one
+    // client must not permanently break every future JNI call in the process.
+    let mut slot = android_client_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(entry) = slot.as_ref()
+        && entry.key == key
+    {
+        return Ok(entry.client.clone());
+    }
+
+    let client = configured_sdk(
+        key.connection_input.clone(),
+        key.server_ca_pem.clone(),
+        key.client_identity_json.clone(),
+    )?;
+    *slot = Some(AndroidClientCacheEntry {
+        key,
+        client: client.clone(),
+    });
+    Ok(client)
+}
+
+fn cached_configured_client_node(
+    connection_input: impl Into<String>,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<ClientNode> {
+    Ok(ClientNode::with_client(cached_configured_sdk(
+        connection_input,
+        server_ca_pem,
+        client_identity_json,
+    )?))
+}
+
+fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("raw") => Ok(Some(StoreIndexView::Raw)),
+        Some("tree") => Ok(Some(StoreIndexView::Tree)),
+        Some(other) => anyhow::bail!("unsupported store index view: {other}"),
+        None => Ok(None),
+    }
+}
+
+fn parse_store_index_sort_order(value: Option<&str>) -> Result<Option<StoreIndexSortOrder>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("path_asc") => Ok(Some(StoreIndexSortOrder::PathAsc)),
+        Some("captured_desc") => Ok(Some(StoreIndexSortOrder::CapturedDesc)),
+        Some(other) => anyhow::bail!("unsupported store index sort order: {other}"),
+        None => Ok(None),
+    }
+}
+
+fn parse_store_index_media_filter(value: Option<&str>) -> Result<Option<StoreIndexMediaFilter>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("all") => Ok(Some(StoreIndexMediaFilter::All)),
+        Some("image") => Ok(Some(StoreIndexMediaFilter::Image)),
+        Some("video") => Ok(Some(StoreIndexMediaFilter::Video)),
+        Some(other) => anyhow::bail!("unsupported store index media filter: {other}"),
+        None => Ok(None),
+    }
+}
+
 /// # Safety
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
@@ -1246,7 +1367,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_put
         let payload = env.convert_byte_array(&payload_ref)?;
 
         let rt = runtime()?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         let report = rt.block_on(client.put_large_aware(key, Bytes::from(payload)))?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -1283,7 +1405,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
         let stage_root = android_download_stage_root("jni-downloads", &connection_input)?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         let mut bytes = Vec::new();
         client.download_to_writer_resumable_staged(
             key,
@@ -1334,7 +1457,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
-        let sdk = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
         let response = sdk.store_index_blocking(
             prefix.as_deref(),
             usize::try_from(depth).unwrap_or(1).max(1),
@@ -1366,6 +1489,75 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_storeIndexWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    prefix: jstring,
+    depth: jint,
+    snapshot: jstring,
+    view: jstring,
+    offset: jint,
+    limit: jint,
+    sort: jstring,
+    media_filter: jstring,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let prefix = optional_jstring(&mut env, prefix)?;
+        let snapshot = optional_jstring(&mut env, snapshot)?;
+        let view = optional_jstring(&mut env, view)?;
+        let sort = optional_jstring(&mut env, sort)?;
+        let media_filter = optional_jstring(&mut env, media_filter)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let sdk = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let options = StoreIndexRequestOptions {
+            view: parse_store_index_view(view.as_deref())?,
+            offset: usize::try_from(offset).ok(),
+            limit: usize::try_from(limit).ok(),
+            sort: parse_store_index_sort_order(sort.as_deref())?,
+            media_filter: parse_store_index_media_filter(media_filter.as_deref())?,
+            ..StoreIndexRequestOptions::default()
+        };
+        let response = sdk.store_index_with_options_blocking(
+            prefix.as_deref(),
+            usize::try_from(depth).unwrap_or(1).max(1),
+            snapshot.as_deref(),
+            options,
+        )?;
+
+        serde_json::to_string(&response).context("failed to serialize paged store index response")
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!("rust storeIndexWithOptions failed to create java string: {err:#}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust storeIndexWithOptions failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamPutObject<
     'local,
 >(
@@ -1387,7 +1579,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
         let mut reader = JavaInputStreamReader::new(&mut env, input_stream)?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         let report = client.put_large_aware_reader(key, &mut reader, size_bytes)?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -1420,7 +1613,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_del
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
         let rt = runtime()?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         rt.block_on(client.delete_path(key))?;
         Ok(204)
     })();
@@ -1461,7 +1655,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         initialize_android_preferences_bridge(&mut env)?;
         let stage_root = android_download_stage_root("jni-downloads", &connection_input)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
-        let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
+        let client =
+            cached_configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
         client.download_to_writer_resumable_staged(
             key,
             snapshot.as_deref(),
@@ -1499,7 +1694,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         initialize_android_preferences_bridge(&mut env)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
         let rt = runtime()?;
-        let client = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let client = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
         let response = rt.block_on(client.get_relative_path(&relative_url))?;
         if !response.status.is_success() {
             anyhow::bail!(
@@ -1540,6 +1735,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
     client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
+        init_android_tracing();
+
         let connection_input: String = env.get_string(&connection_input)?.into();
         let local_folder: String = env.get_string(&local_folder)?.into();
         let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
@@ -1605,6 +1802,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
     client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
+        init_android_tracing();
+
         let profile_id: String = env.get_string(&profile_id)?.into();
         let label: String = env.get_string(&label)?.into();
         let connection_input: String = env.get_string(&connection_input)?.into();

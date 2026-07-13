@@ -21,8 +21,24 @@ const LONG_VERSION: &str = git_version::git_version!(
 #[command(after_help = BUILD_INFO)]
 struct Cli {}
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     Cli::parse();
-    server_node_sdk::run_from_env().await
+
+    let use_current_thread =
+        std::env::var_os("IRONMESH_TOKIO_CURRENT_THREAD").is_some_and(|v| v != "0");
+
+    let runtime = if use_current_thread {
+        eprintln!(
+            "ironmesh-server-node: using Tokio current-thread runtime because \
+IRONMESH_TOKIO_CURRENT_THREAD is set; this avoids worker-pool overhead on \
+single-core hosts"
+        );
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    }
+    .enable_all()
+    .build()?;
+
+    runtime.block_on(server_node_sdk::run_from_env())
 }

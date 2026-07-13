@@ -33,9 +33,9 @@ pub use ironmesh_client::{
     IronMeshClient, ObjectHeadInfo, PreferredHeadReason, RequestedRange, SnapshotRestoreResponse,
     StoreIndexEntry, StoreIndexMediaFilter, StoreIndexMediaSummary, StoreIndexRequestOptions,
     StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, UploadMode, UploadResult,
-    UploadSessionChunkStatus, UploadSessionCompleteInfo, UploadSessionStatus,
-    VersionConsistencyState, VersionGraphSummary, VersionRecordSummary, normalize_server_base_url,
-    snapshot_from_store_index_entries,
+    UploadSessionChunkRef, UploadSessionChunkStatus, UploadSessionCompleteInfo,
+    UploadSessionStatus, VersionConsistencyState, VersionGraphSummary, VersionRecordSummary,
+    normalize_server_base_url, snapshot_from_store_index_entries,
 };
 pub use latency_probe::{
     LatencyProbeAssessment, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,

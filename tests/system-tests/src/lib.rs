@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+mod cli_latency_test;
+mod cli_managed_rendezvous_latency_test;
 mod client_sdk_test;
 mod cluster_test;
 mod config_app_test;

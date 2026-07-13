@@ -139,6 +139,18 @@ enum Commands {
         max_average_ms: Option<f64>,
         #[arg(long)]
         max_p95_ms: Option<f64>,
+        /// Pin --path direct/relay to this cluster node's bootstrap endpoint instead of the
+        /// first configured one. See `--list-targets` for the node ids a bootstrap file offers.
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Pin --path relay to this specific rendezvous URL instead of probing every configured
+        /// one. See `--list-targets` for the rendezvous URLs a bootstrap file offers.
+        #[arg(long)]
+        relay_url: Option<String>,
+        /// Print the node ids and rendezvous URLs available for --node-id/--relay-url and exit
+        /// without running any probes.
+        #[arg(long)]
+        list_targets: bool,
     },
     ServeS3 {
         #[arg(long, default_value = "127.0.0.1:9000")]
@@ -231,10 +243,36 @@ async fn main() -> Result<()> {
             json,
             max_average_ms,
             max_p95_ms,
+            node_id,
+            relay_url,
+            list_targets,
         } => {
+            let node_id = node_id
+                .as_deref()
+                .map(|value| {
+                    value
+                        .parse::<common::NodeId>()
+                        .with_context(|| format!("invalid --node-id {value}"))
+                })
+                .transpose()?;
+
+            if *list_targets {
+                return print_latency_test_targets(&cli).await;
+            }
+
+            if (node_id.is_some() || relay_url.is_some())
+                && matches!(path, LatencyTestPathSelection::Current)
+            {
+                bail!(
+                    "--node-id/--relay-url select a bootstrap target; they have no effect with --path current, which always probes the already-established connection"
+                );
+            }
+
             let suite = run_latency_test(
                 &cli,
                 *path,
+                node_id,
+                relay_url.as_deref(),
                 LatencyProbeConfig {
                     sample_count: *samples,
                     warmup_count: *warmup,
@@ -309,7 +347,7 @@ async fn main() -> Result<()> {
                 WebUiConfig::new("http://127.0.0.1:9")
             }
             .with_service_name("cli-client-web");
-            let app = web_ui_backend::router(web_ui_config);
+            let app = web_ui_backend::router(web_ui_config.with_log_buffer(cli_web_log_buffer()));
 
             info!(bind_addr = %bind_addr, "cli web interface listening");
             println!("web interface at http://{bind_addr}");
@@ -461,11 +499,20 @@ fn init_cli_tracing() {
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt_layer)
+            .with(common::logging::LogCaptureLayer::new(cli_web_log_buffer()))
             .try_init();
     });
     if perf_logging_enabled {
         info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
     }
+}
+
+fn cli_web_log_buffer() -> std::sync::Arc<common::logging::LogBuffer> {
+    static LOG_BUFFER: std::sync::OnceLock<std::sync::Arc<common::logging::LogBuffer>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(
+        LOG_BUFFER.get_or_init(|| std::sync::Arc::new(common::logging::LogBuffer::new(500))),
+    )
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {
@@ -609,11 +656,15 @@ async fn print_json_endpoint(client: &IronMeshClient, path: &str) -> Result<()> 
 async fn run_latency_test(
     cli: &Cli,
     path_selection: LatencyTestPathSelection,
+    node_id: Option<common::NodeId>,
+    relay_url: Option<&str>,
     config: LatencyProbeConfig,
 ) -> Result<LatencyTestSuiteResult> {
     config.validate()?;
     info!(
         path_selection = ?path_selection,
+        node_id = ?node_id,
+        relay_url = relay_url.unwrap_or("<none>"),
         sample_count = config.sample_count,
         warmup_count = config.warmup_count,
         response_bytes = config.response_bytes,
@@ -622,15 +673,22 @@ async fn run_latency_test(
         "starting latency test suite"
     );
 
+    if (node_id.is_some() || relay_url.is_some()) && cli.bootstrap_file.is_none() {
+        bail!(
+            "--node-id/--relay-url require --bootstrap-file so a specific target can be resolved"
+        );
+    }
+
     let current_client = build_authenticated_sdk_from_cli(cli).await?;
     log_client_transport_ready("latency_test_current_client", &current_client);
     let bootstrap = load_bootstrap_from_cli(cli)?;
     let identity = read_client_identity_from_cli(cli)?;
     let diagnostic_targets = bootstrap
         .as_ref()
-        .map(ConnectionBootstrap::diagnostic_targets)
+        .map(|bootstrap| bootstrap.diagnostic_targets_selecting(node_id, relay_url))
         .transpose()?
         .unwrap_or_default();
+    let relay_probe_is_pinned = node_id.is_some() || relay_url.is_some();
 
     let mut targets = match path_selection {
         LatencyTestPathSelection::Current => {
@@ -643,6 +701,7 @@ async fn run_latency_test(
                     &diagnostic_targets,
                     identity.as_ref(),
                     &config,
+                    node_id.is_some(),
                 )
                 .await,
             ]
@@ -653,19 +712,24 @@ async fn run_latency_test(
                 &diagnostic_targets,
                 identity.as_ref(),
                 &config,
-                true,
+                // Once the operator pins a relay target, the relay suite should only exercise the
+                // selected bootstrap-derived path(s), not the unfiltered current runtime.
+                !relay_probe_is_pinned,
             )
             .await
         }
         LatencyTestPathSelection::All => {
             let mut targets = vec![probe_current_latency_target(&current_client, &config).await];
-            if current_client.uses_relay_transport() && diagnostic_targets.direct.is_some() {
+            if (current_client.uses_relay_transport() || node_id.is_some())
+                && diagnostic_targets.direct.is_some()
+            {
                 targets.push(
                     probe_direct_latency_target(
                         &current_client,
                         &diagnostic_targets,
                         identity.as_ref(),
                         &config,
+                        node_id.is_some(),
                     )
                     .await,
                 );
@@ -676,7 +740,9 @@ async fn run_latency_test(
                     &diagnostic_targets,
                     identity.as_ref(),
                     &config,
-                    true,
+                    // `all` already includes the current runtime explicitly via the `current`
+                    // target above, so relay diagnostics should only add bootstrap-derived paths.
+                    false,
                 )
                 .await,
             );
@@ -703,6 +769,39 @@ async fn run_latency_test(
     })
 }
 
+async fn print_latency_test_targets(cli: &Cli) -> Result<()> {
+    let bootstrap = load_bootstrap_from_cli(cli)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--list-targets requires --bootstrap-file so its configured targets can be listed"
+        )
+    })?;
+
+    println!("direct targets (use with --node-id):");
+    let direct_targets = bootstrap.direct_https_targets()?;
+    if direct_targets.is_empty() {
+        println!("  <none>");
+    } else {
+        for target in &direct_targets {
+            match (target.target_node_id, target.server_base_url.as_deref()) {
+                (Some(node_id), Some(url)) => println!("  {node_id}  {url}"),
+                (None, Some(url)) => println!("  <no node_id>  {url}"),
+                _ => {}
+            }
+        }
+    }
+
+    println!("rendezvous URLs (use with --relay-url):");
+    if bootstrap.rendezvous_urls.is_empty() {
+        println!("  <none>");
+    } else {
+        for url in &bootstrap.rendezvous_urls {
+            println!("  {url}");
+        }
+    }
+
+    Ok(())
+}
+
 async fn probe_current_latency_target(
     client: &IronMeshClient,
     config: &LatencyProbeConfig,
@@ -719,13 +818,17 @@ async fn probe_current_latency_target(
     .await
 }
 
+// `force_diagnostic_target` is set when the caller passed `--node-id`: without it, a direct probe
+// silently reuses the already-established `current_client` connection whenever that happens to be
+// direct already, which would ignore the explicitly requested node.
 async fn probe_direct_latency_target(
     current_client: &IronMeshClient,
     diagnostic_targets: &ConnectionBootstrapDiagnosticTargets,
     identity: Option<&ClientIdentityMaterial>,
     config: &LatencyProbeConfig,
+    force_diagnostic_target: bool,
 ) -> LatencyTestPathResult {
-    if !current_client.uses_relay_transport() {
+    if !force_diagnostic_target && !current_client.uses_relay_transport() {
         return probe_latency_client(
             "direct",
             "Direct path (current runtime)".to_string(),

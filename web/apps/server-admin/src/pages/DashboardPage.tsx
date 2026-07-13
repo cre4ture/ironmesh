@@ -8,8 +8,15 @@ import {
   getServerHealth,
   getStorageStatsCurrent,
   getStorageStatsHistory,
+  getProcessStatsCurrent,
+  getProcessStatsHistory,
+  getProcessStatsMemory,
   getReplicationPlan,
-  type StorageStatsSample
+  type StorageStatsSample,
+  type ProcessStatsSample,
+  type ChildProcessStat,
+  type TemperatureComponentStat,
+  type MemoryAttributionSample
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import {
@@ -66,6 +73,12 @@ const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
 ];
 
 const EMPTY_STORAGE_HISTORY: StorageStatsSample[] = [];
+const EMPTY_PROCESS_HISTORY: ProcessStatsSample[] = [];
+const EMPTY_PROCESS_CHILDREN: ChildProcessStat[] = [];
+const EMPTY_TEMPERATURE_COMPONENTS: TemperatureComponentStat[] = [];
+
+const PROCESS_CHART_COLORS = { main: "#38bdf8", children: "#f59e0b" };
+const PROCESS_TEMPERATURE_CHART_COLORS = { hottest: "#f97316", average: "#22c55e" };
 
 type StorageStatsChartMetricKey =
   | "chunkStoreBytes"
@@ -124,6 +137,24 @@ export function DashboardPage() {
     queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(storageHistoryRange), normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster
   });
+  const processStatsCurrentQuery = useQuery({
+    queryKey: ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
+    queryFn: () => getProcessStatsCurrent(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster,
+    refetchInterval: 3_000
+  });
+  const processStatsHistoryQuery = useQuery({
+    queryKey: ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
+    queryFn: () => getProcessStatsHistory(undefined, normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster,
+    refetchInterval: 3_000
+  });
+  const processStatsMemoryQuery = useQuery({
+    queryKey: ["dashboard", "process-stats-memory", normalizedAdminTokenOverride],
+    queryFn: () => getProcessStatsMemory(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster,
+    refetchInterval: 5_000
+  });
   const clusterSummaryQuery = useQuery({
     queryKey: ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
     queryFn: () =>
@@ -162,7 +193,10 @@ export function DashboardPage() {
             ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
             ["dashboard", "cluster-nodes", normalizedAdminTokenOverride],
             ["dashboard", "replication-plan", normalizedAdminTokenOverride],
-            ["dashboard", "repair-activity", normalizedAdminTokenOverride]
+            ["dashboard", "repair-activity", normalizedAdminTokenOverride],
+            ["dashboard", "process-stats-current", normalizedAdminTokenOverride],
+            ["dashboard", "process-stats-history", normalizedAdminTokenOverride],
+            ["dashboard", "process-stats-memory", normalizedAdminTokenOverride]
           ]
         : []),
       ...(canInspectRendezvous
@@ -208,6 +242,12 @@ export function DashboardPage() {
   const backendHealth = backendHealthQuery.data ?? null;
   const storageStats = storageStatsQuery.data ?? null;
   const storageHistory = storageHistoryQuery.data ?? EMPTY_STORAGE_HISTORY;
+  const processStatsCurrent =
+    canInspectCluster ? processStatsCurrentQuery.data ?? null : null;
+  const processStatsHistory =
+    canInspectCluster ? processStatsHistoryQuery.data ?? EMPTY_PROCESS_HISTORY : EMPTY_PROCESS_HISTORY;
+  const memoryAttribution: MemoryAttributionSample | null =
+    canInspectCluster ? processStatsMemoryQuery.data ?? null : null;
   const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
   const mediaCacheClearPending = mediaCacheClearMutation.isPending;
   const loading =
@@ -218,7 +258,10 @@ export function DashboardPage() {
       (clusterSummaryQuery.isFetching ||
         nodesQuery.isFetching ||
         replicationPlanQuery.isFetching ||
-        repairActivityQuery.isFetching)) ||
+        repairActivityQuery.isFetching ||
+        processStatsCurrentQuery.isFetching ||
+        processStatsHistoryQuery.isFetching ||
+        processStatsMemoryQuery.isFetching)) ||
     (canInspectRendezvous && rendezvousConfigQuery.isFetching);
   const error = firstErrorMessage([
     mediaCacheClearMutation.error,
@@ -228,7 +271,10 @@ export function DashboardPage() {
     canInspectCluster ? clusterSummaryQuery.error : null,
     canInspectCluster ? nodesQuery.error : null,
     canInspectCluster ? replicationPlanQuery.error : null,
-    canInspectCluster ? repairActivityQuery.error : null
+    canInspectCluster ? repairActivityQuery.error : null,
+    canInspectCluster ? processStatsCurrentQuery.error : null,
+    canInspectCluster ? processStatsHistoryQuery.error : null,
+    canInspectCluster ? processStatsMemoryQuery.error : null
   ]);
 
   async function confirmMediaCacheClear() {
@@ -254,6 +300,16 @@ export function DashboardPage() {
   const selectedStorageHistoryRange =
     STORAGE_HISTORY_RANGE_OPTIONS.find((option) => option.key === storageHistoryRange) ??
     STORAGE_HISTORY_RANGE_OPTIONS[0];
+  const latestProcessSample = processStatsCurrent?.sample ?? null;
+  const processChildren = processStatsCurrent?.children ?? EMPTY_PROCESS_CHILDREN;
+  const temperatureComponents =
+    processStatsCurrent?.temperature_components ?? EMPTY_TEMPERATURE_COMPONENTS;
+  const hottestTemperatureComponent =
+    temperatureComponents.find((component) => component.temperature_celsius !== null && component.temperature_celsius !== undefined) ??
+    null;
+  const reportingTemperatureComponentCount = temperatureComponents.filter(
+    (component) => component.temperature_celsius !== null && component.temperature_celsius !== undefined
+  ).length;
 
   return (
     <Stack gap="lg">
@@ -278,6 +334,7 @@ export function DashboardPage() {
               clusterSummary ? `${clusterSummary.online_nodes} / ${clusterSummary.total_nodes}` : loading ? <Loader size="sm" /> : "unknown"
             }
             hint="Online / total nodes"
+            testId="dashboard-cluster-nodes-card"
           />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 4 }}>
@@ -597,6 +654,312 @@ export function DashboardPage() {
             </Stack>
           </Card>
         </Grid.Col>
+        <Grid.Col span={12}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="md">
+              <Group justify="space-between" align="flex-start">
+                <Stack gap={4}>
+                  <Text fw={700}>Process resource usage</Text>
+                  <Text size="sm" c="dimmed" maw={760}>
+                    CPU, memory, disk I/O, and temperature sensors for the ironmesh server host,
+                    sampled every few seconds. Child processes (e.g. ffmpeg during video thumbnail
+                    generation) are tracked separately.
+                  </Text>
+                </Stack>
+                <Badge variant="light">
+                  {latestProcessSample
+                    ? `updated ${formatUnixTs(latestProcessSample.collected_at_unix)}`
+                    : "no sample yet"}
+                </Badge>
+              </Group>
+              <Grid>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Main Process CPU"
+                    value={
+                      latestProcessSample
+                        ? `${latestProcessSample.main_cpu_percent.toFixed(1)}%`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      processStatsCurrent
+                        ? `of ${processStatsCurrent.logical_cpu_count} logical cores`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Main Process RAM"
+                    value={
+                      latestProcessSample
+                        ? formatBytes(latestProcessSample.main_memory_bytes)
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Main Process Disk I/O"
+                    value={
+                      latestProcessSample
+                        ? `R ${formatBytes(latestProcessSample.main_disk_read_bytes_per_sec)}/s`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      latestProcessSample
+                        ? `W ${formatBytes(latestProcessSample.main_disk_write_bytes_per_sec)}/s`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Child Processes CPU"
+                    value={
+                      latestProcessSample
+                        ? `${latestProcessSample.children_cpu_percent.toFixed(1)}%`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      latestProcessSample
+                        ? `${latestProcessSample.children_count} process${latestProcessSample.children_count === 1 ? "" : "es"} running`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Child Processes RAM"
+                    value={
+                      latestProcessSample
+                        ? formatBytes(latestProcessSample.children_memory_bytes)
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Child Processes Disk I/O"
+                    value={
+                      latestProcessSample
+                        ? `R ${formatBytes(latestProcessSample.children_disk_read_bytes_per_sec)}/s`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      latestProcessSample
+                        ? `W ${formatBytes(latestProcessSample.children_disk_write_bytes_per_sec)}/s`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Peak Temperature"
+                    value={
+                      latestProcessSample
+                        ? formatTemperature(latestProcessSample.hottest_temperature_celsius)
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      hottestTemperatureComponent
+                        ? `${hottestTemperatureComponent.label}`
+                        : latestProcessSample
+                          ? "No reporting sensors"
+                          : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Average Temperature"
+                    value={
+                      latestProcessSample
+                        ? formatTemperature(latestProcessSample.average_temperature_celsius)
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      latestProcessSample
+                        ? `${latestProcessSample.temperature_reporting_component_count ?? reportingTemperatureComponentCount} reporting sensor${(latestProcessSample.temperature_reporting_component_count ?? reportingTemperatureComponentCount) === 1 ? "" : "s"}`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Temperature Sensors"
+                    value={
+                      latestProcessSample
+                        ? (latestProcessSample.temperature_component_count ?? temperatureComponents.length) > 0
+                          ? `${latestProcessSample.temperature_reporting_component_count ?? reportingTemperatureComponentCount} / ${latestProcessSample.temperature_component_count ?? temperatureComponents.length}`
+                          : "not available"
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint="Reporting / discovered"
+                  />
+                </Grid.Col>
+              </Grid>
+              <ProcessStatsCharts samples={processStatsHistory} />
+              <Stack gap={6}>
+                <Text size="sm" fw={600}>Running child processes</Text>
+                {processChildren.length === 0 ? (
+                  <Text size="sm" c="dimmed">No child processes currently running.</Text>
+                ) : (
+                  <ScrollArea type="auto">
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>PID</Table.Th>
+                          <Table.Th>Name</Table.Th>
+                          <Table.Th>CPU</Table.Th>
+                          <Table.Th>RAM</Table.Th>
+                          <Table.Th>Disk read</Table.Th>
+                          <Table.Th>Disk write</Table.Th>
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {processChildren.map((child) => (
+                          <Table.Tr key={child.pid}>
+                            <Table.Td>{child.pid}</Table.Td>
+                            <Table.Td>{child.name}</Table.Td>
+                            <Table.Td>{child.cpu_percent.toFixed(1)}%</Table.Td>
+                            <Table.Td>{formatBytes(child.memory_bytes)}</Table.Td>
+                            <Table.Td>{formatBytes(child.disk_read_bytes_per_sec)}/s</Table.Td>
+                            <Table.Td>{formatBytes(child.disk_write_bytes_per_sec)}/s</Table.Td>
+                          </Table.Tr>
+                        ))}
+                      </Table.Tbody>
+                    </Table>
+                  </ScrollArea>
+                )}
+              </Stack>
+              <Stack gap={6}>
+                <Text size="sm" fw={600}>Temperature sensors</Text>
+                {temperatureComponents.length === 0 ? (
+                  <Text size="sm" c="dimmed">No temperature sensors currently reporting.</Text>
+                ) : (
+                  <ScrollArea type="auto">
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>Sensor</Table.Th>
+                          <Table.Th>Current</Table.Th>
+                          <Table.Th>Max</Table.Th>
+                          <Table.Th>Critical</Table.Th>
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {temperatureComponents.map((component, index) => (
+                          <Table.Tr key={`${component.label}-${index}`}>
+                            <Table.Td>{component.label}</Table.Td>
+                            <Table.Td>{formatOptionalTemperature(component.temperature_celsius)}</Table.Td>
+                            <Table.Td>{formatOptionalTemperature(component.max_celsius)}</Table.Td>
+                            <Table.Td>{formatOptionalTemperature(component.critical_celsius)}</Table.Td>
+                          </Table.Tr>
+                        ))}
+                      </Table.Tbody>
+                    </Table>
+                  </ScrollArea>
+                )}
+              </Stack>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={12}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="md">
+              <Group justify="space-between" align="flex-start">
+                <Stack gap={4}>
+                  <Text fw={700}>Memory attribution</Text>
+                  <Text size="sm" c="dimmed" maw={760}>
+                    Why the process RSS above is what it is, not just what it is. See{" "}
+                    <Code>docs/node-memory-footprint-reduction-plan.md</Code> for the full analysis.
+                  </Text>
+                </Stack>
+                <Badge variant="light">
+                  {memoryAttribution
+                    ? `updated ${formatUnixTs(memoryAttribution.collected_at_unix)}`
+                    : "no sample yet"}
+                </Badge>
+              </Group>
+              <Grid>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Current-objects cache"
+                    value={
+                      memoryAttribution
+                        ? `${memoryAttribution.current_objects_cache.resident_entries} / ${memoryAttribution.current_objects_cache.capacity}`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      memoryAttribution
+                        ? `~${formatBytes(memoryAttribution.current_objects_cache.estimated_resident_bytes)} resident, of ${memoryAttribution.current_objects_total_count} total objects`
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="In-flight uploads"
+                    value={
+                      memoryAttribution
+                        ? `${memoryAttribution.in_flight_upload_session_count} session${memoryAttribution.in_flight_upload_session_count === 1 ? "" : "s"}`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "pending"
+                    }
+                    hint={
+                      memoryAttribution
+                        ? formatBytes(memoryAttribution.in_flight_upload_bytes)
+                        : undefined
+                    }
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <StatCard
+                    label="Last GC pass"
+                    value={
+                      memoryAttribution?.last_gc_pass
+                        ? `${memoryAttribution.last_gc_pass.retained_manifests_processed} manifests`
+                        : loading
+                          ? <Loader size="sm" />
+                          : "no pass yet"
+                    }
+                    hint={
+                      memoryAttribution?.last_gc_pass
+                        ? `batch ≤ ${memoryAttribution.last_gc_pass.peak_manifest_batch_size}, ${formatUnixTs(memoryAttribution.last_gc_pass.collected_at_unix)}${memoryAttribution.last_gc_pass.dry_run ? " (dry run)" : ""}`
+                        : "triggered manually via maintenance/cleanup"
+                    }
+                  />
+                </Grid.Col>
+              </Grid>
+              <Text size="xs" c="dimmed">
+                FUSE hydrated-file memory isn't attributed here yet — it's tracked client-side, not
+                by this server process, and the corresponding budget/eviction gauge lands with Slice 1.
+              </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
         <Grid.Col span={{ base: 12, xl: 12 }}>
           <Card withBorder radius="md" padding="lg">
             <Stack gap="md">
@@ -788,6 +1151,20 @@ function firstErrorMessage(errors: Array<unknown>): string | null {
   return null;
 }
 
+function formatTemperature(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "not available";
+  }
+  return `${value.toFixed(1)} C`;
+}
+
+function formatOptionalTemperature(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "unknown";
+  }
+  return `${value.toFixed(1)} C`;
+}
+
 function formatRepairActivityState(state: string): string {
   switch (state) {
     case "running":
@@ -879,6 +1256,362 @@ function describeDashboardRepairSummary(
     : "Planner state is not available.";
 
   return [latestRunText, latestSummary, plannerText].filter(Boolean).join(" ");
+}
+
+type ProcessChartMetricKey =
+  | "mainCpuPercent"
+  | "childrenCpuPercent"
+  | "mainMemoryBytes"
+  | "childrenMemoryBytes"
+  | "mainDiskReadBytesPerSec"
+  | "childrenDiskReadBytesPerSec"
+  | "mainDiskWriteBytesPerSec"
+  | "childrenDiskWriteBytesPerSec";
+
+type ProcessChartPoint = {
+  collectedAtMs: number;
+  collectedAtUnix: number;
+} & Record<ProcessChartMetricKey, number>;
+
+type TemperatureChartPoint = {
+  collectedAtMs: number;
+  collectedAtUnix: number;
+  hottestTemperatureCelsius: number | null;
+  averageTemperatureCelsius: number | null;
+};
+
+function ProcessStatsCharts({ samples }: { samples: ProcessStatsSample[] }) {
+  const chartPoints: ProcessChartPoint[] = useMemo(
+    () =>
+      samples.map((sample) => ({
+        collectedAtMs: sample.collected_at_unix * 1000,
+        collectedAtUnix: sample.collected_at_unix,
+        mainCpuPercent: sample.main_cpu_percent,
+        childrenCpuPercent: sample.children_cpu_percent,
+        mainMemoryBytes: sample.main_memory_bytes,
+        childrenMemoryBytes: sample.children_memory_bytes,
+        mainDiskReadBytesPerSec: sample.main_disk_read_bytes_per_sec,
+        childrenDiskReadBytesPerSec: sample.children_disk_read_bytes_per_sec,
+        mainDiskWriteBytesPerSec: sample.main_disk_write_bytes_per_sec,
+        childrenDiskWriteBytesPerSec: sample.children_disk_write_bytes_per_sec
+      })),
+    [samples]
+  );
+  const temperatureChartPoints: TemperatureChartPoint[] = useMemo(
+    () =>
+      samples.map((sample) => ({
+        collectedAtMs: sample.collected_at_unix * 1000,
+        collectedAtUnix: sample.collected_at_unix,
+        hottestTemperatureCelsius: sample.hottest_temperature_celsius ?? null,
+        averageTemperatureCelsius: sample.average_temperature_celsius ?? null
+      })),
+    [samples]
+  );
+
+  if (chartPoints.length === 0) {
+    return <Text c="dimmed">No process stats samples collected yet.</Text>;
+  }
+
+  return (
+    <Grid>
+      <Grid.Col span={{ base: 12, md: 6 }}>
+        <ProcessMetricChart
+          points={chartPoints}
+          mainKey="mainCpuPercent"
+          childrenKey="childrenCpuPercent"
+          title="CPU usage"
+          yLabel="CPU %"
+          yTickFormatter={(value) => `${value.toFixed(0)}%`}
+          tooltipFormatter={(value) => `${value.toFixed(1)}%`}
+        />
+      </Grid.Col>
+      <Grid.Col span={{ base: 12, md: 6 }}>
+        <ProcessMetricChart
+          points={chartPoints}
+          mainKey="mainMemoryBytes"
+          childrenKey="childrenMemoryBytes"
+          title="Memory usage"
+          yLabel="RAM"
+          yTickFormatter={(value) => formatBytes(value)}
+          tooltipFormatter={(value) => formatBytes(value)}
+        />
+      </Grid.Col>
+      <Grid.Col span={{ base: 12, md: 6 }}>
+        <ProcessMetricChart
+          points={chartPoints}
+          mainKey="mainDiskReadBytesPerSec"
+          childrenKey="childrenDiskReadBytesPerSec"
+          title="Disk read"
+          yLabel="Bytes/s"
+          yTickFormatter={(value) => `${formatBytes(value)}/s`}
+          tooltipFormatter={(value) => `${formatBytes(value)}/s`}
+        />
+      </Grid.Col>
+      <Grid.Col span={{ base: 12, md: 6 }}>
+        <ProcessMetricChart
+          points={chartPoints}
+          mainKey="mainDiskWriteBytesPerSec"
+          childrenKey="childrenDiskWriteBytesPerSec"
+          title="Disk write"
+          yLabel="Bytes/s"
+          yTickFormatter={(value) => `${formatBytes(value)}/s`}
+          tooltipFormatter={(value) => `${formatBytes(value)}/s`}
+        />
+      </Grid.Col>
+      <Grid.Col span={{ base: 12, md: 6 }}>
+        <ProcessTemperatureChart points={temperatureChartPoints} />
+      </Grid.Col>
+    </Grid>
+  );
+}
+
+function ProcessMetricChart({
+  points,
+  mainKey,
+  childrenKey,
+  title,
+  yLabel,
+  yTickFormatter,
+  tooltipFormatter
+}: {
+  points: ProcessChartPoint[];
+  mainKey: ProcessChartMetricKey;
+  childrenKey: ProcessChartMetricKey;
+  title: string;
+  yLabel: string;
+  yTickFormatter: (value: number) => string;
+  tooltipFormatter: (value: number) => string;
+}) {
+  const yMax = Math.max(1, ...points.map((point) => Math.max(point[mainKey], point[childrenKey])));
+
+  return (
+    <Stack gap={6}>
+      <Group justify="space-between" wrap="nowrap">
+        <Text size="sm" fw={600}>
+          {title}
+        </Text>
+        <Group gap="xs">
+          <Badge variant="light" color="cyan">
+            Main process
+          </Badge>
+          <Badge variant="light" color="yellow">
+            Child processes
+          </Badge>
+        </Group>
+      </Group>
+      <ZoomableTimeSeriesChart
+        points={points}
+        height="12rem"
+        emptyState={<Text c="dimmed">No samples collected yet.</Text>}
+        zoomInAriaLabel={`Zoom in on ${title} chart`}
+        zoomOutAriaLabel={`Zoom out of ${title} chart`}
+        resetZoomAriaLabel={`Reset ${title} chart zoom`}
+        renderChart={({ xDomain, visibleTimeSpanSeconds, brush }) => (
+          <LineChart
+            data={points}
+            margin={{ top: 4, right: 12, bottom: 12, left: 4 }}
+            accessibilityLayer
+            role="img"
+            title={title}
+            desc={`Main process vs. child processes ${title.toLowerCase()} over time.`}
+            {...({ "aria-label": `${title} chart` } as { "aria-label": string })}
+          >
+            <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" vertical={false} />
+            <XAxis
+              dataKey="collectedAtMs"
+              type="number"
+              scale="time"
+              domain={xDomain}
+              allowDataOverflow
+              tickFormatter={(value) =>
+                formatTimeSeriesChartTimestamp(Math.floor(Number(value) / 1000), visibleTimeSpanSeconds)
+              }
+              tick={{ fill: "#cbd5e1", fontSize: "0.68rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              minTickGap={24}
+            />
+            <YAxis
+              width={64}
+              domain={[0, yMax]}
+              tickFormatter={yTickFormatter}
+              tick={{ fill: "#cbd5e1", fontSize: "0.68rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              label={{
+                value: yLabel,
+                angle: -90,
+                position: "insideLeft",
+                fill: "#e2e8f0",
+                fontSize: "0.7rem",
+                fontWeight: 600
+              }}
+            />
+            <Tooltip
+              formatter={(value, name) => [tooltipFormatter(Number(value)), name]}
+              labelFormatter={(value) => formatUnixTs(Math.floor(Number(value) / 1000))}
+              cursor={{ stroke: "#94a3b8", strokeDasharray: "4 4" }}
+              isAnimationActive={false}
+            />
+            <Line
+              type="linear"
+              dataKey={mainKey}
+              name="Main process"
+              stroke={PROCESS_CHART_COLORS.main}
+              strokeWidth={2}
+              dot={points.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+              activeDot={{ r: 4, strokeWidth: 0 }}
+              isAnimationActive={false}
+            />
+            <Line
+              type="linear"
+              dataKey={childrenKey}
+              name="Child processes"
+              stroke={PROCESS_CHART_COLORS.children}
+              strokeWidth={2}
+              dot={points.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+              activeDot={{ r: 4, strokeWidth: 0 }}
+              isAnimationActive={false}
+            />
+            {brush}
+          </LineChart>
+        )}
+      />
+    </Stack>
+  );
+}
+
+function ProcessTemperatureChart({
+  points
+}: {
+  points: TemperatureChartPoint[];
+}) {
+  const yValues = points.flatMap((point) =>
+    [point.hottestTemperatureCelsius, point.averageTemperatureCelsius].filter(
+      (value): value is number => value !== null && Number.isFinite(value)
+    )
+  );
+
+  if (yValues.length === 0) {
+    return (
+      <Stack gap={6}>
+        <Group justify="space-between" wrap="nowrap">
+          <Text size="sm" fw={600}>
+            Temperature
+          </Text>
+          <Group gap="xs">
+            <Badge variant="light" color="orange">
+              Hottest sensor
+            </Badge>
+            <Badge variant="light" color="green">
+              Average
+            </Badge>
+          </Group>
+        </Group>
+        <Text c="dimmed">No temperature samples collected yet.</Text>
+      </Stack>
+    );
+  }
+
+  const yMax = Math.max(1, ...yValues);
+
+  return (
+    <Stack gap={6}>
+      <Group justify="space-between" wrap="nowrap">
+        <Text size="sm" fw={600}>
+          Temperature
+        </Text>
+        <Group gap="xs">
+          <Badge variant="light" color="orange">
+            Hottest sensor
+          </Badge>
+          <Badge variant="light" color="green">
+            Average
+          </Badge>
+        </Group>
+      </Group>
+      <ZoomableTimeSeriesChart
+        points={points}
+        height="12rem"
+        emptyState={<Text c="dimmed">No samples collected yet.</Text>}
+        zoomInAriaLabel="Zoom in on temperature chart"
+        zoomOutAriaLabel="Zoom out of temperature chart"
+        resetZoomAriaLabel="Reset temperature chart zoom"
+        renderChart={({ xDomain, visibleTimeSpanSeconds, brush }) => (
+          <LineChart
+            data={points}
+            margin={{ top: 4, right: 12, bottom: 12, left: 4 }}
+            accessibilityLayer
+            role="img"
+            title="Temperature"
+            desc="Hottest and average host temperature sensor readings over time."
+            {...({ "aria-label": "Temperature chart" } as { "aria-label": string })}
+          >
+            <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" vertical={false} />
+            <XAxis
+              dataKey="collectedAtMs"
+              type="number"
+              scale="time"
+              domain={xDomain}
+              allowDataOverflow
+              tickFormatter={(value) =>
+                formatTimeSeriesChartTimestamp(Math.floor(Number(value) / 1000), visibleTimeSpanSeconds)
+              }
+              tick={{ fill: "#cbd5e1", fontSize: "0.68rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              minTickGap={24}
+            />
+            <YAxis
+              width={64}
+              domain={[0, yMax]}
+              tickFormatter={(value) => `${value.toFixed(0)} C`}
+              tick={{ fill: "#cbd5e1", fontSize: "0.68rem" }}
+              tickLine={{ stroke: "#475569" }}
+              axisLine={{ stroke: "#334155" }}
+              label={{
+                value: "Temp",
+                angle: -90,
+                position: "insideLeft",
+                fill: "#e2e8f0",
+                fontSize: "0.7rem",
+                fontWeight: 600
+              }}
+            />
+            <Tooltip
+              formatter={(value, name) => [formatTemperature(Number(value)), name]}
+              labelFormatter={(value) => formatUnixTs(Math.floor(Number(value) / 1000))}
+              cursor={{ stroke: "#94a3b8", strokeDasharray: "4 4" }}
+              isAnimationActive={false}
+            />
+            <Line
+              type="linear"
+              dataKey="hottestTemperatureCelsius"
+              name="Hottest sensor"
+              stroke={PROCESS_TEMPERATURE_CHART_COLORS.hottest}
+              strokeWidth={2}
+              dot={points.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+              activeDot={{ r: 4, strokeWidth: 0 }}
+              connectNulls={false}
+              isAnimationActive={false}
+            />
+            <Line
+              type="linear"
+              dataKey="averageTemperatureCelsius"
+              name="Average"
+              stroke={PROCESS_TEMPERATURE_CHART_COLORS.average}
+              strokeWidth={2}
+              dot={points.length === 1 ? { r: 3, strokeWidth: 2 } : false}
+              activeDot={{ r: 4, strokeWidth: 0 }}
+              connectNulls={false}
+              isAnimationActive={false}
+            />
+            {brush}
+          </LineChart>
+        )}
+      />
+    </Stack>
+  );
 }
 
 function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {

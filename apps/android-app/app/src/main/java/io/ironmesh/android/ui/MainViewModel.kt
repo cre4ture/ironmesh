@@ -5,17 +5,20 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.ironmesh.android.api.StoreIndexEntry
+import io.ironmesh.android.api.StoreIndexResponse
+import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncServiceStatus
+import io.ironmesh.android.ui.screens.ThumbnailBitmapCache
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.parseAllowedWifiSsidsInput
-import io.ironmesh.android.work.FolderSyncNetworkGate
-import io.ironmesh.android.saf.IronmeshDocumentColumns
 import io.ironmesh.android.work.FolderSyncScheduler
+import io.ironmesh.android.work.FolderSyncNetworkGate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -34,9 +37,10 @@ enum class GalleryViewMode {
 }
 
 enum class MainSection {
+    HOME,
+    SYNC,
+    LIBRARY,
     SETTINGS,
-    WEB_UI,
-    GALLERY,
 }
 
 enum class FolderSyncActivityFilter {
@@ -48,6 +52,10 @@ enum class FolderSyncActivityFilter {
 
 private const val GALLERY_ROOT_DOCUMENT_ID = "dir:"
 private const val GALLERY_ROOT_PATH = "/"
+private const val GALLERY_PAGE_SIZE = 32
+private const val GALLERY_PAGE_PRELOAD_RADIUS = 1
+private const val GALLERY_PAGE_KEEP_RADIUS = 2
+private const val GALLERY_FLATTENED_DEPTH = 64
 private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
 private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
 
@@ -84,6 +92,24 @@ data class GalleryBreadcrumbItem(
     val pathLabel: String,
 )
 
+data class GalleryCollectionState(
+    val totalItemCount: Int,
+    val pageSize: Int,
+    val pageCount: Int,
+)
+
+enum class GalleryPageStatus {
+    LOADING,
+    READY,
+    ERROR,
+}
+
+data class GalleryPageState(
+    val status: GalleryPageStatus,
+    val items: List<GalleryImageItem> = emptyList(),
+    val error: String? = null,
+)
+
 data class MainUiState(
     val deviceAuthState: DeviceAuthState = DeviceAuthState(),
     val bootstrapInput: String = "",
@@ -104,10 +130,11 @@ data class MainUiState(
     val newSyncAllowOtherConnections: Boolean = true,
     val newSyncAllowRoaming: Boolean = false,
     val newSyncAllowedWifiSsids: String = "",
-    val selectedSection: MainSection = MainSection.SETTINGS,
+    val selectedSection: MainSection = MainSection.HOME,
     val webUiUrl: String = "",
     val galleryMode: GalleryViewMode = GalleryViewMode.FLATTENED_ALL_IMAGES,
-    val galleryItems: List<GalleryImageItem> = emptyList(),
+    val galleryCollection: GalleryCollectionState? = null,
+    val galleryPages: Map<Int, GalleryPageState> = emptyMap(),
     val galleryDirectories: List<GalleryDirectoryItem> = emptyList(),
     val galleryBreadcrumbs: List<GalleryBreadcrumbItem> = emptyList(),
     val galleryCurrentDirectoryDocumentId: String = GALLERY_ROOT_DOCUMENT_ID,
@@ -122,6 +149,8 @@ class MainViewModel(
 ) : AndroidViewModel(application) {
 
     private val repository = IronmeshRepository()
+    private var galleryRequestVersion = 0
+    private var pinnedGalleryItemIndex: Int? = null
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
@@ -233,37 +262,71 @@ class MainViewModel(
 
     fun selectSection(section: MainSection) {
         uiState.value = uiState.value.copy(selectedSection = section)
-        if (section == MainSection.SETTINGS) {
+        if (section == MainSection.SYNC) {
             refreshExpandedFolderSyncHistory(force = true)
+        }
+        if (
+            section == MainSection.LIBRARY &&
+            uiState.value.galleryCollection == null &&
+            uiState.value.galleryDirectories.isEmpty() &&
+            !uiState.value.galleryLoading
+        ) {
+            refreshGallery()
         }
     }
 
     fun refreshGallery() {
-        uiState.value = uiState.value.copy(galleryLoading = true, status = "Loading gallery...")
+        ThumbnailBitmapCache.clear()
+        val request = currentGalleryRequest(pageSize = uiState.value.galleryCollection?.pageSize ?: GALLERY_PAGE_SIZE)
+        val requestVersion = nextGalleryRequestVersion()
+        pinnedGalleryItemIndex = null
+        uiState.value = uiState.value.copy(
+            galleryLoading = true,
+            galleryCollection = null,
+            galleryPages = emptyMap(),
+            status = "Loading gallery...",
+        )
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    loadGalleryState()
+                    loadGalleryState(request)
                 }
             }
                 .onSuccess { snapshot ->
-                    val sorted = sortGallery(snapshot.images, uiState.value.gallerySort)
+                    if (!isCurrentGalleryRequest(requestVersion)) {
+                        return@onSuccess
+                    }
+                    val firstPage = snapshot.firstPageItems
                     uiState.value = uiState.value.copy(
+                        galleryCollection = snapshot.collection,
+                        galleryPages = if (firstPage.isEmpty()) {
+                            emptyMap()
+                        } else {
+                            mapOf(
+                                0 to GalleryPageState(
+                                    status = GalleryPageStatus.READY,
+                                    items = firstPage,
+                                ),
+                            )
+                        },
                         galleryDirectories = snapshot.directories,
                         galleryBreadcrumbs = snapshot.breadcrumbs,
                         galleryCurrentDirectoryDocumentId = snapshot.currentDirectoryDocumentId,
                         galleryCurrentDirectoryPath = snapshot.currentDirectoryPath,
-                        galleryItems = sorted,
                         galleryLoading = false,
                         status = when (snapshot.mode) {
                             GalleryViewMode.FLATTENED_ALL_IMAGES ->
-                                "Gallery loaded: ${sorted.size} images"
+                                "Gallery loaded: ${snapshot.collection.totalItemCount} images"
                             GalleryViewMode.CURRENT_DIRECTORY ->
-                                "Gallery loaded: ${sorted.size} images, ${snapshot.directories.size} folders in ${snapshot.currentDirectoryPath}"
+                                "Gallery loaded: ${snapshot.collection.totalItemCount} images, ${snapshot.directories.size} folders in ${snapshot.currentDirectoryPath}"
                         },
                     )
+                    updateVisibleGalleryPages(setOf(0))
                 }
                 .onFailure { error ->
+                    if (!isCurrentGalleryRequest(requestVersion)) {
+                        return@onFailure
+                    }
                     uiState.value = uiState.value.copy(
                         galleryLoading = false,
                         status = "Error: ${error.message}",
@@ -273,10 +336,15 @@ class MainViewModel(
     }
 
     fun updateGallerySort(sort: GallerySortOption) {
+        if (uiState.value.gallerySort == sort) {
+            return
+        }
         uiState.value = uiState.value.copy(
             gallerySort = sort,
-            galleryItems = sortGallery(uiState.value.galleryItems, sort),
+            galleryCollection = null,
+            galleryPages = emptyMap(),
         )
+        refreshGallery()
     }
 
     fun updateGalleryViewMode(mode: GalleryViewMode) {
@@ -286,6 +354,8 @@ class MainViewModel(
         IronmeshPreferences.setGalleryViewMode(getApplication(), mode)
         uiState.value = uiState.value.copy(
             galleryMode = mode,
+            galleryCollection = null,
+            galleryPages = emptyMap(),
             galleryDirectories = emptyList(),
             galleryBreadcrumbs = emptyList(),
             galleryCurrentDirectoryDocumentId = GALLERY_ROOT_DOCUMENT_ID,
@@ -305,6 +375,8 @@ class MainViewModel(
             emptyList()
         }
         uiState.value = uiState.value.copy(
+            galleryCollection = null,
+            galleryPages = emptyMap(),
             galleryBreadcrumbs = nextBreadcrumbs,
             galleryCurrentDirectoryDocumentId = directory.documentId,
             galleryCurrentDirectoryPath = directory.pathLabel,
@@ -320,6 +392,8 @@ class MainViewModel(
             return
         }
         uiState.value = uiState.value.copy(
+            galleryCollection = null,
+            galleryPages = emptyMap(),
             galleryBreadcrumbs = emptyList(),
             galleryCurrentDirectoryDocumentId = GALLERY_ROOT_DOCUMENT_ID,
             galleryCurrentDirectoryPath = GALLERY_ROOT_PATH,
@@ -335,6 +409,8 @@ class MainViewModel(
         val nextBreadcrumbs = uiState.value.galleryBreadcrumbs.dropLast(1)
         val nextCurrent = nextBreadcrumbs.lastOrNull()
         uiState.value = uiState.value.copy(
+            galleryCollection = null,
+            galleryPages = emptyMap(),
             galleryBreadcrumbs = nextBreadcrumbs,
             galleryCurrentDirectoryDocumentId = nextCurrent?.documentId ?: GALLERY_ROOT_DOCUMENT_ID,
             galleryCurrentDirectoryPath = nextCurrent?.pathLabel ?: GALLERY_ROOT_PATH,
@@ -350,11 +426,158 @@ class MainViewModel(
         val nextBreadcrumbs = uiState.value.galleryBreadcrumbs.take(index + 1)
         val nextCurrent = nextBreadcrumbs.lastOrNull()
         uiState.value = uiState.value.copy(
+            galleryCollection = null,
+            galleryPages = emptyMap(),
             galleryBreadcrumbs = nextBreadcrumbs,
             galleryCurrentDirectoryDocumentId = nextCurrent?.documentId ?: GALLERY_ROOT_DOCUMENT_ID,
             galleryCurrentDirectoryPath = nextCurrent?.pathLabel ?: GALLERY_ROOT_PATH,
         )
         refreshGallery()
+    }
+
+    fun galleryItemAt(index: Int): GalleryImageItem? {
+        val collection = uiState.value.galleryCollection ?: return null
+        if (index < 0 || index >= collection.totalItemCount) {
+            return null
+        }
+        val page = uiState.value.galleryPages[pageIndexForGalleryEntry(index, collection.pageSize)]
+            ?: return null
+        if (page.status != GalleryPageStatus.READY) {
+            return null
+        }
+        return page.items[galleryEntryWithinPage(index, collection.pageSize)]
+    }
+
+    fun pinGalleryItem(index: Int?) {
+        pinnedGalleryItemIndex = index?.takeIf { it >= 0 }
+    }
+
+    fun ensureGalleryItemLoaded(index: Int) {
+        val collection = uiState.value.galleryCollection ?: return
+        if (index < 0 || index >= collection.totalItemCount) {
+            return
+        }
+        ensureGalleryPageLoaded(pageIndexForGalleryEntry(index, collection.pageSize))
+    }
+
+    fun retryGalleryPage(pageIndex: Int) {
+        ensureGalleryPageLoaded(pageIndex, force = true)
+    }
+
+    fun updateVisibleGalleryPages(visiblePageIndices: Set<Int>) {
+        val collection = uiState.value.galleryCollection ?: return
+        if (collection.pageCount == 0) {
+            return
+        }
+
+        val visible = visiblePageIndices
+            .filter { it in 0 until collection.pageCount }
+            .sorted()
+        val pinnedPageIndex = pinnedGalleryItemIndex?.let {
+            pageIndexForGalleryEntry(it, collection.pageSize)
+        }
+        val minVisible = visible.firstOrNull() ?: pinnedPageIndex ?: 0
+        val maxVisible = visible.lastOrNull() ?: pinnedPageIndex ?: 0
+        val rangeMin = pinnedPageIndex?.let { minOf(minVisible, it) } ?: minVisible
+        val rangeMax = pinnedPageIndex?.let { maxOf(maxVisible, it) } ?: maxVisible
+        val preloadStart = (rangeMin - GALLERY_PAGE_PRELOAD_RADIUS).coerceAtLeast(0)
+        val preloadEnd = (rangeMax + GALLERY_PAGE_PRELOAD_RADIUS).coerceAtMost(collection.pageCount - 1)
+        val keepStart = (rangeMin - GALLERY_PAGE_KEEP_RADIUS).coerceAtLeast(0)
+        val keepEnd = (rangeMax + GALLERY_PAGE_KEEP_RADIUS).coerceAtMost(collection.pageCount - 1)
+
+        for (pageIndex in preloadStart..preloadEnd) {
+            ensureGalleryPageLoaded(pageIndex)
+        }
+
+        val nextPages = uiState.value.galleryPages.filterKeys { pageIndex ->
+            pageIndex in keepStart..keepEnd ||
+                uiState.value.galleryPages[pageIndex]?.status == GalleryPageStatus.LOADING
+        }
+        if (nextPages.size != uiState.value.galleryPages.size) {
+            uiState.value = uiState.value.copy(galleryPages = nextPages)
+        }
+    }
+
+    private fun ensureGalleryPageLoaded(
+        pageIndex: Int,
+        force: Boolean = false,
+    ) {
+        val currentState = uiState.value
+        val collection = currentState.galleryCollection ?: return
+        if (pageIndex < 0 || pageIndex >= collection.pageCount) {
+            return
+        }
+
+        val existing = currentState.galleryPages[pageIndex]
+        if (!force && (existing?.status == GalleryPageStatus.READY || existing?.status == GalleryPageStatus.LOADING)) {
+            return
+        }
+
+        val request = currentGalleryRequest(pageSize = collection.pageSize)
+        val requestVersion = galleryRequestVersion
+        uiState.value = currentState.copy(
+            galleryPages = currentState.galleryPages.toMutableMap().apply {
+                put(
+                    pageIndex,
+                    GalleryPageState(
+                        status = GalleryPageStatus.LOADING,
+                        items = existing?.items.orEmpty(),
+                    ),
+                )
+            },
+        )
+
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    loadGalleryPage(
+                        request = request,
+                        pageIndex = pageIndex,
+                    )
+                }
+            }
+                .onSuccess { response ->
+                    if (!isCurrentGalleryRequest(requestVersion)) {
+                        return@onSuccess
+                    }
+                    val items = response.entries.mapNotNull(::galleryImageItemFromEntry)
+                    val nextCollection = collection.copy(
+                        totalItemCount = response.total_entry_count.coerceAtLeast(items.size),
+                        pageCount = resolveGalleryPageCount(
+                            totalItemCount = response.total_entry_count.coerceAtLeast(items.size),
+                            pageSize = collection.pageSize,
+                        ),
+                    )
+                    uiState.value = uiState.value.copy(
+                        galleryCollection = nextCollection,
+                        galleryPages = uiState.value.galleryPages.toMutableMap().apply {
+                            put(
+                                pageIndex,
+                                GalleryPageState(
+                                    status = GalleryPageStatus.READY,
+                                    items = items,
+                                ),
+                            )
+                        },
+                    )
+                }
+                .onFailure { error ->
+                    if (!isCurrentGalleryRequest(requestVersion)) {
+                        return@onFailure
+                    }
+                    uiState.value = uiState.value.copy(
+                        galleryPages = uiState.value.galleryPages.toMutableMap().apply {
+                            put(
+                                pageIndex,
+                                GalleryPageState(
+                                    status = GalleryPageStatus.ERROR,
+                                    error = error.message ?: "Failed to load gallery page",
+                                ),
+                            )
+                        },
+                    )
+                }
+        }
     }
 
     fun addFolderSyncProfile(): FolderSyncNetworkPolicy? {
@@ -531,7 +754,6 @@ class MainViewModel(
         val clientIdentityJson = currentClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             uiState.value = uiState.value.copy(
-                selectedSection = MainSection.WEB_UI,
                 webUiUrl = "",
                 status = "Enroll this device before opening the Web UI.",
             )
@@ -539,7 +761,6 @@ class MainViewModel(
         }
         uiState.value = uiState.value.copy(
             loading = true,
-            selectedSection = MainSection.WEB_UI,
             webUiUrl = "",
             status = "Starting Web UI...",
         )
@@ -603,6 +824,7 @@ class MainViewModel(
                         deviceAuthState = authState,
                         bootstrapInput = "",
                         deviceLabelInput = authState.label.orEmpty(),
+                        selectedSection = MainSection.HOME,
                         status = "Device enrolled: ${authState.deviceId}",
                     )
                     FolderSyncScheduler.reschedule(getApplication())
@@ -622,6 +844,8 @@ class MainViewModel(
             deviceAuthState = DeviceAuthState(),
             bootstrapInput = "",
             deviceLabelInput = "",
+            selectedSection = MainSection.HOME,
+            webUiUrl = "",
             status = "Cleared local device credential",
         )
         FolderSyncScheduler.reschedule(getApplication())
@@ -665,7 +889,7 @@ class MainViewModel(
     }
 
     private fun refreshExpandedFolderSyncHistory(force: Boolean = false) {
-        if (uiState.value.selectedSection != MainSection.SETTINGS) {
+        if (uiState.value.selectedSection != MainSection.SYNC) {
             return
         }
         val historyStates = uiState.value.folderSyncHistory
@@ -760,139 +984,131 @@ class MainViewModel(
             FOLDER_SYNC_HISTORY_REFRESH_MS
     }
 
+    private data class GalleryRequest(
+        val mode: GalleryViewMode,
+        val currentDirectoryDocumentId: String,
+        val currentDirectoryPath: String,
+        val breadcrumbs: List<GalleryBreadcrumbItem>,
+        val sort: GallerySortOption,
+        val pageSize: Int,
+    )
+
     private data class GalleryLoadSnapshot(
         val mode: GalleryViewMode,
         val currentDirectoryDocumentId: String,
         val currentDirectoryPath: String,
         val breadcrumbs: List<GalleryBreadcrumbItem>,
         val directories: List<GalleryDirectoryItem>,
-        val images: List<GalleryImageItem>,
+        val collection: GalleryCollectionState,
+        val firstPageItems: List<GalleryImageItem>,
     )
 
-    private fun loadGalleryState(): GalleryLoadSnapshot {
-        return when (uiState.value.galleryMode) {
-            GalleryViewMode.FLATTENED_ALL_IMAGES -> loadFlattenedGalleryState()
-            GalleryViewMode.CURRENT_DIRECTORY -> loadCurrentDirectoryGalleryState(
-                currentDirectoryDocumentId = uiState.value.galleryCurrentDirectoryDocumentId,
-                currentDirectoryPath = uiState.value.galleryCurrentDirectoryPath,
-                breadcrumbs = uiState.value.galleryBreadcrumbs,
-            )
+    private fun currentGalleryRequest(pageSize: Int): GalleryRequest {
+        val current = uiState.value
+        return GalleryRequest(
+            mode = current.galleryMode,
+            currentDirectoryDocumentId = current.galleryCurrentDirectoryDocumentId,
+            currentDirectoryPath = current.galleryCurrentDirectoryPath,
+            breadcrumbs = current.galleryBreadcrumbs,
+            sort = current.gallerySort,
+            pageSize = pageSize.coerceAtLeast(1),
+        )
+    }
+
+    private suspend fun loadGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+        return when (request.mode) {
+            GalleryViewMode.FLATTENED_ALL_IMAGES -> loadFlattenedGalleryState(request)
+            GalleryViewMode.CURRENT_DIRECTORY -> loadCurrentDirectoryGalleryState(request)
         }
     }
 
-    private fun loadFlattenedGalleryState(): GalleryLoadSnapshot {
-        val application = getApplication<Application>()
-        val authority = "${application.packageName}.documents"
-        val items = mutableListOf<GalleryImageItem>()
-        val visitedDocumentIds = mutableSetOf<String>()
-
-        collectGalleryImages(
-            authority = authority,
-            parentDocumentId = GALLERY_ROOT_DOCUMENT_ID,
-            output = items,
-            visitedDocumentIds = visitedDocumentIds,
+    private suspend fun loadFlattenedGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+        val firstPage = repository.storeIndexImagePage(
+            connectionInput = currentConnectionInput(),
+            prefix = null,
+            depth = GALLERY_FLATTENED_DEPTH,
+            offset = 0,
+            limit = request.pageSize,
+            sort = resolveGalleryStoreSortOrder(request.sort),
+            serverCaPem = currentServerCaPem(),
+            clientIdentityJson = currentClientIdentityJson(),
         )
+        val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
+        val totalItemCount = firstPage.total_entry_count.coerceAtLeast(items.size)
         return GalleryLoadSnapshot(
             mode = GalleryViewMode.FLATTENED_ALL_IMAGES,
             currentDirectoryDocumentId = GALLERY_ROOT_DOCUMENT_ID,
             currentDirectoryPath = GALLERY_ROOT_PATH,
             breadcrumbs = emptyList(),
             directories = emptyList(),
-            images = items,
+            collection = GalleryCollectionState(
+                totalItemCount = totalItemCount,
+                pageSize = request.pageSize,
+                pageCount = resolveGalleryPageCount(totalItemCount, request.pageSize),
+            ),
+            firstPageItems = items,
         )
     }
 
-    private fun loadCurrentDirectoryGalleryState(
-        currentDirectoryDocumentId: String,
-        currentDirectoryPath: String,
-        breadcrumbs: List<GalleryBreadcrumbItem>,
-    ): GalleryLoadSnapshot {
-        val application = getApplication<Application>()
-        val authority = "${application.packageName}.documents"
-        val listing = listGalleryDirectory(
-            authority = authority,
-            parentDocumentId = currentDirectoryDocumentId,
-            currentDirectoryPath = currentDirectoryPath,
+    private suspend fun loadCurrentDirectoryGalleryState(request: GalleryRequest): GalleryLoadSnapshot {
+        val prefix = galleryPrefixForPath(request.currentDirectoryPath)
+        val listing = repository.storeIndexDirectoryListing(
+            connectionInput = currentConnectionInput(),
+            prefix = prefix,
+            depth = 1,
+            serverCaPem = currentServerCaPem(),
+            clientIdentityJson = currentClientIdentityJson(),
         )
+        val firstPage = repository.storeIndexImagePage(
+            connectionInput = currentConnectionInput(),
+            prefix = prefix,
+            depth = 1,
+            offset = 0,
+            limit = request.pageSize,
+            sort = resolveGalleryStoreSortOrder(request.sort),
+            serverCaPem = currentServerCaPem(),
+            clientIdentityJson = currentClientIdentityJson(),
+        )
+        val directories = listing.entries.mapNotNull(::galleryDirectoryItemFromEntry)
+        val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
+        val totalItemCount = firstPage.total_entry_count.coerceAtLeast(items.size)
 
         return GalleryLoadSnapshot(
             mode = GalleryViewMode.CURRENT_DIRECTORY,
-            currentDirectoryDocumentId = currentDirectoryDocumentId,
-            currentDirectoryPath = currentDirectoryPath,
-            breadcrumbs = breadcrumbs,
-            directories = listing.directories,
-            images = listing.images,
+            currentDirectoryDocumentId = request.currentDirectoryDocumentId,
+            currentDirectoryPath = request.currentDirectoryPath,
+            breadcrumbs = request.breadcrumbs,
+            directories = directories,
+            collection = GalleryCollectionState(
+                totalItemCount = totalItemCount,
+                pageSize = request.pageSize,
+                pageCount = resolveGalleryPageCount(totalItemCount, request.pageSize),
+            ),
+            firstPageItems = items,
         )
     }
 
-    private data class GalleryDirectoryListing(
-        val directories: List<GalleryDirectoryItem>,
-        val images: List<GalleryImageItem>,
-    )
-
-    private fun listGalleryDirectory(
-        authority: String,
-        parentDocumentId: String,
-        currentDirectoryPath: String,
-    ): GalleryDirectoryListing {
-        val directories = mutableListOf<GalleryDirectoryItem>()
-        val images = mutableListOf<GalleryImageItem>()
-        val resolver = getApplication<Application>().contentResolver
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-            IronmeshDocumentColumns.COLUMN_REMOTE_PATH,
-            IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH,
-            IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT,
-            IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS,
-            IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS,
-        )
-
-        val childrenUri = DocumentsContract.buildChildDocumentsUri(authority, parentDocumentId)
-        resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-            while (cursor.moveToNext()) {
-                val documentId = cursor.stringOrNull(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                    ?: continue
-                val displayName = cursor.stringOrNull(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                    ?: documentId
-                val mimeType = cursor.stringOrNull(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                    ?: continue
-                val remotePath = cursor.stringOrNull(IronmeshDocumentColumns.COLUMN_REMOTE_PATH)
-
-                if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
-                    directories += GalleryDirectoryItem(
-                        documentId = documentId,
-                        displayName = displayName,
-                        pathLabel = normalizeGalleryDirectoryPath(
-                            remotePath ?: childGalleryPath(currentDirectoryPath, displayName),
-                        ),
-                    )
-                    continue
-                }
-
-                if (!mimeType.startsWith("image/")) {
-                    continue
-                }
-
-                images += GalleryImageItem(
-                    documentUri = DocumentsContract.buildDocumentUri(authority, documentId),
-                    displayName = displayName,
-                    remotePath = remotePath ?: documentId,
-                    mimeType = mimeType,
-                    createdAtUnixMs = cursor.longOrNull(IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS)
-                        ?: cursor.longOrNull(DocumentsContract.Document.COLUMN_LAST_MODIFIED),
-                    width = cursor.intOrNull(IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH),
-                    height = cursor.intOrNull(IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT),
-                    thumbnailStatus = cursor.stringOrNull(IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS),
-                )
-            }
-        }
-
-        return GalleryDirectoryListing(
-            directories = directories.sortedBy { it.displayName.lowercase() },
-            images = images,
+    private suspend fun loadGalleryPage(
+        request: GalleryRequest,
+        pageIndex: Int,
+    ): StoreIndexResponse {
+        val pageSize = request.pageSize.coerceAtLeast(1)
+        val offset = pageIndex.coerceAtLeast(0) * pageSize
+        return repository.storeIndexImagePage(
+            connectionInput = currentConnectionInput(),
+            prefix = when (request.mode) {
+                GalleryViewMode.FLATTENED_ALL_IMAGES -> null
+                GalleryViewMode.CURRENT_DIRECTORY -> galleryPrefixForPath(request.currentDirectoryPath)
+            },
+            depth = when (request.mode) {
+                GalleryViewMode.FLATTENED_ALL_IMAGES -> GALLERY_FLATTENED_DEPTH
+                GalleryViewMode.CURRENT_DIRECTORY -> 1
+            },
+            offset = offset,
+            limit = pageSize,
+            sort = resolveGalleryStoreSortOrder(request.sort),
+            serverCaPem = currentServerCaPem(),
+            clientIdentityJson = currentClientIdentityJson(),
         )
     }
 
@@ -920,89 +1136,92 @@ class MainViewModel(
         return currentDeviceAuthState().serverCaPem?.takeIf { it.isNotBlank() }
     }
 
-    private fun collectGalleryImages(
-        authority: String,
-        parentDocumentId: String,
-        output: MutableList<GalleryImageItem>,
-        visitedDocumentIds: MutableSet<String>,
-    ) {
-        if (!visitedDocumentIds.add(parentDocumentId)) {
-            return
+    private fun galleryImageItemFromEntry(entry: StoreIndexEntry): GalleryImageItem? {
+        if (entry.entry_type != "key") {
+            return null
         }
-        val resolver = getApplication<Application>().contentResolver
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-            IronmeshDocumentColumns.COLUMN_REMOTE_PATH,
-            IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH,
-            IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT,
-            IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS,
-            IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS,
-        )
-
-        val childrenUri = DocumentsContract.buildChildDocumentsUri(authority, parentDocumentId)
-        resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-            while (cursor.moveToNext()) {
-                val documentId = cursor.stringOrNull(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                    ?: continue
-                val mimeType = cursor.stringOrNull(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                    ?: continue
-
-                if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
-                    collectGalleryImages(authority, documentId, output, visitedDocumentIds)
-                    continue
-                }
-
-                if (!mimeType.startsWith("image/")) {
-                    continue
-                }
-
-                output += GalleryImageItem(
-                    documentUri = DocumentsContract.buildDocumentUri(authority, documentId),
-                    displayName = cursor.stringOrNull(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                        ?: documentId,
-                    remotePath = cursor.stringOrNull(IronmeshDocumentColumns.COLUMN_REMOTE_PATH)
-                        ?: documentId,
-                    mimeType = mimeType,
-                    createdAtUnixMs = cursor.longOrNull(IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS)
-                        ?: cursor.longOrNull(DocumentsContract.Document.COLUMN_LAST_MODIFIED),
-                    width = cursor.intOrNull(IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH),
-                    height = cursor.intOrNull(IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT),
-                    thumbnailStatus = cursor.stringOrNull(IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS),
-                )
-            }
+        val path = entry.path.trim().trim('/')
+        if (path.isBlank()) {
+            return null
         }
-    }
-
-    private fun sortGallery(
-        items: List<GalleryImageItem>,
-        sort: GallerySortOption,
-    ): List<GalleryImageItem> {
-        return items.sortedWith(
-            when (sort) {
-                GallerySortOption.CREATION_TIME -> compareByDescending<GalleryImageItem> {
-                    it.createdAtUnixMs ?: Long.MIN_VALUE
-                }.thenBy { it.displayName.lowercase() }
-                GallerySortOption.NAME -> compareBy<GalleryImageItem> {
-                    it.displayName.lowercase()
-                }.thenBy { it.remotePath.lowercase() }
-            },
+        val application = getApplication<Application>()
+        val authority = "${application.packageName}.documents"
+        return GalleryImageItem(
+            documentUri = DocumentsContract.buildDocumentUri(authority, galleryFileDocumentId(path)),
+            displayName = path.substringAfterLast('/'),
+            remotePath = path,
+            mimeType = entry.media?.mime_type ?: "image/*",
+            createdAtUnixMs = entry.media?.taken_at_unix?.times(1000),
+            width = entry.media?.width,
+            height = entry.media?.height,
+            thumbnailStatus = entry.media?.status,
         )
     }
 
-    private fun childGalleryPath(
-        parentPath: String,
-        displayName: String,
-    ): String {
-        val cleanParent = parentPath.removePrefix("/").trimEnd('/')
-        val cleanChild = displayName.trim().trim('/')
-        return when {
-            cleanChild.isBlank() -> GALLERY_ROOT_PATH
-            cleanParent.isBlank() -> "$cleanChild/"
-            else -> "$cleanParent/$cleanChild/"
+    private fun galleryDirectoryItemFromEntry(entry: StoreIndexEntry): GalleryDirectoryItem? {
+        if (entry.entry_type != "prefix") {
+            return null
         }
+        val normalizedPath = entry.path.trim().trim('/').removeSuffix("/")
+        if (normalizedPath.isBlank()) {
+            return null
+        }
+        return GalleryDirectoryItem(
+            documentId = galleryDirectoryDocumentId(normalizedPath),
+            displayName = normalizedPath.substringAfterLast('/'),
+            pathLabel = normalizeGalleryDirectoryPath(normalizedPath),
+        )
+    }
+
+    private fun resolveGalleryStoreSortOrder(sort: GallerySortOption): StoreIndexSortOrder {
+        return when (sort) {
+            GallerySortOption.CREATION_TIME -> StoreIndexSortOrder.CAPTURED_DESC
+            GallerySortOption.NAME -> StoreIndexSortOrder.PATH_ASC
+        }
+    }
+
+    private fun resolveGalleryPageCount(
+        totalItemCount: Int,
+        pageSize: Int,
+    ): Int {
+        if (totalItemCount <= 0) {
+            return 0
+        }
+        return (totalItemCount + pageSize.coerceAtLeast(1) - 1) / pageSize.coerceAtLeast(1)
+    }
+
+    private fun galleryPrefixForPath(path: String): String? {
+        val normalized = path.trim().trim('/')
+        return normalized.takeIf { it.isNotBlank() }
+    }
+
+    private fun galleryDirectoryDocumentId(path: String): String {
+        return if (path.isBlank()) GALLERY_ROOT_DOCUMENT_ID else "dir:${path.trim('/')}"
+    }
+
+    private fun galleryFileDocumentId(path: String): String = "file:${path.trim('/')}"
+
+    private fun pageIndexForGalleryEntry(
+        index: Int,
+        pageSize: Int,
+    ): Int {
+        return index / pageSize.coerceAtLeast(1)
+    }
+
+    private fun galleryEntryWithinPage(
+        index: Int,
+        pageSize: Int,
+    ): Int {
+        return index % pageSize.coerceAtLeast(1)
+    }
+
+    private fun nextGalleryRequestVersion(): Int {
+        galleryRequestVersion += 1
+        return galleryRequestVersion
+    }
+
+    private fun isCurrentGalleryRequest(requestVersion: Int): Boolean {
+        return requestVersion == galleryRequestVersion
     }
 
     private fun normalizeGalleryDirectoryPath(path: String): String {

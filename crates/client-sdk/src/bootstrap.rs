@@ -152,6 +152,27 @@ impl BootstrapEnrollmentResult {
     }
 }
 
+fn known_direct_target_node_ids(direct_targets: &[PlannedConnectionBootstrapTarget]) -> String {
+    let ids = direct_targets
+        .iter()
+        .filter_map(|target| target.target_node_id)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        "<none>".to_string()
+    } else {
+        ids.join(", ")
+    }
+}
+
+fn known_rendezvous_urls(rendezvous_urls: &[String]) -> String {
+    if rendezvous_urls.is_empty() {
+        "<none>".to_string()
+    } else {
+        rendezvous_urls.join(", ")
+    }
+}
+
 impl ConnectionBootstrap {
     pub fn from_json_str(raw: &str) -> Result<Self> {
         let bundle = serde_json::from_str::<Self>(raw).context("failed to parse bootstrap JSON")?;
@@ -298,7 +319,10 @@ impl ConnectionBootstrap {
         Ok(planned)
     }
 
-    fn direct_https_targets(&self) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
+    /// All configured direct HTTPS bootstrap targets, each carrying whichever `target_node_id`
+    /// the bootstrap file recorded for it. Used by diagnostic tooling to enumerate the nodes a
+    /// bootstrap file can address directly (see `diagnostic_targets_selecting`).
+    pub fn direct_https_targets(&self) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         Ok(self
             .normalized_candidate_direct_endpoints()?
             .into_iter()
@@ -451,22 +475,69 @@ impl ConnectionBootstrap {
     }
 
     pub fn diagnostic_targets(&self) -> Result<ConnectionBootstrapDiagnosticTargets> {
+        self.diagnostic_targets_selecting(None, None)
+    }
+
+    /// Like [`diagnostic_targets`](Self::diagnostic_targets), but lets a caller pin the probe to
+    /// one specific cluster node and/or one specific rendezvous URL instead of the first
+    /// configured direct endpoint and every configured rendezvous URL. Used by diagnostic tooling
+    /// (e.g. the CLI's `latency-test --node-id`/`--relay-url`) so an operator can explicitly
+    /// choose which connection to exercise.
+    pub fn diagnostic_targets_selecting(
+        &self,
+        node_id: Option<NodeId>,
+        rendezvous_url: Option<&str>,
+    ) -> Result<ConnectionBootstrapDiagnosticTargets> {
         self.validate()?;
 
         let direct_targets = self.direct_https_targets()?;
-        let direct = direct_targets.first().cloned();
+        let direct = match node_id {
+            Some(node_id) => {
+                let selected = direct_targets
+                    .iter()
+                    .find(|target| target.target_node_id == Some(node_id))
+                    .cloned();
+                if selected.is_none() {
+                    bail!(
+                        "bootstrap does not contain a direct endpoint for node_id {node_id}; known direct target node ids: {}",
+                        known_direct_target_node_ids(&direct_targets)
+                    );
+                }
+                selected
+            }
+            None => direct_targets.first().cloned(),
+        };
+
         let relay = if self.relay_mode == RelayMode::Disabled || self.rendezvous_urls.is_empty() {
             Vec::new()
         } else {
-            let Some(target_node_id) = direct_targets
-                .iter()
-                .find_map(|target| target.target_node_id)
-            else {
+            let resolved_target_node_id = match node_id {
+                Some(node_id) => Some(node_id),
+                None => direct_targets
+                    .iter()
+                    .find_map(|target| target.target_node_id),
+            };
+            let Some(resolved_target_node_id) = resolved_target_node_id else {
                 return Ok(ConnectionBootstrapDiagnosticTargets {
                     direct,
                     relay: Vec::new(),
                 });
             };
+
+            let normalized_selected_url = rendezvous_url
+                .map(|url| url.trim().trim_end_matches('/').to_string())
+                .filter(|url| !url.is_empty());
+            if let Some(selected_url) = normalized_selected_url.as_deref()
+                && !self
+                    .rendezvous_urls
+                    .iter()
+                    .any(|url| url.trim().trim_end_matches('/') == selected_url)
+            {
+                bail!(
+                    "bootstrap does not contain rendezvous URL {selected_url}; known rendezvous URLs: {}",
+                    known_rendezvous_urls(&self.rendezvous_urls)
+                );
+            }
 
             let mut seen_urls = BTreeSet::new();
             self.rendezvous_urls
@@ -476,6 +547,11 @@ impl ConnectionBootstrap {
                     if normalized.is_empty() || !seen_urls.insert(normalized.clone()) {
                         return None;
                     }
+                    if let Some(selected_url) = normalized_selected_url.as_deref()
+                        && normalized != selected_url
+                    {
+                        return None;
+                    }
                     Some(PlannedConnectionBootstrapTarget {
                         cluster_id: self.cluster_id,
                         rendezvous_urls: vec![normalized],
@@ -483,7 +559,7 @@ impl ConnectionBootstrap {
                         relay_mode: self.relay_mode,
                         path_kind: TransportPathKind::RelayTunnel,
                         server_base_url: None,
-                        target_node_id: Some(target_node_id),
+                        target_node_id: Some(resolved_target_node_id),
                         server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                         cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
                         rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
@@ -1257,6 +1333,117 @@ mod tests {
 
         assert!(label.starts_with("relay://"));
         assert!(label.contains("@rendezvous.example"));
+    }
+
+    fn multi_node_bootstrap() -> ConnectionBootstrap {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.rendezvous_urls = vec![
+            "https://rendezvous-a.example".to_string(),
+            "https://rendezvous-b.example".to_string(),
+        ];
+        bootstrap.direct_endpoints = vec![
+            BootstrapEndpoint {
+                url: "https://node-a.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(NodeId::new_v4()),
+            },
+            BootstrapEndpoint {
+                url: "https://node-b.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(NodeId::new_v4()),
+            },
+        ];
+        bootstrap
+    }
+
+    #[test]
+    fn diagnostic_targets_selecting_defaults_to_first_direct_and_all_rendezvous_urls() {
+        let bootstrap = multi_node_bootstrap();
+        let first_node_id = bootstrap.direct_endpoints[0].node_id;
+
+        let targets = bootstrap
+            .diagnostic_targets_selecting(None, None)
+            .expect("default diagnostic targets should build");
+
+        assert_eq!(
+            targets
+                .direct
+                .as_ref()
+                .and_then(|t| t.server_base_url.clone()),
+            Some("https://node-a.example/".to_string())
+        );
+        assert_eq!(targets.relay.len(), 2);
+        assert!(
+            targets
+                .relay
+                .iter()
+                .all(|target| target.target_node_id == first_node_id)
+        );
+    }
+
+    #[test]
+    fn diagnostic_targets_selecting_pins_to_requested_node() {
+        let bootstrap = multi_node_bootstrap();
+        let second_node_id = bootstrap.direct_endpoints[1]
+            .node_id
+            .expect("fixture endpoint should have a node id");
+
+        let targets = bootstrap
+            .diagnostic_targets_selecting(Some(second_node_id), None)
+            .expect("diagnostic targets for a known node id should build");
+
+        assert_eq!(
+            targets
+                .direct
+                .as_ref()
+                .and_then(|t| t.server_base_url.clone()),
+            Some("https://node-b.example/".to_string())
+        );
+        assert_eq!(targets.relay.len(), 2);
+        assert!(
+            targets
+                .relay
+                .iter()
+                .all(|target| target.target_node_id == Some(second_node_id))
+        );
+    }
+
+    #[test]
+    fn diagnostic_targets_selecting_rejects_unknown_node_id() {
+        let bootstrap = multi_node_bootstrap();
+        let unknown_node_id = NodeId::new_v4();
+
+        let error = bootstrap
+            .diagnostic_targets_selecting(Some(unknown_node_id), None)
+            .expect_err("unknown node id should be rejected");
+
+        assert!(error.to_string().contains(&unknown_node_id.to_string()));
+    }
+
+    #[test]
+    fn diagnostic_targets_selecting_pins_to_requested_rendezvous_url() {
+        let bootstrap = multi_node_bootstrap();
+
+        let targets = bootstrap
+            .diagnostic_targets_selecting(None, Some("https://rendezvous-b.example"))
+            .expect("diagnostic targets for a known rendezvous url should build");
+
+        assert_eq!(targets.relay.len(), 1);
+        assert_eq!(
+            targets.relay[0].rendezvous_urls,
+            vec!["https://rendezvous-b.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn diagnostic_targets_selecting_rejects_unknown_rendezvous_url() {
+        let bootstrap = multi_node_bootstrap();
+
+        let error = bootstrap
+            .diagnostic_targets_selecting(None, Some("https://unknown-rendezvous.example"))
+            .expect_err("unknown rendezvous url should be rejected");
+
+        assert!(error.to_string().contains("unknown-rendezvous.example"));
     }
 
     #[test]

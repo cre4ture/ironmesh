@@ -12,6 +12,7 @@ axum.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 client-sdk = { path = "../client-sdk" }
+common = { path = "../common" }
 git-version.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

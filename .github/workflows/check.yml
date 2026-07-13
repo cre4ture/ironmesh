@@ -376,7 +376,39 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # sdkmanager occasionally fetches a corrupted "Android Emulator" package
+      # ("Error on ZipFile unknown archive") while android-emulator-runner sets
+      # up the AVD; this is a known transient issue with that action and
+      # reliably succeeds on retry, so retry the whole step up to twice more
+      # before failing the job.
       - name: Run Android instrumentation tests
+        id: android_instrumentation_tests_1
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -no-metrics
+          script: apps/android-app/gradlew --no-daemon -p apps/android-app :app:connectedDebugAndroidTest
+
+      - name: Run Android instrumentation tests (retry 1)
+        id: android_instrumentation_tests_2
+        if: steps.android_instrumentation_tests_1.outcome == 'failure'
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -no-metrics
+          script: apps/android-app/gradlew --no-daemon -p apps/android-app :app:connectedDebugAndroidTest
+
+      - name: Run Android instrumentation tests (retry 2)
+        id: android_instrumentation_tests_3
+        if: steps.android_instrumentation_tests_2.outcome == 'failure'
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
