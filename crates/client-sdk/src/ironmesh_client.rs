@@ -50,6 +50,7 @@ const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
+const CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,6 +683,35 @@ fn request_auth_headers_for_auth(
         headers.push(connection_name_header(connection_name));
     }
     Ok(headers)
+}
+
+fn method_uses_operation_id(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::DELETE | &Method::PATCH
+    )
+}
+
+fn ensure_operation_id_header(method: &Method, headers: &mut Vec<RelayHttpHeader>) {
+    if !method_uses_operation_id(method) {
+        return;
+    }
+
+    if let Some(header) = headers.iter_mut().find(|header| {
+        header
+            .name
+            .eq_ignore_ascii_case(transport_sdk::HEADER_OPERATION_ID)
+    }) {
+        if header.value.trim().is_empty() {
+            header.value = Uuid::now_v7().to_string();
+        }
+        return;
+    }
+
+    headers.push(RelayHttpHeader {
+        name: transport_sdk::HEADER_OPERATION_ID.to_string(),
+        value: Uuid::now_v7().to_string(),
+    });
 }
 
 fn relay_source_identity_for_auth(auth: &ClientRequestAuth) -> Result<PeerIdentity> {
@@ -1594,6 +1624,7 @@ impl IronMeshClient {
         body: Option<Vec<u8>>,
         route_indices: &[usize],
     ) -> Result<RoutedBufferedTransportResponse> {
+        ensure_operation_id_header(&method, &mut headers);
         self.maybe_spawn_background_quality_refresh();
 
         let mut auth_headers = self.request_auth_headers(&method, &url)?;
@@ -1678,12 +1709,14 @@ impl IronMeshClient {
         payload: Vec<u8>,
         route_indices: &[usize],
     ) -> Result<RoutedBufferedTransportResponse> {
+        let mut operation_headers = Vec::new();
+        ensure_operation_id_header(&Method::PUT, &mut operation_headers);
         if matches!(self.auth, ClientRequestAuth::None) {
             return self
                 .execute_buffered_request_on_route_indices(
                     Method::PUT,
                     url,
-                    Vec::new(),
+                    operation_headers,
                     Some(payload),
                     route_indices,
                 )
@@ -1692,7 +1725,8 @@ impl IronMeshClient {
 
         self.maybe_spawn_background_quality_refresh();
 
-        let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+        let mut auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+        auth_headers.append(&mut operation_headers);
         let mut last_error = None;
         for &route_index in route_indices {
             let Some(endpoint) = self.transport_router.endpoint(route_index).cloned() else {
@@ -3949,6 +3983,47 @@ struct DirectMultiplexSessionContext<'a> {
     connection_name: Option<&'a str>,
 }
 
+#[derive(Debug)]
+struct DirectMultiplexRequestTimeout {
+    method: String,
+    url: String,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for DirectMultiplexRequestTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "direct multiplex {} {} timed out after {:?}",
+            self.method, self.url, self.timeout
+        )
+    }
+}
+
+impl std::error::Error for DirectMultiplexRequestTimeout {}
+
+fn is_direct_multiplex_request_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<DirectMultiplexRequestTimeout>()
+            .is_some()
+    })
+}
+
+async fn run_direct_multiplex_request_with_timeout<T>(
+    method: &Method,
+    url: &Url,
+    request: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT, request)
+        .await
+        .map_err(|_| DirectMultiplexRequestTimeout {
+            method: method.to_string(),
+            url: url.to_string(),
+            timeout: CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT,
+        })?
+}
+
 async fn execute_direct_multiplex_streaming_object_read_request(
     server_base_url: &str,
     session_pool: &TransportSessionPool,
@@ -4042,22 +4117,25 @@ async fn execute_direct_multiplex_streaming_object_write_request(
     body: &[u8],
 ) -> Result<BufferedTransportResponse> {
     for attempt in 0..2 {
-        let session = direct
-            .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
+        let result = run_direct_multiplex_request_with_timeout(method, url, async {
+            let session = direct
+                .session_pool
+                .ensure_direct_session(direct.identity, direct.connection_name)
+                .await
+                .context("failed ensuring direct multiplex session")?;
+            execute_multiplex_streaming_object_write_request(
+                session.as_ref(),
+                method,
+                url,
+                headers,
+                body,
+            )
             .await
-            .context("failed ensuring direct multiplex session")?;
-        let result = execute_multiplex_streaming_object_write_request(
-            session.as_ref(),
-            method,
-            url,
-            headers,
-            body,
-        )
+        })
         .await;
         match result {
             Ok(response) => return Ok(response),
-            Err(err) if attempt == 0 => {
+            Err(err) if attempt == 0 && !is_direct_multiplex_request_timeout(&err) => {
                 direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
@@ -4140,20 +4218,20 @@ async fn execute_direct_multiplex_buffered_request(
     let request_headers = transport_headers_from_relay_headers(headers);
 
     for attempt in 0..2 {
-        let session = direct
-            .session_pool
-            .ensure_direct_session(direct.identity, direct.connection_name)
-            .await
-            .context("failed ensuring direct multiplex session")?;
-        let request = BufferedTransportRequest::new(
-            transport_stream_kind_for_path(&request_path),
-            method.as_str(),
-            request_path.clone(),
-            request_headers.clone(),
-            body.to_vec(),
-        );
+        let result = run_direct_multiplex_request_with_timeout(method, url, async {
+            let session = direct
+                .session_pool
+                .ensure_direct_session(direct.identity, direct.connection_name)
+                .await
+                .context("failed ensuring direct multiplex session")?;
+            let request = BufferedTransportRequest::new(
+                transport_stream_kind_for_path(&request_path),
+                method.as_str(),
+                request_path.clone(),
+                request_headers.clone(),
+                body.to_vec(),
+            );
 
-        let result = async {
             let mut stream = session
                 .open_stream()
                 .await
@@ -4165,12 +4243,12 @@ async fn execute_direct_multiplex_buffered_request(
                 .await
                 .context("failed reading direct multiplex response")?;
             buffered_response_from_multiplex(response)
-        }
+        })
         .await;
 
         match result {
             Ok(response) => return Ok(response),
-            Err(err) if attempt == 0 => {
+            Err(err) if attempt == 0 && !is_direct_multiplex_request_timeout(&err) => {
                 direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,

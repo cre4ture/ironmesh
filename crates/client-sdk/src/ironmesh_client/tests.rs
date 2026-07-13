@@ -723,11 +723,22 @@ async fn serve_test_multiplex_socket(state: RelayTestState, socket: WebSocket, s
         }
     ));
 
-    while let Some(mut stream) = session
-        .accept_stream()
-        .await
-        .expect("multiplexed relay test stream accept should succeed")
-    {
+    loop {
+        let next_stream = match session.accept_stream().await {
+            Ok(next_stream) => next_stream,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("Connection reset")
+                    || message.contains("without closing handshake")
+                {
+                    return;
+                }
+                panic!("multiplexed relay test stream accept should succeed: {error:#}");
+            }
+        };
+        let Some(mut stream) = next_stream else {
+            return;
+        };
         let request = read_buffered_transport_request(&mut stream)
             .await
             .expect("multiplexed relay test request should decode");
@@ -925,6 +936,293 @@ async fn spawn_direct_transport_test_server(
             .expect("direct transport test server should run");
     });
     (state, server)
+}
+
+#[derive(Clone)]
+struct DirectTransportHangAfterFirstSuccessState {
+    public_url: String,
+    cluster_status_hits: Arc<AtomicUsize>,
+    stalled_request_count: Arc<AtomicUsize>,
+    paired_session_count: Arc<AtomicUsize>,
+    captured_stalled_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
+}
+
+#[derive(Clone)]
+struct DirectTransportStallsObjectWriteState {
+    public_url: String,
+    request_count: Arc<AtomicUsize>,
+    cluster_status_hits: Arc<AtomicUsize>,
+    stalled_request_count: Arc<AtomicUsize>,
+    paired_session_count: Arc<AtomicUsize>,
+    captured_stalled_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
+}
+
+async fn direct_transport_hangs_after_first_success_ws(
+    State(state): State<DirectTransportHangAfterFirstSuccessState>,
+    websocket: WebSocketUpgrade,
+) -> impl IntoResponse {
+    websocket.on_upgrade(move |socket| async move {
+        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+        serve_direct_transport_hangs_after_first_success_socket(state, socket).await;
+    })
+}
+
+async fn serve_direct_transport_hangs_after_first_success_socket(
+    state: DirectTransportHangAfterFirstSuccessState,
+    socket: WebSocket,
+) {
+    let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
+    let mut session =
+        MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
+            .expect("stalling direct transport test session should spawn");
+
+    let hello = perform_transport_server_handshake(
+        &mut session,
+        TransportSessionControlMessage::Ready {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            session_id: format!("stalling-direct-session-{}", uuid::Uuid::now_v7()),
+            max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .expect("stalling direct transport handshake should succeed");
+    assert!(matches!(
+        hello,
+        TransportSessionControlMessage::Hello {
+            role: TransportSessionRole::Client,
+            ..
+        }
+    ));
+
+    while let Some(mut stream) = session
+        .accept_stream()
+        .await
+        .expect("stalling direct transport stream accept should succeed")
+    {
+        let request = read_buffered_transport_request(&mut stream)
+            .await
+            .expect("stalling direct transport request should decode");
+
+        if request.path == "/api/v1/cluster/status" {
+            let prior_hits = state.cluster_status_hits.fetch_add(1, Ordering::SeqCst);
+            if prior_hits >= 1 {
+                *state.captured_stalled_request.lock().await = Some(RelayTestCapturedRequest {
+                    kind: Some(request.kind),
+                    method: request.method.clone(),
+                    path_and_query: request.path.clone(),
+                    headers: request
+                        .headers
+                        .iter()
+                        .map(|header| RelayHttpHeader {
+                            name: header.name.clone(),
+                            value: header.value.clone(),
+                        })
+                        .collect(),
+                    body: request.body.clone(),
+                });
+                state.stalled_request_count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+        }
+
+        let response_body = br#"{"status":"ok","route":"direct"}"#.to_vec();
+        write_buffered_transport_response(
+            &mut stream,
+            &MultiplexBufferedTransportResponse {
+                request_id: request.request_id,
+                status: StatusCode::OK.as_u16(),
+                headers: vec![
+                    TransportHeader {
+                        name: "content-type".to_string(),
+                        value: "application/json".to_string(),
+                    },
+                    TransportHeader {
+                        name: "content-length".to_string(),
+                        value: response_body.len().to_string(),
+                    },
+                ],
+                body: response_body,
+            },
+        )
+        .await
+        .expect("stalling direct transport response should write");
+    }
+}
+
+async fn spawn_direct_transport_server_that_hangs_after_first_success() -> (
+    DirectTransportHangAfterFirstSuccessState,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let state = DirectTransportHangAfterFirstSuccessState {
+        public_url: format!("http://{addr}"),
+        cluster_status_hits: Arc::new(AtomicUsize::new(0)),
+        stalled_request_count: Arc::new(AtomicUsize::new(0)),
+        paired_session_count: Arc::new(AtomicUsize::new(0)),
+        captured_stalled_request: Arc::new(Mutex::new(None)),
+    };
+    let router = Router::new()
+        .route(
+            "/transport/ws",
+            get(direct_transport_hangs_after_first_success_ws),
+        )
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("stalling direct transport test server should run");
+    });
+    (state, server)
+}
+
+async fn direct_transport_stalls_object_write_ws(
+    State(state): State<DirectTransportStallsObjectWriteState>,
+    websocket: WebSocketUpgrade,
+) -> impl IntoResponse {
+    websocket.on_upgrade(move |socket| async move {
+        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+        serve_direct_transport_stalls_object_write_socket(state, socket).await;
+    })
+}
+
+async fn serve_direct_transport_stalls_object_write_socket(
+    state: DirectTransportStallsObjectWriteState,
+    socket: WebSocket,
+) {
+    let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
+    let mut session =
+        MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
+            .expect("stalling direct object-write session should spawn");
+
+    let hello = perform_transport_server_handshake(
+        &mut session,
+        TransportSessionControlMessage::Ready {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            session_id: format!("stalling-direct-write-session-{}", uuid::Uuid::now_v7()),
+            max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .expect("stalling direct object-write handshake should succeed");
+    assert!(matches!(
+        hello,
+        TransportSessionControlMessage::Hello {
+            role: TransportSessionRole::Client,
+            ..
+        }
+    ));
+
+    while let Some(mut stream) = session
+        .accept_stream()
+        .await
+        .expect("stalling direct object-write stream accept should succeed")
+    {
+        let request = read_buffered_transport_request(&mut stream)
+            .await
+            .expect("stalling direct object-write request should decode");
+        let prior_requests = state.request_count.fetch_add(1, Ordering::SeqCst);
+
+        if request.path == "/api/v1/cluster/status" {
+            state.cluster_status_hits.fetch_add(1, Ordering::SeqCst);
+        }
+
+        if prior_requests >= 1 {
+            *state.captured_stalled_request.lock().await = Some(RelayTestCapturedRequest {
+                kind: Some(request.kind),
+                method: request.method.clone(),
+                path_and_query: request.path.clone(),
+                headers: request
+                    .headers
+                    .iter()
+                    .map(|header| RelayHttpHeader {
+                        name: header.name.clone(),
+                        value: header.value.clone(),
+                    })
+                    .collect(),
+                body: request.body.clone(),
+            });
+            state.stalled_request_count.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+
+        let (status, body, headers) = if request.path == "/api/v1/cluster/status" {
+            let response_body = br#"{"status":"ok","route":"direct"}"#.to_vec();
+            (
+                StatusCode::OK.as_u16(),
+                response_body.clone(),
+                vec![
+                    TransportHeader {
+                        name: "content-type".to_string(),
+                        value: "application/json".to_string(),
+                    },
+                    TransportHeader {
+                        name: "content-length".to_string(),
+                        value: response_body.len().to_string(),
+                    },
+                ],
+            )
+        } else {
+            (
+                StatusCode::OK.as_u16(),
+                Vec::new(),
+                vec![TransportHeader {
+                    name: "content-length".to_string(),
+                    value: "0".to_string(),
+                }],
+            )
+        };
+        write_buffered_transport_response(
+            &mut stream,
+            &MultiplexBufferedTransportResponse {
+                request_id: request.request_id,
+                status,
+                headers,
+                body,
+            },
+        )
+        .await
+        .expect("stalling direct object-write response should write");
+    }
+}
+
+async fn spawn_direct_transport_server_that_stalls_object_write() -> (
+    DirectTransportStallsObjectWriteState,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let state = DirectTransportStallsObjectWriteState {
+        public_url: format!("http://{addr}"),
+        request_count: Arc::new(AtomicUsize::new(0)),
+        cluster_status_hits: Arc::new(AtomicUsize::new(0)),
+        stalled_request_count: Arc::new(AtomicUsize::new(0)),
+        paired_session_count: Arc::new(AtomicUsize::new(0)),
+        captured_stalled_request: Arc::new(Mutex::new(None)),
+    };
+    let router = Router::new()
+        .route(
+            "/transport/ws",
+            get(direct_transport_stalls_object_write_ws),
+        )
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("stalling direct object-write test server should run");
+    });
+    (state, server)
+}
+
+fn relay_header_value(headers: &[RelayHttpHeader], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.clone())
 }
 
 async fn direct_mixed_workload_ws(
@@ -1926,6 +2224,168 @@ async fn combined_direct_transports_fail_over_to_second_endpoint() {
 
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
+    let (direct_state, direct_server) =
+        spawn_direct_transport_server_that_hangs_after_first_success().await;
+    let relay_body = br#"{"status":"ok","route":"relay"}"#.to_vec();
+    let (relay_state, relay_server) = spawn_relay_test_server(
+        200,
+        vec![
+            RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            RelayHttpHeader {
+                name: "content-length".to_string(),
+                value: relay_body.len().to_string(),
+            },
+        ],
+        relay_body,
+    )
+    .await;
+
+    let test_result = async {
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-stall-failover-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+
+        let direct = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
+            .with_client_identity(identity.clone());
+        let relay = relay_test_client(&relay_state, identity, target_node_id);
+        let client = IronMeshClient::combine(vec![direct, relay])
+            .expect("combined direct+relay client should build");
+
+        // Simulates a live direct session going half-open during a network change such as
+        // Wi-Fi -> cellular. The first request succeeds directly, the next one must switch over.
+        let first = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("initial direct request should succeed");
+        assert_eq!(first["route"], "direct");
+        assert!(!client.uses_relay_transport());
+
+        let fallback = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_json_path("/cluster/status"),
+        )
+        .await;
+        let fallback = match fallback {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(anyhow::anyhow!(
+                    "request returned an error before relay fallback completed: {error:#}"
+                ));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "request did not fall back to relay within 3 seconds after the direct session stalled"
+                ));
+            }
+        };
+
+        assert_eq!(fallback["route"], "relay");
+        assert!(client.uses_relay_transport());
+        assert_eq!(client.relay_target_node_id(), Some(target_node_id));
+        assert_eq!(direct_state.cluster_status_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(direct_state.stalled_request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
+        assert!(relay_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    direct_server.abort();
+    let _ = direct_server.await;
+    relay_server.abort();
+    let _ = relay_server.await;
+
+    test_result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fallback() {
+    let (direct_state, direct_server) =
+        spawn_direct_transport_server_that_stalls_object_write().await;
+    let (relay_state, relay_server) =
+        spawn_relay_test_server(StatusCode::OK.as_u16(), Vec::new(), Vec::new()).await;
+
+    let test_result = async {
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-write-failover-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+
+        let direct = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
+            .with_client_identity(identity.clone());
+        let relay = relay_test_client(&relay_state, identity, target_node_id);
+        let client = IronMeshClient::combine(vec![direct, relay])
+            .expect("combined direct+relay client should build");
+
+        let first = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("initial direct request should succeed");
+        assert_eq!(first["route"], "direct");
+
+        client
+            .post_relative_path("/cluster/status")
+            .await
+            .expect("mutating request should fall back to relay");
+
+        let direct_request = direct_state
+            .captured_stalled_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct stalled request should be captured");
+        let relay_request = relay_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay fallback request should be captured");
+
+        let direct_operation_id =
+            relay_header_value(&direct_request.headers, transport_sdk::HEADER_OPERATION_ID)
+                .expect("direct request should carry an operation id");
+        let relay_operation_id =
+            relay_header_value(&relay_request.headers, transport_sdk::HEADER_OPERATION_ID)
+                .expect("relay request should carry an operation id");
+
+        assert!(!direct_operation_id.trim().is_empty());
+        assert_eq!(direct_operation_id, relay_operation_id);
+        assert_eq!(direct_request.method, "POST");
+        assert_eq!(relay_request.method, "POST");
+        assert_eq!(direct_request.path_and_query, "/api/v1/cluster/status");
+        assert_eq!(relay_request.path_and_query, "/api/v1/cluster/status");
+        assert_eq!(direct_state.cluster_status_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(direct_state.stalled_request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    direct_server.abort();
+    let _ = direct_server.await;
+    relay_server.abort();
+    let _ = relay_server.await;
+
+    test_result.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

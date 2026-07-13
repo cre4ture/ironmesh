@@ -16,12 +16,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::FromRequestParts;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket as AxumWebSocket};
 use axum::extract::{Extension, Path, Query, Request, State, WebSocketUpgrade};
 use axum::http::header;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -101,6 +101,7 @@ const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
 const PROCESS_STATS_SAMPLE_INTERVAL_SECS: u64 = 2;
 const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
+const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -266,6 +267,7 @@ struct ServerAccessRuntime {
     client_credentials: Arc<Mutex<ClientCredentialState>>,
     bootstrap_claims: BootstrapClaimBroker,
     client_connections: Arc<StdMutex<LiveClientConnectionRegistry>>,
+    client_mutation_operations: Arc<StdMutex<ClientMutationOperationStore>>,
     admin_control: AdminControl,
     admin_sessions: Arc<Mutex<AdminSessionStore>>,
     client_auth_control: ClientAuthControl,
@@ -807,7 +809,7 @@ struct UploadSessionStore {
     sessions: HashMap<String, UploadSessionRecord>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadSessionStartRequest {
     key: String,
     total_size_bytes: u64,
@@ -861,6 +863,56 @@ struct ClientAuthReplayCache {
     seen_requests: HashMap<String, u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClientMutationOperationKey {
+    requester_id: String,
+    operation_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ClientMutationRecordedResponse {
+    status: StatusCode,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    body: Bytes,
+}
+
+#[derive(Debug)]
+enum ClientMutationOperationState {
+    InProgress {
+        notify: Arc<Notify>,
+    },
+    Completed {
+        response: ClientMutationRecordedResponse,
+    },
+}
+
+#[derive(Debug)]
+struct ClientMutationOperationEntry {
+    request_fingerprint: String,
+    updated_at_unix: u64,
+    state: ClientMutationOperationState,
+}
+
+#[derive(Debug, Default)]
+struct ClientMutationOperationStore {
+    entries: HashMap<ClientMutationOperationKey, ClientMutationOperationEntry>,
+}
+
+#[derive(Debug)]
+enum ClientMutationOperationClaim {
+    Owner(ClientMutationOperationLease),
+    Wait(Arc<Notify>),
+    Replay(ClientMutationRecordedResponse),
+    Conflict,
+}
+
+#[derive(Debug)]
+struct ClientMutationOperationLease {
+    store: Arc<StdMutex<ClientMutationOperationStore>>,
+    key: ClientMutationOperationKey,
+    completed: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 struct NodeEnrollmentAutoRenewState {
     last_attempt_unix: Option<u64>,
@@ -882,6 +934,74 @@ impl ClientAuthReplayCache {
         let oldest_allowed = now.saturating_sub(CLIENT_AUTH_MAX_CLOCK_SKEW_SECS * 2);
         self.seen_requests
             .retain(|_, seen_at| *seen_at >= oldest_allowed);
+    }
+}
+
+impl ClientMutationOperationStore {
+    fn prune(&mut self, now: u64) {
+        let oldest_allowed = now.saturating_sub(CLIENT_MUTATION_OPERATION_TTL_SECS);
+        self.entries
+            .retain(|_, entry| entry.updated_at_unix >= oldest_allowed);
+    }
+}
+
+impl ClientMutationRecordedResponse {
+    fn into_response(self) -> Response {
+        let mut response = Response::new(Body::from(self.body));
+        *response.status_mut() = self.status;
+        for (name, value) in self.headers {
+            response.headers_mut().insert(name, value);
+        }
+        response
+    }
+}
+
+impl ClientMutationOperationLease {
+    fn complete(&mut self, response: ClientMutationRecordedResponse) {
+        if self.completed {
+            return;
+        }
+
+        let now = unix_ts();
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        store.prune(now);
+        let Some(entry) = store.entries.get_mut(&self.key) else {
+            self.completed = true;
+            return;
+        };
+
+        let notify = match &entry.state {
+            ClientMutationOperationState::InProgress { notify } => Some(notify.clone()),
+            ClientMutationOperationState::Completed { .. } => None,
+        };
+        entry.updated_at_unix = now;
+        entry.state = ClientMutationOperationState::Completed { response };
+        self.completed = true;
+
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ClientMutationOperationLease {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(entry) = store.entries.remove(&self.key)
+            && let ClientMutationOperationState::InProgress { notify } = entry.state
+        {
+            notify.notify_waiters();
+        }
     }
 }
 
@@ -1031,6 +1151,173 @@ fn request_device_id(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn request_operation_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(transport_sdk::HEADER_OPERATION_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn client_mutation_operation_payload_hash(payload: &[u8]) -> String {
+    blake3::hash(payload).to_hex().to_string()
+}
+
+fn client_mutation_operation_fingerprint<T>(label: &str, request: &T) -> String
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(&json!({
+        "label": label,
+        "request": request,
+    }))
+    .expect("client mutation fingerprint should serialize");
+    format!("{label}:{}", blake3::hash(&payload).to_hex())
+}
+
+fn claim_client_mutation_operation(
+    store: &Arc<StdMutex<ClientMutationOperationStore>>,
+    requester_id: String,
+    operation_id: String,
+    request_fingerprint: &str,
+) -> ClientMutationOperationClaim {
+    let key = ClientMutationOperationKey {
+        requester_id,
+        operation_id,
+    };
+    let now = unix_ts();
+    let mut operation_store = match store.lock() {
+        Ok(store) => store,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    operation_store.prune(now);
+
+    if let Some(entry) = operation_store.entries.get_mut(&key) {
+        entry.updated_at_unix = now;
+        if entry.request_fingerprint != request_fingerprint {
+            return ClientMutationOperationClaim::Conflict;
+        }
+        return match &entry.state {
+            ClientMutationOperationState::InProgress { notify } => {
+                ClientMutationOperationClaim::Wait(notify.clone())
+            }
+            ClientMutationOperationState::Completed { response } => {
+                ClientMutationOperationClaim::Replay(response.clone())
+            }
+        };
+    }
+
+    operation_store.entries.insert(
+        key.clone(),
+        ClientMutationOperationEntry {
+            request_fingerprint: request_fingerprint.to_string(),
+            updated_at_unix: now,
+            state: ClientMutationOperationState::InProgress {
+                notify: Arc::new(Notify::new()),
+            },
+        },
+    );
+    ClientMutationOperationClaim::Owner(ClientMutationOperationLease {
+        store: store.clone(),
+        key,
+        completed: false,
+    })
+}
+
+fn client_mutation_operation_conflict_response(operation_id: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!(
+                "operation id {operation_id} was already used for a different mutation request"
+            ),
+        })),
+    )
+        .into_response()
+}
+
+async fn buffer_client_mutation_response(
+    response: Response,
+) -> Result<ClientMutationRecordedResponse> {
+    let (parts, body) = response.into_parts();
+    let body = to_bytes(body, usize::MAX)
+        .await
+        .context("failed to buffer client mutation response body")?;
+    Ok(ClientMutationRecordedResponse {
+        status: parts.status,
+        headers: parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        body,
+    })
+}
+
+async fn run_client_mutation_with_idempotency<F, Fut>(
+    state: &ServerState,
+    headers: &HeaderMap,
+    requester_id: Option<String>,
+    request_fingerprint: String,
+    run: F,
+) -> Response
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Response>,
+{
+    let Some(requester_id) = requester_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return run().await;
+    };
+    let Some(operation_id) = request_operation_id(headers) else {
+        return run().await;
+    };
+
+    let mut run = Some(run);
+    loop {
+        match claim_client_mutation_operation(
+            &state.access.client_mutation_operations,
+            requester_id.clone(),
+            operation_id.clone(),
+            &request_fingerprint,
+        ) {
+            ClientMutationOperationClaim::Owner(mut lease) => {
+                let response = run
+                    .take()
+                    .expect("client mutation idempotency executor should run at most once")(
+                )
+                .await;
+                match buffer_client_mutation_response(response).await {
+                    Ok(recorded) => {
+                        let replay = recorded.clone().into_response();
+                        lease.complete(recorded);
+                        return replay;
+                    }
+                    Err(err) => {
+                        warn!(
+                            requester_id = %requester_id,
+                            operation_id = %operation_id,
+                            error = %err,
+                            "failed to cache client mutation response for idempotency replay"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            }
+            ClientMutationOperationClaim::Wait(notify) => {
+                notify.notified().await;
+            }
+            ClientMutationOperationClaim::Replay(response) => return response.into_response(),
+            ClientMutationOperationClaim::Conflict => {
+                return client_mutation_operation_conflict_response(&operation_id);
+            }
+        }
+    }
 }
 
 fn request_connection_name(headers: &HeaderMap) -> Option<String> {
@@ -5651,6 +5938,9 @@ async fn run_inner(
             client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
             bootstrap_claims: BootstrapClaimBroker::new(),
             client_connections: Arc::new(StdMutex::new(LiveClientConnectionRegistry::default())),
+            client_mutation_operations: Arc::new(StdMutex::new(
+                ClientMutationOperationStore::default(),
+            )),
             admin_control,
             admin_sessions: Arc::new(Mutex::new(AdminSessionStore::default())),
             client_auth_control,
@@ -10180,7 +10470,7 @@ struct StoreIndexChangeWaitResponse {
     changed: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct MediaThumbnailQuery {
     key: String,
     snapshot: Option<String>,
@@ -10318,7 +10608,7 @@ type StoreIndexSnapshotScan = (
     Option<u64>,
 );
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PutObjectQuery {
     state: Option<String>,
     #[serde(default)]
@@ -10330,7 +10620,7 @@ struct PutObjectQuery {
     recursive: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeleteObjectByQuery {
     key: String,
     state: Option<String>,
@@ -10343,7 +10633,7 @@ struct DeleteObjectByQuery {
     recursive: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PathMutationRequest {
     from_path: String,
     to_path: String,
@@ -10351,7 +10641,7 @@ struct PathMutationRequest {
     overwrite: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotRestoreRequest {
     snapshot: String,
     from_path: String,
@@ -10362,7 +10652,7 @@ struct SnapshotRestoreRequest {
     overwrite: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionRestoreRequest {
     #[serde(alias = "target_path")]
     to_path: String,
@@ -10547,8 +10837,22 @@ async fn delete_object_by_query(
     headers: HeaderMap,
     Query(query): Query<DeleteObjectByQuery>,
 ) -> Response {
-    let actor = data_change_actor_from_client_headers(&state, &headers).await;
-    delete_object_by_query_response(&state, query, Some(actor)).await
+    let fingerprint = client_mutation_operation_fingerprint("delete_object_by_query", &query);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            delete_object_by_query_response(&state_for_request, query, Some(actor)).await
+        },
+    )
+    .await
 }
 
 async fn delete_object_by_query_admin(
@@ -10611,8 +10915,22 @@ async fn rename_object_path(
     headers: HeaderMap,
     Json(request): Json<PathMutationRequest>,
 ) -> Response {
-    let actor = data_change_actor_from_client_headers(&state, &headers).await;
-    rename_object_path_response(&state, request, Some(actor)).await
+    let fingerprint = client_mutation_operation_fingerprint("rename_object_path", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            rename_object_path_response(&state_for_request, request, Some(actor)).await
+        },
+    )
+    .await
 }
 
 async fn rename_object_path_admin(
@@ -10747,8 +11065,22 @@ async fn copy_object_path(
     headers: HeaderMap,
     Json(request): Json<PathMutationRequest>,
 ) -> Response {
-    let actor = data_change_actor_from_client_headers(&state, &headers).await;
-    copy_object_path_response(&state, request, Some(actor)).await
+    let fingerprint = client_mutation_operation_fingerprint("copy_object_path", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            copy_object_path_response(&state_for_request, request, Some(actor)).await
+        },
+    )
+    .await
 }
 
 async fn copy_object_path_response(
@@ -10806,7 +11138,25 @@ async fn copy_object_path_response(
 
 async fn restore_snapshot_path(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<SnapshotRestoreRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("restore_snapshot_path", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move { restore_snapshot_path_response(&state_for_request, request).await },
+    )
+    .await
+}
+
+async fn restore_snapshot_path_response(
+    state: &ServerState,
+    request: SnapshotRestoreRequest,
 ) -> Response {
     if request.snapshot.trim().is_empty()
         || request.from_path.trim().is_empty()
@@ -10824,7 +11174,7 @@ async fn restore_snapshot_path(
         overwrite = request.overwrite,
         "snapshot restore request start"
     );
-    let mut store = lock_store(&state, "store_path.restore").await;
+    let mut store = lock_store(state, "store_path.restore").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_started = Instant::now();
     match store
@@ -10850,8 +11200,8 @@ async fn restore_snapshot_path(
                 "snapshot restore applied; publishing namespace change"
             );
             drop(store);
-            publish_namespace_change(&state);
-            request_local_availability_refresh(&state);
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
             (StatusCode::OK, Json(report)).into_response()
         }
         Ok(SnapshotRestoreMutationResult::SourceMissing) => {
@@ -10900,8 +11250,37 @@ async fn restore_snapshot_path(
 
 async fn restore_version_path(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path((key, version_id)): Path<(String, String)>,
     Json(request): Json<VersionRestoreRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "restore_version_path",
+        &json!({
+            "key": key.clone(),
+            "version_id": version_id.clone(),
+            "request": request.clone(),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            restore_version_path_response(&state_for_request, key, version_id, request).await
+        },
+    )
+    .await
+}
+
+async fn restore_version_path_response(
+    state: &ServerState,
+    key: String,
+    version_id: String,
+    request: VersionRestoreRequest,
 ) -> Response {
     if key.trim().is_empty() || version_id.trim().is_empty() || request.to_path.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -10915,7 +11294,7 @@ async fn restore_version_path(
         overwrite = request.overwrite,
         "version restore request start"
     );
-    let mut store = lock_store(&state, "store_path.restore_version").await;
+    let mut store = lock_store(state, "store_path.restore_version").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_started = Instant::now();
     match store
@@ -10933,8 +11312,8 @@ async fn restore_version_path(
                 "version restore applied; publishing namespace change"
             );
             drop(store);
-            publish_namespace_change(&state);
-            request_local_availability_refresh(&state);
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(PathMutationResult::SourceMissing) => {
@@ -10983,20 +11362,57 @@ async fn put_object(
     Path(key): Path<String>,
     Query(query): Query<PutObjectQuery>,
     payload: Bytes,
-) -> impl IntoResponse {
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "put_object",
+        &json!({
+            "key": key.clone(),
+            "query": query.clone(),
+            "payload_hash": client_mutation_operation_payload_hash(payload.as_ref()),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_request = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            put_object_response(
+                &state_for_request,
+                &headers_for_request,
+                key,
+                query,
+                payload,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn put_object_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    key: String,
+    query: PutObjectQuery,
+    payload: Bytes,
+) -> Response {
     if query.version_id.is_some() && !query.internal_replication {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     let version_state = match query.state.as_deref() {
         None | Some("confirmed") => VersionConsistencyState::Confirmed,
         Some("provisional") => VersionConsistencyState::Provisional,
-        Some(_) => return StatusCode::BAD_REQUEST,
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let actor = data_change_actor_from_client_headers(&state, &headers).await;
+    let actor = data_change_actor_from_client_headers(state, headers).await;
     let total_size_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    let mut store = lock_store(&state, "store_object.put").await;
+    let mut store = lock_store(state, "store_object.put").await;
     match store
         .put_object_versioned(
             &key,
@@ -11013,7 +11429,7 @@ async fn put_object(
     {
         Ok(outcome) => {
             drop(store);
-            publish_namespace_change(&state);
+            publish_namespace_change(state);
             spawn_media_metadata_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
             let mut cluster = state.cluster.lock().await;
@@ -11041,7 +11457,7 @@ async fn put_object(
 
             if !query.internal_replication {
                 record_data_change_event(
-                    &state,
+                    state,
                     PendingDataChangeEvent {
                         action: DataChangeAction::Upload,
                         actor: Some(actor.clone()),
@@ -11069,11 +11485,11 @@ async fn put_object(
                 dedup_reused_chunks = outcome.dedup_reused_chunks,
                 "stored object"
             );
-            StatusCode::CREATED
+            StatusCode::CREATED.into_response()
         }
         Err(err) => {
             tracing::error!(error = %err, key = %key, "failed to store object");
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -11082,7 +11498,28 @@ async fn start_upload_session(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(request): Json<UploadSessionStartRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("start_upload_session", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_request = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            start_upload_session_response(&state_for_request, &headers_for_request, request).await
+        },
+    )
+    .await
+}
+
+async fn start_upload_session_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    request: UploadSessionStartRequest,
+) -> Response {
     let key = request.key.trim();
     if key.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -11202,13 +11639,38 @@ async fn delete_upload_session(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(upload_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "delete_upload_session",
+        &json!({ "upload_id": upload_id.clone() }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_request = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            delete_upload_session_response(&state_for_request, &headers_for_request, &upload_id)
+                .await
+        },
+    )
+    .await
+}
+
+async fn delete_upload_session_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    upload_id: &str,
+) -> Response {
     let requester_device_id = request_device_id(&headers);
     let now = unix_ts();
-    let mut sessions = write_upload_sessions(&state, "upload_sessions.delete").await;
+    let mut sessions = write_upload_sessions(state, "upload_sessions.delete").await;
     prune_expired_upload_sessions(&mut sessions, now);
 
-    let Some(session) = sessions.sessions.get(&upload_id) else {
+    let Some(session) = sessions.sessions.get(upload_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if let Some(owner_device_id) = session.owner_device_id.as_deref()
@@ -11220,9 +11682,9 @@ async fn delete_upload_session(
         return StatusCode::CONFLICT.into_response();
     }
 
-    sessions.sessions.remove(&upload_id);
+    sessions.sessions.remove(upload_id);
     drop(sessions);
-    persist_upload_session_store_after_mutation(&state, "delete_upload_session").await;
+    persist_upload_session_store_after_mutation(state, "delete_upload_session").await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -11232,8 +11694,35 @@ async fn upload_session_chunk(
     headers: HeaderMap,
     Path((upload_id, index)): Path<(String, usize)>,
     payload: Bytes,
-) -> impl IntoResponse {
-    upload_session_chunk_response(&state, &headers, &upload_id, index, payload).await
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "upload_session_chunk",
+        &json!({
+            "upload_id": upload_id.clone(),
+            "index": index,
+            "payload_hash": client_mutation_operation_payload_hash(payload.as_ref()),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_request = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            upload_session_chunk_response(
+                &state_for_request,
+                &headers_for_request,
+                &upload_id,
+                index,
+                payload,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 async fn upload_session_chunk_response(
@@ -11368,9 +11857,34 @@ async fn complete_upload_session_route(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(upload_id): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "complete_upload_session",
+        &json!({ "upload_id": upload_id.clone() }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_request = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            complete_upload_session_response(&state_for_request, &headers_for_request, &upload_id)
+                .await
+        },
+    )
+    .await
+}
+
+async fn complete_upload_session_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    upload_id: &str,
+) -> Response {
     let finalize_started_at = Instant::now();
-    let requester_device_id = request_device_id(&headers);
+    let requester_device_id = request_device_id(headers);
     let (
         key,
         total_size_bytes,
@@ -11381,10 +11895,10 @@ async fn complete_upload_session_route(
         chunk_refs,
     ) = {
         let now = unix_ts();
-        let mut sessions = write_upload_sessions(&state, "upload_sessions.complete.prepare").await;
+        let mut sessions = write_upload_sessions(state, "upload_sessions.complete.prepare").await;
         prune_expired_upload_sessions(&mut sessions, now);
 
-        let Some(session) = sessions.sessions.get_mut(&upload_id) else {
+        let Some(session) = sessions.sessions.get_mut(upload_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
         if let Some(owner_device_id) = session.owner_device_id.as_deref()
@@ -11427,7 +11941,7 @@ async fn complete_upload_session_route(
         "finalizing upload session"
     );
 
-    let mut store = lock_store(&state, "upload_session.complete.put_object_from_chunks").await;
+    let mut store = lock_store(state, "upload_session.complete.put_object_from_chunks").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_finalize_started_at = Instant::now();
     let outcome = match store
@@ -11450,8 +11964,8 @@ async fn complete_upload_session_route(
             let store_finalize_ms = store_finalize_started_at.elapsed().as_millis();
             drop(store);
             let mut sessions =
-                write_upload_sessions(&state, "upload_sessions.complete.rollback").await;
-            if let Some(session) = sessions.sessions.get_mut(&upload_id)
+                write_upload_sessions(state, "upload_sessions.complete.rollback").await;
+            if let Some(session) = sessions.sessions.get_mut(upload_id)
                 && !session.completed
             {
                 session.finalizing = false;
@@ -11461,7 +11975,7 @@ async fn complete_upload_session_route(
                     .saturating_add(UPLOAD_SESSION_TTL_SECS);
             }
             drop(sessions);
-            persist_upload_session_store_after_mutation(&state, "complete_upload_session_error")
+            persist_upload_session_store_after_mutation(state, "complete_upload_session_error")
                 .await;
             tracing::error!(
                 error = %err,
@@ -11479,7 +11993,7 @@ async fn complete_upload_session_route(
     let store_finalize_ms = store_finalize_started_at.elapsed().as_millis();
     drop(store);
 
-    publish_namespace_change(&state);
+    publish_namespace_change(state);
     spawn_media_metadata_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
     let mut cluster = state.cluster.lock().await;
@@ -11490,7 +12004,7 @@ async fn complete_upload_session_route(
     );
     drop(cluster);
 
-    if let Err(err) = persist_cluster_replicas_state(&state).await {
+    if let Err(err) = persist_cluster_replicas_state(state).await {
         warn!(
             error = %err,
             "failed to persist cluster replicas after upload session complete"
@@ -11502,21 +12016,21 @@ async fn complete_upload_session_route(
         false,
     ) {
         enqueue_autonomous_post_write_replication(
-            &state,
+            state,
             autonomous_post_write_replication_subjects(&key, outcome.version_id.as_str()),
         )
         .await;
     }
 
     let actor = data_change_actor_from_client_device_id(
-        &state,
+        state,
         requester_device_id
             .as_deref()
             .or(owner_device_id.as_deref()),
     )
     .await;
     record_data_change_event(
-        &state,
+        state,
         PendingDataChangeEvent {
             action: DataChangeAction::Upload,
             actor: Some(actor.clone()),
@@ -11544,8 +12058,8 @@ async fn complete_upload_session_route(
         total_size_bytes,
     };
     let now = unix_ts();
-    let mut sessions = write_upload_sessions(&state, "upload_sessions.complete.finish").await;
-    if let Some(session) = sessions.sessions.get_mut(&upload_id) {
+    let mut sessions = write_upload_sessions(state, "upload_sessions.complete.finish").await;
+    if let Some(session) = sessions.sessions.get_mut(upload_id) {
         session.completed = true;
         session.finalizing = false;
         session.completed_result = Some(response.clone());
@@ -11560,7 +12074,7 @@ async fn complete_upload_session_route(
         return (StatusCode::OK, Json(response)).into_response();
     }
     drop(sessions);
-    persist_upload_session_store_after_mutation(&state, "complete_upload_session").await;
+    persist_upload_session_store_after_mutation(state, "complete_upload_session").await;
     let total_ms = finalize_started_at.elapsed().as_millis();
     info!(
         upload_id = %upload_id,
@@ -11587,9 +12101,31 @@ async fn delete_object(
     headers: HeaderMap,
     Path(key): Path<String>,
     Query(query): Query<PutObjectQuery>,
-) -> impl IntoResponse {
-    let actor = data_change_actor_from_client_headers(&state, &headers).await;
-    delete_object_response(&state, key, query, Some(actor)).await
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "delete_object",
+        &json!({
+            "key": key.clone(),
+            "query": query.clone(),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            delete_object_response(&state_for_request, key, query, Some(actor))
+                .await
+                .into_response()
+        },
+    )
+    .await
 }
 
 async fn delete_object_response(
@@ -13496,9 +14032,27 @@ async fn get_media_thumbnail_admin(
 
 async fn retry_media_cache(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<MediaThumbnailQuery>,
-) -> impl IntoResponse {
-    retry_media_cache_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("retry_media_cache", &query);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            retry_media_cache_response(
+                &state_for_request,
+                query,
+                PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 async fn retry_media_cache_admin(
@@ -14088,16 +14642,58 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
 
 async fn confirm_version(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path((key, version_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    commit_version_inner(state, key, version_id).await
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "confirm_version",
+        &json!({
+            "key": key.clone(),
+            "version_id": version_id.clone(),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            commit_version_inner(state_for_request, key, version_id)
+                .await
+                .into_response()
+        },
+    )
+    .await
 }
 
 async fn commit_version(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path((key, version_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    commit_version_inner(state, key, version_id).await
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "commit_version",
+        &json!({
+            "key": key.clone(),
+            "version_id": version_id.clone(),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            commit_version_inner(state_for_request, key, version_id)
+                .await
+                .into_response()
+        },
+    )
+    .await
 }
 
 async fn commit_version_inner(state: ServerState, key: String, version_id: String) -> StatusCode {
@@ -18014,16 +18610,37 @@ async fn enroll_client_device(
 
 async fn renew_device_rendezvous_identity(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Extension(client_identity): Extension<AuthenticatedClientIdentity>,
-) -> impl IntoResponse {
-    let device_id = &client_identity.device_id;
+) -> Response {
+    let device_id = client_identity.device_id.clone();
+    let fingerprint = client_mutation_operation_fingerprint(
+        "renew_device_rendezvous_identity",
+        &json!({ "device_id": device_id.clone() }),
+    );
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        Some(device_id.clone()),
+        fingerprint,
+        move || async move {
+            renew_device_rendezvous_identity_response(&state_for_request, &device_id).await
+        },
+    )
+    .await
+}
 
+async fn renew_device_rendezvous_identity_response(
+    state: &ServerState,
+    device_id: &str,
+) -> Response {
     let expires_at_unix = {
         let auth_state = state.access.client_credentials.lock().await;
         auth_state
             .credentials
             .iter()
-            .find(|r| &r.device_id == device_id && r.revoked_at_unix.is_none())
+            .find(|r| r.device_id == device_id && r.revoked_at_unix.is_none())
             .and_then(|r| r.issued_credential_pem.as_deref())
             .and_then(parse_credential_pem_expires_at)
     };
