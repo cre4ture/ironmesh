@@ -1182,6 +1182,10 @@ trait MetadataStore: Send + Sync {
     ) -> Result<()>;
     async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()>;
     async fn list_locally_owned_manifests(&self) -> Result<Vec<String>>;
+    async fn filter_locally_owned_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<HashSet<String>>;
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>>;
     async fn list_storage_stats_history(
         &self,
@@ -3962,16 +3966,14 @@ impl PersistentStore {
 
     async fn collect_owned_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
         let referenced = self.collect_referenced_manifest_hashes().await?;
-        let owned = self
-            .metadata_store
-            .list_locally_owned_manifests()
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        Ok(referenced
-            .into_iter()
-            .filter(|manifest_hash| owned.contains(manifest_hash))
-            .collect())
+        if referenced.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let referenced_vec = referenced.into_iter().collect::<Vec<_>>();
+        self.metadata_store
+            .filter_locally_owned_manifests(&referenced_vec)
+            .await
     }
 
     pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {

@@ -1596,6 +1596,47 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn filter_locally_owned_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        const SQLITE_LOCALLY_OWNED_QUERY_BATCH_SIZE: usize = 500;
+
+        if manifest_hashes.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        let manifest_hashes = manifest_hashes.to_vec();
+        self.read(move |db| {
+            let mut owned = std::collections::HashSet::with_capacity(manifest_hashes.len());
+            for chunk in manifest_hashes.chunks(SQLITE_LOCALLY_OWNED_QUERY_BATCH_SIZE) {
+                if chunk.is_empty() {
+                    continue;
+                }
+
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "SELECT manifest_hash
+                     FROM locally_owned_manifests
+                     WHERE manifest_hash IN ({placeholders})"
+                );
+                let mut stmt = db.prepare(&query)?;
+                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                    row.get::<_, String>(0)
+                })?;
+
+                for row in rows {
+                    owned.insert(row?);
+                }
+            }
+
+            Ok(owned)
+        })
+        .await
+    }
+
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
         let payload = self
             .read(|db| {
