@@ -62,10 +62,12 @@ pub use media_tools::{HostDependencyReport, HostDependencyStatus};
 pub(crate) use data_scrub::DataScrubber;
 #[cfg(test)]
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
+use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
 use media_cache::{
-    MEDIA_CACHE_INCOMPLETE_RETRY_SECS, MEDIA_CACHE_SCHEMA_VERSION, exif_gps_coordinate,
-    parse_exif_taken_at, persist_media_cache_record_with_payload, preferred_video_seek_time,
+    MEDIA_CACHE_INCOMPLETE_RETRY_SECS, MEDIA_CACHE_SCHEMA_VERSION, MediaCacheImageLimits,
+    exif_gps_coordinate, parse_exif_taken_at, persist_media_cache_record_with_payload,
+    preferred_video_seek_time,
 };
 pub(crate) use media_cache::{MediaCacheWorker, current_media_cache_metadata};
 use media_tools::MediaToolPaths;
@@ -74,7 +76,6 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
 const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
-const MEDIA_CACHE_BUILD_MAX_CONCURRENCY: usize = 20;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
 const DELETE_RECREATE_LOOP_REPAIR_SAMPLE_LIMIT: usize = 64;
@@ -994,6 +995,7 @@ pub struct PersistentStore {
     metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
     media_cache_build_permits: Arc<Semaphore>,
+    media_cache_build_config: MediaCacheBuildConfig,
     current_objects_cache: std::sync::Mutex<RangeChunkCache<String, CurrentObjectEntry>>,
     gc_manifest_load_batch_size: usize,
     snapshot_batch: Option<ActiveSnapshotBatch>,
@@ -1182,6 +1184,24 @@ trait MetadataStore: Send + Sync {
     ) -> Result<()>;
     async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()>;
     async fn list_locally_owned_manifests(&self) -> Result<Vec<String>>;
+    async fn filter_locally_owned_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<HashSet<String>> {
+        if manifest_hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let locally_owned = self.list_locally_owned_manifests().await?;
+        let requested = manifest_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        Ok(locally_owned
+            .into_iter()
+            .filter(|manifest_hash| requested.contains(manifest_hash.as_str()))
+            .collect())
+    }
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>>;
     async fn list_storage_stats_history(
         &self,
@@ -2025,9 +2045,7 @@ impl PersistentStore {
         let (metadata_db_path, metadata_store): (PathBuf, Arc<dyn MetadataStore>) = match backend {
             MetadataBackendKind::Sqlite => (
                 state_dir.join("metadata.sqlite"),
-                Arc::new(SqliteMetadataStore::open(
-                    &state_dir.join("metadata.sqlite"),
-                )?),
+                Arc::new(SqliteMetadataStore::open(&state_dir.join("metadata.sqlite")).await?),
             ),
             #[cfg(feature = "turso-metadata")]
             MetadataBackendKind::Turso => {
@@ -2042,7 +2060,10 @@ impl PersistentStore {
             std::sync::Mutex::new(RangeChunkCache::new(current_objects_cache_capacity()));
         let snapshot_batch = metadata_store.load_snapshot_batch_state().await?;
         let storage_stats_lock = Arc::new(AsyncMutex::new(()));
-        let media_cache_build_permits = Arc::new(Semaphore::new(MEDIA_CACHE_BUILD_MAX_CONCURRENCY));
+        let media_cache_build_config = MediaCacheBuildConfig::default();
+        let media_cache_build_permits = Arc::new(Semaphore::new(
+            media_cache_build_config.total_permits as usize,
+        ));
         let chunk_ingestor = ChunkIngestor::new(
             chunks_dir.clone(),
             metadata_store.clone(),
@@ -2057,6 +2078,7 @@ impl PersistentStore {
             metadata_db_path,
             media_thumbnails_dir,
             media_cache_build_permits,
+            media_cache_build_config,
             current_objects_cache,
             gc_manifest_load_batch_size: GC_MANIFEST_LOAD_BATCH_SIZE,
             snapshot_batch,
@@ -2079,6 +2101,7 @@ impl PersistentStore {
             self.chunks_dir.clone(),
             self.media_thumbnails_dir.clone(),
             self.media_cache_build_permits.clone(),
+            self.media_cache_build_config.clone(),
             self.metadata_store.clone(),
             self.media_tools.clone(),
         )
@@ -2108,6 +2131,23 @@ impl PersistentStore {
     #[cfg(test)]
     pub fn set_current_objects_cache_capacity_for_test(&mut self, capacity: usize) {
         self.current_objects_cache = std::sync::Mutex::new(RangeChunkCache::new(capacity));
+    }
+
+    #[cfg(test)]
+    pub fn set_media_cache_image_limits_for_test(
+        &mut self,
+        max_dimension: u32,
+        max_pixels: u64,
+        max_decode_bytes: u64,
+    ) {
+        self.media_cache_build_config = self
+            .media_cache_build_config
+            .clone()
+            .with_image_limits_for_test(MediaCacheImageLimits {
+                max_dimension,
+                max_pixels,
+                max_decode_bytes,
+            });
     }
 
     #[cfg(test)]
@@ -3964,16 +4004,14 @@ impl PersistentStore {
 
     async fn collect_owned_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
         let referenced = self.collect_referenced_manifest_hashes().await?;
-        let owned = self
-            .metadata_store
-            .list_locally_owned_manifests()
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        Ok(referenced
-            .into_iter()
-            .filter(|manifest_hash| owned.contains(manifest_hash))
-            .collect())
+        if referenced.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let referenced_vec = referenced.into_iter().collect::<Vec<_>>();
+        self.metadata_store
+            .filter_locally_owned_manifests(&referenced_vec)
+            .await
     }
 
     pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {

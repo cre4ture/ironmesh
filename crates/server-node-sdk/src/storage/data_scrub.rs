@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,11 +7,15 @@ use super::{
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::fs;
+use tokio::fs::{self, File};
+use tokio::io::AsyncReadExt;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 
 const DATA_SCRUB_ISSUE_SAMPLE_LIMIT: usize = 128;
+const DATA_SCRUB_CHUNK_HASH_BUFFER_SIZE: usize = 256 * 1024;
+const VERIFIED_CHUNK_CACHE_CAPACITY: usize = 16_384;
+const VERIFIED_CHUNK_CACHE_ORDER_MULTIPLIER: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -135,11 +139,106 @@ pub(crate) struct DataScrubRunOutput {
 }
 
 #[derive(Debug, Clone)]
-struct VerifiedChunkState {
-    actual_size_bytes: Option<u64>,
-    actual_hash: Option<String>,
-    read_error: Option<String>,
-    missing: bool,
+enum VerifiedChunkState {
+    Present {
+        actual_size_bytes: u64,
+        actual_hash: String,
+    },
+    Missing,
+    ReadError(String),
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedChunkCacheEntry {
+    state: VerifiedChunkState,
+    last_touch: u64,
+}
+
+#[derive(Debug)]
+struct VerifiedChunkCache {
+    capacity: usize,
+    next_touch: u64,
+    entries: HashMap<String, VerifiedChunkCacheEntry>,
+    order: VecDeque<(String, u64)>,
+}
+
+impl VerifiedChunkCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            next_touch: 0,
+            entries: HashMap::with_capacity(capacity.max(1)),
+            order: VecDeque::with_capacity(capacity.max(1)),
+        }
+    }
+
+    fn get(&mut self, hash: &str) -> Option<VerifiedChunkState> {
+        let touch = self.touch();
+        let state = self.entries.get_mut(hash).map(|entry| {
+            entry.last_touch = touch;
+            entry.state.clone()
+        })?;
+        self.order.push_back((hash.to_string(), touch));
+        self.compact_order_if_needed();
+        Some(state)
+    }
+
+    fn insert(&mut self, hash: String, state: VerifiedChunkState) -> VerifiedChunkState {
+        let touch = self.touch();
+        self.entries.insert(
+            hash.clone(),
+            VerifiedChunkCacheEntry {
+                state: state.clone(),
+                last_touch: touch,
+            },
+        );
+        self.order.push_back((hash, touch));
+        self.evict_to_capacity();
+        self.compact_order_if_needed();
+        state
+    }
+
+    fn touch(&mut self) -> u64 {
+        let touch = self.next_touch;
+        self.next_touch = self.next_touch.saturating_add(1);
+        touch
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.entries.len() > self.capacity {
+            let Some((hash, touch)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&hash)
+                .is_some_and(|entry| entry.last_touch == touch)
+            {
+                self.entries.remove(&hash);
+            }
+        }
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        if self.order.len()
+            <= self
+                .capacity
+                .saturating_mul(VERIFIED_CHUNK_CACHE_ORDER_MULTIPLIER)
+        {
+            return;
+        }
+
+        let mut entries = self
+            .entries
+            .iter()
+            .map(|(hash, entry)| (entry.last_touch, hash.clone()))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(touch, _)| *touch);
+        self.order = entries
+            .into_iter()
+            .map(|(touch, hash)| (hash, touch))
+            .collect();
+    }
 }
 
 impl DataScrubber {
@@ -232,13 +331,19 @@ impl DataScrubber {
                 });
         }
 
-        let mut version_indexes = self.metadata_store.load_all_version_indexes().await?;
-        version_indexes.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+        let version_index_object_ids = self.metadata_store.list_version_index_object_ids().await?;
         if subject_filter.is_none() {
-            output.report.version_indexes_scanned = version_indexes.len();
+            output.report.version_indexes_scanned = version_index_object_ids.len();
         }
 
-        for index in version_indexes {
+        for object_id in version_index_object_ids {
+            let Some(index) = self
+                .metadata_store
+                .load_version_index_by_object_id(&object_id)
+                .await?
+            else {
+                continue;
+            };
             let mut records: Vec<_> = index.versions.values().cloned().collect();
             records.sort_by(|a, b| {
                 a.created_at_unix
@@ -289,25 +394,24 @@ impl DataScrubber {
 
         let mut manifest_hashes: Vec<_> = manifest_references.keys().cloned().collect();
         manifest_hashes.sort();
-        let mut verified_chunks = HashMap::<String, VerifiedChunkState>::new();
         let locally_owned_manifests = self
             .metadata_store
-            .list_locally_owned_manifests()
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
+            .filter_locally_owned_manifests(&manifest_hashes)
+            .await?;
+        let mut verified_chunks = VerifiedChunkCache::new(VERIFIED_CHUNK_CACHE_CAPACITY);
+        let mut chunk_hash_buffer = vec![0u8; DATA_SCRUB_CHUNK_HASH_BUFFER_SIZE];
 
         for manifest_hash in manifest_hashes {
             output.report.manifests_scanned = output.report.manifests_scanned.saturating_add(1);
             let contexts = manifest_references
-                .get(&manifest_hash)
-                .cloned()
+                .remove(&manifest_hash)
                 .unwrap_or_default();
             self.verify_manifest(
                 &manifest_hash,
                 &contexts,
                 locally_owned_manifests.contains(&manifest_hash),
                 &mut verified_chunks,
+                &mut chunk_hash_buffer,
                 &mut output,
             )
             .await;
@@ -324,7 +428,8 @@ impl DataScrubber {
         manifest_hash: &str,
         contexts: &[DataScrubReference],
         manifest_locally_owned: bool,
-        verified_chunks: &mut HashMap<String, VerifiedChunkState>,
+        verified_chunks: &mut VerifiedChunkCache,
+        chunk_hash_buffer: &mut [u8],
         output: &mut DataScrubRunOutput,
     ) {
         let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
@@ -422,79 +527,81 @@ impl DataScrubber {
 
         for chunk in &manifest.chunks {
             let verified_state = if let Some(existing) = verified_chunks.get(&chunk.hash) {
-                existing.clone()
+                existing
             } else {
-                let verified = self.verify_chunk(chunk, &mut output.report).await;
-                verified_chunks.insert(chunk.hash.clone(), verified.clone());
-                verified
+                let verified = self
+                    .verify_chunk(chunk, &mut output.report, chunk_hash_buffer)
+                    .await;
+                verified_chunks.insert(chunk.hash.clone(), verified)
             };
 
-            if verified_state.missing {
-                let issue_kind = if manifest_locally_owned {
-                    DataScrubIssueKind::ChunkMissing
-                } else {
-                    DataScrubIssueKind::ReplicaIncomplete
-                };
-                let detail = if manifest_locally_owned {
-                    format!("chunk {} is missing from local storage", chunk.hash)
-                } else {
-                    format!(
-                        "replica is incomplete locally: chunk {} is referenced by metadata manifest {manifest_hash} but is not present in local storage",
-                        chunk.hash
-                    )
-                };
-                self.push_issue(
-                    output,
-                    contexts,
-                    issue_kind,
-                    Some(manifest_hash.to_string()),
-                    Some(chunk.hash.clone()),
-                    detail,
-                );
-                continue;
-            }
+            match verified_state {
+                VerifiedChunkState::Present {
+                    actual_size_bytes,
+                    actual_hash,
+                } => {
+                    if actual_size_bytes != chunk.size_bytes as u64 {
+                        self.push_issue(
+                            output,
+                            contexts,
+                            DataScrubIssueKind::ChunkSizeMismatch,
+                            Some(manifest_hash.to_string()),
+                            Some(chunk.hash.clone()),
+                            format!(
+                                "chunk size mismatch expected={} actual={actual_size_bytes}",
+                                chunk.size_bytes,
+                            ),
+                        );
+                        continue;
+                    }
 
-            if let Some(read_error) = &verified_state.read_error {
-                self.push_issue(
-                    output,
-                    contexts,
-                    DataScrubIssueKind::ChunkUnreadable,
-                    Some(manifest_hash.to_string()),
-                    Some(chunk.hash.clone()),
-                    read_error.clone(),
-                );
-                continue;
-            }
-
-            if verified_state.actual_size_bytes != Some(chunk.size_bytes as u64) {
-                self.push_issue(
-                    output,
-                    contexts,
-                    DataScrubIssueKind::ChunkSizeMismatch,
-                    Some(manifest_hash.to_string()),
-                    Some(chunk.hash.clone()),
-                    format!(
-                        "chunk size mismatch expected={} actual={}",
-                        chunk.size_bytes,
-                        verified_state.actual_size_bytes.unwrap_or_default()
-                    ),
-                );
-                continue;
-            }
-
-            if verified_state.actual_hash.as_deref() != Some(chunk.hash.as_str()) {
-                self.push_issue(
-                    output,
-                    contexts,
-                    DataScrubIssueKind::ChunkHashMismatch,
-                    Some(manifest_hash.to_string()),
-                    Some(chunk.hash.clone()),
-                    format!(
-                        "chunk hash mismatch expected={} actual={}",
-                        chunk.hash,
-                        verified_state.actual_hash.as_deref().unwrap_or("<missing>")
-                    ),
-                );
+                    if actual_hash != chunk.hash {
+                        self.push_issue(
+                            output,
+                            contexts,
+                            DataScrubIssueKind::ChunkHashMismatch,
+                            Some(manifest_hash.to_string()),
+                            Some(chunk.hash.clone()),
+                            format!(
+                                "chunk hash mismatch expected={} actual={actual_hash}",
+                                chunk.hash,
+                            ),
+                        );
+                    }
+                }
+                VerifiedChunkState::Missing => {
+                    let issue_kind = if manifest_locally_owned {
+                        DataScrubIssueKind::ChunkMissing
+                    } else {
+                        DataScrubIssueKind::ReplicaIncomplete
+                    };
+                    let detail = if manifest_locally_owned {
+                        format!("chunk {} is missing from local storage", chunk.hash)
+                    } else {
+                        format!(
+                            "replica is incomplete locally: chunk {} is referenced by metadata manifest {manifest_hash} but is not present in local storage",
+                            chunk.hash
+                        )
+                    };
+                    self.push_issue(
+                        output,
+                        contexts,
+                        issue_kind,
+                        Some(manifest_hash.to_string()),
+                        Some(chunk.hash.clone()),
+                        detail,
+                    );
+                }
+                VerifiedChunkState::ReadError(read_error) => {
+                    self.push_issue(
+                        output,
+                        contexts,
+                        DataScrubIssueKind::ChunkUnreadable,
+                        Some(manifest_hash.to_string()),
+                        Some(chunk.hash.clone()),
+                        read_error,
+                    );
+                }
             }
         }
     }
@@ -511,41 +618,58 @@ impl DataScrubber {
         &self,
         chunk: &ChunkRef,
         report: &mut DataScrubReport,
+        chunk_hash_buffer: &mut [u8],
     ) -> VerifiedChunkState {
         report.chunks_scanned = report.chunks_scanned.saturating_add(1);
         let chunk_path = match chunk_path_for_hash(&self.chunks_dir, &chunk.hash) {
             Ok(p) => p,
             Err(err) => {
-                return VerifiedChunkState {
-                    actual_size_bytes: None,
-                    actual_hash: None,
-                    read_error: Some(format!("invalid chunk hash {}: {err}", chunk.hash)),
-                    missing: false,
-                };
+                return VerifiedChunkState::ReadError(format!(
+                    "invalid chunk hash {}: {err}",
+                    chunk.hash
+                ));
             }
         };
-        match self.read_with_bounded_retry(&chunk_path).await {
-            Ok(payload) => {
-                report.bytes_scanned = report.bytes_scanned.saturating_add(payload.len() as u64);
-                VerifiedChunkState {
-                    actual_size_bytes: Some(payload.len() as u64),
-                    actual_hash: Some(hash_hex(&payload)),
-                    read_error: None,
-                    missing: false,
+        match self.open_with_bounded_retry(&chunk_path).await {
+            Ok(mut file) => {
+                let mut hasher = blake3::Hasher::new();
+                let mut actual_size_bytes = 0u64;
+                loop {
+                    let read = match file.read(chunk_hash_buffer).await {
+                        Ok(read) => read,
+                        Err(err) => {
+                            return VerifiedChunkState::ReadError(format!(
+                                "failed reading chunk {}: {err}",
+                                chunk.hash
+                            ));
+                        }
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    actual_size_bytes = actual_size_bytes.saturating_add(read as u64);
+                    report.bytes_scanned = report.bytes_scanned.saturating_add(read as u64);
+                    hasher.update(&chunk_hash_buffer[..read]);
+                }
+
+                let actual_hash = hasher.finalize().to_hex().to_string();
+                VerifiedChunkState::Present {
+                    actual_size_bytes,
+                    actual_hash,
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => VerifiedChunkState {
-                actual_size_bytes: None,
-                actual_hash: None,
-                read_error: None,
-                missing: true,
-            },
-            Err(err) => VerifiedChunkState {
-                actual_size_bytes: None,
-                actual_hash: None,
-                read_error: Some(format!("failed reading chunk {}: {err}", chunk.hash)),
-                missing: false,
-            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => VerifiedChunkState::Missing,
+            Err(err) => {
+                VerifiedChunkState::ReadError(format!("failed reading chunk {}: {err}", chunk.hash))
+            }
+        }
+    }
+
+    async fn open_with_bounded_retry(&self, path: &Path) -> std::io::Result<File> {
+        match File::open(path).await {
+            Ok(file) => Ok(file),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(err),
+            Err(_) => File::open(path).await,
         }
     }
 

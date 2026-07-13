@@ -1,3 +1,20 @@
+ironmesh (1.0.33-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Move sqlite metadata reads onto tokio-rusqlite and harden media cache
+    cleanup against stale rewrites.
+  * Reduce folder-agent rescans by preferring remote change waits, fix remote
+    refresh regressions, and fix startup preserve false positives for
+    unchanged bytes.
+  * Tighten relay latency probing/target selection and extend managed
+    rendezvous system-test coverage.
+  * Tighten chunk hash path validation, skip already-present chunk uploads,
+    and clarify node-local setup import passwords.
+  * Add repository LICENSE/SECURITY metadata and fix Windows tiny-display
+    builds plus server-admin rust smoke coverage.
+  * Roll the workspace release to 1.0.33.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 13 Jul 2026 08:45:04 +0200
+
 ironmesh (1.0.32-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add cluster node state persistence across restarts, backfill from legacy

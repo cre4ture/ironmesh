@@ -5,16 +5,16 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::extract::State;
-use bytes::{Bytes, BytesMut};
 use exif::{In, Reader as ExifReader, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use image::{DynamicImage, ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tokio::task;
 use tokio::time::{Duration, Instant, timeout};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -25,13 +25,24 @@ use super::media_tools::{
     VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS,
 };
 use super::{
-    MetadataStore, ObjectManifest, StoreReadError, TOMBSTONE_MANIFEST_HASH, chunk_path_for_hash,
+    MetadataStore, ObjectManifest, TOMBSTONE_MANIFEST_HASH, chunk_path_for_hash,
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
 pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 5;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
+const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
+const MEDIA_CACHE_BUILD_BYTES_PER_PERMIT_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_BYTES_PER_PERMIT";
+const MEDIA_CACHE_IMAGE_MAX_DIMENSION_ENV: &str = "IRONMESH_MEDIA_CACHE_IMAGE_MAX_DIMENSION";
+const MEDIA_CACHE_IMAGE_MAX_PIXELS_ENV: &str = "IRONMESH_MEDIA_CACHE_IMAGE_MAX_PIXELS";
+const MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES_ENV: &str = "IRONMESH_MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES";
+const DEFAULT_MEDIA_CACHE_BUILD_TOTAL_PERMITS: u32 = 8;
+const DEFAULT_MEDIA_CACHE_BUILD_BYTES_PER_PERMIT: u64 = 16 * 1024 * 1024;
+const DEFAULT_MEDIA_CACHE_IMAGE_MAX_DIMENSION: u32 = 12_288;
+const DEFAULT_MEDIA_CACHE_IMAGE_MAX_PIXELS: u64 = 40_000_000;
+const DEFAULT_MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+const IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL: u64 = 4;
 pub(super) const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 pub(super) const GRID_THUMBNAIL_PROFILE: &str = "grid";
 pub(super) const MEDIA_FORMAT_SNIFF_BYTES: usize = 64 * 1024;
@@ -99,6 +110,84 @@ struct DerivedMediaCacheArtifact {
     thumbnail_payload: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct MediaCacheBuildConfig {
+    pub(super) total_permits: u32,
+    bytes_per_permit: u64,
+    image_limits: MediaCacheImageLimits,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MediaCacheImageLimits {
+    pub(super) max_dimension: u32,
+    pub(super) max_pixels: u64,
+    pub(super) max_decode_bytes: u64,
+}
+
+impl Default for MediaCacheImageLimits {
+    fn default() -> Self {
+        Self {
+            max_dimension: positive_env_u32(
+                MEDIA_CACHE_IMAGE_MAX_DIMENSION_ENV,
+                DEFAULT_MEDIA_CACHE_IMAGE_MAX_DIMENSION,
+            ),
+            max_pixels: positive_env_u64(
+                MEDIA_CACHE_IMAGE_MAX_PIXELS_ENV,
+                DEFAULT_MEDIA_CACHE_IMAGE_MAX_PIXELS,
+            ),
+            max_decode_bytes: positive_env_u64(
+                MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES_ENV,
+                DEFAULT_MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES,
+            ),
+        }
+    }
+}
+
+impl Default for MediaCacheBuildConfig {
+    fn default() -> Self {
+        Self {
+            total_permits: positive_env_u32(
+                MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV,
+                DEFAULT_MEDIA_CACHE_BUILD_TOTAL_PERMITS,
+            ),
+            bytes_per_permit: positive_env_u64(
+                MEDIA_CACHE_BUILD_BYTES_PER_PERMIT_ENV,
+                DEFAULT_MEDIA_CACHE_BUILD_BYTES_PER_PERMIT,
+            ),
+            image_limits: MediaCacheImageLimits::default(),
+        }
+    }
+}
+
+impl MediaCacheBuildConfig {
+    pub(super) fn permits_for_source_size(&self, source_size_bytes: usize) -> u32 {
+        let source_size_bytes = u64::try_from(source_size_bytes).unwrap_or(u64::MAX);
+        self.permits_for_estimated_bytes(source_size_bytes)
+    }
+
+    fn permits_for_estimated_bytes(&self, estimated_bytes: u64) -> u32 {
+        let permits = if estimated_bytes == 0 {
+            1
+        } else {
+            estimated_bytes.div_ceil(self.bytes_per_permit)
+        };
+        permits.clamp(1, u64::from(self.total_permits)) as u32
+    }
+
+    fn image_limits(&self) -> &MediaCacheImageLimits {
+        &self.image_limits
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_image_limits_for_test(
+        mut self,
+        image_limits: MediaCacheImageLimits,
+    ) -> Self {
+        self.image_limits = image_limits;
+        self
+    }
+}
+
 impl From<CachedMediaMetadata> for DerivedMediaCacheArtifact {
     fn from(metadata: CachedMediaMetadata) -> Self {
         Self {
@@ -114,6 +203,7 @@ pub(crate) struct MediaCacheWorker {
     pub(super) chunks_dir: PathBuf,
     pub(super) media_thumbnails_dir: PathBuf,
     pub(super) media_cache_build_permits: Arc<Semaphore>,
+    pub(super) media_cache_build_config: MediaCacheBuildConfig,
     pub(super) metadata_store: Arc<dyn MetadataStore>,
     pub(super) media_tools: MediaToolPaths,
 }
@@ -124,6 +214,7 @@ impl MediaCacheWorker {
         chunks_dir: PathBuf,
         media_thumbnails_dir: PathBuf,
         media_cache_build_permits: Arc<Semaphore>,
+        media_cache_build_config: MediaCacheBuildConfig,
         metadata_store: Arc<dyn MetadataStore>,
         media_tools: MediaToolPaths,
     ) -> Self {
@@ -132,6 +223,7 @@ impl MediaCacheWorker {
             chunks_dir,
             media_thumbnails_dir,
             media_cache_build_permits,
+            media_cache_build_config,
             metadata_store,
             media_tools,
         }
@@ -209,21 +301,14 @@ impl MediaCacheWorker {
         );
 
         let build_started_at = Instant::now();
-        let derived = {
-            let _build_permit = self
-                .media_cache_build_permits
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("media cache build semaphore should remain open");
-            self.build_media_cache_artifact(
+        let derived = self
+            .build_media_cache_artifact(
                 &manifest,
                 manifest_hash,
                 &content_fingerprint,
                 include_thumbnail,
             )
-            .await
-        };
+            .await;
         let build_record_ms = build_started_at.elapsed().as_millis();
         if include_thumbnail
             && let Some(existing) = existing.as_ref()
@@ -348,71 +433,6 @@ impl MediaCacheWorker {
         Ok(Some(manifest))
     }
 
-    async fn read_object_by_manifest_hash(
-        &self,
-        manifest_hash: &str,
-    ) -> std::result::Result<Bytes, StoreReadError> {
-        let Some(manifest) = self
-            .load_manifest_by_hash(manifest_hash)
-            .await
-            .map_err(StoreReadError::Internal)?
-        else {
-            return Err(StoreReadError::Corrupt(format!(
-                "manifest missing for hash={manifest_hash}"
-            )));
-        };
-
-        let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
-
-        for chunk in manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
-                .map_err(StoreReadError::Internal)?;
-            if !fs::try_exists(&chunk_path)
-                .await
-                .map_err(|err| StoreReadError::Internal(err.into()))?
-            {
-                return Err(StoreReadError::Corrupt(format!(
-                    "missing chunk hash={}",
-                    chunk.hash
-                )));
-            }
-
-            let payload = fs::read(&chunk_path)
-                .await
-                .map_err(|err| StoreReadError::Internal(err.into()))?;
-
-            if payload.len() != chunk.size_bytes {
-                return Err(StoreReadError::Corrupt(format!(
-                    "size mismatch for chunk hash={} expected={} actual={}",
-                    chunk.hash,
-                    chunk.size_bytes,
-                    payload.len()
-                )));
-            }
-
-            let actual_hash = hash_hex(&payload);
-            if actual_hash != chunk.hash {
-                return Err(StoreReadError::Corrupt(format!(
-                    "hash mismatch for chunk expected={} actual={}",
-                    chunk.hash, actual_hash
-                )));
-            }
-
-            assembled.extend_from_slice(&payload);
-        }
-
-        if assembled.len() != manifest.total_size_bytes {
-            return Err(StoreReadError::Corrupt(format!(
-                "assembled payload size mismatch key={} expected={} actual={}",
-                manifest.key,
-                manifest.total_size_bytes,
-                assembled.len()
-            )));
-        }
-
-        Ok(assembled.freeze())
-    }
-
     async fn load_cached_media_metadata(
         &self,
         content_fingerprint: &str,
@@ -484,36 +504,67 @@ impl MediaCacheWorker {
                 );
             }
 
-            let payload = match self.read_object_by_manifest_hash(manifest_hash).await {
-                Ok(payload) => payload,
-                Err(err) => {
-                    return failed_media_cache_artifact(
-                        manifest_hash,
-                        content_fingerprint,
-                        manifest.total_size_bytes,
-                        generated_at_unix,
-                        err.to_string(),
-                    );
-                }
-            };
+            let build_permits = self.media_cache_build_config.permits_for_estimated_bytes(
+                estimated_image_build_bytes(
+                    manifest.total_size_bytes,
+                    image_dimensions(&sniff_bytes, format).ok(),
+                    include_thumbnail,
+                    self.media_cache_build_config.image_limits(),
+                ),
+            );
+            let build_permit = self
+                .media_cache_build_permits
+                .clone()
+                .acquire_many_owned(build_permits)
+                .await
+                .expect("media cache build semaphore should remain open");
 
-            return match derive_image_media_cache(
-                manifest_hash,
-                content_fingerprint,
-                manifest.total_size_bytes,
-                &payload,
-                include_thumbnail,
-            ) {
-                Ok(derived) => derived,
-                Err(err) => failed_media_cache_artifact(
+            let manifest_owned = manifest.clone();
+            let chunks_dir = self.chunks_dir.clone();
+            let manifest_hash_owned = manifest_hash.to_string();
+            let content_fingerprint_owned = content_fingerprint.to_string();
+            let image_limits = self.media_cache_build_config.image_limits().clone();
+
+            return match task::spawn_blocking(move || {
+                let _build_permit = build_permit;
+                build_image_media_cache_blocking(
+                    &manifest_hash_owned,
+                    &content_fingerprint_owned,
+                    &manifest_owned,
+                    &chunks_dir,
+                    include_thumbnail,
+                    &image_limits,
+                )
+            })
+            .await
+            {
+                Ok(Ok(derived)) => derived,
+                Ok(Err(err)) => failed_media_cache_artifact(
                     manifest_hash,
                     content_fingerprint,
                     manifest.total_size_bytes,
                     generated_at_unix,
                     err.to_string(),
                 ),
+                Err(err) => failed_media_cache_artifact(
+                    manifest_hash,
+                    content_fingerprint,
+                    manifest.total_size_bytes,
+                    generated_at_unix,
+                    format!("image media cache task failed: {err}"),
+                ),
             };
         }
+
+        let _build_permit = self
+            .media_cache_build_permits
+            .clone()
+            .acquire_many_owned(
+                self.media_cache_build_config
+                    .permits_for_source_size(manifest.total_size_bytes),
+            )
+            .await
+            .expect("media cache build semaphore should remain open");
 
         match derive_video_media_cache(
             manifest_hash,
@@ -686,6 +737,22 @@ pub fn media_cache_retry_due(metadata: &CachedMediaMetadata, now_unix: u64) -> b
             .retry_after_unix
             .map(|retry_after_unix| retry_after_unix <= now_unix)
             .unwrap_or(true)
+}
+
+fn positive_env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn positive_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn failed_media_cache_artifact(
@@ -1199,12 +1266,77 @@ fn video_mime_type_for_format_name(format_name: Option<&str>) -> Option<String> 
     None
 }
 
+fn build_image_media_cache_blocking(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    manifest: &ObjectManifest,
+    chunks_dir: &Path,
+    include_thumbnail: bool,
+    image_limits: &MediaCacheImageLimits,
+) -> Result<DerivedMediaCacheArtifact> {
+    let payload = read_object_by_manifest_blocking(manifest, chunks_dir)?;
+    derive_image_media_cache(
+        manifest_hash,
+        content_fingerprint,
+        manifest.total_size_bytes,
+        &payload,
+        include_thumbnail,
+        image_limits,
+    )
+}
+
+fn read_object_by_manifest_blocking(
+    manifest: &ObjectManifest,
+    chunks_dir: &Path,
+) -> Result<Vec<u8>> {
+    let mut assembled = Vec::new();
+
+    for chunk in &manifest.chunks {
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
+        let payload = std::fs::read(&chunk_path)
+            .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
+
+        if payload.len() != chunk.size_bytes {
+            bail!(
+                "size mismatch for chunk hash={} expected={} actual={}",
+                chunk.hash,
+                chunk.size_bytes,
+                payload.len()
+            );
+        }
+
+        let actual_hash = hash_hex(&payload);
+        if actual_hash != chunk.hash {
+            bail!(
+                "hash mismatch for chunk expected={} actual={}",
+                chunk.hash,
+                actual_hash
+            );
+        }
+
+        assembled.reserve(payload.len());
+        assembled.extend_from_slice(&payload);
+    }
+
+    if assembled.len() != manifest.total_size_bytes {
+        bail!(
+            "assembled payload size mismatch key={} expected={} actual={}",
+            manifest.key,
+            manifest.total_size_bytes,
+            assembled.len()
+        );
+    }
+
+    Ok(assembled)
+}
+
 fn derive_image_media_cache(
     manifest_hash: &str,
     content_fingerprint: &str,
     source_size_bytes: usize,
     payload: &[u8],
     include_thumbnail: bool,
+    image_limits: &MediaCacheImageLimits,
 ) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
     let format = match image::guess_format(payload) {
@@ -1233,11 +1365,9 @@ fn derive_image_media_cache(
         }
     };
 
-    let image = image::load_from_memory_with_format(payload, format)
-        .context("failed to decode image payload")?;
-    let (width, height) = image.dimensions();
+    let (width, height) = image_dimensions(payload, format)?;
     let (orientation, gps, taken_at_unix) = extract_exif_fields(payload);
-    let metadata = CachedMediaMetadata {
+    let mut metadata = CachedMediaMetadata {
         status: MediaCacheStatus::Ready,
         media_type: Some("image".to_string()),
         mime_type: Some(mime_type),
@@ -1261,19 +1391,28 @@ fn derive_image_media_cache(
         });
     }
 
+    if let Some(error) = validate_image_decode_limits(width, height, image_limits) {
+        metadata.status = MediaCacheStatus::Unsupported;
+        metadata.error = Some(error);
+        return Ok(DerivedMediaCacheArtifact {
+            metadata,
+            thumbnail_payload: None,
+        });
+    }
+
+    let image = decode_image_with_limits(payload, format, image_limits)?;
     let rendered_thumbnail = render_thumbnail(image, orientation, GRID_THUMBNAIL_MAX_DIMENSION)?;
 
+    metadata.thumbnail = Some(CachedThumbnailInfo {
+        profile: GRID_THUMBNAIL_PROFILE.to_string(),
+        format: "jpeg".to_string(),
+        width: rendered_thumbnail.width,
+        height: rendered_thumbnail.height,
+        size_bytes: rendered_thumbnail.payload.len() as u64,
+    });
+
     Ok(DerivedMediaCacheArtifact {
-        metadata: CachedMediaMetadata {
-            thumbnail: Some(CachedThumbnailInfo {
-                profile: GRID_THUMBNAIL_PROFILE.to_string(),
-                format: "jpeg".to_string(),
-                width: rendered_thumbnail.width,
-                height: rendered_thumbnail.height,
-                size_bytes: rendered_thumbnail.payload.len() as u64,
-            }),
-            ..metadata
-        },
+        metadata,
         thumbnail_payload: Some(rendered_thumbnail.payload),
     })
 }
@@ -1293,6 +1432,85 @@ pub(crate) fn current_media_cache_metadata(
     metadata: Option<CachedMediaMetadata>,
 ) -> Option<CachedMediaMetadata> {
     metadata.filter(|metadata| metadata.schema_version == MEDIA_CACHE_SCHEMA_VERSION)
+}
+
+fn image_dimensions(payload: &[u8], format: ImageFormat) -> Result<(u32, u32)> {
+    ImageReader::with_format(Cursor::new(payload), format)
+        .into_dimensions()
+        .context("failed to inspect image dimensions")
+}
+
+fn decode_image_with_limits(
+    payload: &[u8],
+    format: ImageFormat,
+    image_limits: &MediaCacheImageLimits,
+) -> Result<DynamicImage> {
+    let mut reader = ImageReader::with_format(Cursor::new(payload), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(image_limits.max_dimension);
+    limits.max_image_height = Some(image_limits.max_dimension);
+    limits.max_alloc = Some(image_limits.max_decode_bytes);
+    reader.limits(limits);
+    reader.decode().context("failed to decode image payload")
+}
+
+fn estimated_image_build_bytes(
+    source_size_bytes: usize,
+    dimensions: Option<(u32, u32)>,
+    include_thumbnail: bool,
+    image_limits: &MediaCacheImageLimits,
+) -> u64 {
+    let source_size_bytes = u64::try_from(source_size_bytes).unwrap_or(u64::MAX);
+    if !include_thumbnail {
+        return source_size_bytes;
+    }
+
+    let decode_bytes = dimensions
+        .map(|(width, height)| {
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL)
+        })
+        .unwrap_or_else(|| {
+            image_limits.max_decode_bytes.max(
+                image_limits
+                    .max_pixels
+                    .saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL),
+            )
+        });
+
+    decode_bytes.max(source_size_bytes)
+}
+
+fn validate_image_decode_limits(
+    width: u32,
+    height: u32,
+    image_limits: &MediaCacheImageLimits,
+) -> Option<String> {
+    if width > image_limits.max_dimension || height > image_limits.max_dimension {
+        return Some(format!(
+            "image thumbnail generation rejected: dimensions {}x{} exceed limit {}px",
+            width, height, image_limits.max_dimension
+        ));
+    }
+
+    let pixel_count = u64::from(width).saturating_mul(u64::from(height));
+    if pixel_count > image_limits.max_pixels {
+        return Some(format!(
+            "image thumbnail generation rejected: pixel count {} exceeds limit {}",
+            pixel_count, image_limits.max_pixels
+        ));
+    }
+
+    let estimated_decode_bytes = pixel_count.saturating_mul(IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL);
+    if estimated_decode_bytes > image_limits.max_decode_bytes {
+        return Some(format!(
+            "image thumbnail generation rejected: estimated decode footprint {} bytes exceeds limit {} bytes",
+            estimated_decode_bytes, image_limits.max_decode_bytes
+        ));
+    }
+
+    None
 }
 
 fn render_thumbnail(
@@ -1465,5 +1683,103 @@ pub(super) fn exif_gps_coordinate(value: &Value) -> Option<f64> {
             total.is_finite().then_some(total)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_png_bytes() -> Vec<u8> {
+        let image = image::DynamicImage::new_rgba8(4, 3);
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn media_cache_build_config_scales_permits_by_source_size() {
+        let config = MediaCacheBuildConfig {
+            total_permits: 20,
+            bytes_per_permit: 16 * 1024 * 1024,
+            image_limits: MediaCacheImageLimits::default(),
+        };
+
+        assert_eq!(config.permits_for_source_size(0), 1);
+        assert_eq!(config.permits_for_source_size(1), 1);
+        assert_eq!(config.permits_for_source_size(16 * 1024 * 1024), 1);
+        assert_eq!(config.permits_for_source_size((16 * 1024 * 1024) + 1), 2);
+        assert_eq!(
+            config.permits_for_source_size(usize::MAX),
+            config.total_permits
+        );
+    }
+
+    #[test]
+    fn derive_image_media_cache_only_applies_decode_limits_for_thumbnail_builds() {
+        let payload = sample_png_bytes();
+        let image_limits = MediaCacheImageLimits {
+            max_dimension: 10,
+            max_pixels: 11,
+            max_decode_bytes: 1024 * 1024,
+        };
+
+        let metadata_only = derive_image_media_cache(
+            "manifest",
+            "fingerprint",
+            payload.len(),
+            &payload,
+            false,
+            &image_limits,
+        )
+        .unwrap();
+        assert_eq!(metadata_only.metadata.status, MediaCacheStatus::Ready);
+        assert_eq!(metadata_only.metadata.width, Some(4));
+        assert_eq!(metadata_only.metadata.height, Some(3));
+        assert!(metadata_only.metadata.thumbnail.is_none());
+
+        let with_thumbnail = derive_image_media_cache(
+            "manifest",
+            "fingerprint",
+            payload.len(),
+            &payload,
+            true,
+            &image_limits,
+        )
+        .unwrap();
+        assert_eq!(
+            with_thumbnail.metadata.status,
+            MediaCacheStatus::Unsupported
+        );
+        assert_eq!(with_thumbnail.metadata.width, Some(4));
+        assert_eq!(with_thumbnail.metadata.height, Some(3));
+        assert!(with_thumbnail.metadata.thumbnail.is_none());
+        assert!(with_thumbnail.thumbnail_payload.is_none());
+        assert!(
+            with_thumbnail
+                .metadata
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pixel count")
+        );
+    }
+
+    #[test]
+    fn estimated_image_build_bytes_uses_conservative_budget_without_dimensions() {
+        let image_limits = MediaCacheImageLimits {
+            max_dimension: 4_096,
+            max_pixels: 40_000_000,
+            max_decode_bytes: 256 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            estimated_image_build_bytes(32 * 1024, None, true, &image_limits),
+            image_limits
+                .max_decode_bytes
+                .max(image_limits.max_pixels * IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL)
+        );
     }
 }

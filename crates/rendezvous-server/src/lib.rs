@@ -1,36 +1,41 @@
 mod auth;
 
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::http::Uri;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use common::{ClusterId, DeviceId};
-use serde::Serialize;
+use common::{ClusterId, DeviceId, NodeId};
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::rendezvous::{
-    PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
+    DiscoveryResponse, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
+    RendezvousClientConfig, RendezvousControlClient, RendezvousRuntimeState,
 };
 use transport_sdk::{
-    BufferedTransportRequest, ClientBootstrapClaimRedeemRequest,
-    ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode, PresenceRegistry,
-    RelayTicket, RelayTicketRequest, RelayTunnelBroker, RelayTunnelControlMessage,
-    RelayTunnelFrame, RelayTunnelSessionKind, RelayWakeControlMessage, RelayWakeRegistration,
-    TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, WakeRegistrationHandle,
-    issue_relay_ticket as issue_runtime_relay_ticket, perform_transport_client_handshake,
-    read_buffered_transport_response, write_buffered_transport_request,
+    BufferedTransportRequest, CandidateKind, ClientBootstrapClaimRedeemRequest,
+    ClientBootstrapClaimRedeemResponse, ConnectionCandidate, MultiplexConfig, MultiplexMode,
+    PresenceRegistry, RelayTicket, RelayTicketRequest, RelayTunnelBroker,
+    RelayTunnelControlMessage, RelayTunnelFrame, RelayTunnelSessionKind, RelayWakeControlMessage,
+    RelayWakeRegistration, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
+    WakeRegistrationHandle, issue_relay_ticket as issue_runtime_relay_ticket,
+    perform_transport_client_handshake, rank_candidates, read_buffered_transport_response,
+    write_buffered_transport_request,
 };
 
 use crate::auth::{
-    MaybeAuthenticatedPeer, MtlsAuthenticatedPeerAcceptor, build_mtls_rustls_config,
-    ensure_authenticated_peer_identity, require_authenticated_node,
+    MaybeAuthenticatedPeer, MaybeObservedPeerAddr, MtlsAuthenticatedPeerAcceptor,
+    build_mtls_rustls_config, ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -64,6 +69,7 @@ pub struct RendezvousServerConfig {
     pub bind_addr: SocketAddr,
     pub public_url: String,
     pub relay_public_urls: Vec<String>,
+    pub peer_rendezvous_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
 }
 
@@ -72,15 +78,17 @@ pub struct RendezvousAppState {
     pub config: RendezvousServerConfig,
     pub presence: PresenceRegistry,
     pub relay_tunnel: RelayTunnelBroker,
+    pub mesh_peers: Option<RendezvousControlClient>,
 }
 
 impl RendezvousAppState {
-    pub fn new(config: RendezvousServerConfig) -> Self {
-        Self {
+    pub fn new(config: RendezvousServerConfig) -> Result<Self> {
+        Ok(Self {
+            mesh_peers: build_mesh_probe_client(&config)?,
             config,
             presence: PresenceRegistry::new(),
             relay_tunnel: RelayTunnelBroker::new(),
-        }
+        })
     }
 }
 
@@ -99,6 +107,8 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/control/mesh", get(mesh_status))
+        .route("/control/discovery", get(discovery))
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
         .route("/control/relay/ticket", post(issue_relay_ticket))
@@ -110,6 +120,7 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 pub async fn serve(state: RendezvousAppState) -> Result<()> {
     let bind_addr = state.config.bind_addr;
     let app = build_router(state.clone());
+    spawn_mesh_probe_task(state.mesh_peers.clone());
 
     if let Some(mtls) = state.config.mtls.as_ref() {
         let tls_config = build_mtls_rustls_config(mtls)?;
@@ -120,7 +131,11 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
         Ok(())
     } else {
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -134,9 +149,41 @@ async fn health(State(state): State<RendezvousAppState>) -> Json<HealthResponse>
     })
 }
 
+async fn mesh_status(
+    State(state): State<RendezvousAppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+) -> std::result::Result<Json<RendezvousRuntimeState>, (StatusCode, String)> {
+    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
+        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    Ok(Json(
+        state
+            .mesh_peers
+            .as_ref()
+            .map(RendezvousControlClient::runtime_state)
+            .unwrap_or_else(empty_rendezvous_runtime_state),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveryQuery {
+    #[serde(default)]
+    node_id: Option<NodeId>,
+}
+
+async fn discovery(
+    State(state): State<RendezvousAppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+    Query(query): Query<DiscoveryQuery>,
+) -> std::result::Result<Json<DiscoveryResponse>, (StatusCode, String)> {
+    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
+        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    Ok(Json(discovery_response(&state, query.node_id)))
+}
+
 async fn register_presence(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
+    observed_peer_addr: MaybeObservedPeerAddr,
     Json(request): Json<PresenceRegistration>,
 ) -> std::result::Result<Json<RegisterPresenceResponse>, (StatusCode, String)> {
     request
@@ -150,7 +197,10 @@ async fn register_presence(
     )
     .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
 
-    let entry = state.presence.register(request);
+    let entry = state
+        .presence
+        .register(request, observed_peer_addr.socket_addr());
+    let entry = response_presence_entry(entry);
     Ok(Json(RegisterPresenceResponse {
         accepted: true,
         software_version: Some(PACKAGE_VERSION.to_string()),
@@ -163,13 +213,177 @@ async fn list_presence(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
 ) -> std::result::Result<Json<PresenceListResponse>, (StatusCode, String)> {
-    require_authenticated_node(state.config.mtls.is_some(), &authenticated_peer)
+    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let entries = state.presence.list();
+    let entries = state
+        .presence
+        .list()
+        .into_iter()
+        .map(response_presence_entry)
+        .collect::<Vec<_>>();
     Ok(Json(PresenceListResponse {
         registered_endpoints: entries.len(),
         entries,
     }))
+}
+
+fn response_presence_entry(
+    mut entry: transport_sdk::PresenceEntry,
+) -> transport_sdk::PresenceEntry {
+    let Some(candidate) = synthesize_server_reflexive_candidate(&entry) else {
+        return entry;
+    };
+
+    if has_candidate_endpoint(&entry.registration.direct_candidates, &candidate.endpoint) {
+        return entry;
+    }
+
+    let mut candidates = entry.registration.direct_candidates.clone();
+    candidates.push(candidate);
+    entry.registration.direct_candidates = rank_candidates(&candidates);
+    entry
+}
+
+fn synthesize_server_reflexive_candidate(
+    entry: &transport_sdk::PresenceEntry,
+) -> Option<ConnectionCandidate> {
+    let observed_source_addr = entry.observed_source_addr?;
+    let port = entry
+        .registration
+        .peer_api_url
+        .as_deref()
+        .and_then(url_port)
+        .or_else(|| {
+            entry
+                .registration
+                .public_api_url
+                .as_deref()
+                .and_then(url_port)
+        })?;
+    Some(ConnectionCandidate {
+        kind: CandidateKind::ServerReflexive,
+        endpoint: server_reflexive_endpoint(observed_source_addr.ip(), port),
+        rtt_ms: None,
+    })
+}
+
+fn url_port(value: &str) -> Option<u16> {
+    value
+        .parse::<Uri>()
+        .ok()?
+        .authority()
+        .and_then(|authority| authority.port_u16())
+}
+
+fn server_reflexive_endpoint(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("https://{ip}:{port}"),
+        IpAddr::V6(ip) => format!("https://[{ip}]:{port}"),
+    }
+}
+
+fn has_candidate_endpoint(candidates: &[ConnectionCandidate], endpoint: &str) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| candidate.endpoint.trim_end_matches('/') == endpoint)
+}
+
+fn build_mesh_probe_client(
+    config: &RendezvousServerConfig,
+) -> Result<Option<RendezvousControlClient>> {
+    if config.peer_rendezvous_urls.is_empty() {
+        return Ok(None);
+    }
+
+    // Mesh health probes are cluster-agnostic, but the shared rendezvous client
+    // still validates that a non-nil cluster_id is present.
+    let cluster_id = ClusterId::now_v7();
+    let server_ca_pem = rendezvous_mesh_server_ca_pem(config.mtls.as_ref())?;
+    Ok(Some(RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id,
+            rendezvous_urls: config.peer_rendezvous_urls.clone(),
+            heartbeat_interval_secs: 15,
+        },
+        server_ca_pem.as_deref(),
+        None,
+    )?))
+}
+
+fn rendezvous_mesh_server_ca_pem(mtls: Option<&RendezvousMtlsConfig>) -> Result<Option<String>> {
+    let Some(mtls) = mtls else {
+        return Ok(None);
+    };
+
+    match &mtls.client_ca {
+        RendezvousClientCa::File { cert_path } => Ok(Some(
+            std::fs::read_to_string(cert_path)
+                .with_context(|| format!("failed reading {}", cert_path.display()))?,
+        )),
+        RendezvousClientCa::InlinePem { cert_pem } => Ok(Some(cert_pem.clone())),
+    }
+}
+
+fn spawn_mesh_probe_task(mesh_peers: Option<RendezvousControlClient>) {
+    let Some(mesh_peers) = mesh_peers else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        let interval_secs = mesh_peers.config().heartbeat_interval_secs.max(1);
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        ticker.tick().await;
+
+        loop {
+            if let Err(err) = mesh_peers.probe_health_endpoints().await {
+                warn!(
+                    error = %err,
+                    rendezvous_urls = ?mesh_peers.config().rendezvous_urls,
+                    "failed to probe rendezvous mesh peers"
+                );
+            }
+            ticker.tick().await;
+        }
+    });
+}
+
+fn empty_rendezvous_runtime_state() -> RendezvousRuntimeState {
+    RendezvousRuntimeState {
+        active_url: None,
+        endpoint_statuses: Vec::new(),
+    }
+}
+
+fn discovery_response(state: &RendezvousAppState, node_id: Option<NodeId>) -> DiscoveryResponse {
+    let rendezvous_peers = state
+        .mesh_peers
+        .as_ref()
+        .map(RendezvousControlClient::runtime_state)
+        .unwrap_or_else(empty_rendezvous_runtime_state)
+        .endpoint_statuses;
+
+    let (node_candidates, node_relay_capable) = node_id
+        .and_then(|node_id| {
+            state
+                .presence
+                .entry_for_identity(&PeerIdentity::Node(node_id))
+                .map(response_presence_entry)
+        })
+        .map(|entry| {
+            let relay_capable = entry
+                .registration
+                .capabilities
+                .contains(&transport_sdk::TransportCapability::RelayTunnel)
+                || entry.registration.relay_mode != transport_sdk::RelayMode::Disabled;
+            (Some(entry.registration.direct_candidates), relay_capable)
+        })
+        .unwrap_or((None, false));
+
+    DiscoveryResponse {
+        rendezvous_peers,
+        node_candidates,
+        node_relay_capable,
+    }
 }
 
 async fn issue_relay_ticket(
@@ -881,6 +1095,10 @@ async fn send_relay_wake_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::NodeId;
+    use transport_sdk::{
+        RelayMode, RendezvousClientConfig, RendezvousControlClient, TransportCapability,
+    };
 
     #[test]
     fn relay_tunnel_log_context_captures_source_ticket_metadata() {
@@ -935,6 +1153,265 @@ mod tests {
         );
     }
 
+    #[test]
+    fn synthesize_server_reflexive_candidate_uses_observed_ip_and_peer_api_port() {
+        let entry = transport_sdk::PresenceEntry {
+            registration: PresenceRegistration {
+                cluster_id: ClusterId::now_v7(),
+                identity: PeerIdentity::Node(NodeId::now_v7()),
+                public_api_url: Some("https://public.example:9443".to_string()),
+                public_direct_urls: Vec::new(),
+                peer_api_url: Some("https://node.internal:7443".to_string()),
+                direct_candidates: Vec::new(),
+                labels: Default::default(),
+                capacity_bytes: None,
+                free_bytes: None,
+                capabilities: vec![TransportCapability::DirectHttps],
+                relay_mode: RelayMode::Disabled,
+                connected_at_unix: 1,
+            },
+            updated_at_unix: 1,
+            observed_source_addr: Some("203.0.113.10:51000".parse().expect("socket addr")),
+        };
+
+        let candidate = synthesize_server_reflexive_candidate(&entry)
+            .expect("server reflexive candidate should be synthesized");
+        assert_eq!(candidate.kind, CandidateKind::ServerReflexive);
+        assert_eq!(candidate.endpoint, "https://203.0.113.10:7443");
+    }
+
+    #[test]
+    fn synthesize_server_reflexive_candidate_requires_explicit_port() {
+        let entry = transport_sdk::PresenceEntry {
+            registration: PresenceRegistration {
+                cluster_id: ClusterId::now_v7(),
+                identity: PeerIdentity::Node(NodeId::now_v7()),
+                public_api_url: Some("https://public.example".to_string()),
+                public_direct_urls: Vec::new(),
+                peer_api_url: Some("https://node.internal".to_string()),
+                direct_candidates: Vec::new(),
+                labels: Default::default(),
+                capacity_bytes: None,
+                free_bytes: None,
+                capabilities: vec![TransportCapability::DirectHttps],
+                relay_mode: RelayMode::Disabled,
+                connected_at_unix: 1,
+            },
+            updated_at_unix: 1,
+            observed_source_addr: Some("203.0.113.10:51000".parse().expect("socket addr")),
+        };
+
+        assert!(synthesize_server_reflexive_candidate(&entry).is_none());
+    }
+
+    #[tokio::test]
+    async fn plain_http_presence_registration_exposes_observed_source_and_reflexive_candidate() {
+        let cluster_id = ClusterId::now_v7();
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr,
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("rendezvous app state should build");
+        let router = build_router(state);
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("test rendezvous server should run");
+        });
+
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        let registration = PresenceRegistration {
+            cluster_id,
+            identity: PeerIdentity::Node(NodeId::now_v7()),
+            public_api_url: Some("https://public.example:9443".to_string()),
+            public_direct_urls: Vec::new(),
+            peer_api_url: Some("https://node.internal:7443".to_string()),
+            direct_candidates: Vec::new(),
+            labels: Default::default(),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: vec![TransportCapability::DirectHttps],
+            relay_mode: RelayMode::Disabled,
+            connected_at_unix: 1,
+        };
+
+        let response = client
+            .register_presence(&registration)
+            .await
+            .expect("presence registration should succeed");
+        assert_eq!(
+            response.entry.observed_source_addr.map(|addr| addr.ip()),
+            Some("127.0.0.1".parse().expect("loopback ip"))
+        );
+        assert_eq!(
+            response.entry.registration.direct_candidates,
+            vec![ConnectionCandidate {
+                kind: CandidateKind::ServerReflexive,
+                endpoint: "https://127.0.0.1:7443".to_string(),
+                rtt_ms: None,
+            }]
+        );
+
+        let listed = client
+            .list_presence()
+            .await
+            .expect("presence listing should succeed");
+        assert_eq!(listed.registered_endpoints, 1);
+        assert_eq!(listed.entries[0], response.entry);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn mesh_status_reports_connected_peer_after_probe() {
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_addr = peer_listener.local_addr().expect("peer listener addr");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(
+                peer_listener,
+                Router::new().route("/health", get(|| async { StatusCode::OK })),
+            )
+            .await
+            .expect("peer rendezvous should run");
+        });
+
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: vec![format!("http://{peer_addr}")],
+            mtls: None,
+        })
+        .expect("rendezvous app state should build");
+        let mesh_peers = state
+            .mesh_peers
+            .as_ref()
+            .expect("mesh peer client should exist");
+        mesh_peers
+            .probe_health_endpoints()
+            .await
+            .expect("mesh probe should succeed");
+
+        let response = mesh_status(State(state), MaybeAuthenticatedPeer::default())
+            .await
+            .expect("mesh status should succeed without mTLS")
+            .0;
+        assert_eq!(response.active_url, None);
+        assert_eq!(response.endpoint_statuses.len(), 1);
+        assert_eq!(
+            response.endpoint_statuses[0].url,
+            format!("http://{peer_addr}")
+        );
+        assert_eq!(
+            response.endpoint_statuses[0].status,
+            transport_sdk::RendezvousEndpointConnectionState::Connected
+        );
+
+        peer_server.abort();
+        let _ = peer_server.await;
+    }
+
+    #[tokio::test]
+    async fn discovery_returns_mesh_status_and_node_candidates() {
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_addr = peer_listener.local_addr().expect("peer listener addr");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(
+                peer_listener,
+                Router::new().route("/health", get(|| async { StatusCode::OK })),
+            )
+            .await
+            .expect("peer rendezvous should run");
+        });
+
+        let node_id = NodeId::now_v7();
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: vec![format!("http://{peer_addr}")],
+            mtls: None,
+        })
+        .expect("rendezvous app state should build");
+        state.presence.register(
+            PresenceRegistration {
+                cluster_id: ClusterId::now_v7(),
+                identity: PeerIdentity::Node(node_id),
+                public_api_url: None,
+                public_direct_urls: Vec::new(),
+                peer_api_url: Some("https://node.internal:7443".to_string()),
+                direct_candidates: Vec::new(),
+                labels: Default::default(),
+                capacity_bytes: None,
+                free_bytes: None,
+                capabilities: vec![TransportCapability::RelayTunnel],
+                relay_mode: RelayMode::Fallback,
+                connected_at_unix: 1,
+            },
+            Some("203.0.113.10:50000".parse().expect("socket addr")),
+        );
+        state
+            .mesh_peers
+            .as_ref()
+            .expect("mesh peer client should exist")
+            .probe_health_endpoints()
+            .await
+            .expect("mesh probe should succeed");
+
+        let response = discovery(
+            State(state),
+            MaybeAuthenticatedPeer::default(),
+            Query(DiscoveryQuery {
+                node_id: Some(node_id),
+            }),
+        )
+        .await
+        .expect("discovery should succeed without mTLS")
+        .0;
+        assert_eq!(response.rendezvous_peers.len(), 1);
+        assert_eq!(
+            response.rendezvous_peers[0].status,
+            transport_sdk::RendezvousEndpointConnectionState::Connected
+        );
+        assert_eq!(
+            response.node_candidates,
+            Some(vec![ConnectionCandidate {
+                kind: CandidateKind::ServerReflexive,
+                endpoint: "https://203.0.113.10:7443".to_string(),
+                rtt_ms: None,
+            }])
+        );
+        assert!(response.node_relay_capable);
+
+        peer_server.abort();
+        let _ = peer_server.await;
+    }
+
     /// Regression test for a zombie-queue bug: a source that abandons its `ConnectSource`
     /// websocket before pairing completes (e.g. a caller-side timeout firing before the
     /// server's own wait elapses) must not leave a stale entry in the broker's FIFO queue
@@ -958,8 +1435,10 @@ mod tests {
             bind_addr,
             public_url: format!("http://{bind_addr}"),
             relay_public_urls: vec![format!("http://{bind_addr}")],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("test rendezvous app state should build");
         let server_handle = tokio::spawn(async move {
             serve(state)
                 .await
@@ -1085,8 +1564,10 @@ mod tests {
             bind_addr,
             public_url: format!("http://{bind_addr}"),
             relay_public_urls: vec![format!("http://{bind_addr}")],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("test rendezvous app state should build");
         let server_handle = tokio::spawn(async move {
             serve(state)
                 .await

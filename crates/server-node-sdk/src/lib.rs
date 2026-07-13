@@ -85,9 +85,9 @@ use transport_sdk::{
     TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
     TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
     credential_fingerprint, perform_transport_client_handshake, perform_transport_server_handshake,
-    read_buffered_transport_response, read_transport_request_head, verify_signed_request_headers,
-    write_buffered_transport_request, write_buffered_transport_response,
-    write_transport_response_head,
+    read_buffered_transport_response, read_transport_request_head, read_transport_response_head,
+    verify_signed_request_headers, write_buffered_transport_request,
+    write_buffered_transport_response, write_transport_response_head,
 };
 use uuid::Uuid;
 
@@ -7613,11 +7613,12 @@ async fn execute_relay_peer_request(
 ) -> Result<PeerHttpResponse> {
     let normalized_path = normalize_peer_path_and_query(path_and_query)?;
     let request_headers = transport_headers_from_relay_headers(&headers);
+    let request_kind = relay_peer_request_kind(&method, &normalized_path, &body);
 
     for attempt in 0..2 {
         let cached = ensure_relay_peer_session(state, node).await?;
         let request = BufferedTransportRequest::new(
-            TransportStreamKind::Rpc,
+            request_kind,
             method.as_str(),
             normalized_path.clone(),
             request_headers.clone(),
@@ -7639,15 +7640,28 @@ async fn execute_relay_peer_request(
                         node.node_id
                     )
                 })?;
-            let response = read_buffered_transport_response(&mut stream)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed reading multiplex relay peer response for node {}",
-                        node.node_id
-                    )
-                })?;
-            Ok::<PeerHttpResponse, anyhow::Error>(peer_http_response_from_multiplex(response))
+            let response = match request_kind {
+                TransportStreamKind::ObjectRead => read_streamed_relay_peer_response(&mut stream)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed reading multiplex relay peer streamed response for node {}",
+                            node.node_id
+                        )
+                    })?,
+                _ => {
+                    let response = read_buffered_transport_response(&mut stream)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed reading multiplex relay peer response for node {}",
+                                node.node_id
+                            )
+                        })?;
+                    peer_http_response_from_multiplex(response)
+                }
+            };
+            Ok::<PeerHttpResponse, anyhow::Error>(response)
         }
         .await;
 
@@ -7673,6 +7687,21 @@ async fn execute_relay_peer_request(
         "relay peer request retried without producing a response for node {}",
         node.node_id
     )
+}
+
+fn relay_peer_request_kind(
+    method: &reqwest::Method,
+    path_and_query: &str,
+    body: &[u8],
+) -> TransportStreamKind {
+    if method == reqwest::Method::GET
+        && body.is_empty()
+        && transport_service::is_streamed_object_read_path(path_and_query)
+    {
+        TransportStreamKind::ObjectRead
+    } else {
+        TransportStreamKind::Rpc
+    }
 }
 
 fn join_peer_url(base_url: &str, path_and_query: &str) -> Result<reqwest::Url> {
@@ -7946,6 +7975,25 @@ fn peer_http_response_from_multiplex(response: BufferedTransportResponse) -> Pee
     }
 }
 
+async fn read_streamed_relay_peer_response<S>(stream: &mut S) -> Result<PeerHttpResponse>
+where
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+{
+    let head = read_transport_response_head(stream)
+        .await
+        .context("failed reading multiplex relay streamed response head")?;
+    let mut body = Vec::new();
+    stream
+        .read_to_end(&mut body)
+        .await
+        .context("failed reading multiplex relay streamed response body")?;
+    Ok(PeerHttpResponse {
+        status: head.status,
+        headers: relay_headers_from_transport_headers(&head.headers),
+        body: Bytes::from(body),
+    })
+}
+
 fn buffered_transport_error_response(
     request_id: impl Into<String>,
     status: u16,
@@ -8084,11 +8132,11 @@ where
         .map(|(path, _)| path)
         .unwrap_or(raw_path);
     let path_only = transport_service::strip_public_api_v1_prefix(path_only);
-    if !path_only.starts_with("/store/") {
+    if !transport_service::is_streamed_object_read_path(raw_path) {
         let response = buffered_transport_error_response(
             request_head.request_id,
             400,
-            format!("object read streams only support /store/* paths, received {path_only}"),
+            format!("object read streams only support object GET paths, received {path_only}"),
         );
         return write_buffered_transport_response(stream, &response)
             .await

@@ -35,8 +35,9 @@ pub use identity::{
     ClientEnrollmentRequest, ClientIdentityMaterial, IssuedClientIdentity, next_device_id,
 };
 pub use multiplex_transport::{
-    BufferedTransportRequest, BufferedTransportResponse, TransportRequestHead,
-    TransportResponseHead, perform_transport_client_handshake, perform_transport_server_handshake,
+    BufferedTransportRequest, BufferedTransportResponse,
+    MAX_BUFFERED_TRANSPORT_RESPONSE_BODY_BYTES, TransportRequestHead, TransportResponseHead,
+    perform_transport_client_handshake, perform_transport_server_handshake,
     read_buffered_transport_request, read_buffered_transport_response, read_transport_request_head,
     read_transport_response_head, write_buffered_transport_request,
     write_buffered_transport_response, write_transport_request_head, write_transport_response_head,
@@ -52,7 +53,7 @@ pub use relay_wake::{
     RelayWakeClient, RelayWakeControlMessage, RelayWakeEvent, RelayWakeRegistration,
 };
 pub use rendezvous::{
-    PresenceEntry, PresenceListResponse, PresenceRegistration,
+    DiscoveryResponse, PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,

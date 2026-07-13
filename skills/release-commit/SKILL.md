@@ -13,19 +13,30 @@ Read [references/ironmesh-release-facts.md](references/ironmesh-release-facts.md
 
 ## Workflow
 
-1. Make sure the current branch is up to date with the remote.
-2. Check clippy and rust fmt locally before pushing any commits.
-3. Inspect the current branch and current commit on GitHub Actions.
-4. Fix failing CI first and push those fixes before cutting the release commit.
-5. Continue only after the release base commit is green remotely.
-6. Choose the target version.
-7. Update the release files.
-8. Commit, tag, and push using the repo's current release convention.
-9. Verify the pushed release commit on GitHub Actions.
+1. Identify the branch that should actually receive the release commit.
+2. Stop immediately if the current branch is only a stale feature branch, already merged PR branch, or otherwise not the branch that will carry the release commit after push; switch to a clean, up-to-date worktree on the real release target branch first.
+3. Make sure that release target branch is up to date with its remote.
+4. Check clippy and rust fmt locally before pushing any commits.
+5. Inspect the release target branch and its current candidate commit on GitHub Actions.
+6. Fix failing CI first and push those fixes before cutting the release commit.
+7. Continue only after the release base commit is green remotely.
+8. Choose the target version.
+9. Update the release files.
+10. Commit, tag, and push using the repo's current release convention.
+11. Verify the pushed release commit on GitHub Actions.
+
+## Verify The Release Base First
+
+- Treat the branch that will actually host the release commit after push as the release target branch.
+- Default to the repository's current primary release branch unless the caller explicitly asks for another target branch.
+- Verify the current branch is still the right release target before making any release edits, version bumps, commits, or tags.
+- Check whether the current branch's PR is already merged or closed; if so, do not cut the release there even if the local branch still contains the candidate changes.
+- If the release should land on a different branch than the current checkout, switch to that branch or create a fresh worktree from its remote tip before proceeding.
 
 ## Make CI Green
 
 - Treat remote CI state as the source of truth.
+- Validate the exact commit on the exact target branch that will become the release base, not merely an equivalent commit on another branch.
 - Use the repo's current workflows, task runner, branch protection, and recent runs to discover the right validation path instead of relying on a frozen list of commands.
 - Reproduce failures locally when useful, but do not stop at local success; wait for green GitHub runs on the commit that will become the release base.
 - Keep CI repair commits separate from the final release commit.

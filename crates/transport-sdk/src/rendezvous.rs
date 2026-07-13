@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
-use common::ClusterId;
+use common::{ClusterId, NodeId};
 use reqwest::{Certificate, Client, Url};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -68,6 +69,8 @@ pub struct PresenceRegistration {
 pub struct PresenceEntry {
     pub registration: PresenceRegistration,
     pub updated_at_unix: u64,
+    #[serde(default)]
+    pub observed_source_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +86,16 @@ pub struct RegisterPresenceResponse {
 pub struct PresenceListResponse {
     pub registered_endpoints: usize,
     pub entries: Vec<PresenceEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryResponse {
+    #[serde(default)]
+    pub rendezvous_peers: Vec<RendezvousEndpointStatus>,
+    #[serde(default)]
+    pub node_candidates: Option<Vec<ConnectionCandidate>>,
+    #[serde(default)]
+    pub node_relay_capable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -277,6 +290,52 @@ impl RendezvousControlClient {
 
     pub async fn list_presence(&self) -> Result<PresenceListResponse> {
         self.get_json("/control/presence").await
+    }
+
+    pub async fn fetch_mesh(&self) -> Result<RendezvousRuntimeState> {
+        self.get_json("/control/mesh").await
+    }
+
+    pub async fn fetch_discovery(&self, node_id: Option<NodeId>) -> Result<DiscoveryResponse> {
+        let mut last_error = None;
+        for base_url in &self.config.rendezvous_urls {
+            let mut url = control_url(base_url, "/control/discovery")?;
+            if let Some(node_id) = node_id {
+                url.query_pairs_mut()
+                    .append_pair("node_id", &node_id.to_string());
+            }
+
+            match self.http.get(url.clone()).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(ok_response) => match ok_response.json::<DiscoveryResponse>().await {
+                        Ok(payload) => {
+                            self.record_endpoint_result(base_url, Ok(()), true);
+                            return Ok(payload);
+                        }
+                        Err(err) => {
+                            let message =
+                                format!("failed decoding rendezvous response from {url}: {err}");
+                            self.record_endpoint_result(base_url, Err(message.clone()), true);
+                            return Err(anyhow!(message));
+                        }
+                    },
+                    Err(err) => {
+                        let message = format!("rendezvous endpoint {url} returned error: {err}");
+                        self.record_endpoint_result(base_url, Err(message.clone()), true);
+                        last_error = Some(anyhow!(message));
+                    }
+                },
+                Err(err) => {
+                    let message = self.decorate_transport_error(format!(
+                        "failed contacting rendezvous endpoint {url}: {err}"
+                    ));
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
 
     pub async fn issue_relay_ticket(&self, request: &RelayTicketRequest) -> Result<RelayTicket> {
@@ -792,6 +851,7 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::{Json, Router, routing::get};
+    use common::NodeId;
     use uuid::Uuid;
 
     const TEST_RENDEZVOUS_CLIENT_CERT_PEM: &str = concat!(
@@ -881,6 +941,77 @@ mod tests {
             Some(healthy_url.as_str())
         );
         assert!(probed_state.endpoint_statuses[1].active);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn fetch_discovery_returns_mesh_and_node_candidates() {
+        let cluster_id = Uuid::now_v7();
+        let node_id = NodeId::now_v7();
+        let router = Router::new().route(
+            "/control/discovery",
+            get(move || async move {
+                Json(DiscoveryResponse {
+                    rendezvous_peers: vec![RendezvousEndpointStatus {
+                        url: "https://peer-rendezvous.example".to_string(),
+                        status: RendezvousEndpointConnectionState::Connected,
+                        last_attempt_unix: Some(10),
+                        last_success_unix: Some(10),
+                        consecutive_failures: 0,
+                        last_error: None,
+                        active: false,
+                    }],
+                    node_candidates: Some(vec![ConnectionCandidate {
+                        kind: crate::CandidateKind::ServerReflexive,
+                        endpoint: "https://203.0.113.10:7443".to_string(),
+                        rtt_ms: None,
+                    }]),
+                    node_relay_capable: true,
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test rendezvous server should run");
+        });
+
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let discovery = client
+            .fetch_discovery(Some(node_id))
+            .await
+            .expect("discovery fetch should succeed");
+
+        assert_eq!(discovery.rendezvous_peers.len(), 1);
+        assert_eq!(
+            discovery.rendezvous_peers[0].url,
+            "https://peer-rendezvous.example"
+        );
+        assert_eq!(
+            discovery.node_candidates,
+            Some(vec![ConnectionCandidate {
+                kind: crate::CandidateKind::ServerReflexive,
+                endpoint: "https://203.0.113.10:7443".to_string(),
+                rtt_ms: None,
+            }])
+        );
+        assert!(discovery.node_relay_capable);
 
         server.abort();
         let _ = server.await;

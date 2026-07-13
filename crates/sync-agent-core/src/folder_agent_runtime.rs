@@ -839,6 +839,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let preserve_local_files = local_paths_to_preserve_on_startup_with_hash(
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
+        &baseline_hashes_before_remote_sync,
         &remote_hashes_before_remote_sync,
         file_hash_label,
         |path| backend.file_content_fingerprint(options, path),
@@ -925,6 +926,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         None,
     );
 
+    let mut local_state = local_state_before_remote_sync;
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
     let mut initial_remote_outcome = apply_remote_snapshot(
@@ -932,6 +934,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         options,
         &client,
         &initial_snapshot,
+        Some(&mut local_state),
         None,
         Some(&preserve_local_files),
         Some(&matching_remote_files),
@@ -954,24 +957,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
             Some(&startup_reconcile_log_context),
         )?;
         suppressed_uploads.remove(path);
+        remove_local_state_path_and_descendants(&mut local_state, path);
     }
     initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
-
-    let startup_remote_rescan_message =
-        format!("Rescanning {local_tree_label} after applying startup remote changes");
-
-    let mut local_state = scan_local_tree_with_status_progress(
-        backend,
-        options,
-        &connection_target,
-        status_callback.as_ref(),
-        "syncing",
-        "startup",
-        &startup_remote_rescan_message,
-        Some(&remote_index),
-        last_success_unix_ms,
-    )
-    .context("failed to scan local state after initial remote sync")?;
     local_state = startup_baseline_state_from_remote_index(
         &local_state,
         &remote_index,
@@ -1134,7 +1122,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
 
-    let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
+    let refresh_poller = RemoteSnapshotPoller::prefer_server_notifications(refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
     let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
     store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
@@ -1150,10 +1138,11 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_latest_metrics = latest_metrics.clone();
     let remote_last_success = last_success_shared.clone();
     let remote_idle_message = idle_watch_message.clone();
-    let remote_thread = refresh_poller.spawn_changed_paths_loop(
+    let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
         remote_running,
         Some(initial_snapshot),
-        move || {
+        refresh_fetcher,
+        move |refresh_fetcher| {
             fetch_remote_snapshot_with_status_progress(
                 &remote_options,
                 &remote_connection_target,
@@ -1164,7 +1153,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 "steady-state",
                 "checking-remote-snapshot",
                 "Checking remote snapshot for changes",
-                &refresh_fetcher,
+                refresh_fetcher,
                 latest_metrics_value(&remote_latest_metrics),
                 load_optional_unix_ms(&remote_last_success),
                 Some(remote_idle_message.as_str()),
@@ -1209,6 +1198,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 options,
                 &client,
                 &update.snapshot,
+                Some(&mut local_state),
                 Some(&update.changed_paths),
                 None,
                 None,
@@ -1223,20 +1213,6 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         }
 
         if remote_updates_applied {
-            let remote_rescan_message =
-                format!("Rescanning {local_tree_label} after applying remote changes");
-            local_state = scan_local_tree_with_status_progress(
-                backend,
-                options,
-                &connection_target,
-                status_callback.as_ref(),
-                "syncing",
-                "steady-state",
-                &remote_rescan_message,
-                Some(&remote_index),
-                last_success_unix_ms,
-            )
-            .context("failed to rescan local state after remote update")?;
             seed_downloaded_remote_files_into_local_state(
                 &mut local_state,
                 &remote_index,
@@ -1244,11 +1220,14 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 None,
             );
             baseline_dirty = true;
-            next_local_scan = Instant::now()
+            let local_scan_deadline = Instant::now()
                 + steady_state_local_scan_interval(
                     options,
                     backend.local_watch_hints_available(options),
                 );
+            if local_scan_deadline < next_local_scan {
+                next_local_scan = local_scan_deadline;
+            }
             last_success_unix_ms = Some(now_unix_ms());
             store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
             let mut remote_runtime_metrics =
@@ -1523,6 +1502,70 @@ fn seed_downloaded_remote_files_into_local_state(
             .entry(path.clone())
             .or_insert_with(|| entry_state.clone());
     }
+}
+
+fn remove_local_state_path_and_descendants(local_state: &mut LocalTreeState, path: &str) {
+    let prefix = format!("{path}/");
+    local_state.retain(|entry_path, _| entry_path != path && !entry_path.starts_with(&prefix));
+}
+
+fn sync_local_state_parent_directories<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    local_state: &mut LocalTreeState,
+    path: &str,
+) -> Result<()> {
+    for parent in parent_directories(path) {
+        match backend.local_entry_state(options, &parent)? {
+            Some(entry_state) if entry_state.kind == LocalEntryKind::Directory => {
+                local_state.insert(parent, entry_state);
+            }
+            _ => remove_local_state_path_and_descendants(local_state, &parent),
+        }
+    }
+
+    Ok(())
+}
+
+fn sync_local_state_path_and_parents<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    local_state: &mut LocalTreeState,
+    path: &str,
+    entry_state: Option<LocalEntryState>,
+) -> Result<()> {
+    sync_local_state_parent_directories(backend, options, local_state, path)?;
+
+    let entry_state = match entry_state {
+        Some(entry_state) => Some(entry_state),
+        None => backend.local_entry_state(options, path)?,
+    };
+
+    match entry_state {
+        Some(entry_state) => {
+            if entry_state.kind == LocalEntryKind::File {
+                remove_local_state_path_and_descendants(local_state, path);
+            }
+            local_state.insert(path.to_string(), entry_state);
+        }
+        None => remove_local_state_path_and_descendants(local_state, path),
+    }
+
+    Ok(())
+}
+
+fn local_path_diverged_since_baseline<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    local_state: Option<&LocalTreeState>,
+    path: &str,
+) -> Result<bool> {
+    let Some(local_state) = local_state else {
+        return Ok(false);
+    };
+
+    let current = backend.local_entry_state(options, path)?;
+    Ok(local_state.get(path) != current.as_ref())
 }
 
 fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClient> {
@@ -2128,6 +2171,7 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     options: &FolderAgentRuntimeOptions,
     client: &IronMeshClient,
     snapshot: &SyncSnapshot,
+    mut local_state: Option<&mut LocalTreeState>,
     changed_paths: Option<&[String]>,
     preserve_local_files: Option<&BTreeSet<String>>,
     matching_remote_files: Option<&BTreeSet<String>>,
@@ -2190,17 +2234,46 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
             for path in &changed_local_paths {
                 let path = path.as_str();
                 if let Some((EntryKind::Directory, _)) = entry_kinds.get(path) {
+                    if local_state
+                        .as_deref()
+                        .is_some_and(|state| state.contains_key(path))
+                        && local_path_diverged_since_baseline(
+                            backend,
+                            options,
+                            local_state.as_deref(),
+                            path,
+                        )?
+                    {
+                        tracing::info!(
+                            "remote-sync: skipped stale remote directory apply for {path}; local path diverged since the previous baseline"
+                        );
+                        continue;
+                    }
                     outcome.changed_path_count += 1;
                     outcome.ensured_directory_count += 1;
                     backend.ensure_local_directory(options, path)?;
+                    let entry_state = if state_store.is_some() || local_state.is_some() {
+                        backend.local_entry_state(options, path)?
+                    } else {
+                        None
+                    };
                     if let Some(store) = state_store
-                        && let Some(entry_state) = backend.local_entry_state(options, path)?
+                        && let Some(entry_state) = entry_state.as_ref()
                     {
                         store
-                            .upsert_baseline_entry(path, &entry_state)
+                            .upsert_baseline_entry(path, entry_state)
                             .with_context(|| {
                                 format!("failed to persist baseline directory entry for {path}")
                             })?;
+                    }
+                    if let Some(local_state) = local_state.as_deref_mut() {
+                        sync_local_state_path_and_parents(
+                            backend,
+                            options,
+                            local_state,
+                            path,
+                            entry_state,
+                        )?;
                     }
                 }
             }
@@ -2212,6 +2285,21 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                         // Already handled above.
                     }
                     Some((EntryKind::File, remote_key)) => {
+                        if local_state
+                            .as_deref()
+                            .is_some_and(|state| state.contains_key(path))
+                            && local_path_diverged_since_baseline(
+                                backend,
+                                options,
+                                local_state.as_deref(),
+                                path,
+                            )?
+                        {
+                            tracing::info!(
+                                "remote-sync: skipped stale remote file apply for {path}; local path diverged since the previous baseline"
+                            );
+                            continue;
+                        }
                         outcome.changed_path_count += 1;
                         let content_hash = entry_hashes.get(path).map(|hash| hash.as_str());
                         if let Some(entry_state) = matching_local_entry_for_remote_file_change(
@@ -2224,6 +2312,15 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                             tracing::info!(
                                 "remote-sync: skipped download for {path}; local file already matches remote content"
                             );
+                            if let Some(local_state) = local_state.as_deref_mut() {
+                                sync_local_state_path_and_parents(
+                                    backend,
+                                    options,
+                                    local_state,
+                                    path,
+                                    Some(entry_state.clone()),
+                                )?;
+                            }
                             suppressed_uploads.insert(path.to_string(), entry_state);
                             continue;
                         }
@@ -2240,6 +2337,15 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                             modification_log,
                             modification_context,
                         )?;
+                        if let Some(local_state) = local_state.as_deref_mut() {
+                            sync_local_state_path_and_parents(
+                                backend,
+                                options,
+                                local_state,
+                                path,
+                                Some(entry_state.clone()),
+                            )?;
+                        }
                         suppressed_uploads.insert(path.to_string(), entry_state);
                     }
                     None => {
@@ -2267,6 +2373,15 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                             modification_context,
                         )?;
                         suppressed_uploads.remove(path);
+                        if let Some(local_state) = local_state.as_deref_mut() {
+                            remove_local_state_path_and_descendants(local_state, path);
+                            sync_local_state_parent_directories(
+                                backend,
+                                options,
+                                local_state,
+                                path,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2283,17 +2398,31 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                 outcome.changed_path_count += 1;
                 outcome.ensured_directory_count += 1;
                 backend.ensure_local_directory(options, directory)?;
+                let entry_state = if state_store.is_some() || local_state.is_some() {
+                    backend.local_entry_state(options, directory)?
+                } else {
+                    None
+                };
                 if let Some(store) = state_store
-                    && let Some(entry_state) = backend.local_entry_state(options, directory)?
+                    && let Some(entry_state) = entry_state.as_ref()
                 {
                     store
-                        .upsert_baseline_entry(directory, &entry_state)
+                        .upsert_baseline_entry(directory, entry_state)
                         .with_context(|| {
                             format!(
                                 "failed to persist baseline directory entry for {}",
                                 directory
                             )
                         })?;
+                }
+                if let Some(local_state) = local_state.as_deref_mut() {
+                    sync_local_state_path_and_parents(
+                        backend,
+                        options,
+                        local_state,
+                        directory,
+                        entry_state,
+                    )?;
                 }
             }
 
@@ -2330,6 +2459,15 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                     modification_log,
                     modification_context,
                 )?;
+                if let Some(local_state) = local_state.as_deref_mut() {
+                    sync_local_state_path_and_parents(
+                        backend,
+                        options,
+                        local_state,
+                        file,
+                        Some(entry_state.clone()),
+                    )?;
+                }
                 suppressed_uploads.insert(file.clone(), entry_state);
             }
 
@@ -2924,6 +3062,7 @@ mod tests {
             local_path: String,
             remote_key: String,
         },
+        RemoveLocalPath(String),
     }
 
     #[derive(Debug, Default)]
@@ -2990,6 +3129,16 @@ mod tests {
         ) -> Result<()> {
             self.operations
                 .push(BackendOperation::EnsureDirectory(relative_path.to_string()));
+            for parent in parent_directories(relative_path) {
+                self.local_entries.insert(
+                    parent,
+                    LocalEntryState {
+                        kind: LocalEntryKind::Directory,
+                        size_bytes: 0,
+                        modified_unix_ms: 0,
+                    },
+                );
+            }
             self.local_entries.insert(
                 relative_path.to_string(),
                 LocalEntryState {
@@ -3026,6 +3175,17 @@ mod tests {
             if self.fail_download_for.as_deref() == Some(local_relative_path) {
                 bail!("simulated download failure");
             }
+            remove_local_state_path_and_descendants(&mut self.local_entries, local_relative_path);
+            for parent in parent_directories(local_relative_path) {
+                self.local_entries.insert(
+                    parent,
+                    LocalEntryState {
+                        kind: LocalEntryKind::Directory,
+                        size_bytes: 0,
+                        modified_unix_ms: 0,
+                    },
+                );
+            }
             self.local_entries.insert(
                 local_relative_path.to_string(),
                 LocalEntryState {
@@ -3040,9 +3200,22 @@ mod tests {
         fn remove_local_path(
             &mut self,
             _options: &FolderAgentRuntimeOptions,
-            _relative_path: &str,
+            relative_path: &str,
         ) -> Result<()> {
-            panic!("remove_local_path should not be called in this test");
+            self.operations
+                .push(BackendOperation::RemoveLocalPath(relative_path.to_string()));
+            remove_local_state_path_and_descendants(&mut self.local_entries, relative_path);
+            for parent in parent_directories(relative_path) {
+                self.local_entries.insert(
+                    parent,
+                    LocalEntryState {
+                        kind: LocalEntryKind::Directory,
+                        size_bytes: 0,
+                        modified_unix_ms: 17,
+                    },
+                );
+            }
+            Ok(())
         }
 
         fn start_local_change_monitor(
@@ -3209,6 +3382,7 @@ mod tests {
             &options,
             &client,
             &snapshot,
+            None,
             Some(&changed_paths),
             None,
             None,
@@ -3280,6 +3454,7 @@ mod tests {
             &options,
             &client,
             &snapshot,
+            None,
             Some(&changed_paths),
             None,
             None,
@@ -3307,5 +3482,495 @@ mod tests {
             BTreeSet::from(["empty-lifecycle".to_string()])
         );
         assert!(remote_index.files.is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_updates_local_state_for_downloaded_file_parents() {
+        let mut backend = RecordingBackend::default();
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file(
+                "nested/child.txt",
+                "v1",
+                "remote-hash",
+            )],
+        };
+        let changed_paths = vec!["nested/child.txt".to_string()];
+        let scope = PathScope::new(None);
+        let mut local_state = LocalTreeState::new();
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("remote download should succeed");
+
+        assert_eq!(outcome.downloaded_file_count, 1);
+        assert_eq!(
+            local_state.get("nested"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 0,
+            })
+        );
+        assert_eq!(
+            local_state.get("nested/child.txt"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 0,
+            })
+        );
+        assert_eq!(
+            suppressed_uploads.get("nested/child.txt"),
+            local_state.get("nested/child.txt")
+        );
+        assert!(remote_index.directories.is_empty());
+        assert_eq!(
+            remote_index.files,
+            BTreeSet::from(["nested/child.txt".to_string()])
+        );
+    }
+
+    #[test]
+    fn apply_remote_snapshot_replaces_directory_subtree_with_file_in_local_state() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "switch".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 0,
+            },
+        );
+        backend.local_entries.insert(
+            "switch/old.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 5,
+                modified_unix_ms: 9,
+            },
+        );
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file(
+                "switch",
+                "v2",
+                "remote-hash",
+            )],
+        };
+        let changed_paths = vec!["switch".to_string()];
+        let scope = PathScope::new(None);
+        let mut local_state = backend.local_entries.clone();
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        remote_index.directories.insert("switch".to_string());
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("directory-to-file transition should succeed");
+
+        assert_eq!(outcome.downloaded_file_count, 1);
+        assert_eq!(
+            local_state.get("switch"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 0,
+            })
+        );
+        assert!(!local_state.contains_key("switch/old.txt"));
+        assert_eq!(
+            backend.operations,
+            vec![BackendOperation::DownloadFile {
+                local_path: "switch".to_string(),
+                remote_key: "switch".to_string(),
+            }]
+        );
+        assert_eq!(remote_index.files, BTreeSet::from(["switch".to_string()]));
+        assert!(remote_index.directories.is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_removes_deleted_paths_from_local_state_without_rescan() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "nested".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 0,
+            },
+        );
+        backend.local_entries.insert(
+            "nested/child.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 11,
+            },
+        );
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+        };
+        let changed_paths = vec!["nested/child.txt".to_string()];
+        let scope = PathScope::new(None);
+        let mut local_state = backend.local_entries.clone();
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        remote_index.files.insert("nested/child.txt".to_string());
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("remote delete should succeed");
+
+        assert_eq!(outcome.removed_local_path_count, 1);
+        assert_eq!(
+            backend.operations,
+            vec![BackendOperation::RemoveLocalPath(
+                "nested/child.txt".to_string()
+            )]
+        );
+        assert_eq!(
+            backend.local_entries.get("nested"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 17,
+            })
+        );
+        assert!(!backend.local_entries.contains_key("nested/child.txt"));
+        assert_eq!(
+            local_state.get("nested"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 17,
+            })
+        );
+        assert!(!local_state.contains_key("nested/child.txt"));
+        assert!(remote_index.directories.is_empty());
+        assert!(remote_index.files.is_empty());
+    }
+    #[test]
+    fn apply_remote_snapshot_skips_recreating_known_directory_after_local_delete() {
+        let mut backend = RecordingBackend::default();
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::directory(
+                "empty-lifecycle/marker-only",
+            )],
+        };
+        let changed_paths = vec!["empty-lifecycle/marker-only".to_string()];
+        let scope = PathScope::new(None);
+        let mut local_state = LocalTreeState::from([(
+            "empty-lifecycle/marker-only".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 3,
+            },
+        )]);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        remote_index
+            .directories
+            .insert("empty-lifecycle/marker-only".to_string());
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("stale directory echo should be skipped");
+
+        assert_eq!(outcome.changed_path_count, 0);
+        assert!(backend.operations.is_empty());
+        assert!(
+            !backend
+                .local_entries
+                .contains_key("empty-lifecycle/marker-only")
+        );
+        assert!(local_state.contains_key("empty-lifecycle/marker-only"));
+        assert_eq!(
+            remote_index.directories,
+            BTreeSet::from(["empty-lifecycle/marker-only".to_string()])
+        );
+    }
+
+    #[test]
+    fn apply_remote_snapshot_skips_recreating_directory_before_remote_index_catches_up() {
+        let mut backend = RecordingBackend::default();
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::directory(
+                "empty-lifecycle/marker-only",
+            )],
+        };
+        let changed_paths = vec!["empty-lifecycle/marker-only".to_string()];
+        let scope = PathScope::new(None);
+        let mut local_state = LocalTreeState::from([(
+            "empty-lifecycle/marker-only".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 3,
+            },
+        )]);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("stale directory echo should be skipped even before remote index catches up");
+
+        assert_eq!(outcome.changed_path_count, 0);
+        assert!(backend.operations.is_empty());
+        assert!(
+            !backend
+                .local_entries
+                .contains_key("empty-lifecycle/marker-only")
+        );
+        assert!(local_state.contains_key("empty-lifecycle/marker-only"));
+        assert_eq!(
+            remote_index.directories,
+            BTreeSet::from(["empty-lifecycle/marker-only".to_string()])
+        );
+    }
+
+    #[test]
+    fn apply_remote_snapshot_skips_recreating_known_file_after_local_type_flip() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "flip".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 9,
+            },
+        );
+        backend.local_entries.insert(
+            "flip/child.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 9,
+            },
+        );
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file("flip", "v1", "remote-hash")],
+        };
+        let changed_paths = vec!["flip".to_string()];
+        let scope = PathScope::new(None);
+        let mut local_state = LocalTreeState::from([(
+            "flip".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            },
+        )]);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        remote_index.files.insert("flip".to_string());
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("stale file echo should be skipped");
+
+        assert_eq!(outcome.changed_path_count, 0);
+        assert!(backend.operations.is_empty());
+        assert_eq!(
+            backend.local_entries.get("flip"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 9,
+            })
+        );
+        assert!(backend.local_entries.contains_key("flip/child.txt"));
+        assert_eq!(
+            local_state.get("flip"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            })
+        );
+        assert_eq!(remote_index.files, BTreeSet::from(["flip".to_string()]));
+    }
+
+    #[test]
+    fn apply_remote_snapshot_skips_recreating_file_before_remote_index_catches_up() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "flip".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 9,
+            },
+        );
+        backend.local_entries.insert(
+            "flip/child.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 9,
+            },
+        );
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file("flip", "v1", "remote-hash")],
+        };
+        let changed_paths = vec!["flip".to_string()];
+        let scope = PathScope::new(None);
+        let mut local_state = LocalTreeState::from([(
+            "flip".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            },
+        )]);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            Some(&mut local_state),
+            Some(&changed_paths),
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("stale file echo should be skipped even before remote index catches up");
+
+        assert_eq!(outcome.changed_path_count, 0);
+        assert!(backend.operations.is_empty());
+        assert_eq!(
+            backend.local_entries.get("flip"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::Directory,
+                size_bytes: 0,
+                modified_unix_ms: 9,
+            })
+        );
+        assert!(backend.local_entries.contains_key("flip/child.txt"));
+        assert_eq!(
+            local_state.get("flip"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            })
+        );
+        assert_eq!(remote_index.files, BTreeSet::from(["flip".to_string()]));
     }
 }

@@ -185,13 +185,14 @@ pub(crate) async fn execute_replication_repair_inner_with_context(
     sync_availability_views_once(state).await;
     let keys = planning_replication_subjects(state).await;
 
-    let (plan, nodes) = {
+    let plan_snapshot = {
         let mut cluster = state.cluster.lock().await;
         cluster.update_health_and_detect_offline_transition();
-        (cluster.replication_plan(&keys), cluster.list_nodes())
+        cluster.replication_plan_snapshot(&keys)
     };
+    let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
 
-    execute_replication_repair_plan(state, plan, nodes, batch_size_override, false, run_id).await
+    execute_replication_repair_plan(state, &plan, nodes, batch_size_override, false, run_id).await
 }
 
 #[allow(dead_code)]
@@ -224,11 +225,12 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner_with_conte
 
     sync_availability_views_once(state).await;
 
-    let (plan, nodes) = {
+    let plan_snapshot = {
         let mut cluster = state.cluster.lock().await;
         cluster.update_health_and_detect_offline_transition();
-        (cluster.replication_plan(&subjects), cluster.list_nodes())
+        cluster.replication_plan_snapshot(&subjects)
     };
+    let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
     let batch_size_override = batch_size_override.or_else(|| {
         Some(
             plan.items
@@ -238,15 +240,9 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner_with_conte
                 .max(1),
         )
     });
-    let report = execute_replication_repair_plan(
-        state,
-        plan.clone(),
-        nodes,
-        batch_size_override,
-        false,
-        run_id,
-    )
-    .await;
+    let report =
+        execute_replication_repair_plan(state, &plan, nodes, batch_size_override, false, run_id)
+            .await;
 
     (plan, report)
 }
@@ -798,7 +794,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
 
 async fn execute_replication_repair_plan(
     state: &ServerState,
-    plan: ReplicationPlan,
+    plan: &ReplicationPlan,
     nodes: Vec<NodeDescriptor>,
     batch_size_override: Option<usize>,
     verify_local_pulls: bool,
@@ -830,7 +826,7 @@ async fn execute_replication_repair_plan(
     let now = unix_ts();
     let repair_run_id = run_id.unwrap_or("untracked");
 
-    let mut plan_items = plan.items;
+    let mut plan_items = plan.items.iter().collect::<Vec<_>>();
     let plan_item_count = plan_items.len();
     plan_items.sort_by(|a, b| {
         let a_versioned = parse_replication_subject(&a.key)
@@ -1380,7 +1376,7 @@ async fn execute_replication_repair_plan(
             continue;
         };
 
-        for target in item.missing_nodes {
+        for &target in &item.missing_nodes {
             if attempted_transfers >= max_transfers {
                 push_repair_log_entry(
                     &mut detailed_log,

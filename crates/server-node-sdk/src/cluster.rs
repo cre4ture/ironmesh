@@ -104,10 +104,10 @@ fn collect_reachability_urls<'a>(primary: Option<&'a str>, urls: &'a [String]) -
     let mut seen = HashSet::new();
     let mut normalized = Vec::new();
 
-    if let Some(primary) = primary.map(str::trim).filter(|value| !value.is_empty()) {
-        if seen.insert(primary.to_string()) {
-            normalized.push(primary);
-        }
+    if let Some(primary) = primary.map(str::trim).filter(|value| !value.is_empty())
+        && seen.insert(primary.to_string())
+    {
+        normalized.push(primary);
     }
 
     for value in urls {
@@ -164,7 +164,7 @@ pub struct PlacementDecision {
     pub replication_factor: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicationPlanItem {
     pub key: String,
     pub desired_nodes: Vec<NodeId>,
@@ -175,7 +175,7 @@ pub struct ReplicationPlanItem {
     pub deferred_extra_nodes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicationPlan {
     pub generated_at_unix: u64,
     pub under_replicated: usize,
@@ -183,6 +183,14 @@ pub struct ReplicationPlan {
     pub cleanup_deferred_items: usize,
     pub cleanup_deferred_extra_nodes: usize,
     pub items: Vec<ReplicationPlanItem>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationPlanSnapshot {
+    keys: Vec<String>,
+    policy: ReplicationPolicy,
+    nodes: HashMap<NodeId, NodeDescriptor>,
+    current_replicas_by_key: HashMap<String, HashSet<NodeId>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,17 +698,41 @@ impl ClusterService {
     }
 
     pub fn replication_plan(&self, keys: &[String]) -> ReplicationPlan {
+        self.replication_plan_snapshot(keys).plan()
+    }
+
+    pub fn replication_plan_snapshot(&self, keys: &[String]) -> ReplicationPlanSnapshot {
+        let current_replicas_by_key = keys
+            .iter()
+            .map(|key| (key.clone(), self.current_replica_nodes_for_subject(key)))
+            .collect();
+
+        ReplicationPlanSnapshot {
+            keys: keys.to_vec(),
+            policy: self.policy.clone(),
+            nodes: self.nodes.clone(),
+            current_replicas_by_key,
+        }
+    }
+}
+
+impl ReplicationPlanSnapshot {
+    pub fn plan(&self) -> ReplicationPlan {
         let mut items = Vec::new();
         let mut remaining_tolerated_extra = self.policy.accepted_over_replication_items;
 
-        for key in keys {
+        for key in &self.keys {
             let placement_key = replication_placement_key(key);
             let desired_nodes =
                 select_nodes_by_rendezvous(placement_key, &self.nodes, &self.policy);
             let desired_set: HashSet<_> = desired_nodes.iter().copied().collect();
             let target_replica_count = desired_nodes.len();
 
-            let current_set = self.current_replica_nodes_for_subject(key);
+            let empty_current_set = HashSet::new();
+            let current_set = self
+                .current_replicas_by_key
+                .get(key)
+                .unwrap_or(&empty_current_set);
             let mut current_nodes: Vec<_> = current_set.iter().copied().collect();
             current_nodes.sort();
 
@@ -788,6 +820,13 @@ impl ClusterService {
             cleanup_deferred_extra_nodes,
             items,
         }
+    }
+
+    pub fn into_plan_and_nodes(self) -> (ReplicationPlan, Vec<NodeDescriptor>) {
+        let plan = self.plan();
+        let mut nodes: Vec<_> = self.nodes.into_values().collect();
+        nodes.sort_by_key(|node| node.node_id);
+        (plan, nodes)
     }
 }
 
@@ -1133,6 +1172,47 @@ mod tests {
 
         assert!(plan.under_replicated >= 1);
         assert!(plan.over_replicated >= 1);
+    }
+
+    #[test]
+    fn replication_plan_snapshot_matches_direct_plan() {
+        let local = NodeId::new_v4();
+        let policy = ReplicationPolicy {
+            replication_factor: 2,
+            accepted_over_replication_items: 1,
+            ..ReplicationPolicy::default()
+        };
+
+        let mut svc = ClusterService::new(local, policy, 60);
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+
+        svc.note_replica("k-missing", node_a);
+        svc.note_replica("k-extra", node_a);
+        svc.note_replica("k-extra", node_b);
+        svc.note_replica("k-extra", node_c);
+        svc.note_replica("k-deferred", node_a);
+        svc.note_replica("k-deferred", node_b);
+        svc.note_replica("k-deferred", node_c);
+
+        let keys = vec![
+            "k-missing".to_string(),
+            "k-extra".to_string(),
+            "k-deferred".to_string(),
+        ];
+
+        let mut direct_plan = svc.replication_plan(&keys);
+        let (mut snapshot_plan, _) = svc.replication_plan_snapshot(&keys).into_plan_and_nodes();
+
+        direct_plan.generated_at_unix = 0;
+        snapshot_plan.generated_at_unix = 0;
+
+        assert_eq!(snapshot_plan, direct_plan);
     }
 
     #[test]

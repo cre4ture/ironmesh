@@ -5,7 +5,8 @@ use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
     IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
+    build_http_client_from_planned_targets, build_http_client_with_identity_from_pem,
+    build_http_client_with_identity_from_planned_targets, compare_direct_and_relay_latency,
     enroll_connection_input_blocking, normalize_server_base_url,
 };
 use serde::Serialize;
@@ -457,9 +458,49 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
             "building authenticated client from bootstrap"
         );
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
-        let client = match client_identity.as_ref() {
-            Some(identity) => bootstrap.build_client_with_identity(identity),
-            None => bootstrap.build_client(),
+        let refreshed_targets = match bootstrap
+            .refresh_dynamic_targets_blocking(client_identity.as_ref())
+        {
+            Ok(targets) => {
+                info!(
+                    refreshed_target_count = targets.len(),
+                    "refreshed bootstrap targets from rendezvous discovery"
+                );
+                Some(targets)
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to refresh bootstrap targets from rendezvous discovery; falling back to static bootstrap targets"
+                );
+                None
+            }
+        };
+        let client = if let Some(targets) = refreshed_targets.as_ref() {
+            match client_identity.as_ref() {
+                Some(identity) => {
+                    build_http_client_with_identity_from_planned_targets(targets, identity)
+                }
+                None => {
+                    let has_direct_target = targets
+                        .iter()
+                        .any(|target| target.server_base_url.is_some());
+                    if !has_direct_target
+                        && targets
+                            .iter()
+                            .any(|target| target.server_base_url.is_none())
+                    {
+                        bootstrap.build_client()
+                    } else {
+                        build_http_client_from_planned_targets(targets)
+                    }
+                }
+            }
+        } else {
+            match client_identity.as_ref() {
+                Some(identity) => bootstrap.build_client_with_identity(identity),
+                None => bootstrap.build_client(),
+            }
         }?;
         log_client_transport_ready("build_authenticated_sdk_from_cli_blocking", &client);
         return Ok(client);
