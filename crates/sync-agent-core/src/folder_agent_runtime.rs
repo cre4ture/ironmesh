@@ -839,6 +839,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let preserve_local_files = local_paths_to_preserve_on_startup_with_hash(
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
+        &baseline_hashes_before_remote_sync,
         &remote_hashes_before_remote_sync,
         file_hash_label,
         |path| backend.file_content_fingerprint(options, path),
