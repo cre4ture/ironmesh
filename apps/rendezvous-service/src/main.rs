@@ -34,7 +34,7 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
         "rendezvous service listening"
     );
 
-    serve_rendezvous(RendezvousAppState::new(config.server_config())).await
+    serve_rendezvous(RendezvousAppState::new(config.server_config())?).await
 }
 
 #[cfg(test)]
@@ -69,6 +69,7 @@ mod tests {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
             allow_insecure_http: true,
             failover_package: None,
@@ -299,6 +300,7 @@ mod tests {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: Some(config::RendezvousMtlsConfig {
                 client_ca: config::RendezvousClientCa::File {
                     cert_path: rendezvous_ca_path.clone(),
@@ -566,6 +568,7 @@ mod tests {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: Some(config::RendezvousMtlsConfig {
                 client_ca: config::RendezvousClientCa::File {
                     cert_path: rendezvous_ca_path.clone(),
@@ -593,7 +596,8 @@ mod tests {
         )
         .expect("rendezvous mTLS health client should build");
 
-        let rendezvous_state = RendezvousAppState::new(rendezvous_config.server_config());
+        let rendezvous_state = RendezvousAppState::new(rendezvous_config.server_config())
+            .expect("rendezvous app state should build");
         let rendezvous_state_for_server = rendezvous_state.clone();
         let rendezvous_handle = tokio::spawn(async move {
             serve_rendezvous(rendezvous_state_for_server)
@@ -826,6 +830,7 @@ mod tests {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: Some(config::RendezvousMtlsConfig {
                 client_ca: config::RendezvousClientCa::File {
                     cert_path: rendezvous_ca_path.clone(),
@@ -846,7 +851,8 @@ mod tests {
         let target_tls_paths = write_tls_material(&rendezvous_dir, &ca.ca_pem, &target_tls)
             .expect("target TLS material should write");
 
-        let rendezvous_state = RendezvousAppState::new(rendezvous_config.server_config());
+        let rendezvous_state = RendezvousAppState::new(rendezvous_config.server_config())
+            .expect("rendezvous app state should build");
         let rendezvous_state_for_server = rendezvous_state.clone();
         let rendezvous_handle = tokio::spawn(async move {
             serve_rendezvous(rendezvous_state_for_server)

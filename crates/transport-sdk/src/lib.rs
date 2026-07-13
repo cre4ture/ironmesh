@@ -52,7 +52,7 @@ pub use relay_wake::{
     RelayWakeClient, RelayWakeControlMessage, RelayWakeEvent, RelayWakeRegistration,
 };
 pub use rendezvous::{
-    PresenceEntry, PresenceListResponse, PresenceRegistration,
+    DiscoveryResponse, PresenceEntry, PresenceListResponse, PresenceRegistration,
     RENDEZVOUS_IDENTITY_RENEWAL_WINDOW_SECS, RegisterPresenceResponse, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RendezvousRuntimeState, TransportCapability, is_expected_idle_relay_tunnel_accept_timeout,

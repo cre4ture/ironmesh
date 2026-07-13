@@ -1,11 +1,11 @@
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use axum::extract::FromRequestParts;
-use common::NodeId;
+use axum::extract::{FromRequestParts, connect_info::ConnectInfo};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -32,6 +32,15 @@ impl MaybeAuthenticatedPeer {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MaybeObservedPeerAddr(pub(crate) Option<SocketAddr>);
+
+impl MaybeObservedPeerAddr {
+    pub(crate) fn socket_addr(&self) -> Option<SocketAddr> {
+        self.0
+    }
+}
+
 impl<S> FromRequestParts<S> for MaybeAuthenticatedPeer
 where
     S: Send + Sync,
@@ -47,20 +56,43 @@ where
     }
 }
 
-pub(crate) fn require_authenticated_node(
+impl<S> FromRequestParts<S> for MaybeObservedPeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
+        let observed = parts
+            .extensions
+            .get::<MaybeObservedPeerAddr>()
+            .copied()
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|connect_info| Self(Some(connect_info.0)))
+            })
+            .unwrap_or_default();
+        std::future::ready(Ok(observed))
+    }
+}
+
+pub(crate) fn require_any_authenticated_peer(
     mtls_enabled: bool,
     authenticated_peer: &MaybeAuthenticatedPeer,
-) -> Result<Option<NodeId>> {
+) -> Result<()> {
     if !mtls_enabled {
-        return Ok(None);
+        return Ok(());
     }
 
-    match authenticated_peer.identity() {
-        Some(PeerIdentity::Node(node_id)) => Ok(Some(*node_id)),
-        Some(PeerIdentity::Device(device_id)) => bail!(
-            "rendezvous mTLS requires an authenticated node certificate, got device:{device_id}"
-        ),
-        None => bail!("rendezvous mTLS requires an authenticated peer certificate"),
+    if authenticated_peer.identity().is_some() {
+        Ok(())
+    } else {
+        bail!("rendezvous mTLS requires an authenticated peer certificate")
     }
 }
 
@@ -91,13 +123,19 @@ pub(crate) fn ensure_authenticated_peer_identity(
 pub(crate) struct WithAuthenticatedPeer<S> {
     inner: S,
     authenticated_peer: Option<AuthenticatedPeer>,
+    observed_peer_addr: Option<SocketAddr>,
 }
 
 impl<S> WithAuthenticatedPeer<S> {
-    pub(crate) fn new(inner: S, authenticated_peer: Option<AuthenticatedPeer>) -> Self {
+    pub(crate) fn new(
+        inner: S,
+        authenticated_peer: Option<AuthenticatedPeer>,
+        observed_peer_addr: Option<SocketAddr>,
+    ) -> Self {
         Self {
             inner,
             authenticated_peer,
+            observed_peer_addr,
         }
     }
 }
@@ -120,6 +158,10 @@ where
     fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
         if let Some(authenticated_peer) = self.authenticated_peer.clone() {
             req.extensions_mut().insert(authenticated_peer);
+        }
+        if let Some(observed_peer_addr) = self.observed_peer_addr {
+            req.extensions_mut()
+                .insert(MaybeObservedPeerAddr(Some(observed_peer_addr)));
         }
         self.inner.call(req)
     }
@@ -165,6 +207,7 @@ where
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let observed_peer_addr = stream.peer_addr().ok();
         let fut = self.inner.accept(stream, service);
         Box::pin(async move {
             let (tls_stream, service) = fut.await?;
@@ -172,7 +215,7 @@ where
                 .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
             Ok((
                 tls_stream,
-                WithAuthenticatedPeer::new(service, authenticated_peer),
+                WithAuthenticatedPeer::new(service, authenticated_peer, observed_peer_addr),
             ))
         })
     }
@@ -304,4 +347,28 @@ fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
     uri.strip_prefix("urn:ironmesh:device:")
         .and_then(|rest| rest.parse().ok())
         .map(PeerIdentity::Device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::DeviceId;
+
+    #[test]
+    fn require_any_authenticated_peer_accepts_device_certificate() {
+        let peer = MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
+            identity: PeerIdentity::Device(DeviceId::now_v7()),
+        }));
+
+        require_any_authenticated_peer(true, &peer)
+            .expect("device certificates should satisfy read-only rendezvous auth");
+    }
+
+    #[test]
+    fn require_any_authenticated_peer_rejects_missing_certificate_when_mtls_enabled() {
+        let error = require_any_authenticated_peer(true, &MaybeAuthenticatedPeer::default())
+            .expect_err("missing certificates should be rejected");
+
+        assert!(error.to_string().contains("authenticated peer certificate"));
+    }
 }

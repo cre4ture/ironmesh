@@ -708,6 +708,7 @@ async fn capture_mtls_presence_register(
         entry: transport_sdk::PresenceEntry {
             registration,
             updated_at_unix,
+            observed_source_addr: None,
         },
     })
 }
@@ -793,6 +794,7 @@ async fn https_presence_register(
         entry: transport_sdk::PresenceEntry {
             registration,
             updated_at_unix,
+            observed_source_addr: None,
         },
     })
 }
@@ -2081,8 +2083,10 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
             bind_addr: rendezvous_bind_addr,
             public_url: canonical_rendezvous_url.clone(),
             relay_public_urls: vec![canonical_rendezvous_url.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("rendezvous app state should build");
     let rendezvous_listener = tokio::net::TcpListener::bind(rendezvous_bind_addr)
         .await
         .expect("rendezvous listener should bind");
@@ -2121,7 +2125,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
         true,
         local_descriptor.as_ref(),
     );
-    rendezvous_state.presence.register(registration);
+    rendezvous_state.presence.register(registration, None);
 
     let endpoint = super::current_rendezvous_endpoint_clients(&state)
         .await
@@ -2235,8 +2239,10 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
             bind_addr: bind_addr_a,
             public_url: canonical_rendezvous_url_a.clone(),
             relay_public_urls: vec![canonical_rendezvous_url_a.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("rendezvous app state A should build");
     let listener_a = tokio::net::TcpListener::bind(bind_addr_a)
         .await
         .expect("rendezvous listener A should bind");
@@ -2258,8 +2264,10 @@ async fn rendezvous_relay_multiplex_agent_accepts_concurrent_sessions_across_mul
             bind_addr: bind_addr_b,
             public_url: canonical_rendezvous_url_b.clone(),
             relay_public_urls: vec![canonical_rendezvous_url_b.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: None,
-        });
+        })
+        .expect("rendezvous app state B should build");
     let listener_b = tokio::net::TcpListener::bind(bind_addr_b)
         .await
         .expect("rendezvous listener B should bind");
@@ -9690,6 +9698,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let descriptor = node_descriptor_from_presence_entry(&entry)
@@ -9865,6 +9874,7 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let descriptor = node_descriptor_from_presence_entry(&entry)
@@ -9899,6 +9909,7 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
             connected_at_unix: 123,
         },
         updated_at_unix: 456,
+        observed_source_addr: None,
     };
 
     let discovered = super::apply_rendezvous_presence_entries(&state, &[entry]).await;
@@ -11363,6 +11374,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                         entry: transport_sdk::PresenceEntry {
                             registration,
                             updated_at_unix,
+                            observed_source_addr: None,
                         },
                     })
                 }
@@ -11424,6 +11436,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                         entry: transport_sdk::PresenceEntry {
                             registration,
                             updated_at_unix,
+                            observed_source_addr: None,
                         },
                     })
                 }

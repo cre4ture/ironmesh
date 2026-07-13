@@ -22,6 +22,7 @@ impl EmbeddedRendezvousConfig {
             bind_addr: self.bind_addr,
             public_url: self.public_url.clone(),
             relay_public_urls: vec![self.public_url.clone()],
+            peer_rendezvous_urls: Vec::new(),
             mtls: Some(RendezvousMtlsConfig {
                 client_ca: RendezvousClientCa::File {
                     cert_path: self.client_ca_cert_path.clone(),
@@ -36,5 +37,5 @@ impl EmbeddedRendezvousConfig {
 }
 
 pub(crate) async fn run_listener(config: EmbeddedRendezvousConfig) -> Result<()> {
-    serve_rendezvous(RendezvousAppState::new(config.server_config())).await
+    serve_rendezvous(RendezvousAppState::new(config.server_config())?).await
 }
