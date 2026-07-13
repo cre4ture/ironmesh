@@ -458,7 +458,6 @@ impl RemoteSnapshotPoller {
 fn preferred_server_notification_wait_timeout(retry_interval: Duration) -> Duration {
     PREFERRED_SERVER_NOTIFICATION_WAIT_TIMEOUT.max(retry_interval)
 }
-
 fn should_fallback_to_polling_after_wait_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();

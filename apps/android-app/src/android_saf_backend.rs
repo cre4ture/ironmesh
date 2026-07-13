@@ -10,14 +10,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use sync_agent_core::{
-    FolderAgentLocalBackend, FolderAgentRuntimeOptions, FolderAgentStatusCallback, LocalEntryKind,
-    LocalEntryState, LocalTreeScanProgress, LocalTreeState, PathScope,
-    run_folder_agent_with_backend_control,
+    FolderAgentLocalBackend, FolderAgentRuntimeOptions, FolderAgentStatusCallback,
+    FolderAgentWakeCallback, LocalEntryKind, LocalEntryState, LocalTreeScanProgress,
+    LocalTreeState, PathScope, run_folder_agent_with_backend_control,
 };
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +48,7 @@ static ANDROID_SAF_BRIDGE_STATE: OnceLock<AndroidSafBridgeState> = OnceLock::new
 const SAF_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const SAF_SCAN_PROGRESS_ENTRY_STRIDE: u64 = 256;
 const SAF_SCAN_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const SAF_LOCAL_CHANGE_POLL_INTERVAL_FLOOR: Duration = Duration::from_millis(500);
 
 fn bridge_state() -> Result<&'static AndroidSafBridgeState> {
     ANDROID_SAF_BRIDGE_STATE
@@ -262,8 +263,9 @@ struct AndroidSafBackend {
     tree_uri: Option<String>,
     observer_guard: Option<AndroidSafObserverGuard>,
     last_observed_tree_change_version: u64,
-    pending_tree_change_version: Option<u64>,
     cached_tree_state: Option<LocalTreeState>,
+    local_change_monitor_stop: Option<Arc<AtomicBool>>,
+    local_change_monitor_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl AndroidSafBackend {
@@ -306,6 +308,26 @@ impl AndroidSafBackend {
             state.insert(relative_path.to_string(), entry_state.clone());
         }
     }
+
+    fn stop_local_change_monitor(&mut self) {
+        if let Some(stop) = self.local_change_monitor_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(thread) = self.local_change_monitor_thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn local_change_poll_interval(options: &FolderAgentRuntimeOptions) -> Duration {
+        Duration::from_millis(options.local_scan_interval_ms)
+            .max(SAF_LOCAL_CHANGE_POLL_INTERVAL_FLOOR)
+    }
+}
+
+impl Drop for AndroidSafBackend {
+    fn drop(&mut self) {
+        self.stop_local_change_monitor();
+    }
 }
 
 impl FolderAgentLocalBackend for AndroidSafBackend {
@@ -346,11 +368,11 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
     }
 
     fn prepare(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
+        self.stop_local_change_monitor();
         let tree_uri = optional_tree_uri(options)?.to_string();
         self.observer_guard = Some(AndroidSafObserverGuard::new(&tree_uri)?);
         self.tree_uri = Some(tree_uri);
         self.last_observed_tree_change_version = 0;
-        self.pending_tree_change_version = None;
         self.clear_cached_tree_state();
         Ok(())
     }
@@ -413,9 +435,10 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
 
     fn local_entry_state(
         &mut self,
-        _options: &FolderAgentRuntimeOptions,
+        options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<Option<LocalEntryState>> {
+        let _ = options;
         if let Some(entry_state) = self.cached_entry_state(relative_path) {
             return Ok(Some(entry_state));
         }
@@ -429,13 +452,13 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
 
     fn file_content_fingerprint(
         &mut self,
-        _options: &FolderAgentRuntimeOptions,
+        options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<String> {
         let entry_state = match self.cached_entry_state(relative_path) {
             Some(entry_state) => entry_state,
             None => self
-                .local_entry_state(_options, relative_path)?
+                .local_entry_state(options, relative_path)?
                 .ok_or_else(|| anyhow::anyhow!("missing SAF file {relative_path}"))?,
         };
         anyhow::ensure!(
@@ -486,46 +509,48 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         delete_tree_path(self.tree_uri()?, relative_path).map(|_| ())
     }
 
-    fn start_local_change_monitor(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
+    fn start_local_change_monitor(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        on_local_change: FolderAgentWakeCallback,
+    ) -> Result<()> {
+        self.stop_local_change_monitor();
         if options.run_once {
             self.last_observed_tree_change_version = 0;
-            self.pending_tree_change_version = None;
             self.clear_cached_tree_state();
             return Ok(());
         }
 
-        self.last_observed_tree_change_version = tree_change_version(self.tree_uri()?).unwrap_or(0);
-        self.pending_tree_change_version = None;
+        let tree_uri = self.tree_uri()?.to_string();
+        let observed_version = tree_change_version(&tree_uri).unwrap_or(0);
+        let poll_interval = Self::local_change_poll_interval(options);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let watcher = thread::Builder::new()
+            .name("ironmesh-saf-change-watch".to_string())
+            .spawn(move || {
+                let mut last_seen = observed_version;
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    thread::sleep(poll_interval);
+                    if stop_for_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let current_version = tree_change_version(&tree_uri).unwrap_or(last_seen);
+                    if current_version != last_seen {
+                        last_seen = current_version;
+                        on_local_change();
+                    }
+                }
+            })
+            .context("failed to spawn SAF local change monitor")?;
+        self.last_observed_tree_change_version = observed_version;
+        self.local_change_monitor_stop = Some(stop);
+        self.local_change_monitor_thread = Some(watcher);
         Ok(())
     }
 
-    fn local_change_hint_pending(&mut self, options: &FolderAgentRuntimeOptions) -> Result<bool> {
-        if options.run_once {
-            return Ok(false);
-        }
-
-        let current_version =
-            tree_change_version(self.tree_uri()?).unwrap_or(self.last_observed_tree_change_version);
-        if current_version != self.last_observed_tree_change_version {
-            self.pending_tree_change_version = Some(current_version);
-            self.clear_cached_tree_state();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn acknowledge_local_change_hint(
-        &mut self,
-        _options: &FolderAgentRuntimeOptions,
-    ) -> Result<()> {
-        let fallback = self
-            .pending_tree_change_version
-            .unwrap_or(self.last_observed_tree_change_version);
-        self.last_observed_tree_change_version =
-            tree_change_version(self.tree_uri()?).unwrap_or(fallback);
-        self.pending_tree_change_version = None;
-        Ok(())
+    fn local_watch_hints_available(&self, _options: &FolderAgentRuntimeOptions) -> bool {
+        self.local_change_monitor_thread.is_some()
     }
 }
 
