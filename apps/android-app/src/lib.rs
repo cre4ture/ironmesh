@@ -8,6 +8,8 @@ use bytes::Bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
+    use std::time::Duration;
 
     fn sample_profile(
         profile_id: &str,
@@ -83,6 +85,132 @@ mod tests {
         );
         assert!(status.service_message.contains("1 with errors"));
         assert!(status.active_summary.contains("Photos: running"));
+    }
+
+    #[test]
+    fn start_profile_replaces_existing_run_before_spawning_replacement() {
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let spawner_events = Arc::clone(&events);
+        let spawner: AndroidFolderSyncRunSpawner =
+            Arc::new(move |_, label, _, _, running, _, _| {
+                spawner_events
+                    .lock()
+                    .unwrap()
+                    .push(format!("spawn:{label}"));
+                let thread_events = Arc::clone(&spawner_events);
+                let handle = std::thread::spawn(move || {
+                    while running.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    thread_events
+                        .lock()
+                        .unwrap()
+                        .push(format!("joined:{label}"));
+                });
+                Ok(handle)
+            });
+        let mut manager = AndroidFolderSyncManager::with_run_spawner(spawner);
+
+        manager
+            .start_profile(
+                "profile-a".to_string(),
+                "first".to_string(),
+                test_runtime_options(),
+            )
+            .unwrap();
+        manager
+            .start_profile(
+                "profile-a".to_string(),
+                "second".to_string(),
+                test_runtime_options(),
+            )
+            .unwrap();
+        manager.stop_all();
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "spawn:first".to_string(),
+                "joined:first".to_string(),
+                "spawn:second".to_string(),
+                "joined:second".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_profile_removes_status_after_joining_run() {
+        let spawner: AndroidFolderSyncRunSpawner = Arc::new(move |_, _, _, _, running, _, _| {
+            Ok(std::thread::spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }))
+        });
+        let mut manager = AndroidFolderSyncManager::with_run_spawner(spawner);
+
+        manager
+            .start_profile(
+                "profile-a".to_string(),
+                "Photos".to_string(),
+                test_runtime_options(),
+            )
+            .unwrap();
+        manager.stop_profile("profile-a");
+
+        let status = manager.status.lock().unwrap().clone();
+        assert_eq!(status.service_state, "stopped");
+        assert_eq!(status.active_profile_count, 0);
+        assert!(status.profiles.is_empty());
+    }
+
+    #[test]
+    fn start_profile_marks_status_error_when_spawner_fails() {
+        let spawner: AndroidFolderSyncRunSpawner =
+            Arc::new(move |_, _, _, _, _, _, _| Err(anyhow!("simulated spawn failure")));
+        let mut manager = AndroidFolderSyncManager::with_run_spawner(spawner);
+
+        let error = manager
+            .start_profile(
+                "profile-a".to_string(),
+                "Photos".to_string(),
+                test_runtime_options(),
+            )
+            .expect_err("spawner failure should be reported");
+
+        assert!(error.to_string().contains("simulated spawn failure"));
+        let status = manager.status.lock().unwrap().clone();
+        assert_eq!(status.service_state, "error");
+        assert_eq!(status.active_profile_count, 1);
+        assert_eq!(status.error_profile_count, 1);
+        assert_eq!(status.profiles.len(), 1);
+        assert_eq!(status.profiles[0].state, "error");
+        assert!(
+            status.profiles[0]
+                .message
+                .contains("Failed to start continuous sync")
+        );
+    }
+
+    fn test_runtime_options() -> FolderAgentRuntimeOptions {
+        FolderAgentRuntimeOptions {
+            root_dir: PathBuf::from("/tmp/ironmesh-folder-sync-test"),
+            state_root_dir: None,
+            local_tree_uri: None,
+            server_base_url: Some("http://127.0.0.1:1".to_string()),
+            client_bootstrap_json: None,
+            server_ca_pem: None,
+            client_identity_json: None,
+            persist_client_identity: None,
+            prefix: None,
+            depth: 1,
+            remote_refresh_interval_ms: 1_000,
+            local_scan_interval_ms: 1_000,
+            no_watch_local: false,
+            run_once: false,
+            ui_bind: None,
+        }
     }
 }
 use client_sdk::{
@@ -449,13 +577,32 @@ struct AndroidFolderSyncRun {
     thread: thread::JoinHandle<()>,
 }
 
+type AndroidFolderSyncRunSpawner = Arc<
+    dyn Fn(
+            String,
+            String,
+            FolderAgentRuntimeOptions,
+            Option<String>,
+            Arc<AtomicBool>,
+            Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+            FolderAgentStatusCallback,
+        ) -> Result<thread::JoinHandle<()>>
+        + Send
+        + Sync,
+>;
+
 struct AndroidFolderSyncManager {
     runs: BTreeMap<String, AndroidFolderSyncRun>,
     status: Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+    run_spawner: AndroidFolderSyncRunSpawner,
 }
 
 impl AndroidFolderSyncManager {
     fn new() -> Self {
+        Self::with_run_spawner(Arc::new(spawn_folder_sync_run))
+    }
+
+    fn with_run_spawner(run_spawner: AndroidFolderSyncRunSpawner) -> Self {
         Self {
             runs: BTreeMap::new(),
             status: Arc::new(Mutex::new(AndroidFolderSyncServiceStatus {
@@ -464,6 +611,7 @@ impl AndroidFolderSyncManager {
                 updated_unix_ms: now_unix_ms(),
                 ..AndroidFolderSyncServiceStatus::default()
             })),
+            run_spawner,
         }
     }
 
@@ -520,61 +668,37 @@ impl AndroidFolderSyncManager {
                 refresh_service_summary(&status_store);
             });
 
-        let thread_profile_id = profile_id.clone();
-        let thread_label = label.clone();
-        let thread_connection_target = connection_target.clone();
-        let thread_running = running.clone();
-        let status_store = self.status.clone();
-        let thread = thread::Builder::new()
-            .name(format!("ironmesh-folder-sync-{profile_id}"))
-            .spawn(move || {
-                let result = if options.local_tree_uri.is_some() {
-                    android_saf_backend::run_backend_with_control(
+        let thread = match (self.run_spawner)(
+            profile_id.clone(),
+            label.clone(),
+            options.clone(),
+            connection_target.clone(),
+            running.clone(),
+            self.status.clone(),
+            status_callback,
+        ) {
+            Ok(thread) => thread,
+            Err(error) => {
+                let error_message = format!("{error:#}");
+                update_profile_status(
+                    &self.status,
+                    build_profile_status(
+                        profile_id.clone(),
+                        label.clone(),
                         &options,
-                        thread_running,
-                        Some(status_callback),
-                    )
-                } else {
-                    run_folder_agent_with_control(
-                        &options,
-                        thread_running,
-                        false,
-                        Some(status_callback),
-                    )
-                };
-                if let Err(error) = result {
-                    let needs_fallback_error = status_store
-                        .lock()
-                        .ok()
-                        .and_then(|status| {
-                            status
-                                .profiles
-                                .iter()
-                                .find(|profile| profile.profile_id == thread_profile_id)
-                                .cloned()
-                        })
-                        .is_none_or(|profile| profile.state != "error");
-                    if needs_fallback_error {
-                        update_profile_status(
-                            &status_store,
-                            build_profile_status(
-                                thread_profile_id,
-                                thread_label,
-                                &options,
-                                thread_connection_target.as_deref(),
-                                "error",
-                                "error",
-                                "failed",
-                                format!("{error:#}"),
-                                None,
-                                Some(format!("{error:#}")),
-                            ),
-                        );
-                    }
-                    refresh_service_summary(&status_store);
-                }
-            })
-            .context("failed to spawn continuous folder sync thread")?;
+                        connection_target.as_deref(),
+                        "error",
+                        "error",
+                        "failed",
+                        format!("Failed to start continuous sync: {error_message}"),
+                        None,
+                        Some(error_message),
+                    ),
+                );
+                refresh_service_summary(&self.status);
+                return Err(error);
+            }
+        };
 
         self.runs
             .insert(profile_id, AndroidFolderSyncRun { running, thread });
@@ -615,6 +739,65 @@ impl AndroidFolderSyncManager {
 fn folder_sync_manager() -> &'static Mutex<AndroidFolderSyncManager> {
     static MANAGER: OnceLock<Mutex<AndroidFolderSyncManager>> = OnceLock::new();
     MANAGER.get_or_init(|| Mutex::new(AndroidFolderSyncManager::new()))
+}
+
+fn spawn_folder_sync_run(
+    profile_id: String,
+    label: String,
+    options: FolderAgentRuntimeOptions,
+    connection_target: Option<String>,
+    running: Arc<AtomicBool>,
+    status_store: Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+    status_callback: FolderAgentStatusCallback,
+) -> Result<thread::JoinHandle<()>> {
+    let thread_profile_id = profile_id.clone();
+    let thread_label = label.clone();
+    let thread_connection_target = connection_target.clone();
+    thread::Builder::new()
+        .name(format!("ironmesh-folder-sync-{profile_id}"))
+        .spawn(move || {
+            let result = if options.local_tree_uri.is_some() {
+                android_saf_backend::run_backend_with_control(
+                    &options,
+                    running,
+                    Some(status_callback),
+                )
+            } else {
+                run_folder_agent_with_control(&options, running, false, Some(status_callback))
+            };
+            if let Err(error) = result {
+                let needs_fallback_error = status_store
+                    .lock()
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.profile_id == thread_profile_id)
+                            .cloned()
+                    })
+                    .is_none_or(|profile| profile.state != "error");
+                if needs_fallback_error {
+                    update_profile_status(
+                        &status_store,
+                        build_profile_status(
+                            thread_profile_id,
+                            thread_label,
+                            &options,
+                            thread_connection_target.as_deref(),
+                            "error",
+                            "error",
+                            "failed",
+                            format!("{error:#}"),
+                            None,
+                            Some(format!("{error:#}")),
+                        ),
+                    );
+                }
+                refresh_service_summary(&status_store);
+            }
+        })
+        .context("failed to spawn continuous folder sync thread")
 }
 
 fn stop_folder_sync_run(run: AndroidFolderSyncRun) {
