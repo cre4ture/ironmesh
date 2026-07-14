@@ -912,6 +912,7 @@ mod tests {
                 identity: transport_sdk::PeerIdentity::Node(target_node_id),
                 public_api_url: None,
                 peer_api_url: None,
+                public_direct_urls: Vec::new(),
                 direct_candidates: Vec::new(),
                 labels: std::collections::HashMap::new(),
                 capacity_bytes: None,

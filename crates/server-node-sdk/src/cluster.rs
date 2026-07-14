@@ -16,9 +16,23 @@ pub struct NodeReachability {
     #[serde(default)]
     pub public_api_url: Option<String>,
     #[serde(default)]
+    pub public_direct_urls: Vec<String>,
+    #[serde(default)]
     pub peer_api_url: Option<String>,
     #[serde(default)]
+    pub peer_direct_urls: Vec<String>,
+    #[serde(default)]
     pub relay_required: bool,
+}
+
+impl NodeReachability {
+    pub fn public_api_urls(&self) -> Vec<&str> {
+        collect_reachability_urls(self.public_api_url.as_deref(), &self.public_direct_urls)
+    }
+
+    pub fn peer_api_urls(&self) -> Vec<&str> {
+        collect_reachability_urls(self.peer_api_url.as_deref(), &self.peer_direct_urls)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -61,19 +75,20 @@ pub struct NodeDescriptor {
 
 impl NodeDescriptor {
     pub fn public_api_url(&self) -> Option<&str> {
-        self.reachability
-            .public_api_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        self.reachability.public_api_urls().into_iter().next()
     }
 
+    pub fn public_api_urls(&self) -> Vec<&str> {
+        self.reachability.public_api_urls()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn peer_api_url(&self) -> Option<&str> {
-        self.reachability
-            .peer_api_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        self.reachability.peer_api_urls().into_iter().next()
+    }
+
+    pub fn peer_api_urls(&self) -> Vec<&str> {
+        self.reachability.peer_api_urls()
     }
 
     pub fn relay_required(&self) -> bool {
@@ -83,6 +98,34 @@ impl NodeDescriptor {
     pub fn relay_capable(&self) -> bool {
         self.capabilities.relay_tunnel
     }
+}
+
+fn collect_reachability_urls<'a>(primary: Option<&'a str>, urls: &'a [String]) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    if let Some(primary) = primary.map(str::trim).filter(|value| !value.is_empty())
+        && seen.insert(primary.to_string())
+    {
+        normalized.push(primary);
+    }
+
+    for value in urls {
+        let Some(value) = value
+            .as_str()
+            .trim()
+            .strip_suffix('/')
+            .or_else(|| Some(value.as_str().trim()))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if seen.insert(value.to_string()) {
+            normalized.push(value);
+        }
+    }
+
+    normalized
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -908,7 +951,9 @@ mod tests {
             node_id: id,
             reachability: NodeReachability {
                 public_api_url: Some(format!("http://{id}")),
+                public_direct_urls: vec![format!("http://{id}")],
                 peer_api_url: Some(format!("https://{id}")),
+                peer_direct_urls: vec![format!("https://{id}")],
                 relay_required: false,
             },
             capabilities: NodeCapabilities {
@@ -1295,7 +1340,9 @@ mod tests {
             node_id: remote,
             reachability: NodeReachability {
                 public_api_url: Some("https://remote.example".to_string()),
+                public_direct_urls: vec!["https://remote.example".to_string()],
                 peer_api_url: Some("https://remote-internal.example".to_string()),
+                peer_direct_urls: vec!["https://remote-internal.example".to_string()],
                 relay_required: false,
             },
             capabilities: NodeCapabilities {

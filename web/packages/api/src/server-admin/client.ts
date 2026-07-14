@@ -14,6 +14,7 @@ import type {
   ClientCredentialView,
   ClusterSummary,
   ControlPlanePromotionImportResponse,
+  DirectEndpointsConfigView,
   CreateS3AccessKeyRequest,
   CreateS3AccessKeyResponse,
   CreateS3BucketRequest,
@@ -950,6 +951,25 @@ export async function getRendezvousConfig(
 ): Promise<RendezvousConfigView> {
   return fetchAdminJson<RendezvousConfigView>(apiV1("/auth/rendezvous-config"), {
     adminTokenOverride
+  });
+}
+
+export async function getDirectEndpointsConfig(
+  adminTokenOverride?: string
+): Promise<DirectEndpointsConfigView> {
+  return fetchAdminJson<DirectEndpointsConfigView>(apiV1("/auth/direct-endpoints-config"), {
+    adminTokenOverride
+  });
+}
+
+export async function updateDirectEndpointsConfig(
+  request: { public_urls: string[]; peer_urls: string[] },
+  adminTokenOverride?: string
+): Promise<DirectEndpointsConfigView> {
+  return fetchAdminJson<DirectEndpointsConfigView>(apiV1("/auth/direct-endpoints-config"), {
+    method: "PUT",
+    adminTokenOverride,
+    body: request
   });
 }
 

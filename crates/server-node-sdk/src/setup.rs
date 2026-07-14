@@ -1872,6 +1872,7 @@ mod tests {
             public_ca_cert_path: None,
             public_ca_key_path: None,
             bootstrap_trust_roots: None,
+            advertised_direct_endpoints: Vec::new(),
             public_peer_api_enabled: false,
             internal_tls: None,
             internal_ca_key_path: None,

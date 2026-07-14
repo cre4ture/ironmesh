@@ -47,6 +47,8 @@ pub struct PresenceRegistration {
     #[serde(default)]
     pub public_api_url: Option<String>,
     #[serde(default)]
+    pub public_direct_urls: Vec<String>,
+    #[serde(default)]
     pub peer_api_url: Option<String>,
     #[serde(default)]
     pub direct_candidates: Vec<ConnectionCandidate>,
@@ -167,6 +169,7 @@ impl PresenceRegistration {
             bail!("presence registration must include a non-nil cluster_id");
         }
         validate_optional_url("public_api_url", self.public_api_url.as_deref())?;
+        validate_url_list("public_direct_urls", &self.public_direct_urls)?;
         validate_optional_url("peer_api_url", self.peer_api_url.as_deref())?;
         for candidate in &self.direct_candidates {
             candidate.validate()?;
@@ -752,6 +755,23 @@ fn validate_optional_url(field_name: &str, value: Option<&str>) -> Result<()> {
         return Ok(());
     };
     Url::parse(value).with_context(|| format!("invalid {field_name} URL {value}"))?;
+    Ok(())
+}
+
+fn validate_url_list(field_name: &str, values: &[String]) -> Result<()> {
+    let mut seen = HashMap::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("{field_name} must not contain empty URLs");
+        }
+        let parsed =
+            Url::parse(trimmed).with_context(|| format!("invalid {field_name} URL {trimmed}"))?;
+        let normalized = parsed.to_string();
+        if seen.insert(normalized.clone(), ()).is_some() {
+            bail!("{field_name} must not contain duplicate URLs");
+        }
+    }
     Ok(())
 }
 
