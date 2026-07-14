@@ -108,11 +108,23 @@ fun SyncScreen(
                 connectionStatus.nextRetryUnixMs?.let { retryAt ->
                     SyncBadge("Next retry ${formatTimestamp(retryAt)}")
                 }
+                connectionStatus.lastSuccessfulConnectionUnixMs?.let { lastSuccess ->
+                    SyncBadge("Last success ${formatTimestamp(lastSuccess)}")
+                }
             }
             Text(
                 text = connectionStatus.message,
                 style = MaterialTheme.typography.bodyMedium,
             )
+            connectionStatus.lastSuccessfulConnectionUrl
+                ?.takeIf { it.isNotBlank() }
+                ?.let { url ->
+                    Text(
+                        text = "Last working route: $url",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             state.folderSyncStatus.currentActivity
                 .takeIf { it.isNotBlank() && it != connectionStatus.message }
                 ?.let { activity ->
@@ -122,6 +134,42 @@ fun SyncScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+            if (connectionStatus.failedAttempts.isNotEmpty()) {
+                Text(
+                    text = "Recent failed attempts",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                connectionStatus.failedAttempts.forEach { attempt ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = folderSyncFailedAttemptSummary(attempt),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = attempt.url.ifBlank { attempt.endpointLocator },
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            attempt.error?.takeIf { it.isNotBlank() }?.let { error ->
+                                Text(
+                                    text = error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         SectionCard(title = stringResource(R.string.sync_overview)) {

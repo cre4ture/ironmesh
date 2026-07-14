@@ -431,6 +431,7 @@ fn order_clients_by_startup_probe(
 }
 
 async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+    let target_label = startup_probe_target_label(client);
     if let Some(rendezvous) = client.rendezvous_client()
         && let Some(diagnostic) = rendezvous.client_identity_expiry_diagnostic()
     {
@@ -448,7 +449,12 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
         }),
     )
     .await
-    .context("startup signed latency probe timed out")??;
+    .with_context(|| {
+        format!(
+            "startup signed latency probe timed out after {:?} for {target_label}",
+            STARTUP_PROBE_TIMEOUT
+        )
+    })??;
 
     let latency_ms = result
         .summary
@@ -459,14 +465,33 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
 }
 
 async fn probe_direct_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+    let target_label = startup_probe_target_label(client);
     let started_at = Instant::now();
     let response = tokio::time::timeout(STARTUP_PROBE_TIMEOUT, client.get_relative_path("/health"))
         .await
-        .context("startup direct health probe timed out")??;
+        .with_context(|| {
+            format!(
+                "startup direct health probe timed out after {:?} for {target_label}",
+                STARTUP_PROBE_TIMEOUT
+            )
+        })??;
     if !response.status.is_success() {
-        bail!("health probe returned {}", response.status);
+        bail!(
+            "health probe returned {} for {}",
+            response.status,
+            target_label
+        );
     }
     Ok(started_at.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn startup_probe_target_label(client: &IronMeshClient) -> String {
+    client
+        .connection_diagnostics()
+        .endpoints
+        .first()
+        .map(|endpoint| endpoint.locator.clone())
+        .unwrap_or_else(|| "<unknown-target>".to_string())
 }
 
 fn format_build_error_suffix(errors: &[String]) -> String {

@@ -18,6 +18,21 @@ data class FolderSyncConnectionStatus(
     val updatedUnixMs: Long = 0L,
     val retryAttemptCount: Long = 0L,
     val nextRetryUnixMs: Long? = null,
+    val lastSuccessfulConnectionUnixMs: Long? = null,
+    val lastSuccessfulConnectionUrl: String? = null,
+    val failedAttempts: List<FolderSyncFailedConnectionAttempt> = emptyList(),
+)
+
+data class FolderSyncFailedConnectionAttempt(
+    val profileLabel: String = "",
+    val endpointLocator: String = "",
+    val pathKind: String = "",
+    val startedUnixMs: Long = 0L,
+    val finishedUnixMs: Long? = null,
+    val method: String = "",
+    val url: String = "",
+    val timeoutMs: Long? = null,
+    val error: String? = null,
 )
 
 fun nextFolderSyncRetryDelayMs(attempt: Int): Long {

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
-    RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
+    ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
+    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -158,6 +158,7 @@ pub struct FolderAgentRuntimeStatus {
     pub run_mode: String,
     pub last_success_unix_ms: Option<u64>,
     pub last_error: Option<String>,
+    pub connection_diagnostics: Option<ClientConnectionDiagnostics>,
     pub metrics: FolderAgentRuntimeMetrics,
 }
 
@@ -195,8 +196,17 @@ impl FolderAgentRuntimeStatus {
             },
             last_success_unix_ms,
             last_error,
+            connection_diagnostics: None,
             metrics,
         }
+    }
+
+    pub fn with_connection_diagnostics(
+        mut self,
+        connection_diagnostics: ClientConnectionDiagnostics,
+    ) -> Self {
+        self.connection_diagnostics = Some(connection_diagnostics);
+        self
     }
 }
 
@@ -785,6 +795,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     };
 
     let client = configured_client(options)?;
+    let status_callback = attach_connection_diagnostics(status_callback, client.clone());
     let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),
         options.depth,
@@ -1482,6 +1493,20 @@ fn emit_status(
         last_success_unix_ms,
         last_error,
     ));
+}
+
+fn attach_connection_diagnostics(
+    callback: Option<FolderAgentStatusCallback>,
+    client: IronMeshClient,
+) -> Option<FolderAgentStatusCallback> {
+    callback.map(|callback| {
+        let diagnostics_client = client.clone();
+        Arc::new(move |status: FolderAgentRuntimeStatus| {
+            callback(
+                status.with_connection_diagnostics(diagnostics_client.connection_diagnostics()),
+            );
+        }) as FolderAgentStatusCallback
+    })
 }
 
 fn now_unix_ms() -> u64 {

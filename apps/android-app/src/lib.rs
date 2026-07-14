@@ -86,10 +86,10 @@ mod tests {
     }
 }
 use client_sdk::{
-    BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    IronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
-    StoreIndexView, build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    enroll_connection_input_blocking,
+    BootstrapEnrollmentResult, ClientConnectionDiagnostics, ClientIdentityMaterial, ClientNode,
+    ConnectionBootstrap, IronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexSortOrder, StoreIndexView, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, enroll_connection_input_blocking,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -355,6 +355,7 @@ struct AndroidFolderSyncProfileStatus {
     run_mode: String,
     last_success_unix_ms: Option<u64>,
     last_error: Option<String>,
+    connection_diagnostics: Option<ClientConnectionDiagnostics>,
     metrics: FolderAgentRuntimeMetrics,
 }
 
@@ -408,6 +409,7 @@ fn profile_status_from_runtime(
         run_mode: status.run_mode,
         last_success_unix_ms: status.last_success_unix_ms,
         last_error: status.last_error,
+        connection_diagnostics: status.connection_diagnostics,
         metrics: status.metrics,
     }
 }

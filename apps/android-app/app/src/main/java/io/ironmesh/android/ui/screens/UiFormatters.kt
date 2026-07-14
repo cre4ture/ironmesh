@@ -2,6 +2,7 @@ package io.ironmesh.android.ui.screens
 
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncConnectionStatus
+import io.ironmesh.android.data.FolderSyncFailedConnectionAttempt
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
@@ -73,6 +74,9 @@ fun folderSyncConnectionSummary(
     connectionStatus.nextRetryUnixMs?.let { retryAt ->
         parts += "Next retry ${formatTimestamp(retryAt)}"
     }
+    connectionStatus.lastSuccessfulConnectionUnixMs?.let { lastSuccess ->
+        parts += "Last success ${formatTimestamp(lastSuccess)}"
+    }
     if (parts.isEmpty()) {
         parts += serviceStatus.serviceMessage.ifBlank { "Continuous sync is stopped" }
     }
@@ -88,6 +92,32 @@ fun shouldShowRetryConnectionAction(
     }
     return connectionStatus.state != FOLDER_SYNC_CONNECTION_STATE_CONNECTED ||
         connectionStatus.isRetryPending()
+}
+
+fun folderSyncFailedAttemptSummary(attempt: FolderSyncFailedConnectionAttempt): String {
+    val parts = mutableListOf<String>()
+    parts += attempt.profileLabel
+    parts += attempt.method.ifBlank { "Request" }
+    parts += formatTimestamp(attempt.finishedUnixMs ?: attempt.startedUnixMs)
+    attempt.timeoutMs?.let { timeoutMs ->
+        parts += "Timeout ${formatDurationMillis(timeoutMs)}"
+    }
+    return parts.joinToString(" | ")
+}
+
+fun formatDurationMillis(durationMs: Long): String {
+    val totalSeconds = (durationMs / 1000L).coerceAtLeast(1L)
+    return if (totalSeconds < 60L) {
+        "${totalSeconds}s"
+    } else {
+        val minutes = totalSeconds / 60L
+        val seconds = totalSeconds % 60L
+        if (seconds == 0L) {
+            "${minutes}m"
+        } else {
+            "${minutes}m ${seconds}s"
+        }
+    }
 }
 
 fun profileInventorySummary(status: FolderSyncProfileStatus): String {

@@ -31,6 +31,7 @@ pub use device_auth::{
     renew_rendezvous_identity,
 };
 pub use ironmesh_client::{
+    ClientConnectionAttempt, ClientConnectionDiagnostics, ClientEndpointDiagnostics,
     IronMeshClient, ObjectHeadInfo, PreferredHeadReason, RequestedRange, SnapshotRestoreResponse,
     StoreIndexEntry, StoreIndexMediaFilter, StoreIndexMediaSummary, StoreIndexRequestOptions,
     StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, UploadMode, UploadResult,

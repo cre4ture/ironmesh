@@ -23,6 +23,7 @@ import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_ENROLLM
 import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_NETWORK
 import io.ironmesh.android.data.FolderSyncStorageDiagnosticsHelper
 import io.ironmesh.android.data.FolderSyncConnectionStatus
+import io.ironmesh.android.data.FolderSyncFailedConnectionAttempt
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
@@ -126,15 +127,30 @@ class FolderSyncForegroundService : Service() {
         message: String,
         retryCount: Long = retryAttemptCount,
         nextRetryAt: Long? = nextRetryUnixMs,
+        lastSuccessfulConnectionUnixMs: Long? = null,
+        lastSuccessfulConnectionUrl: String? = null,
+        failedAttempts: List<FolderSyncFailedConnectionAttempt>? = null,
     ) {
         val normalizedMessage = message.ifBlank { "Continuous sync is stopped" }
         val previous = lastPublishedConnectionStatus
+        val effectiveLastSuccessfulConnectionUnixMs =
+            lastSuccessfulConnectionUnixMs ?: previous?.lastSuccessfulConnectionUnixMs
+        val effectiveLastSuccessfulConnectionUrl = when {
+            !lastSuccessfulConnectionUrl.isNullOrBlank() -> lastSuccessfulConnectionUrl
+            effectiveLastSuccessfulConnectionUnixMs == previous?.lastSuccessfulConnectionUnixMs ->
+                previous?.lastSuccessfulConnectionUrl
+            else -> null
+        }
+        val effectiveFailedAttempts = failedAttempts ?: previous?.failedAttempts.orEmpty()
         if (
             previous != null &&
             previous.state == state &&
             previous.message == normalizedMessage &&
             previous.retryAttemptCount == retryCount &&
-            previous.nextRetryUnixMs == nextRetryAt
+            previous.nextRetryUnixMs == nextRetryAt &&
+            previous.lastSuccessfulConnectionUnixMs == effectiveLastSuccessfulConnectionUnixMs &&
+            previous.lastSuccessfulConnectionUrl == effectiveLastSuccessfulConnectionUrl &&
+            previous.failedAttempts == effectiveFailedAttempts
         ) {
             return
         }
@@ -145,6 +161,9 @@ class FolderSyncForegroundService : Service() {
             updatedUnixMs = System.currentTimeMillis(),
             retryAttemptCount = retryCount,
             nextRetryUnixMs = nextRetryAt,
+            lastSuccessfulConnectionUnixMs = effectiveLastSuccessfulConnectionUnixMs,
+            lastSuccessfulConnectionUrl = effectiveLastSuccessfulConnectionUrl,
+            failedAttempts = effectiveFailedAttempts,
         )
         lastPublishedConnectionStatus = snapshot
         IronmeshPreferences.setFolderSyncConnectionStatus(applicationContext, snapshot)
@@ -176,8 +195,24 @@ class FolderSyncForegroundService : Service() {
         requestReconcile(reason)
     }
 
-    private fun scheduleRetry(reason: String) {
+    private fun scheduleRetry(
+        reason: String,
+        diagnosticsSummary: ConnectionDiagnosticsSummary? = null,
+    ) {
         if (retryJob?.isActive == true) {
+            if (diagnosticsSummary != null) {
+                publishConnectionStatus(
+                    state = FOLDER_SYNC_CONNECTION_STATE_RETRY_SCHEDULED,
+                    message = buildRetryMessage(reason, nextRetryUnixMs?.let { retryAt ->
+                        (retryAt - System.currentTimeMillis()).coerceAtLeast(1L)
+                    } ?: nextFolderSyncRetryDelayMs(retryAttemptCount.toInt().coerceAtLeast(1))),
+                    retryCount = retryAttemptCount,
+                    nextRetryAt = nextRetryUnixMs,
+                    lastSuccessfulConnectionUnixMs = diagnosticsSummary.lastSuccessfulConnectionUnixMs,
+                    lastSuccessfulConnectionUrl = diagnosticsSummary.lastSuccessfulConnectionUrl,
+                    failedAttempts = diagnosticsSummary.failedAttempts,
+                )
+            }
             return
         }
 
@@ -189,6 +224,9 @@ class FolderSyncForegroundService : Service() {
             message = buildRetryMessage(reason, delayMs),
             retryCount = retryAttemptCount,
             nextRetryAt = nextRetryUnixMs,
+            lastSuccessfulConnectionUnixMs = diagnosticsSummary?.lastSuccessfulConnectionUnixMs,
+            lastSuccessfulConnectionUrl = diagnosticsSummary?.lastSuccessfulConnectionUrl,
+            failedAttempts = diagnosticsSummary?.failedAttempts,
         )
         updateNotification("Retrying sync soon", buildRetryMessage(reason, delayMs))
         retryJob = scope.launch {
@@ -239,7 +277,7 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun buildRetryMessage(reason: String, delayMs: Long): String {
-        val normalizedReason = reason.trim().ifBlank { "connection error" }
+        val normalizedReason = summarizeReason(reason)
         return "Retrying after ${formatRetryDelay(delayMs)} because $normalizedReason"
     }
 
@@ -267,6 +305,75 @@ class FolderSyncForegroundService : Service() {
             ?: status?.serviceMessage?.takeIf { message -> message.isNotBlank() }
             ?: "failed to start sync"
     }
+
+    private fun summarizeReason(reason: String): String {
+        val firstLine = reason
+            .lineSequence()
+            .map { line -> line.trim() }
+            .firstOrNull { line -> line.isNotEmpty() }
+            .orEmpty()
+        val normalized = firstLine.ifBlank { "connection error" }
+        return if (normalized.length <= 180) {
+            normalized
+        } else {
+            normalized.take(177) + "..."
+        }
+    }
+
+    private fun connectionDiagnosticsSummary(
+        status: FolderSyncServiceStatus?,
+    ): ConnectionDiagnosticsSummary {
+        val profiles = status?.profiles.orEmpty()
+        var lastSuccessfulConnectionUnixMs: Long? = null
+        var lastSuccessfulConnectionUrl: String? = null
+        val failedAttempts = mutableListOf<FolderSyncFailedConnectionAttempt>()
+
+        profiles.forEach { profile ->
+            val diagnostics = profile.connectionDiagnostics ?: return@forEach
+            diagnostics.endpoints.forEach { endpoint ->
+                endpoint.lastSuccessUnixMs?.let { lastSuccess ->
+                    if (lastSuccessfulConnectionUnixMs == null || lastSuccess >= lastSuccessfulConnectionUnixMs!!) {
+                        lastSuccessfulConnectionUnixMs = lastSuccess
+                        lastSuccessfulConnectionUrl = endpoint.recentAttempts
+                            .asReversed()
+                            .firstOrNull { attempt -> attempt.outcome == "success" }
+                            ?.url
+                            ?: endpoint.locator
+                    }
+                }
+                endpoint.recentAttempts
+                    .filter { attempt -> attempt.outcome == "failure" }
+                    .forEach { attempt ->
+                        failedAttempts += FolderSyncFailedConnectionAttempt(
+                            profileLabel = profile.label,
+                            endpointLocator = endpoint.locator,
+                            pathKind = endpoint.pathKind,
+                            startedUnixMs = attempt.startedUnixMs,
+                            finishedUnixMs = attempt.finishedUnixMs,
+                            method = attempt.method,
+                            url = attempt.url,
+                            timeoutMs = attempt.timeoutMs,
+                            error = attempt.error?.let(::summarizeReason),
+                        )
+                    }
+            }
+        }
+
+        val sortedAttempts = failedAttempts
+            .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
+            .take(8)
+        return ConnectionDiagnosticsSummary(
+            lastSuccessfulConnectionUnixMs = lastSuccessfulConnectionUnixMs,
+            lastSuccessfulConnectionUrl = lastSuccessfulConnectionUrl,
+            failedAttempts = sortedAttempts,
+        )
+    }
+
+    private data class ConnectionDiagnosticsSummary(
+        val lastSuccessfulConnectionUnixMs: Long? = null,
+        val lastSuccessfulConnectionUrl: String? = null,
+        val failedAttempts: List<FolderSyncFailedConnectionAttempt> = emptyList(),
+    )
 
     private suspend fun reconcileProfiles(): Boolean {
         return reconcileMutex.withLock {
@@ -399,6 +506,7 @@ class FolderSyncForegroundService : Service() {
                 val status = withContext(Dispatchers.IO) {
                     runCatching { repository.getContinuousFolderSyncStatus() }.getOrNull()
                 }
+                val diagnosticsSummary = connectionDiagnosticsSummary(status)
                 val activeProfileCount = status?.activeProfileCount ?: 0L
                 val waitingMessage = waitingSummary
                 val currentWaitingState = waitingState
@@ -410,10 +518,13 @@ class FolderSyncForegroundService : Service() {
                             message = waitingMessage,
                             retryCount = 0L,
                             nextRetryAt = null,
+                            lastSuccessfulConnectionUnixMs = diagnosticsSummary.lastSuccessfulConnectionUnixMs,
+                            lastSuccessfulConnectionUrl = diagnosticsSummary.lastSuccessfulConnectionUrl,
+                            failedAttempts = diagnosticsSummary.failedAttempts,
                         )
                     }
                     (status?.errorProfileCount ?: 0L) > 0L -> {
-                        scheduleRetry(currentErrorMessage(status))
+                        scheduleRetry(currentErrorMessage(status), diagnosticsSummary)
                     }
                     activeProfileCount > 0L -> {
                         hasEstablishedConnection = true
@@ -436,6 +547,9 @@ class FolderSyncForegroundService : Service() {
                             message = connectionMessage,
                             retryCount = 0L,
                             nextRetryAt = null,
+                            lastSuccessfulConnectionUnixMs = diagnosticsSummary.lastSuccessfulConnectionUnixMs,
+                            lastSuccessfulConnectionUrl = diagnosticsSummary.lastSuccessfulConnectionUrl,
+                            failedAttempts = diagnosticsSummary.failedAttempts,
                         )
                     }
                     else -> {
@@ -445,6 +559,9 @@ class FolderSyncForegroundService : Service() {
                             message = status?.serviceMessage ?: "Continuous sync is stopped",
                             retryCount = 0L,
                             nextRetryAt = null,
+                            lastSuccessfulConnectionUnixMs = diagnosticsSummary.lastSuccessfulConnectionUnixMs,
+                            lastSuccessfulConnectionUrl = diagnosticsSummary.lastSuccessfulConnectionUrl,
+                            failedAttempts = diagnosticsSummary.failedAttempts,
                         )
                     }
                 }
