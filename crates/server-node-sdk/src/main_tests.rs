@@ -322,6 +322,7 @@ fn test_cluster_config_without_internal_tls(
         public_ca_cert_path: None,
         public_ca_key_path: None,
         bootstrap_trust_roots: None,
+        advertised_direct_endpoints: Vec::new(),
         public_peer_api_enabled: false,
         internal_tls: None,
         internal_ca_key_path: None,
@@ -427,6 +428,24 @@ fn install_internal_tls_for_test_config(
     });
 }
 
+fn test_node_reachability(
+    public_api_url: Option<&str>,
+    peer_api_url: Option<&str>,
+    relay_required: bool,
+) -> super::cluster::NodeReachability {
+    super::cluster::NodeReachability {
+        public_api_url: public_api_url.map(ToOwned::to_owned),
+        public_direct_urls: public_api_url
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
+        peer_api_url: peer_api_url.map(ToOwned::to_owned),
+        peer_direct_urls: peer_api_url
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
+        relay_required,
+    }
+}
+
 async fn register_cluster_node(
     state: &ServerState,
     node_id: NodeId,
@@ -436,11 +455,7 @@ async fn register_cluster_node(
     let mut cluster = state.cluster.lock().await;
     cluster.register_node(super::cluster::NodeDescriptor {
         node_id,
-        reachability: super::cluster::NodeReachability {
-            public_api_url: public_api_url.map(ToOwned::to_owned),
-            peer_api_url: peer_api_url.map(ToOwned::to_owned),
-            relay_required: false,
-        },
+        reachability: test_node_reachability(public_api_url, peer_api_url, false),
         capabilities: super::cluster::NodeCapabilities {
             public_api: public_api_url.is_some(),
             peer_api: peer_api_url.is_some(),
@@ -5311,6 +5326,18 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.network.rendezvous_registration_enabled = true;
     state.network.rendezvous_mtls_required = true;
+    super::replace_advertised_direct_endpoints(
+        &state,
+        super::build_effective_operator_direct_endpoints(
+            &state,
+            &["https://edge.example:8443".to_string()],
+            &["https://edge.example:18443".to_string()],
+        )
+        .unwrap(),
+    );
+    super::refresh_local_node_reachability(&state)
+        .await
+        .unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -5356,6 +5383,12 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
         Some("cluster-ca")
     );
     assert!(!bootstrap.direct_endpoints.is_empty());
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| endpoint.url == "https://edge.example:8443")
+    );
     assert!(
         bootstrap
             .direct_endpoints
@@ -5467,7 +5500,9 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
             node_id: source.node_id,
             reachability: cluster::NodeReachability {
                 public_api_url: Some("https://127.0.0.1:9".to_string()),
+                public_direct_urls: vec!["https://127.0.0.1:9".to_string()],
                 peer_api_url: Some("https://127.0.0.1:49080".to_string()),
+                peer_direct_urls: vec!["https://127.0.0.1:49080".to_string()],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -5486,7 +5521,9 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
             node_id: target.node_id,
             reachability: cluster::NodeReachability {
                 public_api_url: Some(public_url.clone()),
+                public_direct_urls: vec![public_url.clone()],
                 peer_api_url: Some("https://127.0.0.1:10009".to_string()),
+                peer_direct_urls: vec!["https://127.0.0.1:10009".to_string()],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -6244,13 +6281,17 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
             .into_iter()
             .find(|node| node.node_id == state.node_id)
     };
-    let registration = build_rendezvous_presence_registration(
+    super::replace_advertised_direct_endpoints(
         &state,
-        Some("http://127.0.0.1:39080"),
-        Some("https://127.0.0.1:49080"),
-        true,
-        local_descriptor.as_ref(),
+        super::build_bootstrap_direct_endpoints(
+            Some("http://127.0.0.1:39080"),
+            Some("https://127.0.0.1:49080"),
+            false,
+            state.node_id,
+        )
+        .unwrap(),
     );
+    let registration = build_rendezvous_presence_registration(&state, local_descriptor.as_ref());
     rendezvous_state.presence.register(registration, None);
 
     let endpoint = super::current_rendezvous_endpoint_clients(&state)
@@ -6696,6 +6737,86 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
         Some(requested_node_id)
     );
 
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn issue_node_bootstrap_rejects_invalid_public_url() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_node_bootstrap(
+        State(state.clone()),
+        headers,
+        Json(super::NodeBootstrapIssueRequest {
+            node_id: Some(NodeId::new_v4()),
+            mode: Some(transport_sdk::NodeBootstrapMode::Cluster),
+            data_dir: Some("./data/node-b".to_string()),
+            bind_addr: Some("127.0.0.1:28080".to_string()),
+            public_url: Some("http://127.0.0.1:bad".to_string()),
+            labels: None,
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled: Some(false),
+            internal_bind_addr: Some("127.0.0.1:38080".to_string()),
+            internal_url: Some("https://127.0.0.1:38080".to_string()),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: "tls/cluster-ca.pem".to_string(),
+                cert_path: "tls/internal.pem".to_string(),
+                key_path: "tls/internal.key".to_string(),
+            }),
+            enrollment_issuer_url: None,
+            tls_validity_secs: None,
+            tls_renewal_window_secs: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn issue_node_bootstrap_rejects_invalid_bind_addr_default_url() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_node_bootstrap(
+        State(state.clone()),
+        headers,
+        Json(super::NodeBootstrapIssueRequest {
+            node_id: Some(NodeId::new_v4()),
+            mode: Some(transport_sdk::NodeBootstrapMode::Cluster),
+            data_dir: Some("./data/node-b".to_string()),
+            bind_addr: Some("127.0.0.1:bad".to_string()),
+            public_url: None,
+            labels: None,
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled: Some(false),
+            internal_bind_addr: Some("127.0.0.1:38080".to_string()),
+            internal_url: Some("https://127.0.0.1:38080".to_string()),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: "tls/cluster-ca.pem".to_string(),
+                cert_path: "tls/internal.pem".to_string(),
+                key_path: "tls/internal.key".to_string(),
+            }),
+            enrollment_issuer_url: None,
+            tls_validity_secs: None,
+            tls_renewal_window_secs: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     cleanup_test_state(&state).await;
 }
 
@@ -8734,6 +8855,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
         cluster_id: state.cluster_id,
         identity: transport_sdk::PeerIdentity::Node(state.node_id),
         public_api_url: None,
+        public_direct_urls: Vec::new(),
         peer_api_url: Some(format!("https://{internal_bind_addr}")),
         direct_candidates: Vec::new(),
         labels: HashMap::new(),
@@ -8876,6 +8998,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
         cluster_id: state.cluster_id,
         identity: transport_sdk::PeerIdentity::Node(state.node_id),
         public_api_url: None,
+        public_direct_urls: Vec::new(),
         peer_api_url: None,
         direct_candidates: Vec::new(),
         labels: HashMap::new(),
@@ -11811,11 +11934,11 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
         let mut cluster = target.cluster.lock().await;
         cluster.register_node(super::cluster::NodeDescriptor {
             node_id: source.node_id,
-            reachability: super::cluster::NodeReachability {
-                public_api_url: Some(peer_base_url.clone()),
-                peer_api_url: Some(peer_base_url.clone()),
-                relay_required: false,
-            },
+            reachability: test_node_reachability(
+                Some(peer_base_url.as_str()),
+                Some(peer_base_url.as_str()),
+                false,
+            ),
             capabilities: super::cluster::NodeCapabilities {
                 public_api: true,
                 peer_api: true,
@@ -11973,11 +12096,11 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
         let mut cluster = target.cluster.lock().await;
         cluster.register_node(super::cluster::NodeDescriptor {
             node_id: source.node_id,
-            reachability: super::cluster::NodeReachability {
-                public_api_url: Some(peer_base_url.clone()),
-                peer_api_url: Some(peer_base_url.clone()),
-                relay_required: false,
-            },
+            reachability: test_node_reachability(
+                Some(peer_base_url.as_str()),
+                Some(peer_base_url.as_str()),
+                false,
+            ),
             capabilities: super::cluster::NodeCapabilities {
                 public_api: true,
                 peer_api: true,
@@ -12879,11 +13002,11 @@ async fn build_test_state(
 
     service.register_node(cluster::NodeDescriptor {
         node_id: local_node_id,
-        reachability: cluster::NodeReachability {
-            public_api_url: Some("http://127.0.0.1:39080".to_string()),
-            peer_api_url: Some("https://127.0.0.1:49080".to_string()),
-            relay_required: false,
-        },
+        reachability: test_node_reachability(
+            Some("http://127.0.0.1:39080"),
+            Some("https://127.0.0.1:49080"),
+            false,
+        ),
         capabilities: cluster::NodeCapabilities {
             public_api: true,
             peer_api: true,
@@ -12900,11 +13023,11 @@ async fn build_test_state(
     if replication_factor > 1 {
         service.register_node(cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
-            reachability: cluster::NodeReachability {
-                public_api_url: Some("http://127.0.0.1:9".to_string()),
-                peer_api_url: Some("https://127.0.0.1:10009".to_string()),
-                relay_required: false,
-            },
+            reachability: test_node_reachability(
+                Some("http://127.0.0.1:9"),
+                Some("https://127.0.0.1:10009"),
+                false,
+            ),
             capabilities: cluster::NodeCapabilities {
                 public_api: true,
                 peer_api: true,
@@ -12982,6 +13105,17 @@ async fn build_test_state(
             public_tls_runtime: None,
             internal_tls_runtime: None,
             rendezvous_ca_pem: None,
+            primary_public_direct_url: Some("http://127.0.0.1:39080".to_string()),
+            primary_peer_direct_url: Some("https://127.0.0.1:49080".to_string()),
+            advertised_direct_endpoints: Arc::new(std::sync::Mutex::new(
+                super::build_bootstrap_direct_endpoints(
+                    Some("http://127.0.0.1:39080"),
+                    Some("https://127.0.0.1:49080"),
+                    false,
+                    local_node_id,
+                )
+                .unwrap(),
+            )),
             rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
                 "http://127.0.0.1:39080".to_string(),
             ])),
@@ -13637,11 +13771,7 @@ async fn register_online_source_node(
     let mut cluster = target.cluster.lock().await;
     cluster.register_node(super::cluster::NodeDescriptor {
         node_id: source.node_id,
-        reachability: super::cluster::NodeReachability {
-            public_api_url: Some(peer_base_url.to_string()),
-            peer_api_url: Some(peer_base_url.to_string()),
-            relay_required: false,
-        },
+        reachability: test_node_reachability(Some(peer_base_url), Some(peer_base_url), false),
         capabilities: super::cluster::NodeCapabilities {
             public_api: true,
             peer_api: true,
@@ -14136,18 +14266,25 @@ run_on_main_metadata_backends!(
 #[tokio::test]
 async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-
-    let registration = build_rendezvous_presence_registration(
+    super::replace_advertised_direct_endpoints(
         &state,
-        Some("https://public.example/"),
-        Some("https://public.example"),
-        true,
-        None,
+        super::build_bootstrap_direct_endpoints(
+            Some("https://public.example/"),
+            Some("https://public.example"),
+            false,
+            state.node_id,
+        )
+        .unwrap(),
     );
+    let registration = build_rendezvous_presence_registration(&state, None);
 
     assert_eq!(
         registration.identity,
         transport_sdk::PeerIdentity::Node(state.node_id)
+    );
+    assert_eq!(
+        registration.public_direct_urls,
+        vec!["https://public.example".to_string()]
     );
     assert_eq!(registration.direct_candidates.len(), 1);
     assert_eq!(
@@ -14175,18 +14312,25 @@ async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
 #[tokio::test]
 async fn rendezvous_presence_registration_keeps_public_api_but_excludes_public_direct_candidate() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-
-    let registration = build_rendezvous_presence_registration(
+    super::replace_advertised_direct_endpoints(
         &state,
-        Some("https://public.example"),
-        Some("https://internal.example"),
-        false,
-        None,
+        super::build_bootstrap_direct_endpoints(
+            Some("https://public.example"),
+            Some("https://internal.example"),
+            false,
+            state.node_id,
+        )
+        .unwrap(),
     );
+    let registration = build_rendezvous_presence_registration(&state, None);
 
     assert_eq!(
         registration.public_api_url.as_deref(),
         Some("https://public.example")
+    );
+    assert_eq!(
+        registration.public_direct_urls,
+        vec!["https://public.example".to_string()]
     );
     assert_eq!(
         registration.peer_api_url.as_deref(),
@@ -14218,6 +14362,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(NodeId::new_v4()),
             public_api_url: Some("https://public.example/".to_string()),
+            public_direct_urls: vec!["https://public.example/".to_string()],
             peer_api_url: Some("https://internal.example/".to_string()),
             direct_candidates: vec![transport_sdk::ConnectionCandidate {
                 kind: transport_sdk::CandidateKind::DirectHttps,
@@ -14247,6 +14392,8 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     );
     assert_eq!(descriptor.public_api_url(), Some("https://public.example"));
     assert_eq!(descriptor.peer_api_url(), Some("https://internal.example"));
+    assert_eq!(descriptor.public_api_urls(), vec!["https://public.example"]);
+    assert_eq!(descriptor.peer_api_urls(), vec!["https://internal.example"]);
     assert!(descriptor.capabilities.public_api);
     assert!(descriptor.capabilities.peer_api);
     assert!(!descriptor.relay_required());
@@ -14284,11 +14431,11 @@ async fn backfill_cluster_nodes_from_replica_rows_preserves_existing_descriptors
     let remote_b = NodeId::new_v4();
     let existing = cluster::NodeDescriptor {
         node_id: remote_a,
-        reachability: cluster::NodeReachability {
-            public_api_url: Some("https://public.example".to_string()),
-            peer_api_url: Some("https://internal.example".to_string()),
-            relay_required: true,
-        },
+        reachability: test_node_reachability(
+            Some("https://public.example"),
+            Some("https://internal.example"),
+            true,
+        ),
         capabilities: cluster::NodeCapabilities {
             public_api: true,
             peer_api: true,
@@ -14338,11 +14485,11 @@ async fn register_node_uses_structured_reachability_payload() {
             headers,
             Path(node_id.to_string()),
             Json(super::RegisterNodeRequest {
-                reachability: cluster::NodeReachability {
-                    public_api_url: Some("https://public.example".to_string()),
-                    peer_api_url: Some("https://internal.example".to_string()),
-                    relay_required: true,
-                },
+                reachability: test_node_reachability(
+                    Some("https://public.example"),
+                    Some("https://internal.example"),
+                    true,
+                ),
                 capabilities: Some(cluster::NodeCapabilities {
                     public_api: true,
                     peer_api: true,
@@ -14398,6 +14545,7 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(node_id),
             public_api_url: None,
+            public_direct_urls: Vec::new(),
             peer_api_url: None,
             direct_candidates: Vec::new(),
             labels: HashMap::new(),
@@ -14429,6 +14577,7 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
             cluster_id: state.cluster_id,
             identity: transport_sdk::PeerIdentity::Node(node_id),
             public_api_url: Some("https://public.example".to_string()),
+            public_direct_urls: vec!["https://public.example".to_string()],
             peer_api_url: Some("https://internal.example".to_string()),
             direct_candidates: vec![transport_sdk::ConnectionCandidate {
                 kind: transport_sdk::CandidateKind::DirectHttps,
@@ -14475,11 +14624,11 @@ async fn remove_node_persists_forget_to_cluster_state() {
         let mut cluster = state.cluster.lock().await;
         let _ = cluster.register_node(cluster::NodeDescriptor {
             node_id,
-            reachability: cluster::NodeReachability {
-                public_api_url: Some("https://public.example".to_string()),
-                peer_api_url: Some("https://internal.example".to_string()),
-                relay_required: false,
-            },
+            reachability: test_node_reachability(
+                Some("https://public.example"),
+                Some("https://internal.example"),
+                false,
+            ),
             capabilities: cluster::NodeCapabilities {
                 public_api: true,
                 peer_api: true,
@@ -14531,11 +14680,11 @@ async fn resolve_peer_base_url_prefers_internal_url() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
-        reachability: cluster::NodeReachability {
-            public_api_url: Some("https://public.example".to_string()),
-            peer_api_url: Some("https://internal.example".to_string()),
-            relay_required: false,
-        },
+        reachability: test_node_reachability(
+            Some("https://public.example"),
+            Some("https://internal.example"),
+            false,
+        ),
         capabilities: cluster::NodeCapabilities {
             public_api: true,
             peer_api: true,
@@ -14589,11 +14738,7 @@ async fn resolve_peer_base_url_rejects_public_api_only_candidate() {
     state.network.relay_mode = super::RelayMode::Disabled;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
-        reachability: cluster::NodeReachability {
-            public_api_url: Some("https://public.example".to_string()),
-            peer_api_url: None,
-            relay_required: false,
-        },
+        reachability: test_node_reachability(Some("https://public.example"), None, false),
         capabilities: cluster::NodeCapabilities {
             public_api: true,
             peer_api: false,
@@ -15095,11 +15240,11 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
     state.network.relay_mode = super::RelayMode::Required;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
-        reachability: cluster::NodeReachability {
-            public_api_url: Some("https://public.example".to_string()),
-            peer_api_url: Some("https://internal.example".to_string()),
-            relay_required: false,
-        },
+        reachability: test_node_reachability(
+            Some("https://public.example"),
+            Some("https://internal.example"),
+            false,
+        ),
         capabilities: cluster::NodeCapabilities {
             public_api: true,
             peer_api: true,
@@ -15144,11 +15289,11 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
         } else {
             let node = cluster::NodeDescriptor {
                 node_id: NodeId::new_v4(),
-                reachability: cluster::NodeReachability {
-                    public_api_url: Some("https://relay-cleanup-remote.example".to_string()),
-                    peer_api_url: Some("https://relay-cleanup-remote-internal.example".to_string()),
-                    relay_required: false,
-                },
+                reachability: test_node_reachability(
+                    Some("https://relay-cleanup-remote.example"),
+                    Some("https://relay-cleanup-remote-internal.example"),
+                    false,
+                ),
                 capabilities: cluster::NodeCapabilities {
                     public_api: true,
                     peer_api: true,
@@ -15291,11 +15436,11 @@ async fn execute_peer_request_reuses_warm_relay_session() {
         let mut cluster = state.cluster.lock().await;
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
-            reachability: cluster::NodeReachability {
-                public_api_url: Some("https://relay-reuse-remote.example".to_string()),
-                peer_api_url: Some("https://relay-reuse-remote-internal.example".to_string()),
-                relay_required: false,
-            },
+            reachability: test_node_reachability(
+                Some("https://relay-reuse-remote.example"),
+                Some("https://relay-reuse-remote-internal.example"),
+                false,
+            ),
             capabilities: cluster::NodeCapabilities {
                 public_api: true,
                 peer_api: true,
@@ -15378,11 +15523,11 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
         let mut cluster = state.cluster.lock().await;
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
-            reachability: cluster::NodeReachability {
-                public_api_url: Some("https://relay-reconnect-remote.example".to_string()),
-                peer_api_url: Some("https://relay-reconnect-remote-internal.example".to_string()),
-                relay_required: false,
-            },
+            reachability: test_node_reachability(
+                Some("https://relay-reconnect-remote.example"),
+                Some("https://relay-reconnect-remote-internal.example"),
+                false,
+            ),
             capabilities: cluster::NodeCapabilities {
                 public_api: true,
                 peer_api: true,
@@ -15880,7 +16025,9 @@ async fn execute_peer_request_streams_object_reads_over_relay() {
             node_id: NodeId::new_v4(),
             reachability: cluster::NodeReachability {
                 public_api_url: Some("https://relay-object-read-remote.example".to_string()),
+                public_direct_urls: Vec::new(),
                 peer_api_url: Some("https://relay-object-read-remote-internal.example".to_string()),
+                peer_direct_urls: Vec::new(),
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -16078,13 +16225,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
             .expect("endpoint A should serve");
     });
 
-    let heartbeat_handle = super::spawn_rendezvous_presence_heartbeat(
-        state.clone(),
-        Some("http://127.0.0.1:39080".to_string()),
-        Some("https://127.0.0.1:49080".to_string()),
-        true,
-        30,
-    );
+    let heartbeat_handle = super::spawn_rendezvous_presence_heartbeat(state.clone(), 30);
 
     wait_for_condition(
         "first endpoint receives degraded retries",

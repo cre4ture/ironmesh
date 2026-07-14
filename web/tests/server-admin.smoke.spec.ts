@@ -241,6 +241,15 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
 
   await page.getByText("Control Plane", { exact: true }).click();
+  await expect(page.getByText("Advertised direct node URLs")).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Additional public API URLs" })
+    .fill("https://edge-a.local:8443\nhttps://edge-b.local:8443");
+  await page
+    .getByRole("textbox", { name: "Additional peer API URLs" })
+    .fill("https://edge-a.local:18443\nhttps://edge-b.local:18443");
+  await page.getByRole("button", { name: "Save direct node URLs" }).click();
+  await expect(page.locator("pre").filter({ hasText: "edge-b.local:18443" }).first()).toBeVisible();
   await expect(page.getByText("https://embedded-rendezvous.local:9443", { exact: true })).toBeVisible();
   await page
     .getByRole("textbox", { name: "Editable operator-managed URLs" })
@@ -804,6 +813,16 @@ async function installServerAdminMocks(
     trust_roots: {
       cluster_ca_pem: "-----BEGIN CERTIFICATE-----\\ncluster\\n-----END CERTIFICATE-----"
     }
+  };
+  let directEndpointsConfig = {
+    effective_public_urls: ["https://node-alpha.local", "https://edge.example:8443"],
+    editable_public_urls: ["https://edge.example:8443"],
+    primary_public_url: "https://node-alpha.local",
+    effective_peer_urls: ["https://node-alpha.local:18080", "https://edge.example:18443"],
+    editable_peer_urls: ["https://edge.example:18443"],
+    primary_peer_url: "https://node-alpha.local:18080",
+    persistence_source: "node_enrollment",
+    persisted: true
   };
   let rendezvousConfig = {
     effective_urls: ["https://embedded-rendezvous.local:9443", "https://rendezvous-a.local:9443"],
@@ -1923,6 +1942,35 @@ async function installServerAdminMocks(
         return;
       }
       return json(route, rendezvousConfig);
+    }
+
+    if (pathname === apiV1("/auth/direct-endpoints-config") && method === "GET") {
+      if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
+        await route.fulfill({ status: 401 });
+        return;
+      }
+      return json(route, directEndpointsConfig);
+    }
+
+    if (pathname === apiV1("/auth/direct-endpoints-config") && method === "PUT") {
+      const body = route.request().postDataJSON() as {
+        public_urls?: string[];
+        peer_urls?: string[];
+      };
+      directEndpointsConfig = {
+        ...directEndpointsConfig,
+        editable_public_urls: body.public_urls ?? [],
+        effective_public_urls: [
+          "https://node-alpha.local",
+          ...(body.public_urls ?? [])
+        ],
+        editable_peer_urls: body.peer_urls ?? [],
+        effective_peer_urls: [
+          "https://node-alpha.local:18080",
+          ...(body.peer_urls ?? [])
+        ]
+      };
+      return json(route, directEndpointsConfig);
     }
 
     if (pathname === apiV1("/auth/rendezvous-config") && method === "PUT") {

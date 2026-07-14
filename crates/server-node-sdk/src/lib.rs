@@ -311,6 +311,9 @@ struct ServerNetworkRuntime {
     public_tls_runtime: Option<PublicTlsRuntime>,
     internal_tls_runtime: Option<InternalTlsRuntime>,
     rendezvous_ca_pem: Option<String>,
+    primary_public_direct_url: Option<String>,
+    primary_peer_direct_url: Option<String>,
+    advertised_direct_endpoints: Arc<StdMutex<Vec<BootstrapEndpoint>>>,
     rendezvous_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_registration_enabled: bool,
     rendezvous_mtls_required: bool,
@@ -752,7 +755,7 @@ struct RendezvousEndpointRegistrationView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum RendezvousConfigPersistenceSource {
+enum OperatorConfigPersistenceSource {
     NodeEnrollment,
     RuntimeOnly,
 }
@@ -2887,6 +2890,7 @@ pub struct ServerNodeConfig {
     pub public_ca_cert_path: Option<PathBuf>,
     pub public_ca_key_path: Option<PathBuf>,
     bootstrap_trust_roots: Option<BootstrapTrustRoots>,
+    pub advertised_direct_endpoints: Vec<BootstrapEndpoint>,
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
     pub internal_ca_key_path: Option<PathBuf>,
@@ -4163,6 +4167,146 @@ fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
         .expect("rendezvous URL mutex poisoned") = urls;
 }
 
+fn current_advertised_direct_endpoints(state: &ServerState) -> Vec<BootstrapEndpoint> {
+    state
+        .network
+        .advertised_direct_endpoints
+        .lock()
+        .expect("direct endpoint mutex poisoned")
+        .clone()
+}
+
+fn replace_advertised_direct_endpoints(state: &ServerState, endpoints: Vec<BootstrapEndpoint>) {
+    *state
+        .network
+        .advertised_direct_endpoints
+        .lock()
+        .expect("direct endpoint mutex poisoned") = endpoints;
+}
+
+fn canonicalize_direct_endpoint_url(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let parsed = reqwest::Url::parse(trimmed)
+        .with_context(|| format!("invalid direct endpoint URL {trimmed:?}"))?;
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn normalize_direct_endpoint_urls(values: &[String]) -> Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let canonical = canonicalize_direct_endpoint_url(trimmed)?;
+        if seen.insert(canonical.clone()) {
+            normalized.push(canonical);
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_advertised_direct_endpoints(
+    direct_endpoints: &[BootstrapEndpoint],
+    node_id: NodeId,
+) -> Result<Vec<BootstrapEndpoint>> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for endpoint in direct_endpoints {
+        let Some(usage) = endpoint.usage else {
+            continue;
+        };
+        if !matches!(
+            usage,
+            BootstrapEndpointUse::PublicApi | BootstrapEndpointUse::PeerApi
+        ) {
+            continue;
+        }
+
+        let canonical = canonicalize_direct_endpoint_url(&endpoint.url)?;
+        let seen_key = format!("{usage:?}:{canonical}");
+        if seen.insert(seen_key) {
+            normalized.push(BootstrapEndpoint {
+                url: canonical,
+                usage: Some(usage),
+                node_id: Some(node_id),
+            });
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn effective_direct_endpoints(
+    primary_public_url: Option<&str>,
+    primary_peer_url: Option<&str>,
+    editable_direct_endpoints: &[BootstrapEndpoint],
+    node_id: NodeId,
+) -> Result<Vec<BootstrapEndpoint>> {
+    let mut effective = Vec::new();
+
+    if let Some(public_url) = primary_public_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        effective.push(BootstrapEndpoint {
+            url: canonicalize_direct_endpoint_url(public_url)?,
+            usage: Some(BootstrapEndpointUse::PublicApi),
+            node_id: Some(node_id),
+        });
+    }
+
+    if let Some(peer_url) = primary_peer_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        effective.push(BootstrapEndpoint {
+            url: canonicalize_direct_endpoint_url(peer_url)?,
+            usage: Some(BootstrapEndpointUse::PeerApi),
+            node_id: Some(node_id),
+        });
+    }
+
+    effective.extend(normalize_advertised_direct_endpoints(
+        editable_direct_endpoints,
+        node_id,
+    )?);
+    normalize_advertised_direct_endpoints(&effective, node_id)
+}
+
+fn direct_endpoint_urls_by_usage(
+    direct_endpoints: &[BootstrapEndpoint],
+    usage: BootstrapEndpointUse,
+) -> Vec<String> {
+    direct_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.usage == Some(usage))
+        .map(|endpoint| endpoint.url.clone())
+        .collect()
+}
+
+fn node_reachability_from_direct_endpoints(
+    direct_endpoints: &[BootstrapEndpoint],
+    relay_required: bool,
+) -> NodeReachability {
+    let public_direct_urls =
+        direct_endpoint_urls_by_usage(direct_endpoints, BootstrapEndpointUse::PublicApi);
+    let peer_direct_urls =
+        direct_endpoint_urls_by_usage(direct_endpoints, BootstrapEndpointUse::PeerApi);
+
+    NodeReachability {
+        public_api_url: public_direct_urls.first().cloned(),
+        public_direct_urls,
+        peer_api_url: peer_direct_urls.first().cloned(),
+        peer_direct_urls,
+        relay_required,
+    }
+}
+
 async fn sync_rendezvous_registration_state(state: &ServerState) {
     let urls = current_rendezvous_urls(state);
     let desired = urls.iter().cloned().collect::<HashSet<_>>();
@@ -4752,6 +4896,12 @@ impl ServerNodeConfig {
                 key_path,
             }
         });
+        let advertised_direct_endpoints = effective_direct_endpoints(
+            bootstrap.public_url.as_deref(),
+            bootstrap.internal_url.as_deref(),
+            &bootstrap.direct_endpoints,
+            bootstrap.node_id,
+        )?;
         let rendezvous_configured = !bootstrap.rendezvous_urls.is_empty();
 
         Ok(Self {
@@ -4777,6 +4927,7 @@ impl ServerNodeConfig {
             public_ca_cert_path: bootstrap.public_ca_cert_path.map(PathBuf::from),
             public_ca_key_path: None,
             bootstrap_trust_roots: Some(bootstrap.trust_roots),
+            advertised_direct_endpoints,
             public_peer_api_enabled: bootstrap.public_peer_api_enabled,
             internal_tls,
             internal_ca_key_path: None,
@@ -5037,6 +5188,14 @@ impl ServerNodeConfig {
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
             .unwrap_or(false);
+        let advertised_direct_endpoints = effective_direct_endpoints(
+            public_url.as_deref(),
+            internal_tls
+                .as_ref()
+                .and_then(|tls| tls.internal_url.as_deref()),
+            &[],
+            node_id,
+        )?;
         let default_audit_interval_secs = 3600;
         let default_replication_repair_backoff_secs = 30;
 
@@ -5064,6 +5223,7 @@ impl ServerNodeConfig {
                 .ok()
                 .map(PathBuf::from),
             bootstrap_trust_roots: None,
+            advertised_direct_endpoints,
             public_peer_api_enabled,
             internal_tls,
             internal_ca_key_path: std::env::var("IRONMESH_INTERNAL_TLS_CA_KEY")
@@ -5688,6 +5848,16 @@ async fn run_inner(
         .as_ref()
         .and_then(|tls| tls.internal_url.clone())
         .unwrap_or_else(|| public_url.clone());
+    let advertised_direct_endpoints = effective_direct_endpoints(
+        Some(public_url.as_str()),
+        Some(internal_url.as_str()),
+        &config.advertised_direct_endpoints,
+        config.node_id,
+    )?;
+    let local_reachability = node_reachability_from_direct_endpoints(
+        &advertised_direct_endpoints,
+        config.relay_mode == RelayMode::Required,
+    );
 
     let repair_config = config.repair_config();
     let peer_heartbeat_config = config.peer_heartbeat_config();
@@ -5779,14 +5949,10 @@ async fn run_inner(
 
     let _ = cluster.register_node(NodeDescriptor {
         node_id: config.node_id,
-        reachability: NodeReachability {
-            public_api_url: Some(public_url.clone()),
-            peer_api_url: Some(internal_url),
-            relay_required: config.relay_mode == RelayMode::Required,
-        },
+        reachability: local_reachability.clone(),
         capabilities: NodeCapabilities {
-            public_api: true,
-            peer_api: true,
+            public_api: !local_reachability.public_api_urls().is_empty(),
+            peer_api: !local_reachability.peer_api_urls().is_empty(),
             relay_tunnel: config.rendezvous_registration_enabled
                 && config.relay_mode != RelayMode::Disabled,
         },
@@ -6097,6 +6263,9 @@ async fn run_inner(
             public_tls_runtime,
             internal_tls_runtime,
             rendezvous_ca_pem,
+            primary_public_direct_url: normalize_optional_url(Some(public_url.as_str())),
+            primary_peer_direct_url: normalize_optional_url(Some(internal_url.as_str())),
+            advertised_direct_endpoints: Arc::new(StdMutex::new(advertised_direct_endpoints)),
             rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
             rendezvous_registration_enabled: config.rendezvous_registration_enabled,
             rendezvous_mtls_required: config.rendezvous_mtls_required,
@@ -6158,18 +6327,7 @@ async fn run_inner(
     };
     seed_process_temperature_stats_for_tests(&state);
 
-    let internal_peer_url = config
-        .internal_tls
-        .as_ref()
-        .and_then(|tls| tls.internal_url.clone());
-    start_background_runtimes(
-        &state,
-        &config,
-        &public_url,
-        internal_peer_url.as_deref(),
-        startup_phase_anchor,
-    )
-    .await;
+    start_background_runtimes(&state, &config, startup_phase_anchor).await;
 
     let build_http_routers_phase_started_at =
         log_server_startup_phase_begin("build_http_routers", startup_phase_anchor);
@@ -6193,8 +6351,6 @@ struct ServerApps {
 async fn start_background_runtimes(
     state: &ServerState,
     config: &ServerNodeConfig,
-    public_url: &str,
-    internal_peer_url: Option<&str>,
     startup_phase_anchor: Instant,
 ) {
     spawn_upload_session_store_persister(state.clone());
@@ -6253,13 +6409,7 @@ async fn start_background_runtimes(
 
     if state.network.rendezvous_registration_enabled {
         spawn_rendezvous_peer_discovery(state.clone(), config.replica_view_sync_interval_secs);
-        spawn_rendezvous_presence_heartbeat(
-            state.clone(),
-            Some(public_url.to_string()),
-            internal_peer_url.map(str::to_string),
-            config.public_peer_api_enabled,
-            config.peer_heartbeat_interval_secs,
-        );
+        spawn_rendezvous_presence_heartbeat(state.clone(), config.peer_heartbeat_interval_secs);
 
         if state.network.relay_mode != RelayMode::Disabled {
             spawn_rendezvous_relay_multiplex_agent(state.clone());
@@ -6399,6 +6549,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route(
             "/auth/logging/config",
             get(get_runtime_log_config).put(update_runtime_log_config),
+        )
+        .route(
+            "/auth/direct-endpoints-config",
+            get(get_direct_endpoints_config).put(update_direct_endpoints_config),
         )
         .route(
             "/auth/rendezvous-config",
@@ -7206,9 +7360,6 @@ fn spawn_data_scrubber(state: ServerState) {
 
 fn spawn_rendezvous_presence_heartbeat(
     state: ServerState,
-    public_url: Option<String>,
-    internal_peer_url: Option<String>,
-    public_peer_api_enabled: bool,
     interval_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -7226,13 +7377,8 @@ fn spawn_rendezvous_presence_heartbeat(
                     .into_iter()
                     .find(|node| node.node_id == state.node_id)
             };
-            let registration = build_rendezvous_presence_registration(
-                &state,
-                public_url.as_deref(),
-                internal_peer_url.as_deref(),
-                public_peer_api_enabled,
-                local_descriptor.as_ref(),
-            );
+            let registration =
+                build_rendezvous_presence_registration(&state, local_descriptor.as_ref());
 
             let clients = current_rendezvous_endpoint_clients(&state).await;
             if clients.is_empty() {
@@ -7350,21 +7496,25 @@ fn spawn_rendezvous_presence_heartbeat(
 
 fn build_rendezvous_presence_registration(
     state: &ServerState,
-    public_url: Option<&str>,
-    internal_peer_url: Option<&str>,
-    _public_peer_api_enabled: bool,
     local_descriptor: Option<&NodeDescriptor>,
 ) -> PresenceRegistration {
     let mut direct_candidates = Vec::new();
     let mut seen_endpoints = BTreeSet::new();
-    let public_api_url = normalize_optional_url(public_url);
-    let peer_api_url = normalize_optional_url(internal_peer_url);
+    let direct_endpoints = current_advertised_direct_endpoints(state);
+    let public_direct_urls =
+        direct_endpoint_urls_by_usage(&direct_endpoints, BootstrapEndpointUse::PublicApi);
+    let peer_direct_urls =
+        direct_endpoint_urls_by_usage(&direct_endpoints, BootstrapEndpointUse::PeerApi);
+    let public_api_url = public_direct_urls.first().cloned();
+    let peer_api_url = peer_direct_urls.first().cloned();
 
-    push_rendezvous_direct_candidate(
-        &mut direct_candidates,
-        &mut seen_endpoints,
-        internal_peer_url,
-    );
+    for peer_direct_url in &peer_direct_urls {
+        push_rendezvous_direct_candidate(
+            &mut direct_candidates,
+            &mut seen_endpoints,
+            Some(peer_direct_url.as_str()),
+        );
+    }
 
     let mut capabilities = Vec::new();
     if !direct_candidates.is_empty() {
@@ -7378,6 +7528,7 @@ fn build_rendezvous_presence_registration(
         cluster_id: state.cluster_id,
         identity: PeerIdentity::Node(state.node_id),
         public_api_url,
+        public_direct_urls,
         peer_api_url,
         direct_candidates,
         labels: local_descriptor
@@ -7509,24 +7660,32 @@ fn node_descriptor_from_presence_entry(
         return None;
     };
 
+    let public_direct_urls = normalize_direct_endpoint_urls(&entry.registration.public_direct_urls)
+        .unwrap_or_else(|_| {
+            entry
+                .registration
+                .public_direct_urls
+                .iter()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+                .collect()
+        });
+    let peer_direct_urls = entry
+        .registration
+        .direct_candidates
+        .iter()
+        .filter_map(|candidate| {
+            (candidate.kind == CandidateKind::DirectHttps)
+                .then_some(candidate.endpoint.trim().trim_end_matches('/').to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
     let peer_api_url = entry
         .registration
         .peer_api_url
         .as_deref()
         .and_then(|value| normalize_optional_url(Some(value)))
-        .or_else(|| {
-            entry
-                .registration
-                .direct_candidates
-                .iter()
-                .find_map(|candidate| {
-                    if candidate.kind == CandidateKind::DirectHttps {
-                        normalize_optional_url(Some(candidate.endpoint.as_str()))
-                    } else {
-                        None
-                    }
-                })
-        });
+        .or_else(|| peer_direct_urls.first().cloned());
     let has_relay_capability = entry
         .registration
         .capabilities
@@ -7539,13 +7698,16 @@ fn node_descriptor_from_presence_entry(
         .registration
         .public_api_url
         .as_deref()
-        .and_then(|value| normalize_optional_url(Some(value)));
+        .and_then(|value| normalize_optional_url(Some(value)))
+        .or_else(|| public_direct_urls.first().cloned());
 
     Some(NodeDescriptor {
         node_id: *node_id,
         reachability: NodeReachability {
             public_api_url: public_api_url.clone(),
+            public_direct_urls,
             peer_api_url: peer_api_url.clone(),
+            peer_direct_urls,
             relay_required: entry.registration.relay_mode == RelayMode::Required,
         },
         capabilities: NodeCapabilities {
@@ -7581,12 +7743,14 @@ fn peer_connection_candidates(
     let mut seen_endpoints = BTreeSet::new();
 
     if state.network.relay_mode != RelayMode::Required && !node.relay_required() {
-        push_ranked_peer_candidate(
-            &mut candidates,
-            &mut seen_endpoints,
-            normalize_optional_url(node.peer_api_url()),
-            Some(1),
-        );
+        for (index, peer_api_url) in node.peer_api_urls().into_iter().enumerate() {
+            push_ranked_peer_candidate(
+                &mut candidates,
+                &mut seen_endpoints,
+                normalize_optional_url(Some(peer_api_url)),
+                Some(index.saturating_add(1) as u32),
+            );
+        }
     }
     if state.network.relay_mode != RelayMode::Disabled && node.relay_capable() {
         for relay_url in current_rendezvous_urls(state) {
@@ -15681,13 +15845,33 @@ struct RendezvousConfigView {
     disconnected_retry_interval_secs: u64,
     endpoint_registrations: Vec<RendezvousEndpointRegistrationView>,
     mtls_required: bool,
-    persistence_source: RendezvousConfigPersistenceSource,
+    persistence_source: OperatorConfigPersistenceSource,
+    persisted: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectEndpointsConfigView {
+    effective_public_urls: Vec<String>,
+    editable_public_urls: Vec<String>,
+    primary_public_url: Option<String>,
+    effective_peer_urls: Vec<String>,
+    editable_peer_urls: Vec<String>,
+    primary_peer_url: Option<String>,
+    persistence_source: OperatorConfigPersistenceSource,
     persisted: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateRendezvousConfigRequest {
     editable_urls: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateDirectEndpointsConfigRequest {
+    #[serde(default)]
+    public_urls: Vec<String>,
+    #[serde(default)]
+    peer_urls: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -17179,12 +17363,16 @@ async fn issue_client_bootstrap_impl(
         let mut endpoints = cluster
             .list_nodes()
             .into_iter()
-            .filter_map(|node| {
-                node.public_api_url().map(|url| BootstrapEndpoint {
-                    url: url.to_string(),
-                    usage: Some(BootstrapEndpointUse::PublicApi),
-                    node_id: Some(node.node_id),
-                })
+            .flat_map(|node| {
+                let node_id = node.node_id;
+                node.public_api_urls()
+                    .into_iter()
+                    .map(|url| BootstrapEndpoint {
+                        url: url.to_string(),
+                        usage: Some(BootstrapEndpointUse::PublicApi),
+                        node_id: Some(node_id),
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         endpoints.sort_by(|left, right| {
@@ -17502,31 +17690,13 @@ async fn store_client_bootstrap_claim(
     Ok(claim)
 }
 
-fn build_bootstrap_direct_endpoints(
+pub(crate) fn build_bootstrap_direct_endpoints(
     public_url: Option<&str>,
     internal_url: Option<&str>,
     _public_peer_api_enabled: bool,
     node_id: NodeId,
-) -> Vec<BootstrapEndpoint> {
-    let mut endpoints = Vec::new();
-
-    if let Some(public_url) = public_url {
-        endpoints.push(BootstrapEndpoint {
-            url: public_url.to_string(),
-            usage: Some(BootstrapEndpointUse::PublicApi),
-            node_id: Some(node_id),
-        });
-    }
-
-    if let Some(peer_url) = internal_url {
-        endpoints.push(BootstrapEndpoint {
-            url: peer_url.to_string(),
-            usage: Some(BootstrapEndpointUse::PeerApi),
-            node_id: Some(node_id),
-        });
-    }
-
-    endpoints
+) -> Result<Vec<BootstrapEndpoint>> {
+    effective_direct_endpoints(public_url, internal_url, &[], node_id)
 }
 
 fn default_public_url(bind_addr: &str, tls_enabled: bool) -> String {
@@ -17581,6 +17751,13 @@ fn build_issued_node_bootstrap(
         .internal_url
         .or_else(|| internal_bind_addr.as_deref().map(default_internal_url));
     let _compat_public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(false);
+    let direct_endpoints = build_bootstrap_direct_endpoints(
+        public_url.as_deref(),
+        internal_url.as_deref(),
+        false,
+        node_id,
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let bootstrap = TransportNodeBootstrap {
         version: 1,
@@ -17601,12 +17778,7 @@ fn build_issued_node_bootstrap(
         internal_tls: request.internal_tls,
         rendezvous_urls,
         rendezvous_mtls_required: state.network.rendezvous_mtls_required,
-        direct_endpoints: build_bootstrap_direct_endpoints(
-            public_url.as_deref(),
-            internal_url.as_deref(),
-            false,
-            node_id,
-        ),
+        direct_endpoints,
         relay_mode: state.network.relay_mode,
         trust_roots: bootstrap_trust_roots(state)?,
         enrollment_issuer_url,
@@ -20563,12 +20735,149 @@ async fn list_client_bootstrap_claims(
     (StatusCode::OK, Json(claims)).into_response()
 }
 
-fn rendezvous_config_persistence_source(state: &ServerState) -> RendezvousConfigPersistenceSource {
+fn operator_config_persistence_source(state: &ServerState) -> OperatorConfigPersistenceSource {
     if state.network.node_enrollment_path.is_some() {
-        RendezvousConfigPersistenceSource::NodeEnrollment
+        OperatorConfigPersistenceSource::NodeEnrollment
     } else {
-        RendezvousConfigPersistenceSource::RuntimeOnly
+        OperatorConfigPersistenceSource::RuntimeOnly
     }
+}
+
+fn current_editable_direct_urls(state: &ServerState) -> (Vec<String>, Vec<String>) {
+    let direct_endpoints = current_advertised_direct_endpoints(state);
+    let primary_public = state.network.primary_public_direct_url.as_deref();
+    let primary_peer = state.network.primary_peer_direct_url.as_deref();
+    let editable_public_urls =
+        direct_endpoint_urls_by_usage(&direct_endpoints, BootstrapEndpointUse::PublicApi)
+            .into_iter()
+            .filter(|url| Some(url.as_str()) != primary_public)
+            .collect();
+    let editable_peer_urls =
+        direct_endpoint_urls_by_usage(&direct_endpoints, BootstrapEndpointUse::PeerApi)
+            .into_iter()
+            .filter(|url| Some(url.as_str()) != primary_peer)
+            .collect();
+    (editable_public_urls, editable_peer_urls)
+}
+
+async fn build_direct_endpoints_config_view(
+    state: &ServerState,
+    persisted: bool,
+) -> DirectEndpointsConfigView {
+    let direct_endpoints = current_advertised_direct_endpoints(state);
+    let (editable_public_urls, editable_peer_urls) = current_editable_direct_urls(state);
+    DirectEndpointsConfigView {
+        effective_public_urls: direct_endpoint_urls_by_usage(
+            &direct_endpoints,
+            BootstrapEndpointUse::PublicApi,
+        ),
+        editable_public_urls,
+        primary_public_url: state.network.primary_public_direct_url.clone(),
+        effective_peer_urls: direct_endpoint_urls_by_usage(
+            &direct_endpoints,
+            BootstrapEndpointUse::PeerApi,
+        ),
+        editable_peer_urls,
+        primary_peer_url: state.network.primary_peer_direct_url.clone(),
+        persistence_source: operator_config_persistence_source(state),
+        persisted,
+    }
+}
+
+fn build_effective_operator_direct_endpoints(
+    state: &ServerState,
+    public_urls: &[String],
+    peer_urls: &[String],
+) -> Result<Vec<BootstrapEndpoint>> {
+    let mut editable_endpoints = Vec::new();
+    editable_endpoints.extend(public_urls.iter().map(|url| BootstrapEndpoint {
+        url: url.clone(),
+        usage: Some(BootstrapEndpointUse::PublicApi),
+        node_id: Some(state.node_id),
+    }));
+    editable_endpoints.extend(peer_urls.iter().map(|url| BootstrapEndpoint {
+        url: url.clone(),
+        usage: Some(BootstrapEndpointUse::PeerApi),
+        node_id: Some(state.node_id),
+    }));
+
+    effective_direct_endpoints(
+        state.network.primary_public_direct_url.as_deref(),
+        state.network.primary_peer_direct_url.as_deref(),
+        &editable_endpoints,
+        state.node_id,
+    )
+}
+
+fn persist_direct_endpoints_if_possible(
+    state: &ServerState,
+    direct_endpoints: &[BootstrapEndpoint],
+) -> Result<bool> {
+    let Some(path) = state.network.node_enrollment_path.as_ref() else {
+        return Ok(false);
+    };
+
+    let mut package = NodeEnrollmentPackage::from_path(path)?;
+    package.bootstrap.direct_endpoints = direct_endpoints.to_vec();
+    package.write_to_path(path)?;
+    Ok(true)
+}
+
+async fn refresh_local_node_reachability(state: &ServerState) -> Result<()> {
+    let direct_endpoints = current_advertised_direct_endpoints(state);
+    let reachability = node_reachability_from_direct_endpoints(
+        &direct_endpoints,
+        state.network.relay_mode == RelayMode::Required,
+    );
+
+    let changed = {
+        let mut cluster = state.cluster.lock().await;
+        let existing = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == state.node_id);
+        let labels = existing
+            .as_ref()
+            .map(|node| node.labels.clone())
+            .unwrap_or_default();
+        let capacity_bytes = existing
+            .as_ref()
+            .map(|node| node.capacity_bytes)
+            .unwrap_or(0);
+        let free_bytes = existing.as_ref().map(|node| node.free_bytes).unwrap_or(0);
+        let storage_stats = existing
+            .as_ref()
+            .and_then(|node| node.storage_stats.clone());
+        let last_heartbeat_unix = existing
+            .as_ref()
+            .map(|node| node.last_heartbeat_unix)
+            .unwrap_or(0);
+        let status = existing
+            .as_ref()
+            .map(|node| node.status.clone())
+            .unwrap_or(cluster::NodeStatus::Online);
+        cluster.register_node(NodeDescriptor {
+            node_id: state.node_id,
+            reachability: reachability.clone(),
+            capabilities: NodeCapabilities {
+                public_api: !reachability.public_api_urls().is_empty(),
+                peer_api: !reachability.peer_api_urls().is_empty(),
+                relay_tunnel: state.network.rendezvous_registration_enabled
+                    && state.network.relay_mode != RelayMode::Disabled,
+            },
+            labels,
+            capacity_bytes,
+            free_bytes,
+            storage_stats,
+            last_heartbeat_unix,
+            status,
+        })
+    };
+
+    if changed {
+        persist_cluster_nodes_state(state).await?;
+    }
+    Ok(())
 }
 
 async fn build_rendezvous_config_view(
@@ -20586,7 +20895,7 @@ async fn build_rendezvous_config_view(
         disconnected_retry_interval_secs: RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS,
         endpoint_registrations: rendezvous_registration_views(state).await,
         mtls_required: state.network.rendezvous_mtls_required,
-        persistence_source: rendezvous_config_persistence_source(state),
+        persistence_source: operator_config_persistence_source(state),
         persisted,
     }
 }
@@ -20650,6 +20959,155 @@ fn persist_rendezvous_urls_if_possible(
     package.bootstrap.rendezvous_urls = effective_urls.to_vec();
     package.write_to_path(path)?;
     Ok(true)
+}
+
+async fn get_direct_endpoints_config(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/direct-endpoints-config/get";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let view =
+        build_direct_endpoints_config_view(&state, state.network.node_enrollment_path.is_some())
+            .await;
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "effective_public_urls": view.effective_public_urls.len(),
+            "effective_peer_urls": view.effective_peer_urls.len(),
+            "editable_public_urls": view.editable_public_urls.len(),
+            "editable_peer_urls": view.editable_peer_urls.len(),
+            "persistence_source": view.persistence_source,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(view)).into_response()
+}
+
+async fn update_direct_endpoints_config(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateDirectEndpointsConfigRequest>,
+) -> impl IntoResponse {
+    let action = "auth/direct-endpoints-config/update";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "public_urls": request.public_urls,
+            "peer_urls": request.peer_urls,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let effective_endpoints = match build_effective_operator_direct_endpoints(
+        &state,
+        &request.public_urls,
+        &request.peer_urls,
+    ) {
+        Ok(endpoints) => endpoints,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let persisted = match persist_direct_endpoints_if_possible(&state, &effective_endpoints) {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    replace_advertised_direct_endpoints(&state, effective_endpoints);
+    if let Err(err) = refresh_local_node_reachability(&state).await {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let view = build_direct_endpoints_config_view(&state, persisted).await;
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "effective_public_urls": view.effective_public_urls,
+            "effective_peer_urls": view.effective_peer_urls,
+            "editable_public_urls": view.editable_public_urls,
+            "editable_peer_urls": view.editable_peer_urls,
+            "persistence_source": view.persistence_source,
+            "persisted": view.persisted,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(view)).into_response()
 }
 
 async fn get_rendezvous_config(
@@ -22982,23 +23440,48 @@ async fn register_node(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    let public_api_url = request
+        .reachability
+        .public_api_url
+        .as_deref()
+        .and_then(|value| normalize_optional_url(Some(value)));
+    let peer_api_url = request
+        .reachability
+        .peer_api_url
+        .as_deref()
+        .and_then(|value| normalize_optional_url(Some(value)));
+    let mut public_direct_urls =
+        match normalize_direct_endpoint_urls(&request.reachability.public_direct_urls) {
+            Ok(urls) => urls,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+    let mut peer_direct_urls =
+        match normalize_direct_endpoint_urls(&request.reachability.peer_direct_urls) {
+            Ok(urls) => urls,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+    if let Some(public_api_url) = public_api_url.as_ref()
+        && !public_direct_urls.contains(public_api_url)
+    {
+        public_direct_urls.insert(0, public_api_url.clone());
+    }
+    if let Some(peer_api_url) = peer_api_url.as_ref()
+        && !peer_direct_urls.contains(peer_api_url)
+    {
+        peer_direct_urls.insert(0, peer_api_url.clone());
+    }
+
     let reachability = NodeReachability {
-        public_api_url: request
-            .reachability
-            .public_api_url
-            .as_deref()
-            .and_then(|value| normalize_optional_url(Some(value))),
-        peer_api_url: request
-            .reachability
-            .peer_api_url
-            .as_deref()
-            .and_then(|value| normalize_optional_url(Some(value))),
+        public_api_url: public_api_url.or_else(|| public_direct_urls.first().cloned()),
+        public_direct_urls,
+        peer_api_url: peer_api_url.or_else(|| peer_direct_urls.first().cloned()),
+        peer_direct_urls,
         relay_required: request.reachability.relay_required,
     };
     let requested_capabilities = request.capabilities.unwrap_or_default();
     let capabilities = NodeCapabilities {
-        public_api: requested_capabilities.public_api || reachability.public_api_url.is_some(),
-        peer_api: requested_capabilities.peer_api || reachability.peer_api_url.is_some(),
+        public_api: requested_capabilities.public_api || !reachability.public_api_urls().is_empty(),
+        peer_api: requested_capabilities.peer_api || !reachability.peer_api_urls().is_empty(),
         relay_tunnel: requested_capabilities.relay_tunnel || reachability.relay_required,
     };
 

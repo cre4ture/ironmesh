@@ -92,6 +92,15 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();
 
   await page.getByText("Control Plane", { exact: true }).click();
+  await expect(page.getByText("Advertised direct node URLs")).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Additional public API URLs" })
+    .fill("https://node.example:8443");
+  await page
+    .getByRole("textbox", { name: "Additional peer API URLs" })
+    .fill("https://node.example:18443");
+  await page.getByRole("button", { name: "Save direct node URLs" }).click();
+  await expect(page.locator("pre").filter({ hasText: "node.example:18443" }).first()).toBeVisible();
   await expect(page.getByText("Rendezvous service URLs")).toBeVisible();
   await page
     .getByRole("textbox", { name: "Editable operator-managed URLs" })

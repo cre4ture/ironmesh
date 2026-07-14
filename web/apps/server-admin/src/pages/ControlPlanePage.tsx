@@ -1,15 +1,18 @@
 import {
   exportManagedControlPlanePromotion,
   exportManagedRendezvousFailover,
+  getDirectEndpointsConfig,
   getRendezvousConfig,
   importManagedControlPlanePromotion,
   importManagedRendezvousFailover,
   type ControlPlanePromotionImportResponse,
+  type DirectEndpointsConfigView,
   type ManagedRendezvousFailoverDeploymentTarget,
   type ManagedControlPlanePromotionPackage,
   type ManagedRendezvousFailoverImportResponse,
   type ManagedRendezvousFailoverPackage,
   type RendezvousConfigView,
+  updateDirectEndpointsConfig,
   updateRendezvousConfig
 } from "@ironmesh/api";
 import { JsonBlock } from "@ironmesh/ui";
@@ -33,6 +36,12 @@ import { useAdminAccess } from "../lib/admin-access";
 
 export function ControlPlanePage() {
   const { adminTokenOverride } = useAdminAccess();
+  const [directEndpointsConfig, setDirectEndpointsConfig] = useState<DirectEndpointsConfigView | null>(null);
+  const [editablePublicDirectUrlsText, setEditablePublicDirectUrlsText] = useState("");
+  const [editablePeerDirectUrlsText, setEditablePeerDirectUrlsText] = useState("");
+  const [directEndpointsDirty, setDirectEndpointsDirty] = useState(false);
+  const directEndpointsDirtyRef = useRef(false);
+  const [directEndpointsConfigLoading, setDirectEndpointsConfigLoading] = useState(true);
   const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
   const [editableRendezvousUrlsText, setEditableRendezvousUrlsText] = useState("");
   const [rendezvousUrlsDirty, setRendezvousUrlsDirty] = useState(false);
@@ -58,8 +67,18 @@ export function ControlPlanePage() {
   const [promotionImportResult, setPromotionImportResult] = useState<ControlPlanePromotionImportResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<
-    "rendezvous-config-save" | "rendezvous-export" | "rendezvous-import" | "promotion-export" | "promotion-import" | null
+    | "direct-endpoints-save"
+    | "rendezvous-config-save"
+    | "rendezvous-export"
+    | "rendezvous-import"
+    | "promotion-export"
+    | "promotion-import"
+    | null
   >(null);
+
+  useEffect(() => {
+    directEndpointsDirtyRef.current = directEndpointsDirty;
+  }, [directEndpointsDirty]);
 
   useEffect(() => {
     rendezvousUrlsDirtyRef.current = rendezvousUrlsDirty;
@@ -68,18 +87,28 @@ export function ControlPlanePage() {
   useEffect(() => {
     let cancelled = false;
 
-    async function refreshRendezvousConfig(showLoading: boolean, preserveDraft: boolean) {
+    async function refreshConfigs(showLoading: boolean, preserveDraft: boolean) {
       if (showLoading) {
+        setDirectEndpointsConfigLoading(true);
         setRendezvousConfigLoading(true);
       }
       try {
-        const payload = await getRendezvousConfig(adminTokenOverride);
+        const [directEndpointsPayload, rendezvousPayload] = await Promise.all([
+          getDirectEndpointsConfig(adminTokenOverride),
+          getRendezvousConfig(adminTokenOverride)
+        ]);
         if (cancelled) {
           return;
         }
-        setRendezvousConfig(payload);
+        setDirectEndpointsConfig(directEndpointsPayload);
+        if (!preserveDraft || !directEndpointsDirtyRef.current) {
+          setEditablePublicDirectUrlsText(directEndpointsPayload.editable_public_urls.join("\n"));
+          setEditablePeerDirectUrlsText(directEndpointsPayload.editable_peer_urls.join("\n"));
+          setDirectEndpointsDirty(false);
+        }
+        setRendezvousConfig(rendezvousPayload);
         if (!preserveDraft || !rendezvousUrlsDirtyRef.current) {
-          setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
+          setEditableRendezvousUrlsText(rendezvousPayload.editable_urls.join("\n"));
           setRendezvousUrlsDirty(false);
         }
       } catch (actionError) {
@@ -89,14 +118,15 @@ export function ControlPlanePage() {
         setError(actionError instanceof Error ? actionError.message : String(actionError));
       } finally {
         if (!cancelled && showLoading) {
+          setDirectEndpointsConfigLoading(false);
           setRendezvousConfigLoading(false);
         }
       }
     }
 
-    void refreshRendezvousConfig(true, false);
+    void refreshConfigs(true, false);
     const refreshInterval = window.setInterval(() => {
-      void refreshRendezvousConfig(false, true);
+      void refreshConfigs(false, true);
     }, 5000);
 
     return () => {
@@ -104,6 +134,30 @@ export function ControlPlanePage() {
       window.clearInterval(refreshInterval);
     };
   }, [adminTokenOverride]);
+
+  async function handleSaveDirectEndpointsConfig() {
+    setPendingAction("direct-endpoints-save");
+    setError(null);
+    try {
+      const public_urls = editablePublicDirectUrlsText
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const peer_urls = editablePeerDirectUrlsText
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const payload = await updateDirectEndpointsConfig({ public_urls, peer_urls }, adminTokenOverride);
+      setDirectEndpointsConfig(payload);
+      setEditablePublicDirectUrlsText(payload.editable_public_urls.join("\n"));
+      setEditablePeerDirectUrlsText(payload.editable_peer_urls.join("\n"));
+      setDirectEndpointsDirty(false);
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : String(actionError));
+    } finally {
+      setPendingAction(null);
+    }
+  }
 
   async function handleSaveRendezvousConfig() {
     setPendingAction("rendezvous-config-save");
@@ -219,6 +273,88 @@ export function ControlPlanePage() {
         The new admin surface now exposes both supported transfer paths: move the embedded rendezvous role by itself,
         or move the full control plane together. Both are deliberate failover workflows, not active-active clustering.
       </Text>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between">
+            <Text fw={700}>Advertised direct node URLs</Text>
+            <Badge variant="light">
+              {directEndpointsConfig
+                ? `${directEndpointsConfig.effective_public_urls.length} public / ${directEndpointsConfig.effective_peer_urls.length} peer`
+                : "loading"}
+            </Badge>
+          </Group>
+          <Text c="dimmed">
+            Configure additional direct URLs that this node should advertise. Public URLs are handed to issued client
+            bootstraps, while peer URLs are published through rendezvous so other nodes can retry multiple direct paths
+            before falling back to relay.
+          </Text>
+          <Text size="sm" c="dimmed">
+            Public URLs must already terminate on this node&apos;s public API listener, and the public TLS certificate
+            still needs to cover any hostname clients will dial there.
+          </Text>
+          {directEndpointsConfig?.persistence_source === "runtime_only" ? (
+            <Alert color="yellow" title="Runtime-only persistence">
+              This node does not currently have a persisted node enrollment package, so direct URL edits apply live now
+              but will be lost after restart unless the underlying startup config is updated too.
+            </Alert>
+          ) : null}
+          <Grid>
+            <Grid.Col span={{ base: 12, xl: 6 }}>
+              <Stack gap="sm">
+                <Text fw={600}>Current effective configuration</Text>
+                <JsonBlock
+                  value={
+                    directEndpointsConfig ?? {
+                      status: directEndpointsConfigLoading ? "loading" : "unavailable"
+                    }
+                  }
+                />
+              </Stack>
+            </Grid.Col>
+            <Grid.Col span={{ base: 12, xl: 6 }}>
+              <Stack gap="sm">
+                <Text fw={600}>Additional public API URLs</Text>
+                <Textarea
+                  label="Additional public API URLs"
+                  minRows={4}
+                  autosize
+                  value={editablePublicDirectUrlsText}
+                  onChange={(event) => {
+                    setEditablePublicDirectUrlsText(event.currentTarget.value);
+                    setDirectEndpointsDirty(true);
+                  }}
+                  placeholder={"https://edge.example:8443\nhttps://198.51.100.10:8443"}
+                />
+                <Text fw={600}>Additional peer API URLs</Text>
+                <Textarea
+                  label="Additional peer API URLs"
+                  minRows={4}
+                  autosize
+                  value={editablePeerDirectUrlsText}
+                  onChange={(event) => {
+                    setEditablePeerDirectUrlsText(event.currentTarget.value);
+                    setDirectEndpointsDirty(true);
+                  }}
+                  placeholder={"https://edge.example:18443\nhttps://198.51.100.10:18443"}
+                />
+                <Text size="sm" c="dimmed">
+                  One URL per line. The primary public and peer URLs from this node&apos;s bootstrap stay read-only and
+                  are always kept first.
+                </Text>
+                <Group>
+                  <Button
+                    onClick={() => void handleSaveDirectEndpointsConfig()}
+                    loading={pendingAction === "direct-endpoints-save"}
+                  >
+                    Save direct node URLs
+                  </Button>
+                </Group>
+              </Stack>
+            </Grid.Col>
+          </Grid>
+        </Stack>
+      </Card>
 
       <Card withBorder radius="md" padding="lg">
         <Stack gap="md">

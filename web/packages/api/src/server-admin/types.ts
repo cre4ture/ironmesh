@@ -136,7 +136,9 @@ export type NodeDescriptor = {
   node_id: string;
   reachability: {
     public_api_url?: string | null;
+    public_direct_urls?: string[];
     peer_api_url?: string | null;
+    peer_direct_urls?: string[];
     relay_required: boolean;
   };
   capabilities: {
@@ -807,6 +809,17 @@ export type RendezvousConfigView = {
     software_version: string | null;
   }[];
   mtls_required: boolean;
+  persistence_source: "node_enrollment" | "runtime_only";
+  persisted: boolean;
+};
+
+export type DirectEndpointsConfigView = {
+  effective_public_urls: string[];
+  editable_public_urls: string[];
+  primary_public_url: string | null;
+  effective_peer_urls: string[];
+  editable_peer_urls: string[];
+  primary_peer_url: string | null;
   persistence_source: "node_enrollment" | "runtime_only";
   persisted: boolean;
 };
