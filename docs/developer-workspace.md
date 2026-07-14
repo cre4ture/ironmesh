@@ -160,6 +160,39 @@ Those bridges can be added incrementally without changing the workspace topology
 - Persistent storage strategy and requirements are documented in [persistent-storage-strategy.md](persistent-storage-strategy.md).
 - S3 compatibility-front-end design is documented in [s3-compatible-front-end-design.md](s3-compatible-front-end-design.md).
 
+### Recent S3 milestone notes
+
+- 2026-07-06: official AWS Rust SDK compatibility coverage now spans the native listener plus both direct and relay-backed `serve-s3` gateway paths.
+  The `system-tests` S3 suite now drives `ListBuckets`, `PutObject`, `HeadObject`, `GetObject`, `ListObjectsV2`, and `DeleteObject` against a spawned dedicated S3 listener and through spawned `cli-client serve-s3` gateways in both direct and forced-relay modes, and that smoke path fixed two wire-compatibility issues in the frontend itself: malformed S3 XML namespace attributes and missing bucket-root trailing-slash routing.
+- 2026-07-06: multi-node S3 control-plane replication is now covered as a writable cluster path, not just a read-only fanout.
+  The `system-tests` S3 suite now proves an access key created on node A can be revoked through node B's admin API, that the revocation fans back to node A with the peer node recorded as the latest source, and that node A's dedicated S3 listener subsequently rejects the revoked key.
+- 2026-07-06: S3 runtime coverage now reaches beyond single-node listener behavior into real distributed and transport-backed paths.
+  The `system-tests` S3 suite now proves S3 control-plane fanout from one spawned node to another strongly enough that the peer node's own dedicated S3 listener accepts the replicated bucket mapping and access key, and it also validates a spawned `cli-client serve-s3` gateway carrying signed S3 requests over the real `/s3/*` transport path.
+- 2026-07-06: dedicated-listener runtime coverage now includes the remaining high-value S3 listing edge cases over real HTTP.
+  The `system-tests` S3 suite now validates folder-marker plus `CommonPrefixes` coexistence, continuation-token pagination for `ListObjectsV2`, and delimiter-aware `?versions=` listings with marker-based pagination against a spawned `server-node` S3 listener.
+- 2026-07-06: dedicated-listener runtime coverage now includes `CopyObject` and batched `DeleteObjects` flows over real HTTP.
+  The `system-tests` S3 suite now validates overwrite and metadata-replacement copy semantics across buckets, plus mixed-success `DeleteObjects` responses, delete-marker creation, missing-version errors, and quiet-delete behavior against a spawned `server-node` S3 listener.
+- 2026-07-06: dedicated-listener runtime coverage now includes presigned-request auth and S3-side bucket management over real HTTP.
+  The `system-tests` S3 suite now validates presigned `PUT`/`GET`/`DELETE` flows plus signature tampering failures, and it exercises `allow_manage` bucket creation and deletion semantics, including non-empty-bucket rejection and XML `CreateBucketConfiguration` handling, against a spawned `server-node` S3 listener.
+- 2026-07-06: dedicated-listener runtime coverage now includes versioned-object and delete-marker behavior over real HTTP.
+  The `system-tests` S3 suite now validates enabled-bucket version headers, current-object deletes that produce delete markers, historical reads by `versionId`, and `?versions=` listings against a spawned `server-node` S3 listener.
+- 2026-07-06: dedicated-listener runtime coverage now includes multipart upload flows over real HTTP.
+  The `system-tests` S3 suite now drives `CreateMultipartUpload`, `UploadPart`, paged `ListParts`, `CompleteMultipartUpload`, final-object reads, and abort handling against a spawned `server-node` process with `IRONMESH_S3_BIND` enabled.
+- 2026-07-06: `system-tests` now covers a real dedicated S3 listener socket end to end.
+  The harness reserves `IRONMESH_S3_BIND` ports alongside the public and internal listener ports, and the new runtime test provisions S3 control-plane state through the admin API before exercising SigV4 list, `PUT`, `HEAD`, `GET`, prefix listing, and `DELETE` flows against the bound S3 listener on a spawned `server-node` process.
+- 2026-07-06: relay-backed `serve-s3` gateway coverage now exercises both direct and rendezvous/relay forwarding paths.
+  The `system-tests` S3 suite now spawns a real `cli-client serve-s3` gateway with a bootstrap whose direct public API endpoint has been deliberately blackholed, then proves signed bucket listing, small object traffic, and a multi-MiB object round-trip still succeed by falling back through the rendezvous/relay transport path.
+- 2026-07-06: bootstrap bundles no longer collapse client direct endpoints to the local node when client auth is enabled.
+  Client-credential replication is now treated as part of the working multi-node access model, and bootstrap responses can advertise cluster-wide direct endpoints again.
+- 2026-07-06: cross-node client auth now has explicit regression coverage for both:
+  - snapshot-style credential sync from a peer, and
+  - normal post-enrollment credential fanout.
+  Those tests prove a client credential issued on one node can authenticate against another node after replication, which is the prerequisite for cluster-wide bootstrap endpoint advertisement.
+- 2026-07-06: bootstrap coverage now goes one step further than metadata inspection.
+  A server-node integration test now issues a real bootstrap bundle, enrolls a client from it, syncs the issued credential to a second node, builds a `client-sdk` client from the bootstrap JSON, and successfully reaches the remote node through the production public transport surface (`/transport/ws` plus authenticated public API routes).
+- 2026-07-06: the mandatory S3 admin UI path now has smoke coverage.
+  The browser suite exercises the S3 page in both the mocked server-admin flow and a real `server-node` runtime, including bucket creation, access-key issuance, one-time secret display, and key revocation in the mocked path.
+
 ## Multi-node strategy
 
 - Multi-node requirements, replication strategy, and rollout plan are documented in [multi-node-strategy.md](multi-node-strategy.md).

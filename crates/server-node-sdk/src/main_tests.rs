@@ -26,28 +26,36 @@ use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
-use super::storage::{DataScrubRunTestHook, PersistentStore, PutOptions, VersionConsistencyState};
+use super::storage::{
+    DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord,
+    VersionConsistencyState,
+};
 use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::extract::{Json, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use bytes::Bytes;
 use futures_util::io::AsyncReadExt as FuturesAsyncReadExt;
 use futures_util::{Sink, Stream};
+use hmac::{Hmac, Mac};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::task::{Context, Poll};
+use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 use tower::{Service, ServiceExt};
 use uuid::Uuid;
 use x509_parser::prelude::FromDer;
 
 const TEST_ADMIN_TOKEN: &str = "system-test-admin";
+type TestHmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Copy)]
 enum MainTestBackend {
@@ -306,6 +314,8 @@ fn test_cluster_config_without_internal_tls(
         metadata_backend: super::storage::MetadataBackendKind::Sqlite,
         bind_addr,
         public_url: Some(format!("http://{bind_addr}")),
+        s3_bind_addr: None,
+        s3_public_url: None,
         labels,
         public_tls: None,
         allow_insecure_public_http: true,
@@ -1138,6 +1148,346 @@ fn sample_replicated_client_credential(
     }
 }
 
+fn test_admin_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
+    headers
+}
+
+fn sample_s3_bucket_record(
+    bucket_name: &str,
+    root_prefix: &str,
+    created_at_unix: u64,
+) -> super::S3BucketRecord {
+    super::S3BucketRecord {
+        bucket_name: bucket_name.to_string(),
+        root_prefix: root_prefix.to_string(),
+        versioning_status: super::S3BucketVersioningStatus::Enabled,
+        read_only: false,
+        created_at_unix,
+        updated_at_unix: created_at_unix,
+        created_by: Some("replication-test".to_string()),
+        deleted_at_unix: None,
+    }
+}
+
+fn sample_s3_access_key_record(
+    access_key_id: &str,
+    secret_material: &str,
+    bucket_scope: Vec<String>,
+    created_at_unix: u64,
+) -> super::S3AccessKeyRecord {
+    super::S3AccessKeyRecord {
+        access_key_id: access_key_id.to_string(),
+        secret_material: secret_material.to_string(),
+        description: Some("replication-test".to_string()),
+        bucket_scope,
+        prefix_scope: Vec::new(),
+        allow_list: true,
+        allow_read: true,
+        allow_write: true,
+        allow_delete: true,
+        allow_manage: false,
+        created_at_unix,
+        updated_at_unix: created_at_unix,
+        last_used_at_unix: None,
+        revoked_at_unix: None,
+    }
+}
+
+fn s3_test_hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+fn s3_test_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    s3_test_hex_encode(&hasher.finalize())
+}
+
+fn s3_test_hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = TestHmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key sizes");
+    mac.update(data);
+    let bytes = mac.finalize().into_bytes();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&bytes);
+    output
+}
+
+fn s3_test_derive_signing_key(
+    secret_material: &str,
+    date_scope: &str,
+    region: &str,
+    service: &str,
+) -> Vec<u8> {
+    let secret_key = format!("AWS4{secret_material}");
+    let date_key = s3_test_hmac_sha256(secret_key.as_bytes(), date_scope.as_bytes());
+    let region_key = s3_test_hmac_sha256(&date_key, region.as_bytes());
+    let service_key = s3_test_hmac_sha256(&region_key, service.as_bytes());
+    s3_test_hmac_sha256(&service_key, b"aws4_request").to_vec()
+}
+
+fn s3_signed_request(
+    method: Method,
+    uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> Request<Body> {
+    let host = "s3.local";
+    let amz_date = "20260705T120000Z";
+    let date_scope = "20260705";
+    let region = "us-east-1";
+    let service = "s3";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let payload_hash = s3_test_sha256_hex(body.as_ref());
+    let parsed_uri: Uri = uri.parse().unwrap();
+    let canonical_uri = if parsed_uri.path().is_empty() {
+        "/"
+    } else {
+        parsed_uri.path()
+    };
+    let canonical_query = {
+        let mut pairs = parsed_uri
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (name.to_string(), value.to_string())
+            })
+            .collect::<Vec<_>>();
+        pairs.sort();
+        pairs
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    let canonical_request = format!(
+        "{}\n{}\n{}\nhost:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n\n{signed_headers}\n{payload_hash}",
+        method.as_str(),
+        canonical_uri,
+        canonical_query,
+    );
+    let credential_scope = format!("{date_scope}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        s3_test_sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = s3_test_derive_signing_key(secret_material, date_scope, region, service);
+    let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
+        &signing_key,
+        string_to_sign.as_bytes(),
+    ));
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    let mut request = Request::builder()
+        .method(method)
+        .uri(parsed_uri)
+        .body(Body::from(body))
+        .unwrap();
+    request.headers_mut().insert("host", host.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-amz-date", amz_date.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-amz-content-sha256", payload_hash.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("authorization", authorization.parse().unwrap());
+    for (name, value) in extra_headers {
+        request.headers_mut().insert(
+            name.parse::<axum::http::HeaderName>().unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    request
+}
+
+fn s3_presigned_request(
+    method: Method,
+    uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> Request<Body> {
+    s3_presigned_request_at(
+        method,
+        uri,
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+        super::unix_ts() as i64,
+        900,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn s3_presigned_request_at(
+    method: Method,
+    uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+    signed_at_unix: i64,
+    expires_secs: u64,
+) -> Request<Body> {
+    let host = "s3.local";
+    let (amz_date, date_scope) = sigv4_timestamp_components(signed_at_unix);
+    let region = "us-east-1";
+    let service = "s3";
+    let signed_headers = "host";
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let parsed_uri: Uri = uri.parse().unwrap();
+    let canonical_uri = if parsed_uri.path().is_empty() {
+        "/"
+    } else {
+        parsed_uri.path()
+    };
+    let credential_scope = format!("{date_scope}/{region}/{service}/aws4_request");
+    let credential_value = utf8_percent_encode(
+        &format!("{access_key_id}/{credential_scope}"),
+        NON_ALPHANUMERIC,
+    )
+    .to_string();
+
+    let mut pairs = parsed_uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (name.to_string(), value.to_string())
+        })
+        .collect::<Vec<_>>();
+    pairs.push((
+        "X-Amz-Algorithm".to_string(),
+        "AWS4-HMAC-SHA256".to_string(),
+    ));
+    pairs.push(("X-Amz-Credential".to_string(), credential_value));
+    pairs.push(("X-Amz-Date".to_string(), amz_date.clone()));
+    pairs.push(("X-Amz-Expires".to_string(), expires_secs.to_string()));
+    pairs.push((
+        "X-Amz-SignedHeaders".to_string(),
+        signed_headers.to_string(),
+    ));
+    pairs.sort();
+
+    let canonical_query = pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_request = format!(
+        "{}\n{}\n{}\nhost:{host}\n\n{signed_headers}\n{payload_hash}",
+        method.as_str(),
+        canonical_uri,
+        canonical_query,
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        s3_test_sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = s3_test_derive_signing_key(secret_material, &date_scope, region, service);
+    let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
+        &signing_key,
+        string_to_sign.as_bytes(),
+    ));
+    let full_query = format!("{canonical_query}&X-Amz-Signature={signature}");
+    let full_uri = format!("{canonical_uri}?{full_query}");
+
+    let mut request = Request::builder()
+        .method(method)
+        .uri(full_uri)
+        .body(Body::from(body))
+        .unwrap();
+    request.headers_mut().insert("host", host.parse().unwrap());
+    for (name, value) in extra_headers {
+        request.headers_mut().insert(
+            name.parse::<axum::http::HeaderName>().unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    request
+}
+
+fn sigv4_timestamp_components(unix_ts: i64) -> (String, String) {
+    let timestamp = OffsetDateTime::from_unix_timestamp(unix_ts)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        .to_offset(time::UtcOffset::UTC);
+    let year = timestamp.year();
+    let month = timestamp.month() as u8;
+    let day = timestamp.day();
+    let hour = timestamp.hour();
+    let minute = timestamp.minute();
+    let second = timestamp.second();
+    (
+        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
+        format!("{year:04}{month:02}{day:02}"),
+    )
+}
+
+fn s3_transport_request(
+    method: Method,
+    external_uri: &str,
+    transport_uri: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> transport_sdk::BufferedTransportRequest {
+    let request = s3_signed_request(
+        method.clone(),
+        external_uri,
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body.clone(),
+    );
+    let headers = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| transport_sdk::TransportHeader {
+                    name: name.as_str().to_string(),
+                    value: value.to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        method.as_str(),
+        transport_uri,
+        headers,
+        body.to_vec(),
+    )
+}
+
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = xml.find(&start_tag)? + start_tag.len();
+    let end = start + xml[start..].find(&end_tag)?;
+    Some(xml[start..end].to_string())
+}
+
 async fn import_client_credentials_upserts_idempotently_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let source_node_id = NodeId::new_v4();
@@ -1318,6 +1668,3545 @@ run_on_main_metadata_backends!(
     export_client_credentials_omits_issued_credential_pem_turso
 );
 
+async fn client_credential_sync_enables_remote_client_auth_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    target.access.client_auth_control.require_client_auth = true;
+
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(source.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        source.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
+    {
+        let mut auth = source.access.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
+            device_id: identity.device_id.to_string(),
+            label: Some("Synced Laptop".to_string()),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
+            issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
+            created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+    }
+
+    let app = Router::new()
+        .route("/store/index", get(|| async { StatusCode::OK }))
+        .with_state(target.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            target.clone(),
+            super::require_client_auth,
+        ));
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("sync-nonce-a".to_string()),
+    )
+    .unwrap();
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(source.clone(), &target).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+    super::sync_client_credentials_once(&target).await;
+
+    wait_for_condition(
+        "client credential sync import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let device_id = identity.device_id.to_string();
+            async move {
+                let auth = target.access.client_credentials.lock().await;
+                auth.credentials
+                    .iter()
+                    .any(|record| record.device_id == device_id)
+            }
+        },
+    )
+    .await;
+
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("sync-nonce-b".to_string()),
+    )
+    .unwrap();
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    client_credential_sync_enables_remote_client_auth_impl,
+    client_credential_sync_enables_remote_client_auth,
+    client_credential_sync_enables_remote_client_auth_turso
+);
+
+async fn client_credential_fanout_after_enrollment_enables_remote_client_auth_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    target.access.client_auth_control.require_client_auth = true;
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(target.clone(), &source).await;
+    register_online_source_node(&source, &target, &peer_base_url).await;
+
+    let now = super::unix_ts();
+    {
+        let mut auth = source.access.client_credentials.lock().await;
+        auth.pairing_authorizations
+            .push(super::PairingAuthorizationRecord {
+                token_id: "pair-fanout-1".to_string(),
+                pairing_secret_hash: super::hash_token("pair-secret-fanout"),
+                label: Some("Fanout Laptop".to_string()),
+                created_at_unix: now,
+                expires_at_unix: now + 300,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
+    }
+
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(source.cluster_id, None, None).unwrap();
+    let enrolled = super::enroll_client_device_impl(
+        &source,
+        super::ClientEnrollmentRequest {
+            cluster_id: source.cluster_id,
+            pairing_token: "pair-secret-fanout".to_string(),
+            device_id: Some(identity.device_id),
+            label: None,
+            public_key_pem: identity.public_key_pem.clone(),
+        },
+    )
+    .await
+    .expect("client enrollment should succeed");
+    identity.credential_pem = Some(enrolled.credential_pem.clone());
+
+    let app = Router::new()
+        .route("/store/index", get(|| async { StatusCode::OK }))
+        .with_state(target.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            target.clone(),
+            super::require_client_auth,
+        ));
+
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("fanout-nonce-a".to_string()),
+    )
+    .unwrap();
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    wait_for_condition(
+        "client credential fanout import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let device_id = identity.device_id.to_string();
+            async move {
+                let auth = target.access.client_credentials.lock().await;
+                auth.credentials
+                    .iter()
+                    .any(|record| record.device_id == device_id)
+            }
+        },
+    )
+    .await;
+
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("fanout-nonce-b".to_string()),
+    )
+    .unwrap();
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    client_credential_fanout_after_enrollment_enables_remote_client_auth_impl,
+    client_credential_fanout_after_enrollment_enables_remote_client_auth,
+    client_credential_fanout_after_enrollment_enables_remote_client_auth_turso
+);
+
+async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Disabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+    let create_bucket_body = to_bytes(create_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_bucket: super::S3BucketView = serde_json::from_slice(&create_bucket_body).unwrap();
+    assert_eq!(created_bucket.bucket_name, "photos.example");
+    assert_eq!(created_bucket.root_prefix, "tenant/photos/");
+    assert_eq!(
+        created_bucket.versioning_status,
+        super::S3BucketVersioningStatus::Disabled
+    );
+    assert!(created_bucket.deleted_at_unix.is_none());
+
+    let status_response = super::get_s3_control_plane_status(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let status_body = to_bytes(status_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: super::S3ControlPlaneStatusResponse = serde_json::from_slice(&status_body).unwrap();
+    assert_eq!(status.bucket_count, 1);
+    assert_eq!(status.access_key_count, 0);
+    assert!(status.local_generation >= 1);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        headers.clone(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("photos-writer".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/inbox/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: false,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+    assert!(created_access_key.access_key_id.starts_with("IM"));
+    assert!(!created_access_key.secret_access_key.is_empty());
+    assert_eq!(
+        created_access_key.view.secret_fingerprint,
+        super::text_fingerprint(&created_access_key.secret_access_key)
+    );
+    assert_eq!(
+        created_access_key.view.bucket_scope,
+        vec!["photos.example".to_string()]
+    );
+    assert_eq!(
+        created_access_key.view.prefix_scope,
+        vec!["tenant/photos/inbox/".to_string()]
+    );
+    assert!(created_access_key.view.revoked_at_unix.is_none());
+
+    let listed_buckets = super::list_s3_buckets(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(listed_buckets.status(), StatusCode::OK);
+    let listed_buckets_body = to_bytes(listed_buckets.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_buckets: Vec<super::S3BucketView> =
+        serde_json::from_slice(&listed_buckets_body).unwrap();
+    assert_eq!(listed_buckets.len(), 1);
+    assert_eq!(listed_buckets[0].root_prefix, "tenant/photos/");
+
+    let listed_access_keys = super::list_s3_access_keys(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(listed_access_keys.status(), StatusCode::OK);
+    let listed_access_keys_body = to_bytes(listed_access_keys.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_access_keys: Vec<super::S3AccessKeyView> =
+        serde_json::from_slice(&listed_access_keys_body).unwrap();
+    assert_eq!(listed_access_keys.len(), 1);
+    assert_eq!(
+        listed_access_keys[0].access_key_id,
+        created_access_key.access_key_id
+    );
+
+    {
+        let mut store = lock_store(&state, "tests.s3_control_plane.seed_bucket_object").await;
+        store
+            .put_object_versioned(
+                "tenant/photos/hello.txt",
+                Bytes::from_static(b"hello"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let non_empty_delete = super::delete_s3_bucket(
+        State(state.clone()),
+        headers.clone(),
+        Path("photos.example".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(non_empty_delete.status(), StatusCode::CONFLICT);
+
+    {
+        let mut store = lock_store(&state, "tests.s3_control_plane.tombstone_bucket_object").await;
+        store
+            .tombstone_object("tenant/photos/hello.txt", PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    let revoke_access_key = super::revoke_s3_access_key(
+        State(state.clone()),
+        headers.clone(),
+        Path(created_access_key.access_key_id.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(revoke_access_key.status(), StatusCode::NO_CONTENT);
+
+    let delete_bucket = super::delete_s3_bucket(
+        State(state.clone()),
+        headers.clone(),
+        Path("photos.example".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
+
+    let listed_buckets_after = super::list_s3_buckets(State(state.clone()), headers.clone())
+        .await
+        .into_response();
+    assert_eq!(listed_buckets_after.status(), StatusCode::OK);
+    let listed_buckets_after_body = to_bytes(listed_buckets_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_buckets_after: Vec<super::S3BucketView> =
+        serde_json::from_slice(&listed_buckets_after_body).unwrap();
+    assert!(listed_buckets_after.is_empty());
+
+    let listed_access_keys_after =
+        super::list_s3_access_keys(State(state.clone()), headers.clone())
+            .await
+            .into_response();
+    assert_eq!(listed_access_keys_after.status(), StatusCode::OK);
+    let listed_access_keys_after_body = to_bytes(listed_access_keys_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_access_keys_after: Vec<super::S3AccessKeyView> =
+        serde_json::from_slice(&listed_access_keys_after_body).unwrap();
+    assert_eq!(listed_access_keys_after.len(), 1);
+    assert_eq!(
+        listed_access_keys_after[0].access_key_id,
+        created_access_key.access_key_id
+    );
+    assert!(listed_access_keys_after[0].revoked_at_unix.is_some());
+
+    let status_after = super::get_s3_control_plane_status(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(status_after.status(), StatusCode::OK);
+    let status_after_body = to_bytes(status_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_after: super::S3ControlPlaneStatusResponse =
+        serde_json::from_slice(&status_after_body).unwrap();
+    assert_eq!(status_after.bucket_count, 0);
+    assert_eq!(status_after.access_key_count, 1);
+    assert!(status_after.local_generation >= 4);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_admin_lifecycle_impl,
+    s3_control_plane_admin_lifecycle,
+    s3_control_plane_admin_lifecycle_turso
+);
+
+async fn s3_control_plane_admin_delete_rejects_noncurrent_versions_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-admin-delete-versioned".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"hello"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let delete_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_current.status(), StatusCode::NO_CONTENT);
+
+    let delete_bucket = super::delete_s3_bucket(
+        State(state.clone()),
+        admin_headers,
+        Path("photos.example".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_bucket.status(), StatusCode::CONFLICT);
+    let delete_bucket_body = to_bytes(delete_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_bucket_json: serde_json::Value =
+        serde_json::from_slice(&delete_bucket_body).unwrap();
+    assert_eq!(delete_bucket_json["error"], "bucket is not empty");
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_admin_delete_rejects_noncurrent_versions_impl,
+    s3_control_plane_admin_delete_rejects_noncurrent_versions,
+    s3_control_plane_admin_delete_rejects_noncurrent_versions_turso
+);
+
+async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_node_id = NodeId::new_v4();
+    let initial_bucket = sample_s3_bucket_record("archive.example", "s3/archive.example/", 10);
+    let initial_access_key = sample_s3_access_key_record(
+        "IMSYNC123456789012",
+        "replicated-secret-v1",
+        vec!["archive.example".to_string()],
+        10,
+    );
+
+    let initial_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 1,
+            state: super::S3ControlPlaneState {
+                buckets: vec![initial_bucket.clone()],
+                access_keys: vec![initial_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(initial_import.status(), StatusCode::OK);
+    let initial_import_body = to_bytes(initial_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let initial_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&initial_import_body).unwrap();
+    assert!(initial_report.changed);
+    assert_eq!(initial_report.bucket_count, 1);
+    assert_eq!(initial_report.access_key_count, 1);
+
+    let idempotent_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 1,
+            state: super::S3ControlPlaneState {
+                buckets: vec![initial_bucket.clone()],
+                access_keys: vec![initial_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(idempotent_import.status(), StatusCode::OK);
+    let idempotent_import_body = to_bytes(idempotent_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let idempotent_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&idempotent_import_body).unwrap();
+    assert!(!idempotent_report.changed);
+    assert_eq!(idempotent_report.bucket_count, 1);
+    assert_eq!(idempotent_report.access_key_count, 1);
+
+    let mut deleted_bucket = initial_bucket.clone();
+    deleted_bucket.updated_at_unix = 20;
+    deleted_bucket.deleted_at_unix = Some(21);
+
+    let mut revoked_access_key = initial_access_key.clone();
+    revoked_access_key.updated_at_unix = 22;
+    revoked_access_key.last_used_at_unix = Some(21);
+    revoked_access_key.revoked_at_unix = Some(22);
+
+    let tombstone_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 2,
+            state: super::S3ControlPlaneState {
+                buckets: vec![deleted_bucket.clone()],
+                access_keys: vec![revoked_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(tombstone_import.status(), StatusCode::OK);
+    let tombstone_import_body = to_bytes(tombstone_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tombstone_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&tombstone_import_body).unwrap();
+    assert!(tombstone_report.changed);
+    assert_eq!(tombstone_report.bucket_count, 0);
+    assert_eq!(tombstone_report.access_key_count, 1);
+
+    let stale_import = super::import_s3_control_plane(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: source_node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::S3ControlPlaneImportRequest {
+            cluster_id: state.cluster_id,
+            source_node_id,
+            generation: 1,
+            state: super::S3ControlPlaneState {
+                buckets: vec![initial_bucket.clone()],
+                access_keys: vec![initial_access_key.clone()],
+            },
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(stale_import.status(), StatusCode::OK);
+    let stale_import_body = to_bytes(stale_import.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stale_report: super::S3ControlPlaneImportResponse =
+        serde_json::from_slice(&stale_import_body).unwrap();
+    assert!(!stale_report.changed);
+    assert_eq!(stale_report.bucket_count, 0);
+    assert_eq!(stale_report.access_key_count, 1);
+
+    let control_plane = state.s3.control_plane.lock().await.clone();
+    assert_eq!(control_plane.buckets.len(), 1);
+    assert_eq!(
+        control_plane.buckets[0].deleted_at_unix,
+        deleted_bucket.deleted_at_unix
+    );
+    assert_eq!(control_plane.access_keys.len(), 1);
+    assert_eq!(
+        control_plane.access_keys[0].revoked_at_unix,
+        revoked_access_key.revoked_at_unix
+    );
+    drop(control_plane);
+
+    let persisted = {
+        let store = lock_store(&state, "tests.s3_control_plane.load_persisted").await;
+        store.load_s3_control_plane_state().await.unwrap()
+    };
+    assert_eq!(persisted.buckets.len(), 1);
+    assert_eq!(persisted.buckets[0].deleted_at_unix, Some(21));
+    assert_eq!(persisted.access_keys.len(), 1);
+    assert_eq!(persisted.access_keys[0].revoked_at_unix, Some(22));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_import_merges_tombstones_and_revocations_impl,
+    s3_control_plane_import_merges_tombstones_and_revocations,
+    s3_control_plane_import_merges_tombstones_and_revocations_turso
+);
+
+async fn s3_control_plane_sync_once_enables_s3_crud_on_peer_impl(backend: MainTestBackend) {
+    let mut source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    source.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(source.clone()),
+        headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(source.clone()),
+        headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("peer-sync-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/inbox/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(source.clone(), &target).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+
+    super::sync_s3_control_plane_once(&target).await;
+
+    wait_for_condition(
+        "s3 control plane sync import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let access_key_id = created_access_key.access_key_id.clone();
+            async move {
+                let control_plane = target.s3.control_plane.lock().await;
+                control_plane.buckets.iter().any(|bucket| {
+                    bucket.bucket_name == "photos.example" && bucket.deleted_at_unix.is_none()
+                }) && control_plane
+                    .access_keys
+                    .iter()
+                    .any(|access_key| access_key.access_key_id == access_key_id)
+            }
+        },
+    )
+    .await;
+
+    let status = super::build_s3_control_plane_status_response(&target).await;
+    assert_eq!(status.bucket_count, 1);
+    assert_eq!(status.access_key_count, 1);
+    assert_eq!(status.last_source_node_id, Some(source.node_id));
+
+    let app = super::s3_frontend::build_listener_app().with_state(target.clone());
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/inbox/peer-sync.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"synced through peer"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let get_object = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example/inbox/peer-sync.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), b"synced through peer");
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_sync_once_enables_s3_crud_on_peer_impl,
+    s3_control_plane_sync_once_enables_s3_crud_on_peer,
+    s3_control_plane_sync_once_enables_s3_crud_on_peer_turso
+);
+
+async fn s3_control_plane_fanout_enables_s3_crud_on_peer_impl(backend: MainTestBackend) {
+    let mut source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    source.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let headers = test_admin_headers();
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(target.clone(), &source).await;
+    register_online_source_node(&source, &target, &peer_base_url).await;
+
+    let create_bucket = super::create_s3_bucket(
+        State(source.clone()),
+        headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "fanout.example".to_string(),
+            root_prefix: Some("tenant/fanout".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(source.clone()),
+        headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("fanout-test".to_string()),
+            bucket_scope: vec!["fanout.example".to_string()],
+            prefix_scope: vec!["tenant/fanout/uploads/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    wait_for_condition(
+        "s3 control plane fanout import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let access_key_id = created_access_key.access_key_id.clone();
+            async move {
+                let control_plane = target.s3.control_plane.lock().await;
+                control_plane.buckets.iter().any(|bucket| {
+                    bucket.bucket_name == "fanout.example" && bucket.deleted_at_unix.is_none()
+                }) && control_plane
+                    .access_keys
+                    .iter()
+                    .any(|access_key| access_key.access_key_id == access_key_id)
+            }
+        },
+    )
+    .await;
+
+    let status = super::build_s3_control_plane_status_response(&target).await;
+    assert_eq!(status.bucket_count, 1);
+    assert_eq!(status.access_key_count, 1);
+    assert_eq!(status.last_source_node_id, Some(source.node_id));
+
+    let app = super::s3_frontend::build_listener_app().with_state(target.clone());
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/fanout.example/uploads/fanout.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"fanout replicated"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let get_object = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/fanout.example/uploads/fanout.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), b"fanout replicated");
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_control_plane_fanout_enables_s3_crud_on_peer_impl,
+    s3_control_plane_fanout_enables_s3_crud_on_peer,
+    s3_control_plane_fanout_enables_s3_crud_on_peer_turso
+);
+
+async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-listener-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let list_buckets = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_buckets.status(), StatusCode::OK);
+    let list_buckets_body = to_bytes(list_buckets.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_buckets_xml = String::from_utf8(list_buckets_body.to_vec()).unwrap();
+    assert!(list_buckets_xml.contains("<Name>photos.example</Name>"));
+
+    let head_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/photos.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+
+    let payload = Bytes::from_static(b"hello from the S3 listener");
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[
+                ("content-type", "text/plain"),
+                ("cache-control", "max-age=60"),
+                ("x-amz-meta-color", "blue"),
+            ],
+            payload.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+    let put_etag = put_object
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let put_version_id = put_object
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(put_etag.starts_with('"'));
+    assert!(!put_version_id.is_empty());
+
+    {
+        let store = lock_store(&state, "tests.s3_listener.verify_put_metadata").await;
+        let metadata = store
+            .load_object_version_metadata(&put_version_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(metadata.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(
+            metadata.user_metadata.get("color").map(String::as_str),
+            Some("blue")
+        );
+
+        let version_record = store
+            .load_s3_object_version("photos.example", &put_version_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version_record.ironmesh_key, "tenant/photos/docs/hello.txt");
+
+        let versions = store
+            .list_s3_object_versions_for_key("photos.example", "tenant/photos/docs/hello.txt")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, put_version_id);
+    }
+
+    let list_objects = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    let list_objects_body = to_bytes(list_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_objects_xml = String::from_utf8(list_objects_body.to_vec()).unwrap();
+    assert!(list_objects_xml.contains("<Key>docs/hello.txt</Key>"));
+
+    let get_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    assert_eq!(
+        get_object
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=60")
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get("x-amz-meta-color")
+            .and_then(|value| value.to_str().ok()),
+        Some("blue")
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(put_etag.as_str())
+    );
+    assert_eq!(
+        get_object
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(put_version_id.as_str())
+    );
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), payload.as_ref());
+
+    let delete_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+    let delete_version_id = delete_object
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_ne!(delete_version_id, put_version_id);
+
+    {
+        let store = lock_store(&state, "tests.s3_listener.verify_delete_metadata").await;
+        let versions = store
+            .list_s3_object_versions_for_key("photos.example", "tenant/photos/docs/hello.txt")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions
+                .iter()
+                .any(|record| record.version_id == put_version_id)
+        );
+        assert!(
+            versions
+                .iter()
+                .any(|record| record.version_id == delete_version_id)
+        );
+    }
+
+    let get_deleted_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+    let get_deleted_current_body = to_bytes(get_deleted_current.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_deleted_current_xml = String::from_utf8(get_deleted_current_body.to_vec()).unwrap();
+    assert!(get_deleted_current_xml.contains("<Code>NoSuchKey</Code>"));
+
+    let get_old_version = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/photos.example/docs/hello.txt?versionId={put_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_old_version.status(), StatusCode::OK);
+    let get_old_version_body = to_bytes(get_old_version.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(get_old_version_body.as_ref(), payload.as_ref());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_bucket_listing_and_object_crud_impl,
+    s3_listener_supports_bucket_listing_and_object_crud,
+    s3_listener_supports_bucket_listing_and_object_crud_turso
+);
+
+async fn s3_listener_supports_bucket_create_and_delete_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-bucket-manage-test".to_string()),
+            bucket_scope: vec![
+                "managed.example".to_string(),
+                "managed-body.example".to_string(),
+            ],
+            prefix_scope: vec![],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+    assert!(created_access_key.view.allow_manage);
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let create_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_bucket.status(), StatusCode::OK);
+    assert_eq!(
+        create_bucket
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/managed.example")
+    );
+
+    let head_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/managed.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"hello"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let delete_nonempty_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_nonempty_bucket.status(), StatusCode::CONFLICT);
+    let delete_nonempty_bucket_body = to_bytes(delete_nonempty_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_nonempty_bucket_xml =
+        String::from_utf8(delete_nonempty_bucket_body.to_vec()).unwrap();
+    assert!(delete_nonempty_bucket_xml.contains("<Code>BucketNotEmpty</Code>"));
+
+    let delete_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/managed.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+    let delete_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_bucket.status(), StatusCode::NO_CONTENT);
+
+    let head_deleted_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/managed.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_deleted_bucket.status(), StatusCode::NOT_FOUND);
+
+    let create_bucket_with_body = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/managed-body.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from_static(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <LocationConstraint>eu-central-1</LocationConstraint>
+</CreateBucketConfiguration>"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_bucket_with_body.status(), StatusCode::OK);
+    assert_eq!(
+        create_bucket_with_body
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/managed-body.example")
+    );
+
+    let head_bucket_with_body = app
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            "/managed-body.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket_with_body.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_bucket_create_and_delete_impl,
+    s3_listener_supports_bucket_create_and_delete,
+    s3_listener_supports_bucket_create_and_delete_turso
+);
+
+async fn s3_listener_supports_delete_objects_batches_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "batch.example".to_string(),
+            root_prefix: Some("tenant/batch".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-delete-objects-test".to_string()),
+            bucket_scope: vec!["batch.example".to_string()],
+            prefix_scope: vec!["tenant/batch/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let put_v1 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/batch.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version one"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v1.status(), StatusCode::OK);
+    let v1_version_id = put_v1
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let put_v2 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/batch.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version two"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v2.status(), StatusCode::OK);
+
+    let put_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/batch.example/docs/current.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"current payload"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_current.status(), StatusCode::OK);
+
+    let delete_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Object><Key>docs/versioned.txt</Key><VersionId>{v1_version_id}</VersionId></Object>
+  <Object><Key>docs/current.txt</Key></Object>
+  <Object><Key>docs/missing.txt</Key></Object>
+  <Object><Key>docs/versioned.txt</Key><VersionId>missing-version</VersionId></Object>
+</Delete>"#
+    );
+    let delete_objects = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/batch.example?delete=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from(delete_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_objects.status(), StatusCode::OK);
+    let delete_objects_body = to_bytes(delete_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_objects_xml = String::from_utf8(delete_objects_body.to_vec()).unwrap();
+    assert!(delete_objects_xml.contains(&format!(
+        "<Deleted><Key>docs/versioned.txt</Key><VersionId>{v1_version_id}</VersionId>"
+    )));
+    assert!(delete_objects_xml.contains("<Deleted><Key>docs/current.txt</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>"));
+    assert!(delete_objects_xml.contains("<Deleted><Key>docs/missing.txt</Key>"));
+    assert!(delete_objects_xml.contains("<Error><Key>docs/versioned.txt</Key><VersionId>missing-version</VersionId><Code>NoSuchVersion</Code>"));
+
+    let get_deleted_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/batch.example/docs/current.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_deleted_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let get_deleted_old_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/batch.example/docs/versioned.txt?versionId={v1_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_old_version.status(), StatusCode::NOT_FOUND);
+
+    let quiet_delete = app
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/batch.example?delete=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from_static(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Quiet>true</Quiet>
+  <Object><Key>docs/versioned.txt</Key></Object>
+</Delete>"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(quiet_delete.status(), StatusCode::OK);
+    let quiet_delete_body = to_bytes(quiet_delete.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let quiet_delete_xml = String::from_utf8(quiet_delete_body.to_vec()).unwrap();
+    assert!(!quiet_delete_xml.contains("<Deleted>"));
+    assert!(!quiet_delete_xml.contains("<Error>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_delete_objects_batches_impl,
+    s3_listener_supports_delete_objects_batches,
+    s3_listener_supports_delete_objects_batches_turso
+);
+
+async fn s3_listener_supports_presigned_requests_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-presigned-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let put_object = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::PUT,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"presigned body"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let list_objects = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::GET,
+            "/photos.example?list-type=2&prefix=docs/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    let list_objects_body = to_bytes(list_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_objects_xml = String::from_utf8(list_objects_body.to_vec()).unwrap();
+    assert!(list_objects_xml.contains("<Key>docs/presigned.txt</Key>"));
+
+    let get_object = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::GET,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), b"presigned body");
+
+    let mut tampered_get_object = s3_presigned_request(
+        Method::GET,
+        "/photos.example/docs/presigned.txt",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let tampered_uri = tampered_get_object.uri().to_string();
+    let (tampered_prefix, tampered_last) = tampered_uri.split_at(tampered_uri.len() - 1);
+    let tampered_replacement = if tampered_last == "0" { "1" } else { "0" };
+    *tampered_get_object.uri_mut() = format!("{tampered_prefix}{tampered_replacement}")
+        .parse()
+        .unwrap();
+    let tampered_get_object = app.clone().oneshot(tampered_get_object).await.unwrap();
+    assert_eq!(tampered_get_object.status(), StatusCode::FORBIDDEN);
+    let tampered_get_object_body = to_bytes(tampered_get_object.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tampered_get_object_xml = String::from_utf8(tampered_get_object_body.to_vec()).unwrap();
+    assert!(tampered_get_object_xml.contains("<Code>SignatureDoesNotMatch</Code>"));
+
+    let expired_get_object = app
+        .clone()
+        .oneshot(s3_presigned_request_at(
+            Method::GET,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+            super::unix_ts() as i64 - 3_600,
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(expired_get_object.status(), StatusCode::FORBIDDEN);
+    let expired_get_object_body = to_bytes(expired_get_object.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let expired_get_object_xml = String::from_utf8(expired_get_object_body.to_vec()).unwrap();
+    assert!(expired_get_object_xml.contains("<Code>AuthorizationQueryParametersError</Code>"));
+    assert!(expired_get_object_xml.contains("expired"));
+
+    let delete_object = app
+        .clone()
+        .oneshot(s3_presigned_request(
+            Method::DELETE,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+    let get_missing_object = app
+        .oneshot(s3_presigned_request(
+            Method::GET,
+            "/photos.example/docs/presigned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_missing_object.status(), StatusCode::NOT_FOUND);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_presigned_requests_impl,
+    s3_listener_supports_presigned_requests,
+    s3_listener_supports_presigned_requests_turso
+);
+
+async fn s3_listener_lists_folder_marker_objects_and_common_prefixes_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-folder-marker-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    for path in ["/photos.example/docs/", "/photos.example/docs/hello.txt"] {
+        let put_response = app
+            .clone()
+            .oneshot(s3_signed_request(
+                Method::PUT,
+                path,
+                &created_access_key.access_key_id,
+                &created_access_key.secret_access_key,
+                &[],
+                Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_response.status(), StatusCode::OK);
+    }
+
+    let list_response = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_body = to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_xml = String::from_utf8(list_body.to_vec()).unwrap();
+    assert!(list_xml.contains("<Key>docs/</Key>"));
+    assert!(list_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>"));
+
+    let prefix_without_trailing_delimiter = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2&prefix=docs&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prefix_without_trailing_delimiter.status(), StatusCode::OK);
+    let prefix_without_trailing_delimiter_body =
+        to_bytes(prefix_without_trailing_delimiter.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    let prefix_without_trailing_delimiter_xml =
+        String::from_utf8(prefix_without_trailing_delimiter_body.to_vec()).unwrap();
+    assert!(
+        prefix_without_trailing_delimiter_xml
+            .contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+    );
+    assert!(!prefix_without_trailing_delimiter_xml.contains("docs//"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_lists_folder_marker_objects_and_common_prefixes_impl,
+    s3_listener_lists_folder_marker_objects_and_common_prefixes,
+    s3_listener_lists_folder_marker_objects_and_common_prefixes_turso
+);
+
+async fn s3_listener_continuation_tokens_page_listings_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-continuation-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    for path in ["/photos.example/docs/a.txt", "/photos.example/docs/b.txt"] {
+        let put_response = app
+            .clone()
+            .oneshot(s3_signed_request(
+                Method::PUT,
+                path,
+                &created_access_key.access_key_id,
+                &created_access_key.secret_access_key,
+                &[],
+                Bytes::from_static(b"payload"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_response.status(), StatusCode::OK);
+    }
+
+    let first_response = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/photos.example?list-type=2&max-keys=1",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_xml = String::from_utf8(first_body.to_vec()).unwrap();
+    assert!(first_xml.contains("<Key>docs/a.txt</Key>"));
+    let next_token = first_xml
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|value| value.split("</NextContinuationToken>").next())
+        .expect("paginated S3 listing should expose a next continuation token");
+
+    let second_response = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/photos.example?list-type=2&max-keys=1&continuation-token={next_token}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_xml = String::from_utf8(second_body.to_vec()).unwrap();
+    assert!(second_xml.contains("<Key>docs/b.txt</Key>"));
+    assert!(!second_xml.contains("<NextContinuationToken>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_continuation_tokens_page_listings_impl,
+    s3_listener_continuation_tokens_page_listings,
+    s3_listener_continuation_tokens_page_listings_turso
+);
+
+async fn s3_copy_object_overwrites_targets_and_replaces_metadata_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    for (bucket_name, root_prefix) in [
+        ("source.example", "tenant/source"),
+        ("dest.example", "tenant/dest"),
+    ] {
+        let create_bucket = super::create_s3_bucket(
+            State(state.clone()),
+            test_admin_headers(),
+            Json(super::CreateS3BucketRequest {
+                bucket_name: bucket_name.to_string(),
+                root_prefix: Some(root_prefix.to_string()),
+                versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+                read_only: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(create_bucket.status(), StatusCode::CREATED);
+    }
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-copy-test".to_string()),
+            bucket_scope: vec!["source.example".to_string(), "dest.example".to_string()],
+            prefix_scope: vec!["tenant/source/".to_string(), "tenant/dest/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+    let source_payload = Bytes::from_static(b"hello from source");
+
+    let put_source = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/source.example/docs/hello.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[
+                ("content-type", "text/plain"),
+                ("cache-control", "max-age=60"),
+                ("x-amz-meta-color", "blue"),
+            ],
+            source_payload.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_source.status(), StatusCode::OK);
+
+    let put_existing_dest = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/dest.example/docs/copied.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"old target"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_existing_dest.status(), StatusCode::OK);
+
+    let copy_overwrite = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/dest.example/docs/copied.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("x-amz-copy-source", "/source.example/docs/hello.txt")],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(copy_overwrite.status(), StatusCode::OK);
+    let overwrite_version_id = copy_overwrite
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let overwrite_body = to_bytes(copy_overwrite.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let overwrite_xml = String::from_utf8(overwrite_body.to_vec()).unwrap();
+    assert!(overwrite_xml.contains("<CopyObjectResult"));
+
+    let get_copied = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/dest.example/docs/copied.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_copied.status(), StatusCode::OK);
+    assert_eq!(
+        get_copied
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        get_copied
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=60")
+    );
+    assert_eq!(
+        get_copied
+            .headers()
+            .get("x-amz-meta-color")
+            .and_then(|value| value.to_str().ok()),
+        Some("blue")
+    );
+    let copied_body = to_bytes(get_copied.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(copied_body.as_ref(), source_payload.as_ref());
+
+    {
+        let store = lock_store(&state, "tests.s3_copy.verify_overwrite_versions").await;
+        let versions = store
+            .list_s3_object_versions_for_key("dest.example", "tenant/dest/docs/copied.txt")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions
+                .iter()
+                .any(|record| record.version_id == overwrite_version_id)
+        );
+    }
+
+    let copy_replace = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/dest.example/docs/replaced.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[
+                ("x-amz-copy-source", "/source.example/docs/hello.txt"),
+                ("x-amz-metadata-directive", "REPLACE"),
+                ("content-type", "text/markdown"),
+                ("x-amz-meta-color", "green"),
+            ],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(copy_replace.status(), StatusCode::OK);
+
+    let get_replaced = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/dest.example/docs/replaced.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_replaced.status(), StatusCode::OK);
+    assert_eq!(
+        get_replaced
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/markdown")
+    );
+    assert_eq!(
+        get_replaced
+            .headers()
+            .get("x-amz-meta-color")
+            .and_then(|value| value.to_str().ok()),
+        Some("green")
+    );
+    assert!(
+        get_replaced
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .is_none(),
+        "metadata replacement should not carry over omitted cache-control headers"
+    );
+    let replaced_body = to_bytes(get_replaced.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(replaced_body.as_ref(), source_payload.as_ref());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_copy_object_overwrites_targets_and_replaces_metadata_impl,
+    s3_copy_object_overwrites_targets_and_replaces_metadata,
+    s3_copy_object_overwrites_targets_and_replaces_metadata_turso
+);
+
+async fn s3_multipart_uploads_complete_and_abort_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "media.example".to_string(),
+            root_prefix: Some("tenant/media".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Disabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-multipart-test".to_string()),
+            bucket_scope: vec!["media.example".to_string()],
+            prefix_scope: vec!["tenant/media/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let create_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/media.example/archive/movie.bin?uploads=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[
+                ("content-type", "application/octet-stream"),
+                ("x-amz-meta-origin", "camera"),
+            ],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_upload.status(), StatusCode::OK);
+    let create_upload_body = to_bytes(create_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let create_upload_xml = String::from_utf8(create_upload_body.to_vec()).unwrap();
+    let upload_id = xml_tag_text(&create_upload_xml, "UploadId")
+        .expect("multipart upload initiation should return an UploadId");
+
+    let part1_payload = vec![b'a'; 5 * 1024 * 1024];
+    let part2_payload = b"tail".to_vec();
+
+    let upload_part1 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            &format!("/media.example/archive/movie.bin?partNumber=1&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::from(part1_payload.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload_part1.status(), StatusCode::OK);
+    let part1_etag = upload_part1
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let upload_part2 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            &format!("/media.example/archive/movie.bin?partNumber=2&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::from(part2_payload.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload_part2.status(), StatusCode::OK);
+    let part2_etag = upload_part2
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let head_upload_parts = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::HEAD,
+            &format!("/media.example/archive/movie.bin?uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_upload_parts.status(), StatusCode::OK);
+    let head_upload_parts_body = to_bytes(head_upload_parts.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(head_upload_parts_body.is_empty());
+
+    let list_first_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/media.example/archive/movie.bin?max-parts=1&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_first_page.status(), StatusCode::OK);
+    let list_first_page_body = to_bytes(list_first_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_first_page_xml = String::from_utf8(list_first_page_body.to_vec()).unwrap();
+    assert!(list_first_page_xml.contains("<PartNumber>1</PartNumber>"));
+    assert!(!list_first_page_xml.contains("<PartNumber>2</PartNumber>"));
+    assert!(list_first_page_xml.contains("<NextPartNumberMarker>1</NextPartNumberMarker>"));
+
+    let list_second_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/media.example/archive/movie.bin?part-number-marker=1&uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_second_page.status(), StatusCode::OK);
+    let list_second_page_body = to_bytes(list_second_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_second_page_xml = String::from_utf8(list_second_page_body.to_vec()).unwrap();
+    assert!(list_second_page_xml.contains("<PartNumber>2</PartNumber>"));
+    assert!(!list_second_page_xml.contains("<NextPartNumberMarker>"));
+
+    let complete_payload = Bytes::from(format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<CompleteMultipartUpload>",
+            "<Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>",
+            "<Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part>",
+            "</CompleteMultipartUpload>"
+        ),
+        part1_etag, part2_etag
+    ));
+    let complete_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            &format!("/media.example/archive/movie.bin?uploadId={upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            complete_payload,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete_upload.status(), StatusCode::OK);
+    let complete_etag = complete_upload
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(complete_etag.ends_with("-2\""));
+    let complete_upload_body = to_bytes(complete_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let complete_upload_xml = String::from_utf8(complete_upload_body.to_vec()).unwrap();
+    assert_eq!(
+        xml_tag_text(&complete_upload_xml, "ETag").as_deref(),
+        Some(complete_etag.as_str())
+    );
+
+    let get_completed_object = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/media.example/archive/movie.bin",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_completed_object.status(), StatusCode::OK);
+    assert_eq!(
+        get_completed_object
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(complete_etag.as_str())
+    );
+    assert_eq!(
+        get_completed_object
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        get_completed_object
+            .headers()
+            .get("x-amz-meta-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("camera")
+    );
+    assert!(
+        get_completed_object
+            .headers()
+            .get("x-amz-version-id")
+            .is_none()
+    );
+    let get_completed_object_body = to_bytes(get_completed_object.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut expected_payload = part1_payload.clone();
+    expected_payload.extend_from_slice(&part2_payload);
+    assert_eq!(
+        get_completed_object_body.as_ref(),
+        expected_payload.as_slice()
+    );
+
+    {
+        let store = lock_store(&state, "tests.s3_multipart.verify_complete").await;
+        let versions = store
+            .list_s3_object_versions_for_key("media.example", "tenant/media/archive/movie.bin")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].etag, complete_etag);
+        assert_eq!(versions[0].multipart_part_count, Some(2));
+
+        let metadata = store
+            .load_object_version_metadata(&versions[0].version_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metadata.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            metadata.user_metadata.get("origin").map(String::as_str),
+            Some("camera")
+        );
+    }
+
+    let create_abort_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::POST,
+            "/media.example/archive/abort.bin?uploads=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_abort_upload.status(), StatusCode::OK);
+    let create_abort_upload_body = to_bytes(create_abort_upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let create_abort_upload_xml = String::from_utf8(create_abort_upload_body.to_vec()).unwrap();
+    let abort_upload_id = xml_tag_text(&create_abort_upload_xml, "UploadId")
+        .expect("abort test multipart initiation should return an UploadId");
+
+    let upload_abort_part = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            &format!("/media.example/archive/abort.bin?partNumber=1&uploadId={abort_upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::from_static(b"abort-me"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload_abort_part.status(), StatusCode::OK);
+
+    let abort_upload = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/media.example/archive/abort.bin?uploadId={abort_upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(abort_upload.status(), StatusCode::NO_CONTENT);
+
+    {
+        let sessions = super::read_upload_sessions(&state, "tests.s3_multipart.assert_abort").await;
+        assert!(!sessions.sessions.contains_key(&abort_upload_id));
+    }
+
+    let list_aborted_parts = app
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/media.example/archive/abort.bin?uploadId={abort_upload_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_aborted_parts.status(), StatusCode::NOT_FOUND);
+    let list_aborted_parts_body = to_bytes(list_aborted_parts.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_aborted_parts_xml = String::from_utf8(list_aborted_parts_body.to_vec()).unwrap();
+    assert!(list_aborted_parts_xml.contains("<Code>NoSuchUpload</Code>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_multipart_uploads_complete_and_abort_impl,
+    s3_multipart_uploads_complete_and_abort,
+    s3_multipart_uploads_complete_and_abort_turso
+);
+
+async fn s3_versioning_surface_lists_versions_and_delete_markers_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "versions.example".to_string(),
+            root_prefix: Some("tenant/versions".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Disabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-versioning-test".to_string()),
+            bucket_scope: vec!["versions.example".to_string()],
+            prefix_scope: vec!["tenant/versions/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    let get_versioning_before = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versioning=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_versioning_before.status(), StatusCode::OK);
+    let get_versioning_before_body = to_bytes(get_versioning_before.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_versioning_before_xml = String::from_utf8(get_versioning_before_body.to_vec()).unwrap();
+    assert!(!get_versioning_before_xml.contains("<Status>"));
+
+    let put_versioning = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example?versioning=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "application/xml")],
+            Bytes::from_static(
+                br#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_versioning.status(), StatusCode::OK);
+
+    let get_versioning_after = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versioning=",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_versioning_after.status(), StatusCode::OK);
+    let get_versioning_after_body = to_bytes(get_versioning_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_versioning_after_xml = String::from_utf8(get_versioning_after_body.to_vec()).unwrap();
+    assert!(get_versioning_after_xml.contains("<Status>Enabled</Status>"));
+
+    let put_v1 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version one"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v1.status(), StatusCode::OK);
+    let v1_version_id = put_v1
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let put_v2 = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            Bytes::from_static(b"version two"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_v2.status(), StatusCode::OK);
+    let v2_version_id = put_v2
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let delete_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_current.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let delete_marker_version_id = delete_current
+        .headers()
+        .get("x-amz-version-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let get_deleted_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_current.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_deleted_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let delete_nonempty_bucket = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            "/versions.example",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_nonempty_bucket.status(), StatusCode::CONFLICT);
+    let delete_nonempty_bucket_body = to_bytes(delete_nonempty_bucket.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let delete_nonempty_bucket_xml =
+        String::from_utf8(delete_nonempty_bucket_body.to_vec()).unwrap();
+    assert!(delete_nonempty_bucket_xml.contains("<Code>BucketNotEmpty</Code>"));
+
+    let get_delete_marker_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/versions.example/docs/versioned.txt?versionId={delete_marker_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        get_delete_marker_version.status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        get_delete_marker_version
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        get_delete_marker_version
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(delete_marker_version_id.as_str())
+    );
+    assert!(
+        get_delete_marker_version
+            .headers()
+            .get(axum::http::header::LAST_MODIFIED)
+            .is_some()
+    );
+
+    let first_versions_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&max-keys=2&prefix=docs/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_versions_page.status(), StatusCode::OK);
+    let first_versions_page_body = to_bytes(first_versions_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_versions_page_xml = String::from_utf8(first_versions_page_body.to_vec()).unwrap();
+    assert!(first_versions_page_xml.contains("<DeleteMarker>"));
+    assert!(first_versions_page_xml.contains(&delete_marker_version_id));
+    assert!(first_versions_page_xml.contains(&v2_version_id));
+    assert_eq!(first_versions_page_xml.matches("<DeleteMarker>").count(), 1);
+    assert_eq!(first_versions_page_xml.matches("<Version>").count(), 1);
+    let next_key_marker = xml_tag_text(&first_versions_page_xml, "NextKeyMarker")
+        .expect("truncated versions listing should expose NextKeyMarker");
+    let next_version_id_marker = xml_tag_text(&first_versions_page_xml, "NextVersionIdMarker")
+        .expect("truncated versions listing should expose NextVersionIdMarker");
+
+    let second_versions_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!(
+                "/versions.example?versions=&prefix=docs/&key-marker={next_key_marker}&version-id-marker={next_version_id_marker}"
+            ),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_versions_page.status(), StatusCode::OK);
+    let second_versions_page_body = to_bytes(second_versions_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_versions_page_xml = String::from_utf8(second_versions_page_body.to_vec()).unwrap();
+    assert!(second_versions_page_xml.contains(&v1_version_id));
+    assert!(!second_versions_page_xml.contains(&delete_marker_version_id));
+    assert!(!second_versions_page_xml.contains("<NextKeyMarker>"));
+
+    let copy_source_header =
+        format!("/versions.example/docs/versioned.txt?versionId={v1_version_id}");
+    let copy_old_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::PUT,
+            "/versions.example/docs/copied-from-v1.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("x-amz-copy-source", copy_source_header.as_str())],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(copy_old_version.status(), StatusCode::OK);
+
+    let get_copied_old_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/copied-from-v1.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_copied_old_version.status(), StatusCode::OK);
+    let get_copied_old_version_body = to_bytes(get_copied_old_version.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(get_copied_old_version_body.as_ref(), b"version one");
+
+    let delete_delete_marker = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/versions.example/docs/versioned.txt?versionId={delete_marker_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_delete_marker.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_delete_marker
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(delete_marker_version_id.as_str())
+    );
+    assert_eq!(
+        delete_delete_marker
+            .headers()
+            .get("x-amz-delete-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let get_restored_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_restored_current.status(), StatusCode::OK);
+    let get_restored_current_body = to_bytes(get_restored_current.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(get_restored_current_body.as_ref(), b"version two");
+
+    let delete_v1_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/versions.example/docs/versioned.txt?versionId={v1_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_v1_version.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_v1_version
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(v1_version_id.as_str())
+    );
+    assert!(
+        delete_v1_version
+            .headers()
+            .get("x-amz-delete-marker")
+            .is_none()
+    );
+
+    let get_deleted_v1_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!("/versions.example/docs/versioned.txt?versionId={v1_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_deleted_v1_version.status(), StatusCode::NOT_FOUND);
+    let get_deleted_v1_version_body = to_bytes(get_deleted_v1_version.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_deleted_v1_version_xml =
+        String::from_utf8(get_deleted_v1_version_body.to_vec()).unwrap();
+    assert!(get_deleted_v1_version_xml.contains("<Code>NoSuchVersion</Code>"));
+
+    let delete_v2_version = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::DELETE,
+            &format!("/versions.example/docs/versioned.txt?versionId={v2_version_id}"),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_v2_version.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_v2_version
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(v2_version_id.as_str())
+    );
+    assert!(
+        delete_v2_version
+            .headers()
+            .get("x-amz-delete-marker")
+            .is_none()
+    );
+
+    let get_missing_current = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example/docs/versioned.txt",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_missing_current.status(), StatusCode::NOT_FOUND);
+    assert!(
+        get_missing_current
+            .headers()
+            .get("x-amz-delete-marker")
+            .is_none()
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_versioning_surface_lists_versions_and_delete_markers_impl,
+    s3_versioning_surface_lists_versions_and_delete_markers,
+    s3_versioning_surface_lists_versions_and_delete_markers_turso
+);
+
+async fn s3_object_version_prefix_listing_treats_wildcards_literally_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+
+    {
+        let store = lock_store(&state, "tests.s3_versions.literal_prefixes").await;
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/100%/match.txt".to_string(),
+                version_id: "version-percent-match".to_string(),
+                etag: "etag-percent-match".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/100abc/other.txt".to_string(),
+                version_id: "version-percent-other".to_string(),
+                etag: "etag-percent-other".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 11,
+            })
+            .await
+            .unwrap();
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/a_b/match.txt".to_string(),
+                version_id: "version-underscore-match".to_string(),
+                etag: "etag-underscore-match".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 12,
+            })
+            .await
+            .unwrap();
+        store
+            .persist_s3_object_version(&S3ObjectVersionRecord {
+                bucket_name: "photos.example".to_string(),
+                ironmesh_key: "tenant/photos/acb/other.txt".to_string(),
+                version_id: "version-underscore-other".to_string(),
+                etag: "etag-underscore-other".to_string(),
+                multipart_part_count: None,
+                created_at_unix: 13,
+            })
+            .await
+            .unwrap();
+    }
+
+    {
+        let store = lock_store(&state, "tests.s3_versions.literal_prefixes.verify").await;
+        let percent_versions = store
+            .list_s3_object_versions("photos.example", Some("tenant/photos/100%/"))
+            .await
+            .unwrap();
+        assert_eq!(percent_versions.len(), 1);
+        assert_eq!(percent_versions[0].version_id, "version-percent-match");
+
+        let underscore_versions = store
+            .list_s3_object_versions("photos.example", Some("tenant/photos/a_b/"))
+            .await
+            .unwrap();
+        assert_eq!(underscore_versions.len(), 1);
+        assert_eq!(
+            underscore_versions[0].version_id,
+            "version-underscore-match"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_object_version_prefix_listing_treats_wildcards_literally_impl,
+    s3_object_version_prefix_listing_treats_wildcards_literally,
+    s3_object_version_prefix_listing_treats_wildcards_literally_turso
+);
+
+async fn s3_version_listing_supports_delimiter_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "versions.example".to_string(),
+            root_prefix: Some("tenant/versions".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-version-delimiter-test".to_string()),
+            bucket_scope: vec!["versions.example".to_string()],
+            prefix_scope: vec!["tenant/versions/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+
+    for (path, body) in [
+        (
+            "/versions.example/root.txt",
+            Bytes::from_static(b"root version"),
+        ),
+        (
+            "/versions.example/docs/a.txt",
+            Bytes::from_static(b"docs a version"),
+        ),
+        (
+            "/versions.example/docs/sub/b.txt",
+            Bytes::from_static(b"docs sub b version"),
+        ),
+    ] {
+        let put_object = app
+            .clone()
+            .oneshot(s3_signed_request(
+                Method::PUT,
+                path,
+                &created_access_key.access_key_id,
+                &created_access_key.secret_access_key,
+                &[("content-type", "text/plain")],
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put_object.status(), StatusCode::OK);
+    }
+
+    let root_versions = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(root_versions.status(), StatusCode::OK);
+    let root_versions_body = to_bytes(root_versions.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let root_versions_xml = String::from_utf8(root_versions_body.to_vec()).unwrap();
+    assert!(root_versions_xml.contains("<Delimiter>/</Delimiter>"));
+    assert!(root_versions_xml.contains("<Key>root.txt</Key>"));
+    assert!(root_versions_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>"));
+    assert!(!root_versions_xml.contains("<Key>docs/a.txt</Key>"));
+    assert!(!root_versions_xml.contains("<Key>docs/sub/b.txt</Key>"));
+
+    let first_root_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&delimiter=/&max-keys=1",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_root_page.status(), StatusCode::OK);
+    let first_root_page_body = to_bytes(first_root_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_root_page_xml = String::from_utf8(first_root_page_body.to_vec()).unwrap();
+    assert!(first_root_page_xml.contains("<IsTruncated>true</IsTruncated>"));
+    assert!(
+        first_root_page_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+    );
+    assert_eq!(
+        xml_tag_text(&first_root_page_xml, "NextKeyMarker").as_deref(),
+        Some("root.txt")
+    );
+    assert!(xml_tag_text(&first_root_page_xml, "NextVersionIdMarker").is_some());
+
+    let root_version_id =
+        xml_tag_text(&first_root_page_xml, "NextVersionIdMarker").expect("next version marker");
+    let second_root_page = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            &format!(
+                "/versions.example?versions=&delimiter=/&max-keys=1&key-marker=root.txt&version-id-marker={root_version_id}"
+            ),
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_root_page.status(), StatusCode::OK);
+    let second_root_page_body = to_bytes(second_root_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_root_page_xml = String::from_utf8(second_root_page_body.to_vec()).unwrap();
+    assert!(second_root_page_xml.contains("<Key>root.txt</Key>"));
+    assert!(
+        !second_root_page_xml.contains("<CommonPrefixes><Prefix>docs/</Prefix></CommonPrefixes>")
+    );
+
+    let docs_versions = app
+        .clone()
+        .oneshot(s3_signed_request(
+            Method::GET,
+            "/versions.example?versions=&prefix=docs/&delimiter=/",
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(docs_versions.status(), StatusCode::OK);
+    let docs_versions_body = to_bytes(docs_versions.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let docs_versions_xml = String::from_utf8(docs_versions_body.to_vec()).unwrap();
+    assert!(docs_versions_xml.contains("<Key>docs/a.txt</Key>"));
+    assert!(
+        docs_versions_xml.contains("<CommonPrefixes><Prefix>docs/sub/</Prefix></CommonPrefixes>")
+    );
+    assert!(!docs_versions_xml.contains("<Key>docs/sub/b.txt</Key>"));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_version_listing_supports_delimiter_impl,
+    s3_version_listing_supports_delimiter,
+    s3_version_listing_supports_delimiter_turso
+);
+
+async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-transport-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let scope =
+        super::transport_service::TransportExecutionScope::Internal(super::InternalCaller {
+            node_id: NodeId::new_v4(),
+            cluster_id: state.cluster_id,
+        });
+
+    let list_buckets_request = s3_transport_request(
+        Method::GET,
+        "/",
+        "/s3/",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let list_buckets = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &list_buckets_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(list_buckets.status, StatusCode::OK.as_u16());
+    let list_buckets_xml = String::from_utf8(list_buckets.body).unwrap();
+    assert!(list_buckets_xml.contains("<Name>photos.example</Name>"));
+
+    let payload = Bytes::from_static(b"transported through multiplex");
+    let put_object_request = s3_transport_request(
+        Method::PUT,
+        "/photos.example/docs/transport.txt",
+        "/s3/photos.example/docs/transport.txt",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[("content-type", "text/plain")],
+        payload.clone(),
+    );
+    let put_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &put_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(put_object.status, StatusCode::OK.as_u16());
+
+    let get_object_request = s3_transport_request(
+        Method::GET,
+        "/photos.example/docs/transport.txt",
+        "/s3/photos.example/docs/transport.txt",
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let get_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &get_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(get_object.status, StatusCode::OK.as_u16());
+    assert_eq!(get_object.body.as_slice(), payload.as_ref());
+    assert!(get_object.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("x-amz-version-id") && !header.value.is_empty()
+    }));
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_transport_executes_listener_requests_impl,
+    s3_transport_executes_listener_requests,
+    s3_transport_executes_listener_requests_turso
+);
+
 #[tokio::test]
 async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
@@ -1483,6 +5372,242 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     assert!(bootstrap.pairing_token.is_some());
 
     cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn issue_bootstrap_bundle_keeps_cluster_endpoints_when_client_auth_is_required() {
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    state.access.client_auth_control.require_client_auth = true;
+    state.network.public_ca_pem = Some("public-ca".to_string());
+    state.network.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.network.internal_ca_key_pem = Some("cluster-key".to_string());
+    state.network.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
+
+    let remote_node_id = {
+        let cluster = state.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != state.node_id)
+            .map(|node| node.node_id)
+            .expect("expected seeded remote placeholder node")
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_bootstrap_bundle(
+        State(state.clone()),
+        headers,
+        Json(super::PairingTokenIssueRequest {
+            label: Some("tablet".to_string()),
+            expires_in_secs: Some(600),
+            preferred_rendezvous_url: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let bootstrap: transport_sdk::ClientBootstrap = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(bootstrap.direct_endpoints.len(), 2);
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| endpoint.node_id == Some(state.node_id))
+    );
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| endpoint.node_id == Some(remote_node_id))
+    );
+    assert_eq!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .map(|endpoint| endpoint.url.as_str())
+            .collect::<Vec<_>>(),
+        vec!["http://127.0.0.1:39080", "http://127.0.0.1:9"]
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node() {
+    let mut source = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut target = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    target.cluster_id = source.cluster_id;
+    target.access.client_auth_control.require_client_auth = true;
+
+    let bind_addr = free_bind_addr();
+    let public_url = format!("https://127.0.0.1:{}", bind_addr.port());
+    let (public_ca_pem, _, server_cert_pem, server_key_pem) =
+        generate_test_https_ca_and_server_material(bind_addr, "bootstrap-remote-client-auth");
+    source.network.public_ca_pem = Some(public_ca_pem.clone());
+
+    {
+        let mut cluster = source.cluster.lock().await;
+        cluster.register_node(cluster::NodeDescriptor {
+            node_id: source.node_id,
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://127.0.0.1:9".to_string()),
+                peer_api_url: Some("https://127.0.0.1:49080".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 900_000,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+        cluster.register_node(cluster::NodeDescriptor {
+            node_id: target.node_id,
+            reachability: cluster::NodeReachability {
+                public_api_url: Some(public_url.clone()),
+                peer_api_url: Some("https://127.0.0.1:10009".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 800_000,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+    }
+
+    let tls_root = fresh_test_dir("bootstrap-remote-client-auth");
+    let cert_path = tls_root.join("public.pem");
+    let key_path = tls_root.join("public.key");
+    std::fs::write(&cert_path, server_cert_pem).unwrap();
+    std::fs::write(&key_path, server_key_pem).unwrap();
+
+    let app = super::build_server_apps(&target).public_app;
+    let server_handle = tokio::spawn(async move {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .unwrap();
+        axum_server::bind_rustls(bind_addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let probe_http = super::build_http_client_from_optional_pem(Some(&public_ca_pem)).unwrap();
+    wait_for_http_status(
+        &probe_http,
+        &format!("{public_url}/api/v1/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let (bootstrap, _) = super::issue_client_bootstrap_impl(
+        &source,
+        super::PairingTokenIssueRequest {
+            label: Some("Bootstrap Laptop".to_string()),
+            expires_in_secs: Some(600),
+            preferred_rendezvous_url: None,
+        },
+    )
+    .await
+    .expect("bootstrap issuance should succeed");
+    let bootstrap_json = serde_json::to_string(&bootstrap).unwrap();
+    let bootstrap = client_sdk::ConnectionBootstrap::from_json_str(&bootstrap_json).unwrap();
+
+    assert_eq!(bootstrap.direct_endpoints.len(), 2);
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .any(|endpoint| endpoint.node_id == Some(source.node_id))
+    );
+    assert!(bootstrap.direct_endpoints.iter().any(|endpoint| {
+        endpoint.node_id == Some(target.node_id) && endpoint.url == public_url
+    }));
+
+    let mut identity = transport_sdk::ClientIdentityMaterial::generate(
+        source.cluster_id,
+        None,
+        Some("Bootstrap Laptop".to_string()),
+    )
+    .unwrap();
+    let enrolled = super::enroll_client_device_impl(
+        &source,
+        super::ClientEnrollmentRequest {
+            cluster_id: source.cluster_id,
+            pairing_token: bootstrap.pairing_token.clone().unwrap(),
+            device_id: Some(identity.device_id),
+            label: identity.label.clone(),
+            public_key_pem: identity.public_key_pem.clone(),
+        },
+    )
+    .await
+    .expect("client enrollment should succeed");
+    identity.credential_pem = Some(enrolled.credential_pem.clone());
+
+    let (peer_base_url, sync_handle) =
+        spawn_internal_peer_api_server_for_caller(source.clone(), &target).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+    super::sync_client_credentials_once(&target).await;
+
+    wait_for_condition(
+        "bootstrap-issued credential sync import",
+        Duration::from_secs(5),
+        || {
+            let target = target.clone();
+            let device_id = identity.device_id.to_string();
+            async move {
+                let auth = target.access.client_credentials.lock().await;
+                auth.credentials
+                    .iter()
+                    .any(|record| record.device_id == device_id)
+            }
+        },
+    )
+    .await;
+
+    let client = bootstrap.build_client_with_identity(&identity).unwrap();
+    let response = client.get_json_path("/cluster/status").await.unwrap();
+    assert_eq!(
+        response
+            .get("local_node_id")
+            .and_then(|value| value.as_str()),
+        Some(target.node_id.to_string().as_str())
+    );
+
+    sync_handle.abort();
+    server_handle.abort();
+    cleanup_test_state(&target).await;
+    cleanup_test_state(&source).await;
+    let _ = std::fs::remove_dir_all(&tls_root);
 }
 
 #[tokio::test]
@@ -5545,7 +9670,12 @@ async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: 
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
+                multipart_parts: std::collections::BTreeMap::new(),
+                multipart_bucket_name: None,
+                multipart_object_metadata: None,
+                multipart_completed_result: None,
                 created_at_unix: now,
                 updated_at_unix: now,
                 expires_at_unix: now + 300,
@@ -5888,6 +10018,53 @@ fn store_index_prefix_respects_path_boundaries() {
         .collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["images/cat.png"]);
+}
+
+#[test]
+fn key_listing_cursor_keeps_folder_marker_objects_distinct_from_common_prefixes() {
+    let keys = vec![
+        "docs/".to_string(),
+        "docs/file.txt".to_string(),
+        "notes.txt".to_string(),
+    ];
+
+    let first_page = super::listing::paginate_sorted_keys(
+        &keys,
+        "test-scope",
+        super::listing::KeyListingPrefixMode::ExactStartsWith,
+        "",
+        Some("/"),
+        Some(1),
+        None,
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(first_page.entries.len(), 1);
+    assert_eq!(first_page.entries[0].path, "docs/");
+    assert_eq!(
+        first_page.entries[0].kind,
+        super::listing::KeyListingEntryKind::Object
+    );
+
+    let second_page = super::listing::paginate_sorted_keys(
+        &keys,
+        "test-scope",
+        super::listing::KeyListingPrefixMode::ExactStartsWith,
+        "",
+        Some("/"),
+        Some(1),
+        first_page.next_cursor.as_deref(),
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(second_page.entries[0].path, "docs/");
+    assert_eq!(
+        second_page.entries[0].kind,
+        super::listing::KeyListingEntryKind::CommonPrefix
+    );
 }
 
 #[test]
@@ -6735,6 +10912,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -6813,6 +10992,8 @@ async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -6884,6 +11065,8 @@ async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -6951,6 +11134,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7023,6 +11208,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7091,6 +11278,8 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7159,6 +11348,8 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7223,6 +11414,8 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
                 depth: Some(1),
                 snapshot: None,
                 view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7265,6 +11458,98 @@ run_on_main_metadata_backends!(
     list_store_index_sets_timing_headers_impl,
     list_store_index_sets_timing_headers,
     list_store_index_sets_timing_headers_turso
+);
+
+async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "docs/a.txt",
+                bytes::Bytes::from_static(b"a"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        locked
+            .put_object_versioned(
+                "docs/folder/b.txt",
+                bytes::Bytes::from_static(b"b"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("docs".to_string()),
+                depth: Some(1),
+                snapshot: None,
+                view: None,
+                cursor: None,
+                page_size: Some(1),
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+    let first_body = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_payload["total_entry_count"], 2);
+    assert_eq!(first_payload["entries"][0]["path"], "docs/a.txt");
+    assert_eq!(first_payload["entries"][0]["entry_type"], "key");
+    let next_cursor = first_payload["next_cursor"]
+        .as_str()
+        .expect("cursor mode should return a continuation token")
+        .to_string();
+
+    let second_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("docs".to_string()),
+                depth: Some(1),
+                snapshot: None,
+                view: None,
+                cursor: Some(next_cursor),
+                page_size: Some(1),
+                offset: None,
+                limit: None,
+                sort: None,
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+    let second_body = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(second_payload["entries"][0]["path"], "docs/folder/");
+    assert_eq!(second_payload["entries"][0]["entry_type"], "prefix");
+    assert_eq!(second_payload["has_more"], false);
+    assert!(second_payload["next_cursor"].is_null());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_cursor_mode_pages_raw_entries_impl,
+    list_store_index_cursor_mode_pages_raw_entries,
+    list_store_index_cursor_mode_pages_raw_entries_turso
 );
 
 #[test]
@@ -7433,6 +11718,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -7872,6 +12159,8 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 depth: Some(2),
                 snapshot: None,
                 view: None,
+                cursor: None,
+                page_size: None,
                 offset: None,
                 limit: None,
                 sort: None,
@@ -8676,6 +12965,15 @@ async fn build_test_state(
             client_auth_control: super::ClientAuthControl::default(),
             client_auth_replay_cache: Arc::new(Mutex::new(super::ClientAuthReplayCache::default())),
         },
+        s3: super::ServerS3Runtime {
+            control_plane: Arc::new(Mutex::new(super::S3ControlPlaneState::default())),
+            sync_runtime: Arc::new(std::sync::Mutex::new(
+                super::S3ControlPlaneSyncRuntime::default(),
+            )),
+            listener_enabled: false,
+            public_url: None,
+            tls_enabled: false,
+        },
         network: super::ServerNetworkRuntime {
             public_ca_pem: None,
             public_ca_key_pem: None,
@@ -8800,7 +13098,12 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
+                multipart_parts: std::collections::BTreeMap::new(),
+                multipart_bucket_name: None,
+                multipart_object_metadata: None,
+                multipart_completed_result: None,
                 created_at_unix: now,
                 updated_at_unix: now,
                 expires_at_unix: now + 300,
@@ -8889,7 +13192,12 @@ async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass()
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
+                multipart_parts: std::collections::BTreeMap::new(),
+                multipart_bucket_name: None,
+                multipart_object_metadata: None,
+                multipart_completed_result: None,
                 created_at_unix: now,
                 updated_at_unix: now,
                 expires_at_unix: now + 300,
@@ -9282,6 +13590,37 @@ async fn spawn_internal_peer_api_server(
         .expect("test peer listener should bind");
     let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
     let app = super::build_internal_peer_api().with_state(state);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("internal peer api should serve in tests");
+    });
+    (peer_base_url, handle)
+}
+
+async fn spawn_internal_peer_api_server_for_caller(
+    state: ServerState,
+    caller: &ServerState,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test peer listener should bind");
+    let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let internal_caller = super::InternalCaller {
+        node_id: caller.node_id,
+        cluster_id: caller.cluster_id,
+    };
+    let app = super::build_internal_peer_api()
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            move |mut request: Request<Body>, next: axum::middleware::Next| {
+                let internal_caller = internal_caller.clone();
+                async move {
+                    request.extensions_mut().insert(internal_caller);
+                    next.run(request).await
+                }
+            },
+        ));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
             .await

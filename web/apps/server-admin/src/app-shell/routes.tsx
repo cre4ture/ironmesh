@@ -1,4 +1,4 @@
-import { IconActivity, IconArrowsTransferUp, IconCertificate, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconActivity, IconArrowsTransferUp, IconCertificate, IconCloud, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { RepairPage } from "../pages/RepairPage";
 import { SetupPage } from "../pages/SetupPage";
@@ -13,6 +13,7 @@ import { LogsPage } from "../pages/LogsPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { ExplorerPage } from "../pages/ExplorerPage";
 import { MetadataPage } from "../pages/MetadataPage";
+import { S3ControlPlanePage } from "../pages/S3ControlPlanePage";
 
 export const serverAdminRoutes = [
   {
@@ -84,6 +85,13 @@ export const serverAdminRoutes = [
     description: "Review enrolled client credentials, recent bootstrap claims, and revoke access when needed.",
     icon: IconKey,
     element: <ClientCredentialsPage />
+  },
+  {
+    id: "s3",
+    label: "S3",
+    description: "Manage replicated S3 bucket mappings, access keys, and listener status for the S3-compatible frontend.",
+    icon: IconCloud,
+    element: <S3ControlPlanePage />
   },
   {
     id: "certificates",

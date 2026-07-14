@@ -6,7 +6,7 @@ use crate::framework::{
     start_zero_touch_server, stop_server, wait_for_rendezvous_registered_endpoints,
 };
 use anyhow::{Context, Result, bail};
-use client_sdk::{BootstrapEndpoint, BootstrapEndpointUse, ConnectionBootstrap};
+use client_sdk::ConnectionBootstrap;
 use std::fs;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -291,10 +291,6 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
         wait_for_cluster_nodes_with_cookie(&insecure_http, NODE_A_BIND, &admin_cookie_a, 2, 120)
             .await?;
 
-        // Client bootstrap issued by a managed/appliance node still only lists the issuing node's
-        // own direct endpoint (client credentials need to propagate to other nodes before those
-        // nodes will trust them, same restriction as the classic runtime), so node B's endpoint
-        // is merged in manually below. All configured rendezvous URLs are listed regardless.
         let bootstrap = issue_bootstrap_bundle_with_cookie(
             &insecure_http,
             NODE_A_BIND,
@@ -303,10 +299,18 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
             Some(3600),
         )
         .await?;
+        let mut direct_node_ids = bootstrap
+            .direct_endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.node_id.map(|node_id| node_id.to_string()))
+            .collect::<Vec<_>>();
+        direct_node_ids.sort();
+        let mut expected_direct_node_ids = vec![node_id_a.clone(), node_id_b.clone()];
+        expected_direct_node_ids.sort();
         assert_eq!(
-            bootstrap.direct_endpoints.len(),
-            1,
-            "expected a single-node client bootstrap under required client auth, got {:?}",
+            direct_node_ids,
+            expected_direct_node_ids,
+            "expected both cluster nodes in the managed bootstrap, got {:?}",
             bootstrap.direct_endpoints
         );
         assert_eq!(
@@ -316,24 +320,10 @@ async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_c
             bootstrap.rendezvous_urls
         );
 
-        let mut merged_bootstrap = bootstrap.clone();
-        merged_bootstrap.direct_endpoints.push(BootstrapEndpoint {
-            url: format!("https://{NODE_B_BIND}"),
-            usage: Some(BootstrapEndpointUse::PublicApi),
-            node_id: Some(
-                node_id_b
-                    .parse()
-                    .context("node_id_b should be a valid uuid")?,
-            ),
-        });
         let bootstrap_path = client_dir.join("cli-managed-latency.bootstrap.json");
         bootstrap.write_to_path(&bootstrap_path)?;
-        let merged_bootstrap_path = client_dir.join("cli-managed-latency-merged.bootstrap.json");
-        merged_bootstrap.write_to_path(&merged_bootstrap_path)?;
-
-        let bootstrap_arg = merged_bootstrap_path.to_string_lossy().into_owned();
-        // The identity file lives next to the *originally issued* bootstrap file; the merged
-        // bootstrap above reuses that same enrolled identity.
+        let bootstrap_arg = bootstrap_path.to_string_lossy().into_owned();
+        // The identity file lives next to the bootstrap file used for enrollment.
         let identity_path = default_client_identity_path(&bootstrap_path);
         let identity_arg = identity_path.to_string_lossy().into_owned();
 

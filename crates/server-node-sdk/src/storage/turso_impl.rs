@@ -14,9 +14,11 @@ use super::{
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, ManifestSummary, ManualRepairActionRunRecord,
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, ReconcileMarker, RepairAttemptRecord, RepairRunRecord, SnapshotInfo,
-    SnapshotManifest, StorageStatsSample, StorageStatsState, compress_snapshot_json,
-    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample,
+    StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
+    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -635,6 +637,188 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
+    async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState> {
+        let mut bucket_rows = self
+            .connection
+            .query(
+                "SELECT bucket_name, root_prefix, versioning_status, read_only,
+                        created_at_unix, updated_at_unix, created_by, deleted_at_unix
+                 FROM s3_buckets
+                 ORDER BY bucket_name",
+                (),
+            )
+            .await?;
+        let mut buckets = Vec::new();
+        while let Some(row) = bucket_rows.next().await? {
+            let versioning_status = row_string(&row, 2, "s3_buckets.versioning_status")?;
+            buckets.push(S3BucketRecord {
+                bucket_name: row_string(&row, 0, "s3_buckets.bucket_name")?,
+                root_prefix: row_string(&row, 1, "s3_buckets.root_prefix")?,
+                versioning_status: S3BucketVersioningStatus::parse(&versioning_status)
+                    .with_context(|| {
+                        format!(
+                            "invalid s3 bucket versioning status in Turso metadata database {}: {versioning_status}",
+                            self.metadata_path.display()
+                        )
+                    })?,
+                read_only: row_bool(&row, 3, "s3_buckets.read_only")?,
+                created_at_unix: row_u64(&row, 4, "s3_buckets.created_at_unix")?,
+                updated_at_unix: row_u64(&row, 5, "s3_buckets.updated_at_unix")?,
+                created_by: row_opt_string(&row, 6, "s3_buckets.created_by")?,
+                deleted_at_unix: row_opt_u64(&row, 7, "s3_buckets.deleted_at_unix")?,
+            });
+        }
+
+        let mut access_key_rows = self
+            .connection
+            .query(
+                "SELECT access_key_id, secret_material, description, bucket_scope_json,
+                        prefix_scope_json, allow_list, allow_read, allow_write,
+                        allow_delete, allow_manage, created_at_unix, updated_at_unix,
+                        last_used_at_unix, revoked_at_unix
+                 FROM s3_access_keys
+                 ORDER BY access_key_id",
+                (),
+            )
+            .await?;
+        let mut access_keys = Vec::new();
+        while let Some(row) = access_key_rows.next().await? {
+            let bucket_scope_json = row_blob(&row, 3, "s3_access_keys.bucket_scope_json")?;
+            let prefix_scope_json = row_blob(&row, 4, "s3_access_keys.prefix_scope_json")?;
+            access_keys.push(S3AccessKeyRecord {
+                access_key_id: row_string(&row, 0, "s3_access_keys.access_key_id")?,
+                secret_material: row_string(&row, 1, "s3_access_keys.secret_material")?,
+                description: row_opt_string(&row, 2, "s3_access_keys.description")?,
+                bucket_scope: self.decode_json(bucket_scope_json, "s3 access key bucket scope")?,
+                prefix_scope: self.decode_json(prefix_scope_json, "s3 access key prefix scope")?,
+                allow_list: row_bool(&row, 5, "s3_access_keys.allow_list")?,
+                allow_read: row_bool(&row, 6, "s3_access_keys.allow_read")?,
+                allow_write: row_bool(&row, 7, "s3_access_keys.allow_write")?,
+                allow_delete: row_bool(&row, 8, "s3_access_keys.allow_delete")?,
+                allow_manage: row_bool(&row, 9, "s3_access_keys.allow_manage")?,
+                created_at_unix: row_u64(&row, 10, "s3_access_keys.created_at_unix")?,
+                updated_at_unix: row_u64(&row, 11, "s3_access_keys.updated_at_unix")?,
+                last_used_at_unix: row_opt_u64(&row, 12, "s3_access_keys.last_used_at_unix")?,
+                revoked_at_unix: row_opt_u64(&row, 13, "s3_access_keys.revoked_at_unix")?,
+            });
+        }
+
+        Ok(S3ControlPlaneState {
+            buckets,
+            access_keys,
+        })
+    }
+
+    async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
+        self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: Result<()> = async {
+            self.connection
+                .execute("DELETE FROM s3_buckets", ())
+                .await?;
+            self.connection
+                .execute("DELETE FROM s3_access_keys", ())
+                .await?;
+
+            for bucket in &state.buckets {
+                self.connection
+                    .execute(
+                        "INSERT INTO s3_buckets (
+                             bucket_name,
+                             root_prefix,
+                             versioning_status,
+                             read_only,
+                             created_at_unix,
+                             updated_at_unix,
+                             created_by,
+                             deleted_at_unix
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        (
+                            bucket.bucket_name.as_str(),
+                            bucket.root_prefix.as_str(),
+                            bucket.versioning_status.as_str(),
+                            if bucket.read_only { 1_i64 } else { 0_i64 },
+                            i64::try_from(bucket.created_at_unix)
+                                .context("s3 bucket created_at_unix overflow")?,
+                            i64::try_from(bucket.updated_at_unix)
+                                .context("s3 bucket updated_at_unix overflow")?,
+                            bucket.created_by.clone(),
+                            bucket
+                                .deleted_at_unix
+                                .map(i64::try_from)
+                                .transpose()
+                                .context("s3 bucket deleted_at_unix overflow")?,
+                        ),
+                    )
+                    .await?;
+            }
+
+            for access_key in &state.access_keys {
+                self.connection
+                    .execute(
+                        "INSERT INTO s3_access_keys (
+                             access_key_id,
+                             secret_material,
+                             description,
+                             bucket_scope_json,
+                             prefix_scope_json,
+                             allow_list,
+                             allow_read,
+                             allow_write,
+                             allow_delete,
+                             allow_manage,
+                             created_at_unix,
+                             updated_at_unix,
+                             last_used_at_unix,
+                             revoked_at_unix
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        (
+                            access_key.access_key_id.as_str(),
+                            access_key.secret_material.as_str(),
+                            access_key.description.clone(),
+                            serde_json::to_vec(&access_key.bucket_scope)?,
+                            serde_json::to_vec(&access_key.prefix_scope)?,
+                            if access_key.allow_list { 1_i64 } else { 0_i64 },
+                            if access_key.allow_read { 1_i64 } else { 0_i64 },
+                            if access_key.allow_write { 1_i64 } else { 0_i64 },
+                            if access_key.allow_delete {
+                                1_i64
+                            } else {
+                                0_i64
+                            },
+                            if access_key.allow_manage {
+                                1_i64
+                            } else {
+                                0_i64
+                            },
+                            i64::try_from(access_key.created_at_unix)
+                                .context("s3 access key created_at_unix overflow")?,
+                            i64::try_from(access_key.updated_at_unix)
+                                .context("s3 access key updated_at_unix overflow")?,
+                            access_key
+                                .last_used_at_unix
+                                .map(i64::try_from)
+                                .transpose()
+                                .context("s3 access key last_used_at_unix overflow")?,
+                            access_key
+                                .revoked_at_unix
+                                .map(i64::try_from)
+                                .transpose()
+                                .context("s3 access key revoked_at_unix overflow")?,
+                        ),
+                    )
+                    .await?;
+            }
+
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
+    }
+
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
         let mut rows = self
             .connection
@@ -1057,6 +1241,248 @@ impl MetadataStore for TursoMetadataStore {
         }
 
         Ok(summaries)
+    }
+
+    async fn load_object_version_metadata(
+        &self,
+        version_id: &str,
+    ) -> Result<Option<ObjectVersionMetadataRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT content_type, content_encoding, content_language,
+                        cache_control, content_disposition, user_metadata_json,
+                        checksum_sha256, checksum_crc32c, updated_at_unix
+                 FROM object_version_metadata
+                 WHERE version_id = ?1",
+                (version_id,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+
+        let user_metadata_json = row_blob(&row, 5, "object_version_metadata.user_metadata_json")?;
+        Ok(Some(ObjectVersionMetadataRecord {
+            version_id: version_id.to_string(),
+            content_type: row_opt_string(&row, 0, "object_version_metadata.content_type")?,
+            content_encoding: row_opt_string(&row, 1, "object_version_metadata.content_encoding")?,
+            content_language: row_opt_string(&row, 2, "object_version_metadata.content_language")?,
+            cache_control: row_opt_string(&row, 3, "object_version_metadata.cache_control")?,
+            content_disposition: row_opt_string(
+                &row,
+                4,
+                "object_version_metadata.content_disposition",
+            )?,
+            user_metadata: self.decode_json(user_metadata_json, "object version user metadata")?,
+            checksum_sha256: row_opt_string(&row, 6, "object_version_metadata.checksum_sha256")?,
+            checksum_crc32c: row_opt_string(&row, 7, "object_version_metadata.checksum_crc32c")?,
+            updated_at_unix: row_u64(&row, 8, "object_version_metadata.updated_at_unix")?,
+        }))
+    }
+
+    async fn persist_object_version_metadata(
+        &self,
+        metadata: &ObjectVersionMetadataRecord,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO object_version_metadata (
+                     version_id,
+                     content_type,
+                     content_encoding,
+                     content_language,
+                     cache_control,
+                     content_disposition,
+                     user_metadata_json,
+                     checksum_sha256,
+                     checksum_crc32c,
+                     updated_at_unix
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(version_id) DO UPDATE
+                 SET content_type = excluded.content_type,
+                     content_encoding = excluded.content_encoding,
+                     content_language = excluded.content_language,
+                     cache_control = excluded.cache_control,
+                     content_disposition = excluded.content_disposition,
+                     user_metadata_json = excluded.user_metadata_json,
+                     checksum_sha256 = excluded.checksum_sha256,
+                     checksum_crc32c = excluded.checksum_crc32c,
+                     updated_at_unix = excluded.updated_at_unix",
+                (
+                    metadata.version_id.as_str(),
+                    metadata.content_type.clone(),
+                    metadata.content_encoding.clone(),
+                    metadata.content_language.clone(),
+                    metadata.cache_control.clone(),
+                    metadata.content_disposition.clone(),
+                    serde_json::to_vec(&metadata.user_metadata)?,
+                    metadata.checksum_sha256.clone(),
+                    metadata.checksum_crc32c.clone(),
+                    i64::try_from(metadata.updated_at_unix)
+                        .context("object version updated_at_unix overflow")?,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM object_version_metadata WHERE version_id = ?1",
+                (version_id,),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn load_s3_object_version(
+        &self,
+        bucket_name: &str,
+        version_id: &str,
+    ) -> Result<Option<S3ObjectVersionRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT ironmesh_key, etag, multipart_part_count, created_at_unix
+                 FROM s3_object_versions
+                 WHERE bucket_name = ?1 AND version_id = ?2",
+                (bucket_name, version_id),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(S3ObjectVersionRecord {
+            bucket_name: bucket_name.to_string(),
+            ironmesh_key: row_string(&row, 0, "s3_object_versions.ironmesh_key")?,
+            version_id: version_id.to_string(),
+            etag: row_string(&row, 1, "s3_object_versions.etag")?,
+            multipart_part_count: row_opt_u32(&row, 2, "s3_object_versions.multipart_part_count")?,
+            created_at_unix: row_u64(&row, 3, "s3_object_versions.created_at_unix")?,
+        }))
+    }
+
+    async fn list_s3_object_versions_for_key(
+        &self,
+        bucket_name: &str,
+        ironmesh_key: &str,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT version_id, etag, multipart_part_count, created_at_unix
+                 FROM s3_object_versions
+                 WHERE bucket_name = ?1 AND ironmesh_key = ?2
+                 ORDER BY created_at_unix DESC, version_id DESC",
+                (bucket_name, ironmesh_key),
+            )
+            .await?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            records.push(S3ObjectVersionRecord {
+                bucket_name: bucket_name.to_string(),
+                ironmesh_key: ironmesh_key.to_string(),
+                version_id: row_string(&row, 0, "s3_object_versions.version_id")?,
+                etag: row_string(&row, 1, "s3_object_versions.etag")?,
+                multipart_part_count: row_opt_u32(
+                    &row,
+                    2,
+                    "s3_object_versions.multipart_part_count",
+                )?,
+                created_at_unix: row_u64(&row, 3, "s3_object_versions.created_at_unix")?,
+            });
+        }
+        Ok(records)
+    }
+
+    async fn list_s3_object_versions(
+        &self,
+        bucket_name: &str,
+        ironmesh_key_prefix: Option<&str>,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        let mut records = Vec::new();
+        let mut rows = if let Some(prefix) = ironmesh_key_prefix {
+            let like_pattern = super::sqlite_like_prefix_pattern(prefix);
+            self.connection
+                .query(
+                    "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                     FROM s3_object_versions
+                     WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2 ESCAPE '\\'
+                     ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                    (bucket_name, like_pattern.as_str()),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                     FROM s3_object_versions
+                     WHERE bucket_name = ?1
+                     ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                    (bucket_name,),
+                )
+                .await?
+        };
+
+        while let Some(row) = rows.next().await? {
+            records.push(S3ObjectVersionRecord {
+                bucket_name: bucket_name.to_string(),
+                ironmesh_key: row_string(&row, 0, "s3_object_versions.ironmesh_key")?,
+                version_id: row_string(&row, 1, "s3_object_versions.version_id")?,
+                etag: row_string(&row, 2, "s3_object_versions.etag")?,
+                multipart_part_count: row_opt_u32(
+                    &row,
+                    3,
+                    "s3_object_versions.multipart_part_count",
+                )?,
+                created_at_unix: row_u64(&row, 4, "s3_object_versions.created_at_unix")?,
+            });
+        }
+        Ok(records)
+    }
+
+    async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO s3_object_versions (
+                     bucket_name,
+                     ironmesh_key,
+                     version_id,
+                     etag,
+                     multipart_part_count,
+                     created_at_unix
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(bucket_name, version_id) DO UPDATE
+                 SET ironmesh_key = excluded.ironmesh_key,
+                     etag = excluded.etag,
+                     multipart_part_count = excluded.multipart_part_count,
+                     created_at_unix = excluded.created_at_unix",
+                (
+                    record.bucket_name.as_str(),
+                    record.ironmesh_key.as_str(),
+                    record.version_id.as_str(),
+                    record.etag.as_str(),
+                    record.multipart_part_count.map(i64::from),
+                    i64::try_from(record.created_at_unix)
+                        .context("s3 object version created_at_unix overflow")?,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM s3_object_versions
+                 WHERE bucket_name = ?1 AND version_id = ?2",
+                (bucket_name, version_id),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn persist_manifest_summary(
@@ -1795,6 +2221,57 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 state_json BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS s3_buckets (
+                bucket_name TEXT PRIMARY KEY,
+                root_prefix TEXT NOT NULL,
+                versioning_status TEXT NOT NULL,
+                read_only INTEGER NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                created_by TEXT,
+                deleted_at_unix INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS s3_access_keys (
+                access_key_id TEXT PRIMARY KEY,
+                secret_material TEXT NOT NULL,
+                description TEXT,
+                bucket_scope_json BLOB NOT NULL,
+                prefix_scope_json BLOB NOT NULL,
+                allow_list INTEGER NOT NULL,
+                allow_read INTEGER NOT NULL,
+                allow_write INTEGER NOT NULL,
+                allow_delete INTEGER NOT NULL,
+                allow_manage INTEGER NOT NULL DEFAULT 0,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL,
+                last_used_at_unix INTEGER,
+                revoked_at_unix INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS object_version_metadata (
+                version_id TEXT PRIMARY KEY,
+                content_type TEXT,
+                content_encoding TEXT,
+                content_language TEXT,
+                cache_control TEXT,
+                content_disposition TEXT,
+                user_metadata_json BLOB NOT NULL,
+                checksum_sha256 TEXT,
+                checksum_crc32c TEXT,
+                updated_at_unix INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS s3_object_versions (
+                bucket_name TEXT NOT NULL,
+                ironmesh_key TEXT NOT NULL,
+                version_id TEXT NOT NULL,
+                etag TEXT NOT NULL,
+                multipart_part_count INTEGER,
+                created_at_unix INTEGER NOT NULL,
+                PRIMARY KEY(bucket_name, version_id)
+            );
+
             CREATE TABLE IF NOT EXISTS admin_audit_events (
                 event_id TEXT PRIMARY KEY,
                 created_at_unix INTEGER NOT NULL,
@@ -1869,9 +2346,25 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON data_change_events(actor_id);
             CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
                 ON cluster_replicas(subject);
+            CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
+                ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
             ",
         )
         .await?;
+    if let Err(err) = connection
+        .execute(
+            "ALTER TABLE s3_access_keys ADD COLUMN allow_manage INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+    {
+        let duplicate_column = err
+            .to_string()
+            .contains("duplicate column name: allow_manage");
+        if !duplicate_column {
+            return Err(err).context("failed to migrate turso s3_access_keys.allow_manage");
+        }
+    }
     Ok(())
 }
 
@@ -1905,4 +2398,42 @@ fn row_u64(row: &turso::Row, idx: usize, label: &str) -> Result<u64> {
 fn row_usize(row: &turso::Row, idx: usize, label: &str) -> Result<usize> {
     let value = row_u64(row, idx, label)?;
     usize::try_from(value).with_context(|| format!("integer overflow for {label}: {value}"))
+}
+
+fn row_bool(row: &turso::Row, idx: usize, label: &str) -> Result<bool> {
+    match row.get_value(idx)? {
+        turso::Value::Integer(value) => Ok(value != 0),
+        other => bail!("expected integer value for {label}, got {other:?}"),
+    }
+}
+
+fn row_opt_string(row: &turso::Row, idx: usize, label: &str) -> Result<Option<String>> {
+    match row.get_value(idx)? {
+        turso::Value::Null => Ok(None),
+        turso::Value::Text(value) => Ok(Some(value)),
+        turso::Value::Blob(value) => Ok(Some(
+            String::from_utf8(value).with_context(|| format!("invalid utf-8 in {label}"))?,
+        )),
+        other => bail!("expected optional text value for {label}, got {other:?}"),
+    }
+}
+
+fn row_opt_u64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<u64>> {
+    match row.get_value(idx)? {
+        turso::Value::Null => Ok(None),
+        turso::Value::Integer(value) => {
+            Ok(Some(u64::try_from(value).with_context(|| {
+                format!("negative integer for {label}: {value}")
+            })?))
+        }
+        other => bail!("expected optional integer value for {label}, got {other:?}"),
+    }
+}
+
+fn row_opt_u32(row: &turso::Row, idx: usize, label: &str) -> Result<Option<u32>> {
+    row_opt_u64(row, idx, label)?
+        .map(|value| {
+            u32::try_from(value).with_context(|| format!("integer overflow for {label}: {value}"))
+        })
+        .transpose()
 }

@@ -10,7 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
-use futures_util::{Sink, Stream};
+use futures_util::{Sink, Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::{
     Arc, Barrier,
@@ -595,6 +595,76 @@ async fn direct_transport_ws(
     })
 }
 
+#[derive(Clone)]
+struct RelayMixedWorkloadState {
+    public_url: String,
+    payload: Arc<Vec<u8>>,
+    issued_ticket_count: Arc<AtomicUsize>,
+    paired_session_count: Arc<AtomicUsize>,
+}
+
+async fn issue_mixed_workload_ticket(
+    State(state): State<RelayMixedWorkloadState>,
+    Json(request): Json<RelayTicketRequest>,
+) -> Json<RelayTicket> {
+    state.issued_ticket_count.fetch_add(1, Ordering::SeqCst);
+    Json(RelayTicket {
+        cluster_id: request.cluster_id,
+        session_id: format!("relay-mixed-session-{}", uuid::Uuid::now_v7()),
+        source: request.source,
+        target: request.target,
+        session_kind: request.session_kind,
+        relay_urls: vec![state.public_url],
+        issued_at_unix: 1,
+        expires_at_unix: 61,
+    })
+}
+
+async fn relay_mixed_workload_tunnel_ws(
+    State(state): State<RelayMixedWorkloadState>,
+    websocket: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    websocket.on_upgrade(move |mut socket| async move {
+        let initial = match socket.recv().await {
+            Some(Ok(Message::Text(text))) => text,
+            _ => return,
+        };
+        let RelayTunnelControlMessage::ConnectSource { ticket } =
+            serde_json::from_str(&initial).expect("mixed workload relay control should parse")
+        else {
+            return;
+        };
+
+        let session = RelayTunnelSession {
+            cluster_id: ticket.cluster_id,
+            session_id: ticket.session_id.clone(),
+            source: ticket.source.clone(),
+            target: ticket.target.clone(),
+            session_kind: ticket.session_kind,
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&RelayTunnelControlMessage::Paired { session })
+                    .expect("mixed workload paired control should serialize")
+                    .into(),
+            ))
+            .await
+            .expect("mixed workload paired response should send");
+
+        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            ticket.session_kind,
+            RelayTunnelSessionKind::MultiplexTransport
+        );
+        serve_mixed_workload_transport_socket(
+            socket,
+            Arc::clone(&state.payload),
+            ticket.session_id,
+        )
+        .await;
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RelayTestWsMessage {
     Binary(Vec<u8>),
@@ -993,7 +1063,6 @@ async fn serve_direct_transport_hangs_after_first_success_socket(
     let mut session =
         MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
             .expect("stalling direct transport test session should spawn");
-
     let hello = perform_transport_server_handshake(
         &mut session,
         TransportSessionControlMessage::Ready {
@@ -1331,178 +1400,232 @@ fn relay_header_value(headers: &[RelayHttpHeader], name: &str) -> Option<String>
         .map(|header| header.value.clone())
 }
 
+async fn serve_mixed_workload_transport_socket(
+    socket: WebSocket,
+    payload: Arc<Vec<u8>>,
+    session_id: String,
+) {
+    let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
+    let mut session =
+        MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
+            .expect("mixed workload session should spawn");
+    let hello = perform_transport_server_handshake(
+        &mut session,
+        TransportSessionControlMessage::Ready {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            session_id,
+            max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .expect("mixed workload handshake should succeed");
+    assert!(matches!(
+        hello,
+        TransportSessionControlMessage::Hello {
+            role: TransportSessionRole::Client,
+            ..
+        }
+    ));
+
+    while let Some(mut stream) = session
+        .accept_stream()
+        .await
+        .expect("mixed workload stream accept should succeed")
+    {
+        let payload = Arc::clone(&payload);
+        tokio::spawn(async move {
+            let request = read_buffered_transport_request(&mut stream)
+                .await
+                .expect("mixed workload request should decode");
+
+            match (request.kind, request.method.as_str(), request.path.as_str()) {
+                (TransportStreamKind::Rpc, "HEAD", "/api/v1/store/large.bin") => {
+                    write_buffered_transport_response(
+                        &mut stream,
+                        &MultiplexBufferedTransportResponse {
+                            request_id: request.request_id,
+                            status: StatusCode::OK.as_u16(),
+                            headers: vec![
+                                TransportHeader {
+                                    name: ACCEPT_RANGES.as_str().to_string(),
+                                    value: "bytes".to_string(),
+                                },
+                                TransportHeader {
+                                    name: CONTENT_LENGTH.as_str().to_string(),
+                                    value: payload.len().to_string(),
+                                },
+                                TransportHeader {
+                                    name: ETAG.as_str().to_string(),
+                                    value: "\"mixed-etag\"".to_string(),
+                                },
+                                TransportHeader {
+                                    name: "x-ironmesh-object-size".to_string(),
+                                    value: payload.len().to_string(),
+                                },
+                            ],
+                            body: Vec::new(),
+                        },
+                    )
+                    .await
+                    .expect("mixed workload HEAD response should write");
+                }
+                (TransportStreamKind::ObjectRead, "GET", "/api/v1/store/large.bin") => {
+                    let range = request
+                        .headers
+                        .iter()
+                        .find(|header| header.name.eq_ignore_ascii_case("range"))
+                        .map(|header| header.value.clone())
+                        .expect("range header should be present");
+                    let (start, end_inclusive) = parse_range_header(&range, payload.len());
+                    let selected = &payload[start..=end_inclusive];
+                    write_transport_response_head(
+                        &mut stream,
+                        &TransportResponseHead {
+                            request_id: request.request_id,
+                            status: StatusCode::PARTIAL_CONTENT.as_u16(),
+                            headers: vec![
+                                TransportHeader {
+                                    name: ACCEPT_RANGES.as_str().to_string(),
+                                    value: "bytes".to_string(),
+                                },
+                                TransportHeader {
+                                    name: CONTENT_LENGTH.as_str().to_string(),
+                                    value: selected.len().to_string(),
+                                },
+                                TransportHeader {
+                                    name: CONTENT_RANGE.as_str().to_string(),
+                                    value: format!(
+                                        "bytes {start}-{end_inclusive}/{}",
+                                        payload.len()
+                                    ),
+                                },
+                                TransportHeader {
+                                    name: ETAG.as_str().to_string(),
+                                    value: "\"mixed-etag\"".to_string(),
+                                },
+                                TransportHeader {
+                                    name: "x-ironmesh-object-size".to_string(),
+                                    value: payload.len().to_string(),
+                                },
+                            ],
+                        },
+                    )
+                    .await
+                    .expect("mixed workload object-read head should write");
+
+                    for chunk in selected.chunks(16 * 1024) {
+                        stream
+                            .write_all(chunk)
+                            .await
+                            .expect("mixed workload object-read body should write");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    stream
+                        .close()
+                        .await
+                        .expect("mixed workload object-read stream should close");
+                }
+                (
+                    TransportStreamKind::ObjectRead,
+                    "GET",
+                    "/s3/photos.example/docs/streamed.txt",
+                ) => {
+                    write_transport_response_head(
+                        &mut stream,
+                        &TransportResponseHead {
+                            request_id: request.request_id,
+                            status: StatusCode::OK.as_u16(),
+                            headers: vec![
+                                TransportHeader {
+                                    name: CONTENT_LENGTH.as_str().to_string(),
+                                    value: payload.len().to_string(),
+                                },
+                                TransportHeader {
+                                    name: ETAG.as_str().to_string(),
+                                    value: "\"s3-streamed-etag\"".to_string(),
+                                },
+                                TransportHeader {
+                                    name: "content-type".to_string(),
+                                    value: "application/octet-stream".to_string(),
+                                },
+                            ],
+                        },
+                    )
+                    .await
+                    .expect("mixed workload S3 object-read head should write");
+
+                    for chunk in payload.chunks(16 * 1024) {
+                        stream
+                            .write_all(chunk)
+                            .await
+                            .expect("mixed workload S3 object-read body should write");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    stream
+                        .close()
+                        .await
+                        .expect("mixed workload S3 object-read stream should close");
+                }
+                (TransportStreamKind::Rpc, "GET", "/api/v1/cluster/status") => {
+                    write_buffered_transport_response(
+                        &mut stream,
+                        &MultiplexBufferedTransportResponse {
+                            request_id: request.request_id,
+                            status: StatusCode::OK.as_u16(),
+                            headers: vec![
+                                TransportHeader {
+                                    name: "content-type".to_string(),
+                                    value: "application/json".to_string(),
+                                },
+                                TransportHeader {
+                                    name: "content-length".to_string(),
+                                    value: br#"{"status":"ok"}"#.len().to_string(),
+                                },
+                            ],
+                            body: br#"{"status":"ok"}"#.to_vec(),
+                        },
+                    )
+                    .await
+                    .expect("mixed workload RPC response should write");
+                }
+                _ => {
+                    write_buffered_transport_response(
+                        &mut stream,
+                        &MultiplexBufferedTransportResponse {
+                            request_id: request.request_id,
+                            status: StatusCode::BAD_REQUEST.as_u16(),
+                            headers: vec![
+                                TransportHeader {
+                                    name: "content-type".to_string(),
+                                    value: "text/plain; charset=utf-8".to_string(),
+                                },
+                                TransportHeader {
+                                    name: "content-length".to_string(),
+                                    value: b"unsupported".len().to_string(),
+                                },
+                            ],
+                            body: b"unsupported".to_vec(),
+                        },
+                    )
+                    .await
+                    .expect("mixed workload error response should write");
+                }
+            }
+        });
+    }
+}
+
 async fn direct_mixed_workload_ws(
     websocket: WebSocketUpgrade,
     State(payload): State<Arc<Vec<u8>>>,
 ) -> impl IntoResponse {
     websocket.on_upgrade(move |socket| async move {
-        let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
-        let mut session =
-            MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
-                .expect("mixed workload session should spawn");
-        let hello = perform_transport_server_handshake(
-            &mut session,
-            TransportSessionControlMessage::Ready {
-                protocol_version: TRANSPORT_PROTOCOL_VERSION,
-                session_id: format!("mixed-session-{}", uuid::Uuid::now_v7()),
-                max_concurrent_streams: MultiplexConfig::default().max_num_streams,
-            },
+        serve_mixed_workload_transport_socket(
+            socket,
+            payload,
+            format!("mixed-session-{}", uuid::Uuid::now_v7()),
         )
-        .await
-        .expect("mixed workload handshake should succeed");
-        assert!(matches!(
-            hello,
-            TransportSessionControlMessage::Hello {
-                role: TransportSessionRole::Client,
-                ..
-            }
-        ));
-
-        while let Some(mut stream) = session
-            .accept_stream()
-            .await
-            .expect("mixed workload stream accept should succeed")
-        {
-            let payload = Arc::clone(&payload);
-            tokio::spawn(async move {
-                let request = read_buffered_transport_request(&mut stream)
-                    .await
-                    .expect("mixed workload request should decode");
-
-                match (request.kind, request.method.as_str(), request.path.as_str()) {
-                    (TransportStreamKind::Rpc, "HEAD", "/api/v1/store/large.bin") => {
-                        write_buffered_transport_response(
-                            &mut stream,
-                            &MultiplexBufferedTransportResponse {
-                                request_id: request.request_id,
-                                status: StatusCode::OK.as_u16(),
-                                headers: vec![
-                                    TransportHeader {
-                                        name: ACCEPT_RANGES.as_str().to_string(),
-                                        value: "bytes".to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: CONTENT_LENGTH.as_str().to_string(),
-                                        value: payload.len().to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: ETAG.as_str().to_string(),
-                                        value: "\"mixed-etag\"".to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: "x-ironmesh-object-size".to_string(),
-                                        value: payload.len().to_string(),
-                                    },
-                                ],
-                                body: Vec::new(),
-                            },
-                        )
-                        .await
-                        .expect("mixed workload HEAD response should write");
-                    }
-                    (TransportStreamKind::ObjectRead, "GET", "/api/v1/store/large.bin") => {
-                        let range = request
-                            .headers
-                            .iter()
-                            .find(|header| header.name.eq_ignore_ascii_case("range"))
-                            .map(|header| header.value.clone())
-                            .expect("range header should be present");
-                        let (start, end_inclusive) = parse_range_header(&range, payload.len());
-                        let selected = &payload[start..=end_inclusive];
-                        write_transport_response_head(
-                            &mut stream,
-                            &TransportResponseHead {
-                                request_id: request.request_id,
-                                status: StatusCode::PARTIAL_CONTENT.as_u16(),
-                                headers: vec![
-                                    TransportHeader {
-                                        name: ACCEPT_RANGES.as_str().to_string(),
-                                        value: "bytes".to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: CONTENT_LENGTH.as_str().to_string(),
-                                        value: selected.len().to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: CONTENT_RANGE.as_str().to_string(),
-                                        value: format!(
-                                            "bytes {start}-{end_inclusive}/{}",
-                                            payload.len()
-                                        ),
-                                    },
-                                    TransportHeader {
-                                        name: ETAG.as_str().to_string(),
-                                        value: "\"mixed-etag\"".to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: "x-ironmesh-object-size".to_string(),
-                                        value: payload.len().to_string(),
-                                    },
-                                ],
-                            },
-                        )
-                        .await
-                        .expect("mixed workload object-read head should write");
-
-                        for chunk in selected.chunks(16 * 1024) {
-                            stream
-                                .write_all(chunk)
-                                .await
-                                .expect("mixed workload object-read body should write");
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        }
-                        stream
-                            .close()
-                            .await
-                            .expect("mixed workload object-read stream should close");
-                    }
-                    (TransportStreamKind::Rpc, "GET", "/api/v1/cluster/status") => {
-                        write_buffered_transport_response(
-                            &mut stream,
-                            &MultiplexBufferedTransportResponse {
-                                request_id: request.request_id,
-                                status: StatusCode::OK.as_u16(),
-                                headers: vec![
-                                    TransportHeader {
-                                        name: "content-type".to_string(),
-                                        value: "application/json".to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: "content-length".to_string(),
-                                        value: br#"{"status":"ok"}"#.len().to_string(),
-                                    },
-                                ],
-                                body: br#"{"status":"ok"}"#.to_vec(),
-                            },
-                        )
-                        .await
-                        .expect("mixed workload RPC response should write");
-                    }
-                    _ => {
-                        write_buffered_transport_response(
-                            &mut stream,
-                            &MultiplexBufferedTransportResponse {
-                                request_id: request.request_id,
-                                status: StatusCode::BAD_REQUEST.as_u16(),
-                                headers: vec![
-                                    TransportHeader {
-                                        name: "content-type".to_string(),
-                                        value: "text/plain; charset=utf-8".to_string(),
-                                    },
-                                    TransportHeader {
-                                        name: "content-length".to_string(),
-                                        value: b"unsupported".len().to_string(),
-                                    },
-                                ],
-                                body: b"unsupported".to_vec(),
-                            },
-                        )
-                        .await
-                        .expect("mixed workload error response should write");
-                    }
-                }
-            });
-        }
+        .await;
     })
 }
 
@@ -1522,6 +1645,43 @@ async fn spawn_direct_mixed_workload_test_server(
             .expect("mixed workload server should run");
     });
     (format!("http://{addr}"), server)
+}
+
+async fn spawn_relay_mixed_workload_test_server(
+    payload: Arc<Vec<u8>>,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr");
+    let state = RelayMixedWorkloadState {
+        public_url: format!("http://{addr}"),
+        payload,
+        issued_ticket_count: Arc::new(AtomicUsize::new(0)),
+        paired_session_count: Arc::new(AtomicUsize::new(0)),
+    };
+    let issued_ticket_count = Arc::clone(&state.issued_ticket_count);
+    let paired_session_count = Arc::clone(&state.paired_session_count);
+    let router = Router::new()
+        .route("/control/relay/ticket", post(issue_mixed_workload_ticket))
+        .route("/relay/tunnel/ws", get(relay_mixed_workload_tunnel_ws))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("relay mixed workload server should run");
+    });
+    (
+        state.public_url,
+        issued_ticket_count,
+        paired_session_count,
+        server,
+    )
 }
 
 fn relay_test_client_for_public_url(
@@ -1591,6 +1751,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     offset: 0,
                     limit: None,
                     has_more: false,
+                    next_cursor: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -1616,6 +1777,7 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             offset: 0,
             limit: None,
             has_more: false,
+            next_cursor: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
@@ -2200,6 +2362,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     offset: 0,
                     limit: None,
                     has_more: false,
+                    next_cursor: None,
                     media_summary: StoreIndexMediaSummary::default(),
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
@@ -2225,6 +2388,7 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             offset: 0,
             limit: None,
             has_more: false,
+            next_cursor: None,
             media_summary: StoreIndexMediaSummary::default(),
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
@@ -3007,6 +3171,134 @@ async fn direct_transport_keeps_small_rpcs_responsive_during_streamed_downloads(
     let snapshot = client.transport_session_pool_snapshot();
     assert_eq!(snapshot.connect_count, 1);
     assert!(snapshot.reuse_count >= 2);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn direct_transport_streams_relative_s3_reads_without_blocking_small_rpcs() {
+    let payload = Arc::new(vec![0x7B; 1024 * 1024]);
+    let payload_len = payload.len();
+    let (base_url, server) = spawn_direct_mixed_workload_test_server(Arc::clone(&payload)).await;
+
+    let mut identity = ClientIdentityMaterial::generate(
+        uuid::Uuid::now_v7(),
+        None,
+        Some("direct-stream-relative-s3-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let client = IronMeshClient::from_direct_base_url(base_url).with_client_identity(identity);
+
+    let download_client = client.clone();
+    let download_future = async move {
+        let mut response = download_client
+            .request_relative_path_streaming_response(
+                Method::GET,
+                "/s3/photos.example/docs/streamed.txt",
+                Vec::new(),
+            )
+            .await
+            .expect("streamed relative S3 read should succeed");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"s3-streamed-etag\"")
+        );
+
+        let mut output = Vec::new();
+        while let Some(chunk) = response.body.next().await {
+            let chunk = chunk.expect("streamed relative S3 body chunk should succeed");
+            output.extend_from_slice(chunk.as_ref());
+        }
+        output
+    };
+    let rpc_future = async {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.get_json_path("/cluster/status"),
+        )
+        .await
+        .expect("small RPC should not be blocked behind streamed relative S3 read")
+        .expect("small RPC should succeed")
+    };
+    let (output, rpc_response) = tokio::join!(download_future, rpc_future);
+
+    assert_eq!(rpc_response["status"], "ok");
+    assert_eq!(output.len(), payload_len);
+    assert_eq!(output, payload.as_ref().to_vec());
+    let snapshot = client.transport_session_pool_snapshot();
+    assert_eq!(snapshot.connect_count, 1);
+    assert!(snapshot.reuse_count >= 1);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn relay_transport_streams_relative_s3_reads_without_blocking_small_rpcs() {
+    let payload = Arc::new(vec![0x7B; 1024 * 1024]);
+    let payload_len = payload.len();
+    let (public_url, issued_ticket_count, paired_session_count, server) =
+        spawn_relay_mixed_workload_test_server(Arc::clone(&payload)).await;
+
+    let mut identity = ClientIdentityMaterial::generate(
+        uuid::Uuid::now_v7(),
+        None,
+        Some("relay-stream-relative-s3-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let client = relay_test_client_for_public_url(public_url, identity, NodeId::new_v4());
+
+    let download_client = client.clone();
+    let download_future = async move {
+        let mut response = download_client
+            .request_relative_path_streaming_response(
+                Method::GET,
+                "/s3/photos.example/docs/streamed.txt",
+                Vec::new(),
+            )
+            .await
+            .expect("relay streamed relative S3 read should succeed");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response
+                .headers
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"s3-streamed-etag\"")
+        );
+
+        let mut output = Vec::new();
+        while let Some(chunk) = response.body.next().await {
+            let chunk = chunk.expect("relay streamed relative S3 body chunk should succeed");
+            output.extend_from_slice(chunk.as_ref());
+        }
+        output
+    };
+    let rpc_future = async {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.get_json_path("/cluster/status"),
+        )
+        .await
+        .expect("small RPC should not be blocked behind relay streamed relative S3 read")
+        .expect("small RPC should succeed")
+    };
+    let (output, rpc_response) = tokio::join!(download_future, rpc_future);
+
+    assert_eq!(rpc_response["status"], "ok");
+    assert_eq!(output.len(), payload_len);
+    assert_eq!(output, payload.as_ref().to_vec());
+    assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
+    assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
 
     server.abort();
     let _ = server.await;

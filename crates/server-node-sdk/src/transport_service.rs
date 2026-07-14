@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, Uri};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use tower::ServiceExt;
@@ -25,7 +26,7 @@ use crate::{
     renew_device_rendezvous_identity, replication, replication_plan, request_has_admin_auth,
     require_client_auth, require_client_or_admin_auth, require_internal_caller,
     restore_snapshot_path, restore_version_path, run_cleanup, run_tombstone_archive_purge,
-    run_tombstone_archive_restore, run_tombstone_compaction, start_upload_session,
+    run_tombstone_archive_restore, run_tombstone_compaction, s3_frontend, start_upload_session,
     storage_stats_current, storage_stats_history, transport_headers_from_response,
     trigger_replication_audit, upload_session_chunk, validate_client_auth_request,
     wait_for_store_index_change,
@@ -64,6 +65,9 @@ pub(super) fn is_streamed_object_read_path(path_and_query: &str) -> bool {
         .map(|(path, _)| path)
         .unwrap_or(path_and_query.trim());
     let path_only = strip_public_api_v1_prefix(path_only);
+    if s3_frontend::is_transport_path(path_only) {
+        return true;
+    }
     let Some(tail) = path_only.strip_prefix("/store/") else {
         return false;
     };
@@ -153,6 +157,36 @@ async fn try_execute_direct_transport_request(
                 anyhow::anyhow!("failed parsing latency diagnostic query {raw_path}: {err}")
             })?;
             Some(latency_diagnostic(State(state.clone()), Query(query)).await)
+        }
+        (method @ ("GET" | "HEAD" | "PUT" | "DELETE" | "POST"), path)
+            if s3_frontend::is_transport_path(path) =>
+        {
+            if let Some(response) = authorize_direct_transport_fast_path(
+                state,
+                scope,
+                &request.request_id,
+                &headers,
+                method,
+                raw_path,
+                DirectAuthPolicy::Client,
+            )
+            .await?
+            {
+                return Ok(Some(response));
+            }
+            let method = axum::http::Method::from_bytes(method.as_bytes()).map_err(|err| {
+                anyhow::anyhow!("failed parsing S3 transport method {method}: {err}")
+            })?;
+            Some(
+                s3_frontend::execute_transport_request(
+                    state.clone(),
+                    method,
+                    raw_path,
+                    headers.clone(),
+                    Bytes::from(request.body.clone()),
+                )
+                .await,
+            )
         }
         ("GET", "/store/index") => {
             if let Some(response) = authorize_direct_transport_fast_path(
@@ -703,6 +737,10 @@ mod tests {
         assert!(is_streamed_object_read_path("/store/file.txt"));
         assert!(is_streamed_object_read_path(
             "/api/v1/store/folder%2Ffile.txt?version=test"
+        ));
+        assert!(is_streamed_object_read_path("/s3/demo.example/path.txt"));
+        assert!(is_streamed_object_read_path(
+            "/api/v1/s3/demo.example/path.txt?versionId=test"
         ));
         assert!(!is_streamed_object_read_path("/store/index"));
         assert!(!is_streamed_object_read_path(

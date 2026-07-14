@@ -26,8 +26,10 @@ fs2 = "0.4"
 git-version.workspace = true
 futures-core = "0.3"
 futures-util = "0.3"
+hmac = "0.12"
 http-body-util = "0.1"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+md-5 = "0.10"
 percent-encoding = "2"
 pbkdf2 = "0.12"
 rand = "0.8"
@@ -55,6 +57,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 x509-parser = "0.16"
+
+[dev-dependencies]
+client-sdk = { path = "../client-sdk" }
 
 [lints]
 workspace = true

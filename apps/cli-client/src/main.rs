@@ -1,4 +1,10 @@
 use anyhow::{Context, Result, bail};
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::extract::{OriginalUri, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
 use bytes::Bytes;
 use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
@@ -9,6 +15,7 @@ use client_sdk::{
     build_http_client_with_identity_from_planned_targets, compare_direct_and_relay_latency,
     enroll_connection_input_blocking, normalize_server_base_url,
 };
+use futures_util::TryStreamExt;
 use serde::Serialize;
 use std::fs;
 use std::net::SocketAddr;
@@ -61,6 +68,11 @@ struct LatencyTestSuiteResult {
     targets: Vec<LatencyTestPathResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<LatencyProbeComparison>,
+}
+
+#[derive(Clone)]
+struct S3GatewayState {
+    client: IronMeshClient,
 }
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
@@ -140,6 +152,10 @@ enum Commands {
         /// without running any probes.
         #[arg(long)]
         list_targets: bool,
+    },
+    ServeS3 {
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        bind: String,
     },
     ServeWeb {
         #[arg(long, default_value = "127.0.0.1:8081")]
@@ -274,6 +290,25 @@ async fn main() -> Result<()> {
             }
             validate_latency_test_thresholds(&suite, *max_average_ms, *max_p95_ms)
         }
+        Commands::ServeS3 { bind } => {
+            let bind_addr: SocketAddr = bind.parse()?;
+            let client = build_authenticated_sdk_from_cli(&cli).await?;
+            log_client_transport_ready("serve_s3", &client);
+            info!(
+                bind_addr = %bind_addr,
+                transport_mode = current_transport_mode(&client),
+                target = describe_current_target(&client).as_deref().unwrap_or("<unknown>"),
+                "starting S3 gateway"
+            );
+
+            let app = Router::new()
+                .route("/", any(s3_gateway_proxy))
+                .route("/{*path}", any(s3_gateway_proxy))
+                .with_state(S3GatewayState { client });
+            let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+            axum::serve(listener, app).await?;
+            Ok(())
+        }
         Commands::ServeWeb { bind } => {
             let bind_addr: SocketAddr = bind.parse()?;
             info!(
@@ -321,6 +356,115 @@ async fn main() -> Result<()> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+    }
+}
+
+async fn s3_gateway_proxy(
+    State(state): State<S3GatewayState>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let transport_path = s3_transport_proxy_path(&uri);
+    let forwarded_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect::<Vec<_>>();
+    if method == Method::GET && s3_gateway_get_uses_streaming_transport(&uri) {
+        let response = state
+            .client
+            .request_relative_path_streaming_response(method, &transport_path, forwarded_headers)
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed forwarding S3 request through Ironmesh transport: {err:#}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut proxy_response = Response::new(Body::from_stream(response.body));
+        *proxy_response.status_mut() = response.status;
+        *proxy_response.headers_mut() = response.headers;
+        return proxy_response;
+    }
+
+    let response = if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
+        let body_stream = TryStreamExt::map_err(body.into_data_stream(), |err| {
+            std::io::Error::other(format!(
+                "failed reading incoming S3 gateway request body: {err}"
+            ))
+        });
+        state
+            .client
+            .request_relative_path_streaming_body(
+                method,
+                &transport_path,
+                forwarded_headers,
+                body_stream,
+            )
+            .await
+    } else {
+        let body = match to_bytes(body, usize::MAX).await {
+            Ok(body) => body,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("failed reading incoming S3 request body: {err:#}"),
+                )
+                    .into_response();
+            }
+        };
+        state
+            .client
+            .request_relative_path(
+                method,
+                &transport_path,
+                forwarded_headers,
+                (!body.is_empty()).then(|| body.to_vec()),
+            )
+            .await
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("failed forwarding S3 request through Ironmesh transport: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut proxy_response = Response::new(Body::from(response.body));
+    *proxy_response.status_mut() = response.status;
+    *proxy_response.headers_mut() = response.headers;
+    proxy_response
+}
+
+fn s3_gateway_get_uses_streaming_transport(uri: &axum::http::Uri) -> bool {
+    let trimmed_path = uri.path().trim_matches('/');
+    !trimmed_path.is_empty() && trimmed_path.contains('/')
+}
+
+fn s3_transport_proxy_path(uri: &axum::http::Uri) -> String {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    if path_and_query == "/" {
+        "/s3/".to_string()
+    } else {
+        format!("/s3{path_and_query}")
     }
 }
 
@@ -1087,6 +1231,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::ReplicationPlan => "replication-plan",
         Commands::CacheList => "cache-list",
         Commands::LatencyTest { .. } => "latency-test",
+        Commands::ServeS3 { .. } => "serve-s3",
         Commands::ServeWeb { .. } => "serve-web",
     }
 }
@@ -1210,7 +1355,495 @@ fn unix_ts_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
+    use axum::extract::{
+        Json, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    };
+    use axum::http::{StatusCode as AxumStatusCode, Uri, header};
+    use axum::routing::{get, post};
     use clap::Parser;
+    use client_sdk::{RendezvousClientConfig, RendezvousControlClient};
+    use common::NodeId;
+    use futures_util::{AsyncWriteExt, Sink, Stream, stream};
+    use std::pin::Pin;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll};
+    use tokio::sync::Mutex;
+    use transport_sdk::{
+        BufferedTransportResponse as MultiplexBufferedTransportResponse, DecodedWebSocketMessage,
+        MultiplexConfig, MultiplexMode, MultiplexedSession, RelayTicket, RelayTicketRequest,
+        RelayTunnelControlMessage, RelayTunnelSession, RelayTunnelSessionKind,
+        TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportResponseHead,
+        TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
+        WebSocketByteStream, WebSocketMessageCodec, perform_transport_server_handshake,
+        read_buffered_transport_request, write_buffered_transport_response,
+        write_transport_response_head,
+    };
+
+    #[derive(Debug, Clone)]
+    struct ObservedGatewayRequest {
+        method: Method,
+        path_and_query: String,
+        content_type: Option<String>,
+        forwarded_test_header: Option<String>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ObservedRelayGatewayRequest {
+        kind: TransportStreamKind,
+        method: String,
+        path_and_query: String,
+        content_type: Option<String>,
+        forwarded_test_header: Option<String>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct GatewayTargetState {
+        requests: Arc<Mutex<Vec<ObservedGatewayRequest>>>,
+    }
+
+    #[derive(Clone)]
+    struct RelayGatewayState {
+        public_url: String,
+        requests: Arc<Mutex<Vec<ObservedRelayGatewayRequest>>>,
+        issued_ticket_count: Arc<AtomicUsize>,
+        paired_session_count: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RelayTestWsMessage {
+        Binary(Vec<u8>),
+        Text(String),
+        Ping(Vec<u8>),
+        Pong(Vec<u8>),
+        Close,
+    }
+
+    impl WebSocketMessageCodec for RelayTestWsMessage {
+        fn decode(self) -> std::io::Result<DecodedWebSocketMessage> {
+            Ok(match self {
+                Self::Binary(bytes) => DecodedWebSocketMessage::Binary(bytes),
+                Self::Text(_) => DecodedWebSocketMessage::Ignore,
+                Self::Ping(payload) => DecodedWebSocketMessage::Ping(payload),
+                Self::Pong(_) => DecodedWebSocketMessage::Pong,
+                Self::Close => DecodedWebSocketMessage::Close,
+            })
+        }
+
+        fn binary(bytes: Vec<u8>) -> Self {
+            Self::Binary(bytes)
+        }
+
+        fn pong(bytes: Vec<u8>) -> Self {
+            Self::Pong(bytes)
+        }
+    }
+
+    struct RelayTestSocketAdapter {
+        socket: WebSocket,
+    }
+
+    impl Stream for RelayTestSocketAdapter {
+        type Item = Result<RelayTestWsMessage, axum::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.socket).poll_next(cx) {
+                Poll::Ready(Some(Ok(Message::Binary(bytes)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Binary(bytes.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(Message::Text(text)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Text(text.to_string()))))
+                }
+                Poll::Ready(Some(Ok(Message::Ping(payload)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Ping(payload.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(Message::Pong(payload)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Pong(payload.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(Message::Close(_)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Close)))
+                }
+                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl Sink<RelayTestWsMessage> for RelayTestSocketAdapter {
+        type Error = axum::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_ready(cx)
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: RelayTestWsMessage) -> Result<(), Self::Error> {
+            let message = match item {
+                RelayTestWsMessage::Binary(bytes) => Message::Binary(bytes.into()),
+                RelayTestWsMessage::Text(text) => Message::Text(text.into()),
+                RelayTestWsMessage::Ping(payload) => Message::Ping(payload.into()),
+                RelayTestWsMessage::Pong(payload) => Message::Pong(payload.into()),
+                RelayTestWsMessage::Close => Message::Close(None),
+            };
+            Pin::new(&mut self.get_mut().socket).start_send(message)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_flush(cx)
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_close(cx)
+        }
+    }
+
+    async fn gateway_target_handler(
+        State(state): State<GatewayTargetState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Response {
+        let body = to_bytes(body, usize::MAX)
+            .await
+            .expect("gateway target request body should read");
+        state.requests.lock().await.push(ObservedGatewayRequest {
+            method: method.clone(),
+            path_and_query: uri
+                .path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| uri.path().to_string()),
+            content_type: headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            forwarded_test_header: headers
+                .get("x-forwarded-test")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            body: body.to_vec(),
+        });
+
+        match (method, uri.path()) {
+            (Method::GET, "/s3/files.example/docs/read.txt") => {
+                let body = Body::from_stream(stream::iter([
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"streamed ")),
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"through gateway")),
+                ]));
+                let mut response = Response::new(body);
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/plain"),
+                );
+                response.headers_mut().insert(
+                    header::ETAG,
+                    header::HeaderValue::from_static("\"gateway-etag\""),
+                );
+                response
+            }
+            (Method::PUT, "/s3/files.example/docs/write.txt") => {
+                let mut response = StatusCode::OK.into_response();
+                response.headers_mut().insert(
+                    "x-amz-version-id",
+                    header::HeaderValue::from_static("gateway-version"),
+                );
+                response
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn spawn_gateway_target_server() -> (
+        String,
+        Arc<Mutex<Vec<ObservedGatewayRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gateway target listener should bind");
+        let bind_addr = listener.local_addr().expect("gateway target listener addr");
+        let state = GatewayTargetState::default();
+        let observed_requests = Arc::clone(&state.requests);
+        let app = Router::new()
+            .route("/s3", any(gateway_target_handler))
+            .route("/s3/{*path}", any(gateway_target_handler))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("gateway target test server should serve");
+        });
+        (format!("http://{bind_addr}"), observed_requests, handle)
+    }
+
+    async fn issue_gateway_relay_ticket(
+        State(state): State<RelayGatewayState>,
+        Json(request): Json<RelayTicketRequest>,
+    ) -> Json<RelayTicket> {
+        state.issued_ticket_count.fetch_add(1, Ordering::SeqCst);
+        Json(RelayTicket {
+            cluster_id: request.cluster_id,
+            session_id: format!("gateway-relay-session-{}", uuid::Uuid::now_v7()),
+            source: request.source,
+            target: request.target,
+            session_kind: request.session_kind,
+            relay_urls: vec![state.public_url],
+            issued_at_unix: 1,
+            expires_at_unix: 61,
+        })
+    }
+
+    async fn gateway_relay_tunnel_ws(
+        State(state): State<RelayGatewayState>,
+        websocket: WebSocketUpgrade,
+    ) -> impl axum::response::IntoResponse {
+        websocket.on_upgrade(move |mut socket| async move {
+            let initial = match socket.recv().await {
+                Some(Ok(Message::Text(text))) => text,
+                _ => return,
+            };
+            let RelayTunnelControlMessage::ConnectSource { ticket } =
+                serde_json::from_str(&initial).expect("gateway relay control should parse")
+            else {
+                return;
+            };
+
+            let session = RelayTunnelSession {
+                cluster_id: ticket.cluster_id,
+                session_id: ticket.session_id.clone(),
+                source: ticket.source.clone(),
+                target: ticket.target.clone(),
+                session_kind: ticket.session_kind,
+            };
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&RelayTunnelControlMessage::Paired { session })
+                        .expect("gateway relay paired control should serialize")
+                        .into(),
+                ))
+                .await
+                .expect("gateway relay paired response should send");
+
+            state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                ticket.session_kind,
+                RelayTunnelSessionKind::MultiplexTransport
+            );
+            serve_gateway_relay_transport_socket(
+                socket,
+                Arc::clone(&state.requests),
+                ticket.session_id,
+            )
+            .await;
+        })
+    }
+
+    async fn serve_gateway_relay_transport_socket(
+        socket: WebSocket,
+        observed_requests: Arc<Mutex<Vec<ObservedRelayGatewayRequest>>>,
+        session_id: String,
+    ) {
+        let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
+        let mut session =
+            MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
+                .expect("gateway relay session should spawn");
+        let hello = perform_transport_server_handshake(
+            &mut session,
+            TransportSessionControlMessage::Ready {
+                protocol_version: TRANSPORT_PROTOCOL_VERSION,
+                session_id,
+                max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+            },
+        )
+        .await
+        .expect("gateway relay handshake should succeed");
+        assert!(matches!(
+            hello,
+            TransportSessionControlMessage::Hello {
+                role: TransportSessionRole::Client,
+                ..
+            }
+        ));
+
+        loop {
+            let mut stream = match session.accept_stream().await {
+                Ok(Some(stream)) => stream,
+                Ok(None) => break,
+                Err(err) => {
+                    let error = format!("{err:#}");
+                    if error.contains("Connection reset")
+                        || error.contains("closed")
+                        || error.contains("decode error")
+                    {
+                        break;
+                    }
+                    panic!("gateway relay stream accept should succeed: {err:#}");
+                }
+            };
+            let request = read_buffered_transport_request(&mut stream)
+                .await
+                .expect("gateway relay request should decode");
+            let header_value = |name: &str| {
+                request
+                    .headers
+                    .iter()
+                    .find(|header| header.name.eq_ignore_ascii_case(name))
+                    .map(|header| header.value.clone())
+            };
+            observed_requests
+                .lock()
+                .await
+                .push(ObservedRelayGatewayRequest {
+                    kind: request.kind,
+                    method: request.method.clone(),
+                    path_and_query: request.path.clone(),
+                    content_type: header_value(header::CONTENT_TYPE.as_str()),
+                    forwarded_test_header: header_value("x-forwarded-test"),
+                    body: request.body.clone(),
+                });
+
+            match (request.kind, request.method.as_str(), request.path.as_str()) {
+                (
+                    TransportStreamKind::ObjectRead,
+                    "GET",
+                    "/s3/files.example/docs/read.txt?versionId=v1",
+                ) => {
+                    let body = b"streamed through relay gateway";
+                    write_transport_response_head(
+                        &mut stream,
+                        &TransportResponseHead {
+                            request_id: request.request_id,
+                            status: AxumStatusCode::OK.as_u16(),
+                            headers: vec![
+                                TransportHeader {
+                                    name: header::CONTENT_LENGTH.as_str().to_string(),
+                                    value: body.len().to_string(),
+                                },
+                                TransportHeader {
+                                    name: header::CONTENT_TYPE.as_str().to_string(),
+                                    value: "text/plain".to_string(),
+                                },
+                                TransportHeader {
+                                    name: header::ETAG.as_str().to_string(),
+                                    value: "\"gateway-etag\"".to_string(),
+                                },
+                            ],
+                        },
+                    )
+                    .await
+                    .expect("gateway relay GET response head should write");
+                    stream
+                        .write_all(body)
+                        .await
+                        .expect("gateway relay GET response body should write");
+                    stream
+                        .close()
+                        .await
+                        .expect("gateway relay GET stream should close");
+                }
+                (TransportStreamKind::ObjectWrite, "PUT", "/s3/files.example/docs/write.txt") => {
+                    write_buffered_transport_response(
+                        &mut stream,
+                        &MultiplexBufferedTransportResponse {
+                            request_id: request.request_id,
+                            status: AxumStatusCode::OK.as_u16(),
+                            headers: vec![TransportHeader {
+                                name: "x-amz-version-id".to_string(),
+                                value: "gateway-version".to_string(),
+                            }],
+                            body: Vec::new(),
+                        },
+                    )
+                    .await
+                    .expect("gateway relay PUT response should write");
+                }
+                _ => {
+                    write_buffered_transport_response(
+                        &mut stream,
+                        &MultiplexBufferedTransportResponse {
+                            request_id: request.request_id,
+                            status: AxumStatusCode::BAD_REQUEST.as_u16(),
+                            headers: vec![TransportHeader {
+                                name: header::CONTENT_TYPE.as_str().to_string(),
+                                value: "text/plain; charset=utf-8".to_string(),
+                            }],
+                            body: b"unsupported".to_vec(),
+                        },
+                    )
+                    .await
+                    .expect("gateway relay error response should write");
+                }
+            }
+        }
+    }
+
+    async fn spawn_gateway_relay_server() -> (
+        String,
+        Arc<Mutex<Vec<ObservedRelayGatewayRequest>>>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gateway relay listener should bind");
+        let bind_addr = listener.local_addr().expect("gateway relay listener addr");
+        let state = RelayGatewayState {
+            public_url: format!("http://{bind_addr}"),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            issued_ticket_count: Arc::new(AtomicUsize::new(0)),
+            paired_session_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let observed_requests = Arc::clone(&state.requests);
+        let issued_ticket_count = Arc::clone(&state.issued_ticket_count);
+        let paired_session_count = Arc::clone(&state.paired_session_count);
+        let app = Router::new()
+            .route("/control/relay/ticket", post(issue_gateway_relay_ticket))
+            .route("/relay/tunnel/ws", get(gateway_relay_tunnel_ws))
+            .with_state(state.clone());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("gateway relay test server should serve");
+        });
+        (
+            state.public_url,
+            observed_requests,
+            issued_ticket_count,
+            paired_session_count,
+            handle,
+        )
+    }
+
+    fn relay_gateway_test_client(public_url: impl Into<String>) -> IronMeshClient {
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("serve-s3-relay-test".to_string()),
+        )
+        .expect("relay gateway identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let rendezvous = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec![public_url.into()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("gateway relay rendezvous client should build");
+        IronMeshClient::with_relay_transport("https://relay.invalid/", rendezvous, NodeId::new_v4())
+            .with_client_identity(identity)
+    }
 
     #[test]
     fn cli_accepts_server_base_url_flag() {
@@ -1244,5 +1877,264 @@ mod tests {
             Some("http://127.0.0.1:8080")
         );
         assert_eq!(connection_source(&cli), "server_base_url");
+    }
+
+    #[test]
+    fn cli_accepts_serve_s3_subcommand() {
+        let cli = Cli::try_parse_from([
+            "ironmesh",
+            "--server-base-url",
+            "http://127.0.0.1:8080",
+            "serve-s3",
+            "--bind",
+            "127.0.0.1:9001",
+        ])
+        .expect("serve-s3 command should parse");
+
+        assert!(matches!(cli.command, Commands::ServeS3 { .. }));
+        assert_eq!(command_name(&cli.command), "serve-s3");
+    }
+
+    #[test]
+    fn s3_transport_proxy_path_preserves_root_and_query() {
+        let root_uri: axum::http::Uri = "/".parse().unwrap();
+        assert_eq!(s3_transport_proxy_path(&root_uri), "/s3/");
+
+        let object_uri: axum::http::Uri = "/bucket/photos/cat.jpg?versionId=v1".parse().unwrap();
+        assert_eq!(
+            s3_transport_proxy_path(&object_uri),
+            "/s3/bucket/photos/cat.jpg?versionId=v1"
+        );
+    }
+
+    #[test]
+    fn s3_gateway_get_streaming_mode_distinguishes_object_reads_from_listings() {
+        let service_root: axum::http::Uri = "/?x-id=ListBuckets".parse().unwrap();
+        assert!(!s3_gateway_get_uses_streaming_transport(&service_root));
+
+        let bucket_listing: axum::http::Uri =
+            "/photos.example?list-type=2&prefix=docs/".parse().unwrap();
+        assert!(!s3_gateway_get_uses_streaming_transport(&bucket_listing));
+
+        let object_read: axum::http::Uri =
+            "/photos.example/docs/cat.jpg?versionId=v1".parse().unwrap();
+        assert!(s3_gateway_get_uses_streaming_transport(&object_read));
+    }
+
+    #[tokio::test]
+    async fn s3_gateway_proxy_forwards_direct_get_and_put_requests() {
+        let (target_base_url, observed_requests, target_handle) =
+            spawn_gateway_target_server().await;
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gateway proxy listener should bind");
+        let proxy_bind_addr = proxy_listener
+            .local_addr()
+            .expect("gateway proxy listener addr");
+        let proxy_app = Router::new()
+            .route("/", any(s3_gateway_proxy))
+            .route("/{*path}", any(s3_gateway_proxy))
+            .with_state(S3GatewayState {
+                client: IronMeshClient::from_direct_base_url(target_base_url),
+            });
+        let proxy_handle = tokio::spawn(async move {
+            axum::serve(proxy_listener, proxy_app)
+                .await
+                .expect("gateway proxy test server should serve");
+        });
+        let proxy_base_url = format!("http://{proxy_bind_addr}");
+        let http = reqwest::Client::new();
+
+        let get_response = http
+            .get(format!(
+                "{proxy_base_url}/files.example/docs/read.txt?versionId=v1"
+            ))
+            .header("x-forwarded-test", "read")
+            .send()
+            .await
+            .expect("gateway GET should respond");
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(
+            get_response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            get_response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"gateway-etag\"")
+        );
+        let get_body = get_response
+            .bytes()
+            .await
+            .expect("gateway GET body should read");
+        assert_eq!(get_body.as_ref(), b"streamed through gateway");
+
+        let put_response = http
+            .put(format!("{proxy_base_url}/files.example/docs/write.txt"))
+            .header(header::CONTENT_TYPE.as_str(), "text/plain")
+            .header("x-forwarded-test", "write")
+            .body("gateway body")
+            .send()
+            .await
+            .expect("gateway PUT should respond");
+        assert_eq!(put_response.status(), StatusCode::OK);
+        assert_eq!(
+            put_response
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("gateway-version")
+        );
+
+        let observed_requests = observed_requests.lock().await.clone();
+        assert_eq!(observed_requests.len(), 2);
+        assert_eq!(observed_requests[0].method, Method::GET);
+        assert_eq!(
+            observed_requests[0].path_and_query,
+            "/s3/files.example/docs/read.txt?versionId=v1"
+        );
+        assert_eq!(
+            observed_requests[0].forwarded_test_header.as_deref(),
+            Some("read")
+        );
+        assert!(observed_requests[0].body.is_empty());
+
+        assert_eq!(observed_requests[1].method, Method::PUT);
+        assert_eq!(
+            observed_requests[1].path_and_query,
+            "/s3/files.example/docs/write.txt"
+        );
+        assert_eq!(
+            observed_requests[1].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            observed_requests[1].forwarded_test_header.as_deref(),
+            Some("write")
+        );
+        assert_eq!(observed_requests[1].body, b"gateway body");
+
+        proxy_handle.abort();
+        let _ = proxy_handle.await;
+        target_handle.abort();
+        let _ = target_handle.await;
+    }
+
+    #[tokio::test]
+    async fn s3_gateway_proxy_forwards_relay_get_and_put_requests() {
+        let (
+            relay_public_url,
+            observed_requests,
+            issued_ticket_count,
+            paired_session_count,
+            relay_handle,
+        ) = spawn_gateway_relay_server().await;
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gateway relay proxy listener should bind");
+        let proxy_bind_addr = proxy_listener
+            .local_addr()
+            .expect("gateway relay proxy listener addr");
+        let proxy_app = Router::new()
+            .route("/", any(s3_gateway_proxy))
+            .route("/{*path}", any(s3_gateway_proxy))
+            .with_state(S3GatewayState {
+                client: relay_gateway_test_client(relay_public_url),
+            });
+        let proxy_handle = tokio::spawn(async move {
+            axum::serve(proxy_listener, proxy_app)
+                .await
+                .expect("gateway relay proxy test server should serve");
+        });
+        let proxy_base_url = format!("http://{proxy_bind_addr}");
+        let http = reqwest::Client::new();
+
+        let get_response = http
+            .get(format!(
+                "{proxy_base_url}/files.example/docs/read.txt?versionId=v1"
+            ))
+            .header("x-forwarded-test", "read")
+            .send()
+            .await
+            .expect("gateway relay GET should respond");
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(
+            get_response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            get_response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"gateway-etag\"")
+        );
+        let get_body = get_response
+            .bytes()
+            .await
+            .expect("gateway relay GET body should read");
+        assert_eq!(get_body.as_ref(), b"streamed through relay gateway");
+
+        let put_response = http
+            .put(format!("{proxy_base_url}/files.example/docs/write.txt"))
+            .header(header::CONTENT_TYPE.as_str(), "text/plain")
+            .header("x-forwarded-test", "write")
+            .body("gateway body")
+            .send()
+            .await
+            .expect("gateway relay PUT should respond");
+        assert_eq!(put_response.status(), StatusCode::OK);
+        assert_eq!(
+            put_response
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("gateway-version")
+        );
+
+        let observed_requests = observed_requests.lock().await.clone();
+        assert_eq!(observed_requests.len(), 2);
+        assert_eq!(observed_requests[0].kind, TransportStreamKind::ObjectRead);
+        assert_eq!(observed_requests[0].method, "GET");
+        assert_eq!(
+            observed_requests[0].path_and_query,
+            "/s3/files.example/docs/read.txt?versionId=v1"
+        );
+        assert_eq!(
+            observed_requests[0].forwarded_test_header.as_deref(),
+            Some("read")
+        );
+        assert!(observed_requests[0].body.is_empty());
+
+        assert_eq!(observed_requests[1].kind, TransportStreamKind::ObjectWrite);
+        assert_eq!(observed_requests[1].method, "PUT");
+        assert_eq!(
+            observed_requests[1].path_and_query,
+            "/s3/files.example/docs/write.txt"
+        );
+        assert_eq!(
+            observed_requests[1].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            observed_requests[1].forwarded_test_header.as_deref(),
+            Some("write")
+        );
+        assert_eq!(observed_requests[1].body, b"gateway body");
+        assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
+        assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
+
+        proxy_handle.abort();
+        let _ = proxy_handle.await;
+        relay_handle.abort();
+        let _ = relay_handle.await;
     }
 }

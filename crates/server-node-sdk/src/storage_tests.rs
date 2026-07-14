@@ -3808,6 +3808,81 @@ run_on_all_metadata_backends!(
     copy_creates_new_object_id_with_provenance_turso
 );
 
+async fn copy_overwrite_preserves_target_history_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("copy-overwrite-history").await;
+
+    let source = store
+        .put_object_versioned(
+            "docs/source.txt",
+            Bytes::from_static(b"source-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let target = store
+        .put_object_versioned(
+            "docs/target.txt",
+            Bytes::from_static(b"target-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let target_before = store
+        .list_versions("docs/target.txt")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let copied = store
+        .copy_object_path("docs/source.txt", "docs/target.txt", true)
+        .await
+        .unwrap();
+    assert_eq!(copied, PathMutationResult::Applied);
+
+    let payload = store
+        .get_object("docs/target.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(payload.as_ref(), b"source-v1");
+
+    let target_after = store
+        .list_versions("docs/target.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target_after.object_id, target_before.object_id);
+    assert_eq!(target_after.versions.len(), 2);
+    let preferred_head_id = target_after
+        .preferred_head_version_id
+        .clone()
+        .expect("overwritten target should have a preferred head");
+    let preferred_head = target_after
+        .versions
+        .iter()
+        .find(|record| record.version_id == preferred_head_id)
+        .expect("preferred head should exist");
+    assert_eq!(
+        preferred_head.parent_version_ids,
+        vec![target.version_id.clone()]
+    );
+    assert_eq!(
+        preferred_head.copied_from_version_id.as_deref(),
+        Some(source.version_id.as_str())
+    );
+    assert_eq!(
+        preferred_head.copied_from_path.as_deref(),
+        Some("docs/source.txt")
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    copy_overwrite_preserves_target_history_impl,
+    copy_overwrite_preserves_target_history,
+    copy_overwrite_preserves_target_history_turso
+);
+
 async fn restore_snapshot_same_path_creates_new_head_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("restore-snapshot-same-path").await;
 
@@ -4103,6 +4178,96 @@ run_on_all_metadata_backends!(
     restore_version_to_custom_target_uses_metadata_copy_impl,
     restore_version_to_custom_target_uses_metadata_copy,
     restore_version_to_custom_target_uses_metadata_copy_turso
+);
+
+async fn restore_version_overwrite_preserves_target_history_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("restore-version-overwrite-history")
+        .await;
+
+    let source_first = store
+        .put_object_versioned(
+            "docs/source.txt",
+            Bytes::from_static(b"source-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let _source_second = store
+        .put_object_versioned(
+            "docs/source.txt",
+            Bytes::from_static(b"source-v2"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let target_first = store
+        .put_object_versioned(
+            "docs/target.txt",
+            Bytes::from_static(b"target-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let target_before = store
+        .list_versions("docs/target.txt")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let restored = store
+        .restore_version_path(
+            "docs/source.txt",
+            &source_first.version_id,
+            "docs/target.txt",
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored, PathMutationResult::Applied);
+
+    let payload = store
+        .get_object("docs/target.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(payload.as_ref(), b"source-v1");
+
+    let target_after = store
+        .list_versions("docs/target.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target_after.object_id, target_before.object_id);
+    assert_eq!(target_after.versions.len(), 2);
+    let preferred_head_id = target_after
+        .preferred_head_version_id
+        .clone()
+        .expect("overwritten target should have a preferred head");
+    let preferred_head = target_after
+        .versions
+        .iter()
+        .find(|record| record.version_id == preferred_head_id)
+        .expect("preferred head should exist");
+    assert_eq!(
+        preferred_head.parent_version_ids,
+        vec![target_first.version_id.clone()]
+    );
+    assert_eq!(
+        preferred_head.copied_from_version_id.as_deref(),
+        Some(source_first.version_id.as_str())
+    );
+    assert_eq!(
+        preferred_head.copied_from_path.as_deref(),
+        Some("docs/source.txt")
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_version_overwrite_preserves_target_history_impl,
+    restore_version_overwrite_preserves_target_history,
+    restore_version_overwrite_preserves_target_history_turso
 );
 
 async fn load_cluster_replicas_returns_empty_when_file_missing_impl(backend: StorageTestBackend) {

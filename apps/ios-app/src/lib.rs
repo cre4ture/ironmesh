@@ -1024,6 +1024,7 @@ mod tests {
             offset: 0,
             limit: None,
             has_more: false,
+            next_cursor: None,
             media_summary: Default::default(),
             entries,
         };

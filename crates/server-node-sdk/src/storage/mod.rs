@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -648,6 +648,138 @@ pub struct ClientBootstrapClaimRecord {
     pub consumed_by_device_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum S3BucketVersioningStatus {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl S3BucketVersioningStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disabled" => Some(Self::Disabled),
+            "enabled" => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct S3BucketRecord {
+    pub bucket_name: String,
+    pub root_prefix: String,
+    pub versioning_status: S3BucketVersioningStatus,
+    pub read_only: bool,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub deleted_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct S3AccessKeyRecord {
+    pub access_key_id: String,
+    pub secret_material: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub bucket_scope: Vec<String>,
+    #[serde(default)]
+    pub prefix_scope: Vec<String>,
+    pub allow_list: bool,
+    pub allow_read: bool,
+    pub allow_write: bool,
+    pub allow_delete: bool,
+    #[serde(default)]
+    pub allow_manage: bool,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    #[serde(default)]
+    pub last_used_at_unix: Option<u64>,
+    #[serde(default)]
+    pub revoked_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct S3ControlPlaneState {
+    #[serde(default)]
+    pub buckets: Vec<S3BucketRecord>,
+    #[serde(default)]
+    pub access_keys: Vec<S3AccessKeyRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ObjectVersionMetadataRecord {
+    pub version_id: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    #[serde(default)]
+    pub content_language: Option<String>,
+    #[serde(default)]
+    pub cache_control: Option<String>,
+    #[serde(default)]
+    pub content_disposition: Option<String>,
+    #[serde(default)]
+    pub user_metadata: BTreeMap<String, String>,
+    #[serde(default)]
+    pub checksum_sha256: Option<String>,
+    #[serde(default)]
+    pub checksum_crc32c: Option<String>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct S3ObjectVersionRecord {
+    pub bucket_name: String,
+    pub ironmesh_key: String,
+    pub version_id: String,
+    pub etag: String,
+    #[serde(default)]
+    pub multipart_part_count: Option<u32>,
+    pub created_at_unix: u64,
+}
+
+pub(super) fn sqlite_like_prefix_pattern(prefix: &str) -> String {
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for ch in prefix.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectVersionInspection {
+    pub version_id: String,
+    pub manifest_hash: String,
+    pub created_at_unix: u64,
+    pub total_size_bytes: Option<u64>,
+    pub is_delete_marker: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteObjectVersionOutcome {
+    pub version_id: String,
+    pub was_delete_marker: bool,
+    pub current_object_exists: bool,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -917,6 +1049,45 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["state_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "s3_buckets",
+        tracked_columns: &[
+            "bucket_name",
+            "root_prefix",
+            "versioning_status",
+            "created_by",
+            "deleted_at_unix",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "s3_access_keys",
+        tracked_columns: &[
+            "access_key_id",
+            "secret_material",
+            "description",
+            "bucket_scope_json",
+            "prefix_scope_json",
+            "updated_at_unix",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "object_version_metadata",
+        tracked_columns: &[
+            "version_id",
+            "content_type",
+            "content_encoding",
+            "content_language",
+            "cache_control",
+            "content_disposition",
+            "user_metadata_json",
+            "checksum_sha256",
+            "checksum_crc32c",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "s3_object_versions",
+        tracked_columns: &["bucket_name", "ironmesh_key", "version_id", "etag"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "admin_audit_events",
         tracked_columns: &["event_id", "event_json"],
     },
@@ -1122,6 +1293,8 @@ trait MetadataStore: Send + Sync {
     -> Result<()>;
     async fn load_client_credential_state(&self) -> Result<ClientCredentialState>;
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()>;
+    async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState>;
+    async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()>;
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>>;
     async fn load_snapshot_batch_state(&self) -> Result<Option<ActiveSnapshotBatch>>;
     async fn persist_snapshot_batch_state(&self, state: Option<&ActiveSnapshotBatch>)
@@ -1151,6 +1324,33 @@ trait MetadataStore: Send + Sync {
         &self,
         manifest_hashes: &[String],
     ) -> Result<HashMap<String, ManifestSummary>>;
+    async fn load_object_version_metadata(
+        &self,
+        version_id: &str,
+    ) -> Result<Option<ObjectVersionMetadataRecord>>;
+    async fn persist_object_version_metadata(
+        &self,
+        metadata: &ObjectVersionMetadataRecord,
+    ) -> Result<()>;
+    async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()>;
+    async fn load_s3_object_version(
+        &self,
+        bucket_name: &str,
+        version_id: &str,
+    ) -> Result<Option<S3ObjectVersionRecord>>;
+    #[allow(dead_code)]
+    async fn list_s3_object_versions_for_key(
+        &self,
+        bucket_name: &str,
+        ironmesh_key: &str,
+    ) -> Result<Vec<S3ObjectVersionRecord>>;
+    async fn list_s3_object_versions(
+        &self,
+        bucket_name: &str,
+        ironmesh_key_prefix: Option<&str>,
+    ) -> Result<Vec<S3ObjectVersionRecord>>;
+    async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()>;
+    async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()>;
     async fn persist_manifest_summary(
         &self,
         manifest_hash: &str,
@@ -2352,6 +2552,182 @@ impl PersistentStore {
             .await
     }
 
+    pub async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState> {
+        self.metadata_store.load_s3_control_plane_state().await
+    }
+
+    pub async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
+        self.metadata_store
+            .persist_s3_control_plane_state(state)
+            .await
+    }
+
+    pub async fn load_object_version_metadata(
+        &self,
+        version_id: &str,
+    ) -> Result<Option<ObjectVersionMetadataRecord>> {
+        self.metadata_store
+            .load_object_version_metadata(version_id)
+            .await
+    }
+
+    pub async fn persist_object_version_metadata(
+        &self,
+        metadata: &ObjectVersionMetadataRecord,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_object_version_metadata(metadata)
+            .await
+    }
+
+    pub async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()> {
+        self.metadata_store
+            .delete_object_version_metadata(version_id)
+            .await
+    }
+
+    pub async fn load_s3_object_version(
+        &self,
+        bucket_name: &str,
+        version_id: &str,
+    ) -> Result<Option<S3ObjectVersionRecord>> {
+        self.metadata_store
+            .load_s3_object_version(bucket_name, version_id)
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn list_s3_object_versions_for_key(
+        &self,
+        bucket_name: &str,
+        ironmesh_key: &str,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        self.metadata_store
+            .list_s3_object_versions_for_key(bucket_name, ironmesh_key)
+            .await
+    }
+
+    pub async fn list_s3_object_versions(
+        &self,
+        bucket_name: &str,
+        ironmesh_key_prefix: Option<&str>,
+    ) -> Result<Vec<S3ObjectVersionRecord>> {
+        self.metadata_store
+            .list_s3_object_versions(bucket_name, ironmesh_key_prefix)
+            .await
+    }
+
+    pub async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
+        self.metadata_store.persist_s3_object_version(record).await
+    }
+
+    pub async fn delete_s3_object_version(
+        &self,
+        bucket_name: &str,
+        version_id: &str,
+    ) -> Result<()> {
+        self.metadata_store
+            .delete_s3_object_version(bucket_name, version_id)
+            .await
+    }
+
+    pub async fn inspect_object_version(
+        &self,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<ObjectVersionInspection>> {
+        let Some(object_id) = self
+            .resolve_object_id_for_key_version(key, version_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
+            return Ok(None);
+        };
+        let Some(record) = index.versions.get(version_id) else {
+            return Ok(None);
+        };
+        if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(Some(ObjectVersionInspection {
+                version_id: record.version_id.clone(),
+                manifest_hash: record.manifest_hash.clone(),
+                created_at_unix: record.created_at_unix,
+                total_size_bytes: None,
+                is_delete_marker: true,
+            }));
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await? else {
+            bail!(
+                "manifest missing for key={key} version_id={} hash={}",
+                record.version_id,
+                record.manifest_hash
+            );
+        };
+
+        Ok(Some(ObjectVersionInspection {
+            version_id: record.version_id.clone(),
+            manifest_hash: record.manifest_hash.clone(),
+            created_at_unix: record.created_at_unix,
+            total_size_bytes: Some(manifest.total_size_bytes as u64),
+            is_delete_marker: false,
+        }))
+    }
+
+    pub async fn delete_object_version_for_key(
+        &mut self,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<DeleteObjectVersionOutcome>> {
+        let Some(object_id) = self
+            .resolve_object_id_for_key_version(key, version_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(mut index) = self.load_version_index_by_object_id(&object_id).await? else {
+            return Ok(None);
+        };
+        let Some(record) = index.versions.get(version_id).cloned() else {
+            return Ok(None);
+        };
+
+        let touched_paths = BTreeSet::from([key.to_string()]);
+        let before_binding = self.current_state_binding(key).await?;
+        self.maybe_rotate_snapshot_batch(&touched_paths).await?;
+
+        index.versions.remove(version_id);
+        if index.versions.is_empty() {
+            self.delete_version_index_by_object_id(&object_id).await?;
+            if self.object_id_for_key(key).await?.as_deref() == Some(object_id.as_str()) {
+                self.remove_current_object(key).await?;
+            }
+        } else {
+            index.head_version_ids = recompute_head_version_ids(&index);
+            index.preferred_head_version_id = choose_preferred_head(&index);
+            self.persist_version_index_by_object_id(&object_id, &index)
+                .await?;
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?;
+        }
+
+        self.delete_object_version_metadata(version_id).await?;
+        let changed_paths = if self.current_state_binding(key).await? != before_binding {
+            touched_paths
+        } else {
+            BTreeSet::new()
+        };
+        self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
+            .await?;
+
+        Ok(Some(DeleteObjectVersionOutcome {
+            version_id: version_id.to_string(),
+            was_delete_marker: record.manifest_hash == TOMBSTONE_MANIFEST_HASH,
+            current_object_exists: self.object_id_for_key(key).await?.is_some(),
+        }))
+    }
+
     #[cfg(test)]
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
@@ -2515,7 +2891,7 @@ impl PersistentStore {
     ) -> std::result::Result<String, StoreReadError> {
         let manifest_hash = if let Some(version_id) = version_id {
             let Some(object_id) = self
-                .object_id_for_key(key)
+                .resolve_object_id_for_key_version(key, version_id)
                 .await
                 .map_err(StoreReadError::Internal)?
             else {
@@ -3079,8 +3455,27 @@ impl PersistentStore {
         let Some(object_id) = self.object_id_for_key(key).await? else {
             return Ok(None);
         };
+        self.version_graph_summary_for_object_id(key, &object_id)
+            .await
+    }
 
-        let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
+    pub async fn list_versions_with_history(
+        &self,
+        key: &str,
+    ) -> Result<Option<VersionGraphSummary>> {
+        let Some(object_id) = self.resolve_object_id_for_key_history(key).await? else {
+            return Ok(None);
+        };
+        self.version_graph_summary_for_object_id(key, &object_id)
+            .await
+    }
+
+    async fn version_graph_summary_for_object_id(
+        &self,
+        key: &str,
+        object_id: &str,
+    ) -> Result<Option<VersionGraphSummary>> {
+        let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
             return Ok(None);
         };
 
@@ -5467,10 +5862,7 @@ impl PersistentStore {
             return Ok(PathMutationResult::SourceMissing);
         };
 
-        if self.current_object_entry(to_path).await?.is_some() {
-            if !overwrite {
-                return Ok(PathMutationResult::TargetExists);
-            }
+        if self.current_object_entry(to_path).await?.is_some() && !overwrite {
             return Ok(PathMutationResult::TargetExists);
         }
 
@@ -5497,42 +5889,17 @@ impl PersistentStore {
         let copied_manifest_hash = self
             .clone_manifest_for_key(&source_head.manifest_hash, to_path)
             .await?;
-        let copied_object_id = generate_object_id();
-        let copied_version_id = format!("copy-{}-{}", unix_ts_nanos(), &copied_manifest_hash[..12]);
-        let copied_record = FileVersionRecord {
-            version_id: copied_version_id.clone(),
-            object_id: copied_object_id.clone(),
-            manifest_hash: copied_manifest_hash.clone(),
-            logical_path: Some(to_path.to_string()),
-            parent_version_ids: Vec::new(),
-            state: source_head.state.clone(),
-            created_at_unix: unix_ts(),
-            copied_from_object_id: Some(source_object_id),
-            copied_from_version_id: Some(source_head.version_id.clone()),
-            copied_from_path: Some(from_path.to_string()),
-        };
-
-        let mut copied_index = empty_version_index(&copied_object_id);
-        copied_index
-            .versions
-            .insert(copied_version_id.clone(), copied_record);
-        copied_index.head_version_ids = vec![copied_version_id];
-        copied_index.preferred_head_version_id = choose_preferred_head(&copied_index);
-        self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
-            .await?;
-
-        self.upsert_current_object(
+        self.persist_copied_version_to_target(
+            from_path,
             to_path,
-            CurrentObjectEntry {
-                manifest_hash: copied_manifest_hash,
-                object_id: copied_object_id,
-            },
+            copied_manifest_hash,
+            Some(source_object_id),
+            Some(source_head.version_id.clone()),
+            source_head.state.clone(),
+            "copy",
+            true,
         )
-        .await?;
-        self.persist_current_state_with_snapshot_batch(touched_paths, true, unix_ts())
-            .await?;
-
-        Ok(PathMutationResult::Applied)
+        .await
     }
 
     pub async fn restore_snapshot_path(
@@ -6548,96 +6915,86 @@ impl PersistentStore {
         create_snapshot: bool,
         overwrite: bool,
     ) -> Result<PathMutationResult> {
-        if source_path != target_path && self.current_object_entry(target_path).await?.is_some() {
-            if !overwrite {
-                return Ok(PathMutationResult::TargetExists);
-            }
+        if source_path != target_path
+            && self.current_object_entry(target_path).await?.is_some()
+            && !overwrite
+        {
             return Ok(PathMutationResult::TargetExists);
         }
 
-        let restored_manifest_hash = self
-            .clone_manifest_for_key(&source.manifest_hash, target_path)
-            .await?;
         let touched_paths = BTreeSet::from([target_path.to_string()]);
         if create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         }
-
-        if source_path == target_path {
-            let object_id = self
-                .object_id_for_key(target_path)
-                .await?
-                .unwrap_or_else(generate_object_id);
-            let mut index = self
-                .load_version_index_by_object_id(&object_id)
-                .await?
-                .unwrap_or_else(|| empty_version_index(&object_id));
-            let restore_version_id = format!(
-                "restore-{}-{}",
-                unix_ts_nanos(),
-                &restored_manifest_hash[..12]
-            );
-            let parent_version_ids = index.preferred_head_version_id.iter().cloned().collect();
-
-            index.versions.insert(
-                restore_version_id.clone(),
-                FileVersionRecord {
-                    version_id: restore_version_id,
-                    object_id: object_id.clone(),
-                    manifest_hash: restored_manifest_hash,
-                    logical_path: Some(target_path.to_string()),
-                    parent_version_ids,
-                    state: source.state,
-                    created_at_unix: unix_ts(),
-                    copied_from_object_id: source.object_id,
-                    copied_from_version_id: source.version_id,
-                    copied_from_path: Some(source_path.to_string()),
-                },
-            );
-            index.head_version_ids = recompute_head_version_ids(&index);
-            index.preferred_head_version_id = choose_preferred_head(&index);
-
-            self.persist_version_index_by_object_id(&object_id, &index)
-                .await?;
-            self.sync_current_state_for_key_from_index(target_path, &index)
-                .await?;
-            self.persist_current_state_with_snapshot_batch(
-                touched_paths,
-                create_snapshot,
-                unix_ts(),
-            )
+        let restored_manifest_hash = self
+            .clone_manifest_for_key(&source.manifest_hash, target_path)
             .await?;
-            return Ok(PathMutationResult::Applied);
-        }
 
-        let copied_object_id = generate_object_id();
+        self.persist_copied_version_to_target(
+            source_path,
+            target_path,
+            restored_manifest_hash,
+            source.object_id,
+            source.version_id,
+            source.state,
+            "restore",
+            create_snapshot,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_copied_version_to_target(
+        &mut self,
+        source_path: &str,
+        target_path: &str,
+        manifest_hash: String,
+        copied_from_object_id: Option<String>,
+        copied_from_version_id: Option<String>,
+        state: VersionConsistencyState,
+        version_prefix: &str,
+        create_snapshot: bool,
+    ) -> Result<PathMutationResult> {
+        let touched_paths = BTreeSet::from([target_path.to_string()]);
+        let target_object_id = self
+            .object_id_for_key(target_path)
+            .await?
+            .unwrap_or_else(generate_object_id);
+        let mut target_index = self
+            .load_version_index_by_object_id(&target_object_id)
+            .await?
+            .unwrap_or_else(|| empty_version_index(&target_object_id));
         let copied_version_id = format!(
-            "restore-{}-{}",
+            "{version_prefix}-{}-{}",
             unix_ts_nanos(),
-            &restored_manifest_hash[..12]
+            &manifest_hash[..12]
         );
-        let copied_record = FileVersionRecord {
-            version_id: copied_version_id.clone(),
-            object_id: copied_object_id.clone(),
-            manifest_hash: restored_manifest_hash,
-            logical_path: Some(target_path.to_string()),
-            parent_version_ids: Vec::new(),
-            state: source.state,
-            created_at_unix: unix_ts(),
-            copied_from_object_id: source.object_id,
-            copied_from_version_id: source.version_id,
-            copied_from_path: Some(source_path.to_string()),
-        };
+        let parent_version_ids = target_index
+            .preferred_head_version_id
+            .iter()
+            .cloned()
+            .collect();
 
-        let mut copied_index = empty_version_index(&copied_object_id);
-        copied_index
-            .versions
-            .insert(copied_version_id.clone(), copied_record);
-        copied_index.head_version_ids = vec![copied_version_id];
-        copied_index.preferred_head_version_id = choose_preferred_head(&copied_index);
-        self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
+        target_index.versions.insert(
+            copied_version_id.clone(),
+            FileVersionRecord {
+                version_id: copied_version_id,
+                object_id: target_object_id.clone(),
+                manifest_hash,
+                logical_path: Some(target_path.to_string()),
+                parent_version_ids,
+                state,
+                created_at_unix: unix_ts(),
+                copied_from_object_id,
+                copied_from_version_id,
+                copied_from_path: Some(source_path.to_string()),
+            },
+        );
+        target_index.head_version_ids = recompute_head_version_ids(&target_index);
+        target_index.preferred_head_version_id = choose_preferred_head(&target_index);
+        self.persist_version_index_by_object_id(&target_object_id, &target_index)
             .await?;
-        self.sync_current_state_for_key_from_index(target_path, &copied_index)
+        self.sync_current_state_for_key_from_index(target_path, &target_index)
             .await?;
         self.persist_current_state_with_snapshot_batch(touched_paths, create_snapshot, unix_ts())
             .await?;
@@ -6732,7 +7089,10 @@ impl PersistentStore {
         source_path: &str,
         version_id: &str,
     ) -> Result<Option<SnapshotRestoreSource>> {
-        let Some(source_object_id) = self.object_id_for_key(source_path).await? else {
+        let Some(source_object_id) = self
+            .resolve_object_id_for_key_version(source_path, version_id)
+            .await?
+        else {
             return Ok(None);
         };
 

@@ -9,15 +9,21 @@ authors = ["ironmesh contributors"]
 
 [dependencies]
 anyhow = "1"
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+aws-types = "1"
 axum = "0.8"
 blake3 = "1"
 bytes = "1"
 client-sdk = { path = "../../crates/client-sdk" }
+hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
+percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rcgen = "0.14"
 serde_json = "1"
+sha2 = "0.10"
 sync-agent-core = { path = "../../crates/sync-agent-core" }
 time = "0.3"
 tokio = { version = "1", features = ["full"] }

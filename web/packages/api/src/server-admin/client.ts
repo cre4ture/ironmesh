@@ -14,6 +14,9 @@ import type {
   ClientCredentialView,
   ClusterSummary,
   ControlPlanePromotionImportResponse,
+  CreateS3AccessKeyRequest,
+  CreateS3AccessKeyResponse,
+  CreateS3BucketRequest,
   DataChangeAction,
   DataChangeEventsResponse,
   DataScrubActivityStatusResponse,
@@ -42,6 +45,9 @@ import type {
   RepairHistoryResponse,
   RendezvousConfigView,
   ReplicationPlan,
+  S3AccessKeyView,
+  S3BucketView,
+  S3ControlPlaneStatusResponse,
   ServerHealthResponse,
   StorageStatsCurrentResponse,
   StorageStatsSample,
@@ -848,6 +854,75 @@ export async function listClientBootstrapClaims(
   return fetchAdminJson<ClientBootstrapClaimView[]>(apiV1("/auth/bootstrap-claims"), {
     adminTokenOverride
   });
+}
+
+export async function getS3ControlPlaneStatus(
+  adminTokenOverride?: string
+): Promise<S3ControlPlaneStatusResponse> {
+  return fetchAdminJson<S3ControlPlaneStatusResponse>(apiV1("/auth/s3/status"), {
+    adminTokenOverride
+  });
+}
+
+export async function listS3Buckets(
+  adminTokenOverride?: string
+): Promise<S3BucketView[]> {
+  return fetchAdminJson<S3BucketView[]>(apiV1("/auth/s3/buckets"), {
+    adminTokenOverride
+  });
+}
+
+export async function createS3Bucket(
+  request: CreateS3BucketRequest,
+  adminTokenOverride?: string
+): Promise<S3BucketView> {
+  return fetchAdminJson<S3BucketView>(apiV1("/auth/s3/buckets"), {
+    method: "POST",
+    adminTokenOverride,
+    body: request
+  });
+}
+
+export async function deleteS3Bucket(
+  bucketName: string,
+  adminTokenOverride?: string
+): Promise<void> {
+  await fetchAdminJson(`${apiV1("/auth/s3/buckets")}/${encodeURIComponent(bucketName)}`, {
+    method: "DELETE",
+    adminTokenOverride
+  });
+}
+
+export async function listS3AccessKeys(
+  adminTokenOverride?: string
+): Promise<S3AccessKeyView[]> {
+  return fetchAdminJson<S3AccessKeyView[]>(apiV1("/auth/s3/access-keys"), {
+    adminTokenOverride
+  });
+}
+
+export async function createS3AccessKey(
+  request: CreateS3AccessKeyRequest,
+  adminTokenOverride?: string
+): Promise<CreateS3AccessKeyResponse> {
+  return fetchAdminJson<CreateS3AccessKeyResponse>(apiV1("/auth/s3/access-keys"), {
+    method: "POST",
+    adminTokenOverride,
+    body: request
+  });
+}
+
+export async function revokeS3AccessKey(
+  accessKeyId: string,
+  adminTokenOverride?: string
+): Promise<void> {
+  await fetchAdminJson(
+    `${apiV1("/auth/s3/access-keys")}/${encodeURIComponent(accessKeyId)}/revoke`,
+    {
+      method: "POST",
+      adminTokenOverride
+    }
+  );
 }
 
 export async function revokeClientCredential(

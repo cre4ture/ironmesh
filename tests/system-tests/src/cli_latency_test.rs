@@ -7,7 +7,6 @@ use crate::framework::{
     wait_for_online_nodes, wait_for_rendezvous_registered_endpoints,
 };
 use anyhow::{Context, Result};
-use client_sdk::{BootstrapEndpoint, BootstrapEndpointUse};
 use std::fs;
 
 const RENDEZVOUS_BIND: &str = "127.0.0.1:19470";
@@ -31,10 +30,7 @@ async fn cli_latency_test_supports_list_targets_and_explicit_node_and_relay_sele
     // IRONMESH_REQUIRE_CLIENT_AUTH=true matches every other cluster test in this suite: the
     // direct multiplexed transport used by latency diagnostics (/transport/ws) requires an
     // authenticated client identity to be attached to the request, which the server only does
-    // when client auth is required. In that mode a single node's issued bootstrap only lists its
-    // own direct endpoint (client credentials still need to replicate to other nodes before those
-    // nodes will trust them), so this test manually merges node B's endpoint into the enrolled
-    // bootstrap below rather than relying on bootstrap-bundle issuance to discover it.
+    // when client auth is required.
     let node_env = [
         ("IRONMESH_CLUSTER_ID", CLUSTER_ID),
         ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
@@ -69,29 +65,24 @@ async fn cli_latency_test_supports_list_targets_and_explicit_node_and_relay_sele
         )
         .await?;
 
+        let mut direct_node_ids = enrolled
+            .bootstrap
+            .direct_endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.node_id.map(|node_id| node_id.to_string()))
+            .collect::<Vec<_>>();
+        direct_node_ids.sort();
         assert_eq!(
-            enrolled.bootstrap.direct_endpoints.len(),
-            1,
-            "expected a single-node client bootstrap under required client auth, got {:?}",
+            direct_node_ids,
+            vec![NODE_ID_A.to_string(), NODE_ID_B.to_string()],
+            "expected both cluster nodes in the issued bootstrap, got {:?}",
             enrolled.bootstrap.direct_endpoints
         );
-
-        let mut merged_bootstrap = enrolled.bootstrap.clone();
-        merged_bootstrap.direct_endpoints.push(BootstrapEndpoint {
-            url: base_b.clone(),
-            usage: Some(BootstrapEndpointUse::PublicApi),
-            node_id: Some(
-                NODE_ID_B
-                    .parse()
-                    .context("NODE_ID_B should be a valid uuid")?,
-            ),
-        });
         let merged_bootstrap_path = client_dir.join("cli-latency-merged.bootstrap.json");
-        merged_bootstrap.write_to_path(&merged_bootstrap_path)?;
+        enrolled.bootstrap.write_to_path(&merged_bootstrap_path)?;
 
         let bootstrap_arg = merged_bootstrap_path.to_string_lossy().into_owned();
-        // The identity file lives next to the *originally issued* bootstrap file; the merged
-        // bootstrap above reuses that same enrolled identity.
+        // The identity file lives next to the originally issued bootstrap file.
         let identity_path = default_client_identity_path(&enrolled.bootstrap_path);
         let identity_arg = identity_path.to_string_lossy().into_owned();
 

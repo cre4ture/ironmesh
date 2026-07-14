@@ -694,6 +694,73 @@ export type ClientBootstrapClaimView = {
   status: ClientBootstrapClaimStatus;
 };
 
+export type S3BucketVersioningStatus = "disabled" | "enabled";
+
+export type S3BucketView = {
+  bucket_name: string;
+  root_prefix: string;
+  versioning_status: S3BucketVersioningStatus;
+  read_only: boolean;
+  created_at_unix: number;
+  updated_at_unix: number;
+  created_by: string | null;
+  deleted_at_unix: number | null;
+};
+
+export type S3AccessKeyView = {
+  access_key_id: string;
+  description: string | null;
+  bucket_scope: string[];
+  prefix_scope: string[];
+  allow_list: boolean;
+  allow_read: boolean;
+  allow_write: boolean;
+  allow_delete: boolean;
+  allow_manage: boolean;
+  created_at_unix: number;
+  updated_at_unix: number;
+  last_used_at_unix: number | null;
+  revoked_at_unix: number | null;
+  secret_fingerprint: string;
+};
+
+export type S3ControlPlaneStatusResponse = {
+  listener_enabled: boolean;
+  public_url: string | null;
+  tls_enabled: boolean;
+  gateway_command_hint: string;
+  local_generation: number;
+  last_applied_at_unix: number | null;
+  last_source_node_id: string | null;
+  last_error: string | null;
+  bucket_count: number;
+  access_key_count: number;
+};
+
+export type CreateS3BucketRequest = {
+  bucket_name: string;
+  root_prefix?: string | null;
+  versioning_status?: S3BucketVersioningStatus | null;
+  read_only?: boolean;
+};
+
+export type CreateS3AccessKeyRequest = {
+  description?: string | null;
+  bucket_scope?: string[];
+  prefix_scope?: string[];
+  allow_list?: boolean;
+  allow_read?: boolean;
+  allow_write?: boolean;
+  allow_delete?: boolean;
+  allow_manage?: boolean;
+};
+
+export type CreateS3AccessKeyResponse = {
+  access_key_id: string;
+  secret_access_key: string;
+  view: S3AccessKeyView;
+};
+
 export type NodeCertificateStatus = {
   name: string;
   configured: boolean;

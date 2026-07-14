@@ -722,8 +722,15 @@ async fn start_server_with_env_options_inner(
     let internal_bind = internal_bind_from_public_bind(bind)?;
     let internal_url = format!("https://{internal_bind}");
     let cluster_id = cluster_id_for_test_node(extra_env);
-    let resource_guards =
-        lock_test_resources([tcp_resource_key(bind), tcp_resource_key(&internal_bind)]).await;
+    let mut resource_keys = vec![tcp_resource_key(bind), tcp_resource_key(&internal_bind)];
+    if let Some(s3_bind) = extra_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (*key == "IRONMESH_S3_BIND").then_some(*value))
+    {
+        resource_keys.push(tcp_resource_key(s3_bind));
+    }
+    let resource_guards = lock_test_resources(resource_keys).await;
 
     let tls_dir = data_dir.join("tls");
     fs::create_dir_all(&tls_dir).context("failed creating tls dir")?;
