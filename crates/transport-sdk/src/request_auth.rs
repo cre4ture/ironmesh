@@ -13,6 +13,7 @@ use crate::identity::ClientIdentityMaterial;
 pub const HEADER_CLUSTER_ID: &str = "x-ironmesh-cluster-id";
 pub const HEADER_DEVICE_ID: &str = "x-ironmesh-device-id";
 pub const HEADER_CONNECTION_NAME: &str = "x-ironmesh-connection-name";
+pub const HEADER_OPERATION_ID: &str = "x-ironmesh-operation-id";
 pub const HEADER_CREDENTIAL_FINGERPRINT: &str = "x-ironmesh-credential-fingerprint";
 pub const HEADER_AUTH_TIMESTAMP: &str = "x-ironmesh-auth-timestamp";
 pub const HEADER_AUTH_NONCE: &str = "x-ironmesh-auth-nonce";

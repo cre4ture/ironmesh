@@ -34,7 +34,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::extract::{Json, Path, Query, State};
-use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use bytes::Bytes;
@@ -9788,6 +9788,196 @@ run_on_main_metadata_backends!(
     start_upload_session_prefills_existing_chunk_refs_turso
 );
 
+#[tokio::test]
+async fn client_mutation_operation_waiter_observes_completion_without_missing_signal() {
+    let store = Arc::new(std::sync::Mutex::new(
+        super::ClientMutationOperationStore::default(),
+    ));
+    let mut owner = match super::claim_client_mutation_operation(
+        &store,
+        "device-idempotent".to_string(),
+        "operation-complete".to_string(),
+        "fingerprint-complete",
+    ) {
+        super::ClientMutationOperationClaim::Owner(owner) => owner,
+        claim => panic!("expected owner claim, got {claim:?}"),
+    };
+    let mut waiter = match super::claim_client_mutation_operation(
+        &store,
+        "device-idempotent".to_string(),
+        "operation-complete".to_string(),
+        "fingerprint-complete",
+    ) {
+        super::ClientMutationOperationClaim::Wait(waiter) => waiter,
+        claim => panic!("expected waiter claim, got {claim:?}"),
+    };
+
+    owner.complete(super::ClientMutationRecordedResponse {
+        status: StatusCode::CREATED,
+        headers: Vec::new(),
+        body: Bytes::from_static(b"ok"),
+    });
+
+    tokio::time::timeout(Duration::from_millis(100), async {
+        if !*waiter.borrow() {
+            waiter
+                .changed()
+                .await
+                .expect("waiter should observe owner completion");
+        }
+    })
+    .await
+    .expect("waiter should not block after owner completion");
+
+    match super::claim_client_mutation_operation(
+        &store,
+        "device-idempotent".to_string(),
+        "operation-complete".to_string(),
+        "fingerprint-complete",
+    ) {
+        super::ClientMutationOperationClaim::Replay(response) => {
+            assert_eq!(response.status, StatusCode::CREATED);
+            assert_eq!(response.body, Bytes::from_static(b"ok"));
+        }
+        claim => panic!("expected replay claim after completion, got {claim:?}"),
+    }
+}
+
+async fn start_upload_session_replays_same_response_for_same_operation_id_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let request = super::UploadSessionStartRequest {
+        key: "uploads/idempotent.bin".to_string(),
+        total_size_bytes: 5,
+        state: None,
+        parent: Vec::new(),
+        version_id: None,
+        chunk_refs: Vec::new(),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-idempotent"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-start-upload"),
+    );
+
+    let first =
+        super::start_upload_session(State(state.clone()), headers.clone(), Json(request.clone()))
+            .await
+            .into_response();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("first response body should read");
+    let first_view = serde_json::from_slice::<super::UploadSessionView>(&first_body)
+        .expect("first upload session view should parse");
+
+    let second = super::start_upload_session(State(state.clone()), headers, Json(request))
+        .await
+        .into_response();
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second_body = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("second response body should read");
+    let second_view = serde_json::from_slice::<super::UploadSessionView>(&second_body)
+        .expect("second upload session view should parse");
+
+    assert_eq!(first_view.upload_id, second_view.upload_id);
+    assert_eq!(first_view.key, second_view.key);
+
+    let sessions = super::read_upload_sessions(&state, "tests.upload_sessions.assert").await;
+    assert_eq!(sessions.sessions.len(), 1);
+    assert!(sessions.sessions.contains_key(&first_view.upload_id));
+    drop(sessions);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    start_upload_session_replays_same_response_for_same_operation_id_impl,
+    start_upload_session_replays_same_response_for_same_operation_id,
+    start_upload_session_replays_same_response_for_same_operation_id_turso
+);
+
+async fn start_upload_session_conflicts_on_operation_id_payload_mismatch_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-idempotent"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-start-upload-conflict"),
+    );
+
+    let first = super::start_upload_session(
+        State(state.clone()),
+        headers.clone(),
+        Json(super::UploadSessionStartRequest {
+            key: "uploads/alpha.bin".to_string(),
+            total_size_bytes: 5,
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+            chunk_refs: Vec::new(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = super::start_upload_session(
+        State(state.clone()),
+        headers,
+        Json(super::UploadSessionStartRequest {
+            key: "uploads/beta.bin".to_string(),
+            total_size_bytes: 5,
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+            chunk_refs: Vec::new(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let second_body = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("conflict response body should read");
+    let second_json = serde_json::from_slice::<serde_json::Value>(&second_body)
+        .expect("conflict response should be json");
+    assert!(
+        second_json["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("operation id"))
+    );
+
+    let sessions = super::read_upload_sessions(&state, "tests.upload_sessions.assert").await;
+    assert_eq!(sessions.sessions.len(), 1);
+    assert!(
+        sessions
+            .sessions
+            .values()
+            .any(|session| session.key == "uploads/alpha.bin")
+    );
+    drop(sessions);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    start_upload_session_conflicts_on_operation_id_payload_mismatch_impl,
+    start_upload_session_conflicts_on_operation_id_payload_mismatch,
+    start_upload_session_conflicts_on_operation_id_payload_mismatch_turso
+);
+
 #[test]
 fn store_index_depth_groups_prefixes() {
     let keys = vec![
@@ -12134,6 +12324,7 @@ async fn retry_media_cache_rebuilds_video_poster_impl(backend: MainTestBackend) 
     let response = axum::response::IntoResponse::into_response(
         super::retry_media_cache(
             axum::extract::State(state.clone()),
+            HeaderMap::new(),
             axum::extract::Query(query),
         )
         .await,
@@ -12774,6 +12965,9 @@ async fn build_test_state(
             bootstrap_claims: transport_sdk::BootstrapClaimBroker::new(),
             client_connections: Arc::new(std::sync::Mutex::new(
                 super::LiveClientConnectionRegistry::default(),
+            )),
+            client_mutation_operations: Arc::new(std::sync::Mutex::new(
+                super::ClientMutationOperationStore::default(),
             )),
             admin_control: AdminControl::default(),
             admin_sessions: Arc::new(Mutex::new(super::AdminSessionStore::default())),

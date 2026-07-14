@@ -2,7 +2,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::{NodeId, StorageObjectMeta};
 use futures_util::io::{
-    AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
+    AsyncRead, AsyncReadExt as FuturesAsyncReadExt, AsyncWrite,
+    AsyncWriteExt as FuturesAsyncWriteExt,
 };
 use futures_util::stream::{Stream, StreamExt};
 use reqwest::Client as HttpClient;
@@ -52,6 +53,7 @@ const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
+const CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,6 +688,57 @@ fn request_auth_headers_for_auth(
     Ok(headers)
 }
 
+fn method_uses_operation_id(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::DELETE | &Method::PATCH
+    )
+}
+
+fn ensure_operation_id_header(method: &Method, headers: &mut Vec<RelayHttpHeader>) {
+    if !method_uses_operation_id(method) {
+        return;
+    }
+
+    if let Some(header) = headers.iter_mut().find(|header| {
+        header
+            .name
+            .eq_ignore_ascii_case(transport_sdk::HEADER_OPERATION_ID)
+    }) {
+        if header.value.trim().is_empty() {
+            header.value = Uuid::now_v7().to_string();
+        }
+        return;
+    }
+
+    headers.push(RelayHttpHeader {
+        name: transport_sdk::HEADER_OPERATION_ID.to_string(),
+        value: Uuid::now_v7().to_string(),
+    });
+}
+
+fn direct_multiplex_failover_timeout(url: &Url, allow_failover_timeout: bool) -> Option<Duration> {
+    if !allow_failover_timeout || direct_multiplex_request_is_long_running(url) {
+        return None;
+    }
+    Some(CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT)
+}
+
+fn direct_multiplex_request_is_long_running(url: &Url) -> bool {
+    match strip_client_api_v1_prefix(url.path()) {
+        "/store/index/changes/wait" => true,
+        "/diagnostics/latency" => url
+            .query_pairs()
+            .find_map(|(name, value)| {
+                (name == "server_delay_ms")
+                    .then(|| value.parse::<u64>().ok())
+                    .flatten()
+            })
+            .is_some_and(|server_delay_ms| server_delay_ms > 0),
+        _ => false,
+    }
+}
+
 fn relay_source_identity_for_auth(auth: &ClientRequestAuth) -> Result<PeerIdentity> {
     match auth {
         ClientRequestAuth::SignedIdentity(identity) => Ok(PeerIdentity::Device(identity.device_id)),
@@ -704,10 +757,35 @@ fn apply_headers_to_request(
     })
 }
 
+#[derive(Clone, Copy)]
+struct TransportRequestOptions<'a> {
+    connection_name: Option<&'a str>,
+    direct_failover_timeout: Option<Duration>,
+}
+
+impl<'a> TransportRequestOptions<'a> {
+    const fn new(
+        connection_name: Option<&'a str>,
+        direct_failover_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            connection_name,
+            direct_failover_timeout,
+        }
+    }
+
+    const fn without_direct_failover_timeout(self) -> Self {
+        Self {
+            connection_name: self.connection_name,
+            direct_failover_timeout: None,
+        }
+    }
+}
+
 async fn execute_buffered_request_for_transport(
     transport: &ClientTransport,
     auth: &ClientRequestAuth,
-    connection_name: Option<&str>,
+    options: TransportRequestOptions<'_>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -725,10 +803,15 @@ async fn execute_buffered_request_for_transport(
                     server_base_url,
                     session_pool,
                     identity,
-                    connection_name,
+                    connection_name: options.connection_name,
                 };
                 return execute_direct_multiplex_buffered_request(
-                    direct, method, url, headers, body,
+                    direct,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    options.direct_failover_timeout,
                 )
                 .await
                 .with_context(|| format!("failed to execute multiplexed {} {}", method, url));
@@ -760,7 +843,7 @@ async fn execute_buffered_request_for_transport(
             execute_relay_multiplex_buffered_request(
                 relay,
                 source,
-                connection_name,
+                options.connection_name,
                 method,
                 url,
                 headers,
@@ -860,7 +943,7 @@ async fn execute_streaming_object_read_request_for_transport(
 async fn execute_streaming_object_write_request_for_transport(
     transport: &ClientTransport,
     auth: &ClientRequestAuth,
-    connection_name: Option<&str>,
+    options: TransportRequestOptions<'_>,
     method: &Method,
     url: &Url,
     headers: &[RelayHttpHeader],
@@ -877,10 +960,15 @@ async fn execute_streaming_object_write_request_for_transport(
                     server_base_url,
                     session_pool,
                     identity,
-                    connection_name,
+                    connection_name: options.connection_name,
                 };
                 return execute_direct_multiplex_streaming_object_write_request(
-                    direct, method, url, headers, body,
+                    direct,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    options.direct_failover_timeout,
                 )
                 .await
                 .with_context(|| format!("failed to execute streamed {} {}", method, url));
@@ -889,7 +977,7 @@ async fn execute_streaming_object_write_request_for_transport(
             execute_buffered_request_for_transport(
                 transport,
                 auth,
-                connection_name,
+                options.without_direct_failover_timeout(),
                 method,
                 url,
                 headers,
@@ -902,7 +990,7 @@ async fn execute_streaming_object_write_request_for_transport(
             execute_relay_multiplex_streaming_object_write_request(
                 relay,
                 source,
-                connection_name,
+                options.connection_name,
                 method,
                 url,
                 headers,
@@ -1017,7 +1105,7 @@ async fn probe_endpoint_background_quality(
     let response = execute_buffered_request_for_transport(
         &endpoint.transport,
         auth,
-        connection_name,
+        TransportRequestOptions::new(connection_name, None),
         &method,
         &url,
         &headers,
@@ -1729,6 +1817,9 @@ impl IronMeshClient {
         body: Option<Vec<u8>>,
         route_indices: &[usize],
     ) -> Result<RoutedBufferedTransportResponse> {
+        ensure_operation_id_header(&method, &mut headers);
+        let direct_failover_timeout =
+            direct_multiplex_failover_timeout(&url, route_indices.len() > 1);
         self.maybe_spawn_background_quality_refresh();
 
         let mut auth_headers = self.request_auth_headers(&method, &url)?;
@@ -1755,7 +1846,10 @@ impl IronMeshClient {
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
-                self.connection_name.as_deref(),
+                TransportRequestOptions::new(
+                    self.connection_name.as_deref(),
+                    direct_failover_timeout,
+                ),
                 &method,
                 &endpoint_url,
                 &auth_headers,
@@ -1813,12 +1907,16 @@ impl IronMeshClient {
         payload: Vec<u8>,
         route_indices: &[usize],
     ) -> Result<RoutedBufferedTransportResponse> {
+        let mut operation_headers = Vec::new();
+        ensure_operation_id_header(&Method::PUT, &mut operation_headers);
+        let direct_failover_timeout =
+            direct_multiplex_failover_timeout(&url, route_indices.len() > 1);
         if matches!(self.auth, ClientRequestAuth::None) {
             return self
                 .execute_buffered_request_on_route_indices(
                     Method::PUT,
                     url,
-                    Vec::new(),
+                    operation_headers,
                     Some(payload),
                     route_indices,
                 )
@@ -1827,7 +1925,8 @@ impl IronMeshClient {
 
         self.maybe_spawn_background_quality_refresh();
 
-        let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+        let mut auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+        auth_headers.append(&mut operation_headers);
         let mut last_error = None;
         for &route_index in route_indices {
             let Some(endpoint) = self.transport_router.endpoint(route_index).cloned() else {
@@ -1849,7 +1948,10 @@ impl IronMeshClient {
             match execute_streaming_object_write_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
-                self.connection_name.as_deref(),
+                TransportRequestOptions::new(
+                    self.connection_name.as_deref(),
+                    direct_failover_timeout,
+                ),
                 &Method::PUT,
                 &endpoint_url,
                 &auth_headers,
@@ -4236,6 +4338,7 @@ async fn execute_multiplex_streaming_object_write_request(
     url: &Url,
     headers: &[RelayHttpHeader],
     body: &[u8],
+    response_head_timeout: Option<Duration>,
 ) -> Result<BufferedTransportResponse> {
     let request_path = path_and_query(url);
     let mut stream = session
@@ -4265,10 +4368,9 @@ async fn execute_multiplex_streaming_object_write_request(
         .close()
         .await
         .context("failed closing streamed object-write request body")?;
-    let response = read_buffered_transport_response(&mut stream)
+    read_direct_multiplex_buffered_response(&mut stream, method, url, response_head_timeout)
         .await
-        .context("failed reading streamed object-write response")?;
-    buffered_response_from_multiplex(response)
+        .context("failed reading streamed object-write response")
 }
 
 async fn execute_multiplex_streaming_write_request(
@@ -4362,6 +4464,67 @@ struct DirectMultiplexSessionContext<'a> {
     connection_name: Option<&'a str>,
 }
 
+#[derive(Debug)]
+struct DirectMultiplexRequestTimeout {
+    method: String,
+    url: String,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for DirectMultiplexRequestTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "direct multiplex {} {} timed out after {:?}",
+            self.method, self.url, self.timeout
+        )
+    }
+}
+
+impl std::error::Error for DirectMultiplexRequestTimeout {}
+
+fn is_direct_multiplex_request_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<DirectMultiplexRequestTimeout>()
+            .is_some()
+    })
+}
+
+async fn read_direct_multiplex_buffered_response<T>(
+    reader: &mut T,
+    method: &Method,
+    url: &Url,
+    response_head_timeout: Option<Duration>,
+) -> Result<BufferedTransportResponse>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let response_head = match response_head_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, read_transport_response_head(reader))
+            .await
+            .map_err(|_| DirectMultiplexRequestTimeout {
+                method: method.to_string(),
+                url: url.to_string(),
+                timeout,
+            })?,
+        None => read_transport_response_head(reader).await,
+    }
+    .context("failed reading direct multiplex response head")?;
+
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .await
+        .context("failed reading direct multiplex response body")?;
+    buffered_response_from_multiplex(MultiplexBufferedTransportResponse {
+        request_id: response_head.request_id,
+        status: response_head.status,
+        headers: response_head.headers,
+        body,
+    })
+}
+
 async fn execute_direct_multiplex_streaming_read_request(
     server_base_url: &str,
     session_pool: &TransportSessionPool,
@@ -4451,6 +4614,7 @@ async fn execute_direct_multiplex_streaming_object_write_request(
     url: &Url,
     headers: &[RelayHttpHeader],
     body: &[u8],
+    response_head_timeout: Option<Duration>,
 ) -> Result<BufferedTransportResponse> {
     for attempt in 0..2 {
         let session = direct
@@ -4464,11 +4628,12 @@ async fn execute_direct_multiplex_streaming_object_write_request(
             url,
             headers,
             body,
+            response_head_timeout,
         )
         .await;
         match result {
             Ok(response) => return Ok(response),
-            Err(err) if attempt == 0 => {
+            Err(err) if attempt == 0 && !is_direct_multiplex_request_timeout(&err) => {
                 direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
@@ -4515,6 +4680,7 @@ async fn execute_relay_multiplex_streaming_object_write_request(
             url,
             headers,
             body,
+            None,
         )
         .await;
         match result {
@@ -4585,6 +4751,7 @@ async fn execute_direct_multiplex_buffered_request(
     url: &Url,
     headers: &[RelayHttpHeader],
     body: &[u8],
+    response_head_timeout: Option<Duration>,
 ) -> Result<BufferedTransportResponse> {
     let request_path = path_and_query(url);
     let request_headers = transport_headers_from_relay_headers(headers);
@@ -4611,16 +4778,14 @@ async fn execute_direct_multiplex_buffered_request(
             write_buffered_transport_request(&mut stream, &request)
                 .await
                 .context("failed writing direct multiplex request")?;
-            let response = read_buffered_transport_response(&mut stream)
+            read_direct_multiplex_buffered_response(&mut stream, method, url, response_head_timeout)
                 .await
-                .context("failed reading direct multiplex response")?;
-            buffered_response_from_multiplex(response)
         }
         .await;
 
         match result {
             Ok(response) => return Ok(response),
-            Err(err) if attempt == 0 => {
+            Err(err) if attempt == 0 && !is_direct_multiplex_request_timeout(&err) => {
                 direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,

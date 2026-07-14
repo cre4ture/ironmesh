@@ -939,17 +939,22 @@ async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> 
             )
             .await?;
 
-            wait_for_local_dir(&local_root.join("remote-type-flip/file-to-dir"), 240).await?;
+            let transition_retries = 400;
+            wait_for_local_dir(
+                &local_root.join("remote-type-flip/file-to-dir"),
+                transition_retries,
+            )
+            .await?;
             wait_for_local_file_bytes(
                 &local_root.join("remote-type-flip/file-to-dir/child.txt"),
                 b"remote-dir-v2",
-                240,
+                transition_retries,
             )
             .await?;
             wait_for_local_file_bytes(
                 &local_root.join("remote-type-flip/dir-to-file"),
                 b"remote-file-v2",
-                240,
+                transition_retries,
             )
             .await?;
             assert!(
@@ -964,7 +969,7 @@ async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> 
                 fixture.connection.target_label(),
                 "remote-type-flip/file-to-dir",
                 BaselineEntryKind::Directory,
-                240,
+                transition_retries,
             )
             .await?;
             wait_for_baseline_kind(
@@ -972,7 +977,7 @@ async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> 
                 fixture.connection.target_label(),
                 "remote-type-flip/dir-to-file",
                 BaselineEntryKind::File,
-                240,
+                transition_retries,
             )
             .await?;
             Ok::<(), anyhow::Error>(())

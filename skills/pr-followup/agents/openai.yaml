@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Follow-up"
+  short_description: "Monitor and repair an Ironmesh PR"
+  default_prompt: "Use $pr-followup to keep checking my Ironmesh pull request, merge base-branch updates, fix CI or review issues, and push follow-up commits until the PR is clear or blocked."
