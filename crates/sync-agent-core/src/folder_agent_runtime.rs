@@ -59,6 +59,7 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
 }
 
 pub type FolderAgentStatusCallback = Arc<dyn Fn(FolderAgentRuntimeStatus) + Send + Sync + 'static>;
+pub type FolderAgentWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -289,19 +290,14 @@ pub trait FolderAgentLocalBackend {
         relative_path: &str,
     ) -> Result<()>;
 
-    fn start_local_change_monitor(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()>;
+    fn start_local_change_monitor(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        on_local_change: FolderAgentWakeCallback,
+    ) -> Result<()>;
 
     fn local_watch_hints_available(&self, _options: &FolderAgentRuntimeOptions) -> bool {
         false
-    }
-
-    fn local_change_hint_pending(&mut self, options: &FolderAgentRuntimeOptions) -> Result<bool>;
-
-    fn acknowledge_local_change_hint(
-        &mut self,
-        _options: &FolderAgentRuntimeOptions,
-    ) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -313,9 +309,14 @@ enum LocalChangeMonitorState {
     PollingFallback,
 }
 
+enum FolderAgentRuntimeEvent {
+    RemoteUpdate(RemoteSnapshotUpdate),
+    LocalHint,
+    Shutdown,
+}
+
 #[derive(Default)]
 struct NativeFilesystemBackend {
-    local_event_rx: Option<mpsc::Receiver<()>>,
     watcher: Option<RecommendedWatcher>,
     local_change_monitor_state: LocalChangeMonitorState,
 }
@@ -457,8 +458,11 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
         remove_local_path(&options.root_dir, relative_path, None, None, None)
     }
 
-    fn start_local_change_monitor(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
-        self.local_event_rx = None;
+    fn start_local_change_monitor(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        on_local_change: FolderAgentWakeCallback,
+    ) -> Result<()> {
         self.watcher = None;
         self.local_change_monitor_state = LocalChangeMonitorState::PollingFallback;
 
@@ -466,10 +470,8 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
             return Ok(());
         }
 
-        let (local_event_tx, local_event_rx) = mpsc::channel::<()>();
-        match start_local_watcher(options.root_dir.clone(), local_event_tx) {
+        match start_local_watcher(options.root_dir.clone(), on_local_change) {
             Ok(watcher) => {
-                self.local_event_rx = Some(local_event_rx);
                 self.watcher = Some(watcher);
                 self.local_change_monitor_state = LocalChangeMonitorState::WatchHints;
             }
@@ -485,18 +487,6 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
 
     fn local_watch_hints_available(&self, _options: &FolderAgentRuntimeOptions) -> bool {
         self.local_change_monitor_state == LocalChangeMonitorState::WatchHints
-    }
-
-    fn local_change_hint_pending(&mut self, _options: &FolderAgentRuntimeOptions) -> Result<bool> {
-        let Some(local_event_rx) = &self.local_event_rx else {
-            return Ok(false);
-        };
-
-        let mut local_scan_requested = false;
-        while local_event_rx.try_recv().is_ok() {
-            local_scan_requested = true;
-        }
-        Ok(local_scan_requested)
     }
 }
 
@@ -1102,8 +1092,15 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         return Ok(());
     }
 
+    let (runtime_event_tx, runtime_event_rx) = mpsc::channel::<FolderAgentRuntimeEvent>();
+    let wake_runtime: FolderAgentWakeCallback = Arc::new({
+        let runtime_event_tx = runtime_event_tx.clone();
+        move || {
+            let _ = runtime_event_tx.send(FolderAgentRuntimeEvent::Shutdown);
+        }
+    });
     if install_signal_handler {
-        install_ctrlc_handler(running.clone())?;
+        install_ctrlc_handler(running.clone(), Some(wake_runtime))?;
     }
     emit_status(
         status_callback.as_ref(),
@@ -1126,8 +1123,6 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
     let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
     store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
-
-    let (remote_tx, remote_rx) = mpsc::channel::<RemoteSnapshotUpdate>();
     let remote_running = running.clone();
     let remote_stop_signal = running.clone();
     let remote_status_callback = status_callback.clone();
@@ -1138,6 +1133,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_latest_metrics = latest_metrics.clone();
     let remote_last_success = last_success_shared.clone();
     let remote_idle_message = idle_watch_message.clone();
+    let remote_event_tx = runtime_event_tx.clone();
     let remote_thread = refresh_poller.spawn_fetcher_loop_with_fetch(
         remote_running,
         Some(initial_snapshot),
@@ -1160,22 +1156,41 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
             )
         },
         move |update| {
-            if remote_tx.send(update).is_err() {
+            if remote_event_tx
+                .send(FolderAgentRuntimeEvent::RemoteUpdate(update))
+                .is_err()
+            {
                 remote_stop_signal.store(false, Ordering::SeqCst);
             }
         },
     );
 
-    backend.start_local_change_monitor(options)?;
+    let local_change_wake: FolderAgentWakeCallback = Arc::new({
+        let runtime_event_tx = runtime_event_tx.clone();
+        move || {
+            let _ = runtime_event_tx.send(FolderAgentRuntimeEvent::LocalHint);
+        }
+    });
+    backend.start_local_change_monitor(options, local_change_wake)?;
 
     let mut next_local_scan = Instant::now()
         + steady_state_local_scan_interval(options, backend.local_watch_hints_available(options));
+    let mut pending_local_scan_hint = false;
+    let mut pending_remote_updates = Vec::new();
 
     while running.load(Ordering::SeqCst) {
+        if !drain_runtime_events(
+            &runtime_event_rx,
+            &mut pending_remote_updates,
+            &mut pending_local_scan_hint,
+        ) {
+            break;
+        }
+
         let mut baseline_dirty = false;
         let mut remote_updates_applied = false;
         let mut combined_remote_outcome = RemoteApplyOutcome::default();
-        while let Ok(update) = remote_rx.try_recv() {
+        for update in std::mem::take(&mut pending_remote_updates) {
             let mut remote_pending_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             remote_pending_metrics.changed_path_count = usize_to_u64(update.changed_paths.len());
@@ -1260,11 +1275,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
             set_latest_metrics(&latest_metrics, &remote_runtime_metrics);
         }
 
-        let local_scan_requested = backend.local_change_hint_pending(options)?;
         let watch_hints_available = backend.local_watch_hints_available(options);
         let local_scan_interval = steady_state_local_scan_interval(options, watch_hints_available);
         let local_scan_trigger = local_scan_trigger(
-            local_scan_requested,
+            pending_local_scan_hint,
             Instant::now(),
             next_local_scan,
             watch_hints_available,
@@ -1335,7 +1349,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                         &mut remote_index,
                         &mut suppressed_uploads,
                         Some(&modification_log_store),
-                        Some(if local_scan_requested {
+                        Some(if pending_local_scan_hint {
                             &local_watch_log_context
                         } else {
                             &local_scan_log_context
@@ -1356,7 +1370,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 baseline_dirty = true;
             }
             if matches!(local_scan_trigger, LocalScanTrigger::WatchHint) {
-                backend.acknowledge_local_change_hint(options)?;
+                pending_local_scan_hint = false;
             }
             next_local_scan = Instant::now() + local_scan_interval;
             last_success_unix_ms = Some(now_unix_ms());
@@ -1400,8 +1414,18 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 .persist_local_baseline(&local_state)
                 .context("failed to persist sqlite baseline during runtime")?;
         }
-
-        thread::sleep(Duration::from_millis(250));
+        if !remote_updates_applied
+            && local_scan_trigger.is_none()
+            && !wait_for_runtime_event(
+                &runtime_event_rx,
+                running.as_ref(),
+                next_local_scan,
+                &mut pending_remote_updates,
+                &mut pending_local_scan_hint,
+            )
+        {
+            break;
+        }
     }
 
     running.store(false, Ordering::SeqCst);
@@ -1607,23 +1631,29 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClie
     )
 }
 
-fn install_ctrlc_handler(running: Arc<AtomicBool>) -> Result<()> {
+fn install_ctrlc_handler(
+    running: Arc<AtomicBool>,
+    on_stop: Option<FolderAgentWakeCallback>,
+) -> Result<()> {
     ctrlc::set_handler(move || {
         running.store(false, Ordering::SeqCst);
+        if let Some(on_stop) = on_stop.as_ref() {
+            on_stop();
+        }
     })
     .context("failed to install Ctrl+C handler")
 }
 
 fn start_local_watcher(
     root_dir: PathBuf,
-    local_event_tx: mpsc::Sender<()>,
+    on_local_change: FolderAgentWakeCallback,
 ) -> Result<RecommendedWatcher> {
     let mut watcher =
         notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
             Ok(event) => match event.kind {
                 EventKind::Access(_) => {}
                 _ => {
-                    let _ = local_event_tx.send(());
+                    on_local_change();
                 }
             },
             Err(error) => {
@@ -2491,6 +2521,7 @@ enum LocalScanTrigger {
 
 const LOCAL_SCAN_INTERVAL_FLOOR: Duration = Duration::from_millis(250);
 const WATCH_LOCAL_FALLBACK_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const IDLE_STOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn watch_mode_label(
     options: &FolderAgentRuntimeOptions,
@@ -2534,6 +2565,56 @@ fn local_scan_trigger(
         Some(LocalScanTrigger::WatchFallbackInterval)
     } else {
         Some(LocalScanTrigger::PollingInterval)
+    }
+}
+
+fn enqueue_runtime_event(
+    event: FolderAgentRuntimeEvent,
+    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_local_scan_hint: &mut bool,
+) -> bool {
+    match event {
+        FolderAgentRuntimeEvent::RemoteUpdate(update) => pending_remote_updates.push(update),
+        FolderAgentRuntimeEvent::LocalHint => *pending_local_scan_hint = true,
+        FolderAgentRuntimeEvent::Shutdown => return false,
+    }
+    true
+}
+
+fn drain_runtime_events(
+    runtime_event_rx: &mpsc::Receiver<FolderAgentRuntimeEvent>,
+    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_local_scan_hint: &mut bool,
+) -> bool {
+    while let Ok(event) = runtime_event_rx.try_recv() {
+        if !enqueue_runtime_event(event, pending_remote_updates, pending_local_scan_hint) {
+            return false;
+        }
+    }
+    true
+}
+
+fn idle_wait_timeout(now: Instant, next_local_scan: Instant) -> Duration {
+    next_local_scan
+        .saturating_duration_since(now)
+        .min(IDLE_STOP_CHECK_INTERVAL)
+}
+
+fn wait_for_runtime_event(
+    runtime_event_rx: &mpsc::Receiver<FolderAgentRuntimeEvent>,
+    running: &AtomicBool,
+    next_local_scan: Instant,
+    pending_remote_updates: &mut Vec<RemoteSnapshotUpdate>,
+    pending_local_scan_hint: &mut bool,
+) -> bool {
+    if !running.load(Ordering::SeqCst) {
+        return false;
+    }
+
+    match runtime_event_rx.recv_timeout(idle_wait_timeout(Instant::now(), next_local_scan)) {
+        Ok(event) => enqueue_runtime_event(event, pending_remote_updates, pending_local_scan_hint),
+        Err(mpsc::RecvTimeoutError::Timeout) => running.load(Ordering::SeqCst),
+        Err(mpsc::RecvTimeoutError::Disconnected) => false,
     }
 }
 
@@ -3221,15 +3302,9 @@ mod tests {
         fn start_local_change_monitor(
             &mut self,
             _options: &FolderAgentRuntimeOptions,
+            _on_local_change: FolderAgentWakeCallback,
         ) -> Result<()> {
             Ok(())
-        }
-
-        fn local_change_hint_pending(
-            &mut self,
-            _options: &FolderAgentRuntimeOptions,
-        ) -> Result<bool> {
-            Ok(false)
         }
     }
 
@@ -3300,6 +3375,20 @@ mod tests {
         assert_eq!(
             local_scan_trigger(false, now, now, false),
             Some(LocalScanTrigger::PollingInterval)
+        );
+    }
+
+    #[test]
+    fn idle_wait_timeout_caps_shutdown_polling() {
+        let now = Instant::now();
+
+        assert_eq!(
+            idle_wait_timeout(now, now + Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            idle_wait_timeout(now, now + Duration::from_secs(30)),
+            IDLE_STOP_CHECK_INTERVAL
         );
     }
 
