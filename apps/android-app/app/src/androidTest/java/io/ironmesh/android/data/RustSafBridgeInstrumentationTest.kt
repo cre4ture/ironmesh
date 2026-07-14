@@ -1,15 +1,20 @@
 package io.ironmesh.android.data
 
-import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 @RunWith(AndroidJUnit4::class)
 class RustSafBridgeInstrumentationTest {
@@ -64,10 +69,76 @@ class RustSafBridgeInstrumentationTest {
                 output.write("observer".toByteArray())
             }
 
-            assertTrue(waitForTreeVersionGreaterThan(before))
+            assertTrue(RustSafBridge.awaitTreeChangeVersion(treeUriString, before, 5_000))
         } finally {
             RustSafBridge.releaseTreeObserver(treeUriString)
         }
+    }
+
+    @Test
+    fun listTreeSnapshot_exposesDeterministicProgressWhileProviderQueryIsBlocked() {
+        TestTreeDocumentsProvider.seedFile(appContext, "blocked/child.txt", "payload".toByteArray())
+        TestTreeDocumentsProvider.installChildQueryBarrier("")
+        val snapshotRef = AtomicReference<String?>()
+        val errorRef = AtomicReference<Throwable?>()
+        val finished = CountDownLatch(1)
+        val worker = thread(name = "blocked-snapshot") {
+            try {
+                snapshotRef.set(RustSafBridge.listTreeSnapshot(treeUriString))
+            } catch (error: Throwable) {
+                errorRef.set(error)
+            } finally {
+                finished.countDown()
+            }
+        }
+
+        try {
+            assertTrue(TestTreeDocumentsProvider.awaitChildQueryBarrier(""))
+            val progressJson = RustSafBridge.getTreeScanProgress(treeUriString)
+            assertNotNull(progressJson)
+            val progress = JSONObject(requireNotNull(progressJson))
+            assertTrue(progress.getLong("pendingDirectoryCount") >= 1L)
+            assertTrue(progress.getString("currentPath").isNotBlank())
+        } finally {
+            TestTreeDocumentsProvider.releaseChildQueryBarrier("")
+        }
+
+        assertTrue(finished.await(5, TimeUnit.SECONDS))
+        worker.join(1_000)
+        assertFalse(worker.isAlive)
+        val error = errorRef.get()
+        if (error != null) {
+            throw AssertionError("snapshot should complete after releasing the provider barrier", error)
+        }
+
+        val paths = snapshotPaths(requireNotNull(snapshotRef.get()))
+        assertTrue(paths.contains("blocked"))
+        assertTrue(paths.contains("blocked/child.txt"))
+    }
+
+    @Test
+    fun openTreeFileInput_failsWhenProviderDeletesFileBetweenLookupAndOpen() {
+        TestTreeDocumentsProvider.seedFile(appContext, "race/transient.txt", "before".toByteArray())
+        TestTreeDocumentsProvider.deleteFileBeforeNextReadOpen("race/transient.txt")
+
+        val error = runCatching {
+            RustSafBridge.openTreeFileInput(treeUriString, "race/transient.txt").use { input ->
+                input.readBytes()
+            }
+        }.exceptionOrNull()
+
+        assertNotNull(error)
+    }
+
+    @Test
+    fun listTreeSnapshot_propagatesProviderChildQueryFailures() {
+        TestTreeDocumentsProvider.failNextChildQuery("", "simulated root query failure")
+
+        val error = runCatching {
+            RustSafBridge.listTreeSnapshot(treeUriString)
+        }.exceptionOrNull()
+
+        assertNotNull(error)
     }
 
     private fun snapshotPaths(snapshotJson: String): Set<String> {
@@ -77,16 +148,5 @@ class RustSafBridgeInstrumentationTest {
             result += array.getJSONObject(index).getString("path")
         }
         return result
-    }
-
-    private fun waitForTreeVersionGreaterThan(previous: Long, timeoutMs: Long = 5_000): Boolean {
-        val deadline = SystemClock.elapsedRealtime() + timeoutMs
-        while (SystemClock.elapsedRealtime() < deadline) {
-            if (RustSafBridge.getTreeChangeVersion(treeUriString) > previous) {
-                return true
-            }
-            SystemClock.sleep(100)
-        }
-        return false
     }
 }

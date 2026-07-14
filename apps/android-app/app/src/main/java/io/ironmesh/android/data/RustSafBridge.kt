@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Log
@@ -91,6 +92,18 @@ object RustSafBridge {
         synchronized(observerLock) {
             return treeObservers[treeUriString]?.version?.get() ?: 0L
         }
+    }
+
+    @JvmStatic
+    fun awaitTreeChangeVersion(
+        treeUriString: String,
+        previousVersion: Long,
+        timeoutMs: Long,
+    ): Boolean {
+        val observerState = synchronized(observerLock) {
+            treeObservers[treeUriString]
+        } ?: return false
+        return observerState.awaitVersionGreaterThan(previousVersion, timeoutMs)
     }
 
     @JvmStatic
@@ -682,6 +695,7 @@ object RustSafBridge {
     ) {
         val version = AtomicLong(0L)
         private val handler = Handler(Looper.getMainLooper())
+        private val versionMonitor = Object()
         private val observers = linkedMapOf<String, ContentObserver>()
 
         fun updateObservedChildrenUris(childrenUris: Set<Uri>) {
@@ -699,15 +713,29 @@ object RustSafBridge {
                 }
                 val observer = object : ContentObserver(handler) {
                     override fun onChange(selfChange: Boolean) {
-                        version.incrementAndGet()
+                        incrementVersion()
                     }
 
                     override fun onChange(selfChange: Boolean, uri: Uri?) {
-                        version.incrementAndGet()
+                        incrementVersion()
                     }
                 }
                 resolver.registerContentObserver(uri, false, observer)
                 observers[uriString] = observer
+            }
+        }
+
+        fun awaitVersionGreaterThan(previousVersion: Long, timeoutMs: Long): Boolean {
+            val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(0L)
+            synchronized(versionMonitor) {
+                while (version.get() <= previousVersion) {
+                    val remaining = deadline - SystemClock.elapsedRealtime()
+                    if (remaining <= 0L) {
+                        return version.get() > previousVersion
+                    }
+                    versionMonitor.wait(remaining)
+                }
+                return true
             }
         }
 
@@ -716,6 +744,13 @@ object RustSafBridge {
                 resolver.unregisterContentObserver(observer)
             }
             observers.clear()
+        }
+
+        private fun incrementVersion() {
+            synchronized(versionMonitor) {
+                version.incrementAndGet()
+                versionMonitor.notifyAll()
+            }
         }
     }
 }
