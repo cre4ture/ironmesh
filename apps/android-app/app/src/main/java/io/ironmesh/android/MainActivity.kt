@@ -199,6 +199,7 @@ class MainActivity : ComponentActivity() {
                                 MainSection.HOME -> HomeScreen(
                                     state = state,
                                     onRunSyncNow = vm::runFolderSyncNow,
+                                    onRetryConnection = vm::retryFolderSyncConnection,
                                     onOpenWebConsole = onOpenWebConsole,
                                     onOpenSync = { vm.selectSection(MainSection.SYNC) },
                                     onSelectSection = vm::selectSection,

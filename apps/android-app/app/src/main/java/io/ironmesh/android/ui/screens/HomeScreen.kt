@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
+import io.ironmesh.android.data.isConnected
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.components.EmptyStateCard
@@ -31,30 +32,21 @@ import io.ironmesh.android.ui.components.StatusHeroCard
 fun HomeScreen(
     state: MainUiState,
     onRunSyncNow: () -> Unit,
+    onRetryConnection: () -> Unit,
     onOpenWebConsole: () -> Unit,
     onOpenSync: () -> Unit,
     onSelectSection: (MainSection) -> Unit,
 ) {
     val status = state.folderSyncStatus
+    val connectionStatus = state.folderSyncConnectionStatus
+    val hasProfiles = state.syncProfiles.isNotEmpty()
     val heroTone = when {
         status.errorProfileCount > 0L -> HeroTone.Error
-        status.activeProfileCount == 0L -> HeroTone.Warning
+        !connectionStatus.isConnected() -> HeroTone.Warning
         else -> HeroTone.Good
     }
-    val heroTitle = when {
-        status.errorProfileCount > 0L -> status.serviceMessage.ifBlank { "Sync needs attention" }
-        status.activeProfileCount == 0L -> "Set up your first sync profile"
-        else -> "Sync is healthy"
-    }
-    val heroBody = buildString {
-        append("${status.activeProfileCount} active profile(s)")
-        status.lastSuccessUnixMs?.let { lastSuccess ->
-            append(" | Last success ${formatTimestamp(lastSuccess)}")
-        }
-        if (status.currentActivity.isNotBlank()) {
-            append(" | ${status.currentActivity}")
-        }
-    }
+    val heroTitle = folderSyncConnectionHeadline(connectionStatus, status, hasProfiles)
+    val heroBody = folderSyncConnectionSummary(connectionStatus, status)
 
     androidx.compose.foundation.layout.Column(
         modifier = Modifier
@@ -70,6 +62,11 @@ fun HomeScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = onRunSyncNow) {
                     Text(stringResource(R.string.sync_now))
+                }
+                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles)) {
+                    OutlinedButton(onClick = onRetryConnection) {
+                        Text(stringResource(R.string.retry_connection))
+                    }
                 }
                 OutlinedButton(onClick = onOpenWebConsole) {
                     Text(stringResource(R.string.open_web_console))

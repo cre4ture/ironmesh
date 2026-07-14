@@ -11,6 +11,7 @@ object IronmeshPreferences {
     private const val PREF_SYNC_CONFIGS = "folder_sync_configs"
     private const val PREF_DEVICE_AUTH_STATE = "device_auth_state"
     private const val PREF_GALLERY_VIEW_MODE = "gallery_view_mode"
+    private const val PREF_FOLDER_SYNC_CONNECTION_STATUS = "folder_sync_connection_status"
 
     private val moshi: Moshi by lazy {
         Moshi.Builder()
@@ -25,6 +26,10 @@ object IronmeshPreferences {
 
     private val deviceAuthStateAdapter by lazy {
         moshi.adapter(DeviceAuthState::class.java)
+    }
+
+    private val folderSyncConnectionStatusAdapter by lazy {
+        moshi.adapter(FolderSyncConnectionStatus::class.java)
     }
 
     private fun prefs(context: Context) =
@@ -64,5 +69,22 @@ object IronmeshPreferences {
 
     fun setGalleryViewMode(context: Context, mode: GalleryViewMode) {
         prefs(context).edit().putString(PREF_GALLERY_VIEW_MODE, mode.name).apply()
+    }
+
+    fun getFolderSyncConnectionStatus(context: Context): FolderSyncConnectionStatus {
+        val raw = prefs(context).getString(PREF_FOLDER_SYNC_CONNECTION_STATUS, null)
+            ?: return FolderSyncConnectionStatus()
+        return runCatching {
+            folderSyncConnectionStatusAdapter.fromJson(raw) ?: FolderSyncConnectionStatus()
+        }.getOrDefault(FolderSyncConnectionStatus())
+    }
+
+    fun setFolderSyncConnectionStatus(context: Context, status: FolderSyncConnectionStatus) {
+        val payload = folderSyncConnectionStatusAdapter.toJson(status)
+        prefs(context).edit().putString(PREF_FOLDER_SYNC_CONNECTION_STATUS, payload).apply()
+    }
+
+    fun clearFolderSyncConnectionStatus(context: Context) {
+        prefs(context).edit().remove(PREF_FOLDER_SYNC_CONNECTION_STATUS).apply()
     }
 }

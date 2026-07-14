@@ -38,6 +38,7 @@ import io.ironmesh.android.R
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
+import io.ironmesh.android.data.isConnected
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import io.ironmesh.android.ui.FolderSyncHistoryState
 import io.ironmesh.android.ui.MainUiState
@@ -56,6 +57,8 @@ fun SyncScreen(
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
+    val connectionStatus = state.folderSyncConnectionStatus
+    val hasProfiles = state.syncProfiles.isNotEmpty()
     var showCreateSheet by rememberSaveable { mutableStateOf(false) }
     var detailProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -63,7 +66,7 @@ fun SyncScreen(
     val editingProfile = state.syncProfiles.firstOrNull { it.id == editingProfileId }
     val heroTone = when {
         state.folderSyncStatus.errorProfileCount > 0L -> HeroTone.Error
-        state.folderSyncStatus.activeProfileCount == 0L -> HeroTone.Warning
+        !connectionStatus.isConnected() -> HeroTone.Warning
         else -> HeroTone.Good
     }
 
@@ -74,18 +77,51 @@ fun SyncScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         StatusHeroCard(
-            title = displayStatusToken(state.folderSyncStatus.serviceState),
-            subtitle = state.folderSyncStatus.serviceMessage,
+            title = folderSyncConnectionHeadline(connectionStatus, state.folderSyncStatus, hasProfiles),
+            subtitle = folderSyncConnectionSummary(connectionStatus, state.folderSyncStatus),
             tone = heroTone,
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = { showCreateSheet = true }) {
                     Text(stringResource(R.string.new_profile))
                 }
+                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles)) {
+                    OutlinedButton(onClick = vm::retryFolderSyncConnection) {
+                        Text(stringResource(R.string.retry_connection))
+                    }
+                }
                 OutlinedButton(onClick = vm::runFolderSyncNow) {
                     Text(stringResource(R.string.sync_now))
                 }
             }
+        }
+
+        SectionCard(title = stringResource(R.string.connection_status)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SyncBadge(displayStatusToken(connectionStatus.state))
+                if (connectionStatus.retryAttemptCount > 0L) {
+                    SyncBadge("Retry ${connectionStatus.retryAttemptCount}")
+                }
+                connectionStatus.nextRetryUnixMs?.let { retryAt ->
+                    SyncBadge("Next retry ${formatTimestamp(retryAt)}")
+                }
+            }
+            Text(
+                text = connectionStatus.message,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            state.folderSyncStatus.currentActivity
+                .takeIf { it.isNotBlank() && it != connectionStatus.message }
+                ?.let { activity ->
+                    Text(
+                        text = activity,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
         }
 
         SectionCard(title = stringResource(R.string.sync_overview)) {

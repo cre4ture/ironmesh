@@ -1,10 +1,19 @@
 package io.ironmesh.android.ui.screens
 
 import io.ironmesh.android.data.FolderSyncModificationRecord
+import io.ironmesh.android.data.FolderSyncConnectionStatus
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
+import io.ironmesh.android.data.FolderSyncServiceStatus
+import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_CONNECTED
+import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_CONNECTING
+import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_RECONNECTING
+import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_RETRY_SCHEDULED
+import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
+import io.ironmesh.android.data.FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_NETWORK
 import io.ironmesh.android.data.formatAllowedWifiSsidsInput
+import io.ironmesh.android.data.isRetryPending
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import java.time.Instant
 import java.time.ZoneId
@@ -24,6 +33,61 @@ fun displayStatusToken(value: String): String {
                 if (ch.isLowerCase()) ch.titlecase() else ch.toString()
             }
         }
+}
+
+fun folderSyncConnectionHeadline(
+    connectionStatus: FolderSyncConnectionStatus,
+    serviceStatus: FolderSyncServiceStatus,
+    hasProfiles: Boolean,
+): String {
+    if (!hasProfiles) {
+        return "Set up your first sync profile"
+    }
+    return when (connectionStatus.state) {
+        FOLDER_SYNC_CONNECTION_STATE_CONNECTING -> "Connecting sync service"
+        FOLDER_SYNC_CONNECTION_STATE_RECONNECTING -> "Reconnecting sync service"
+        FOLDER_SYNC_CONNECTION_STATE_RETRY_SCHEDULED -> "Retry scheduled"
+        FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_NETWORK -> "Waiting for network"
+        FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_ENROLLMENT -> "Enrollment needed"
+        FOLDER_SYNC_CONNECTION_STATE_CONNECTED -> "Sync is healthy"
+        else -> serviceStatus.serviceMessage.ifBlank { "Sync needs attention" }
+    }
+}
+
+fun folderSyncConnectionSummary(
+    connectionStatus: FolderSyncConnectionStatus,
+    serviceStatus: FolderSyncServiceStatus,
+): String {
+    val parts = mutableListOf<String>()
+    connectionStatus.message
+        .trim()
+        .takeIf { it.isNotBlank() }
+        ?.let(parts::add)
+    serviceStatus.currentActivity
+        .trim()
+        .takeIf { it.isNotBlank() && it != connectionStatus.message.trim() }
+        ?.let(parts::add)
+    if (connectionStatus.retryAttemptCount > 0L) {
+        parts += "Retry ${connectionStatus.retryAttemptCount}"
+    }
+    connectionStatus.nextRetryUnixMs?.let { retryAt ->
+        parts += "Next retry ${formatTimestamp(retryAt)}"
+    }
+    if (parts.isEmpty()) {
+        parts += serviceStatus.serviceMessage.ifBlank { "Continuous sync is stopped" }
+    }
+    return parts.joinToString(" | ")
+}
+
+fun shouldShowRetryConnectionAction(
+    connectionStatus: FolderSyncConnectionStatus,
+    hasProfiles: Boolean,
+): Boolean {
+    if (!hasProfiles) {
+        return false
+    }
+    return connectionStatus.state != FOLDER_SYNC_CONNECTION_STATE_CONNECTED ||
+        connectionStatus.isRetryPending()
 }
 
 fun profileInventorySummary(status: FolderSyncProfileStatus): String {
