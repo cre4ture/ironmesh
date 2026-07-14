@@ -668,6 +668,13 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun requestReconcile(reason: String) {
+        if (
+            reason == "manual retry" ||
+            reason.startsWith("retry attempt") ||
+            retryAttemptCount > 0L
+        ) {
+            lastDesiredSignature = null
+        }
         if (!reason.startsWith("retry attempt")) {
             retryJob?.cancel()
             retryJob = null
