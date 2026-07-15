@@ -10,6 +10,8 @@ import android.provider.DocumentsProvider
 import java.io.File
 import java.io.FileNotFoundException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class TestTreeDocumentsProvider : DocumentsProvider() {
@@ -53,6 +55,9 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
         if (!parentFile.isDirectory) {
             return result
         }
+        val relativeParentPath = relativePathForFile(parentFile)
+        blockChildQueryIfConfigured(relativeParentPath)
+        failChildQueryIfConfigured(relativeParentPath)
 
         parentFile.listFiles()
             ?.sortedBy { it.name }
@@ -105,11 +110,16 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
         val file = fileForDocumentId(documentId)
-        file.parentFile?.mkdirs()
-        if (!file.exists()) {
-            file.createNewFile()
-        }
-        if (!mode.contains('w')) {
+        maybeDeleteBeforeReadOpen(file, mode)
+        if (mode.contains('w')) {
+            file.parentFile?.mkdirs()
+            if (!file.exists()) {
+                file.createNewFile()
+            }
+        } else {
+            if (!file.exists()) {
+                throw FileNotFoundException("missing document $documentId")
+            }
             recordReadOpen(file)
         }
         val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.parseMode(mode))
@@ -197,7 +207,7 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
                 deleteRecursively(root)
             }
             root.mkdirs()
-            openCounts.clear()
+            resetFaults()
         }
 
         fun seedFile(context: Context, relativePath: String, bytes: ByteArray) {
@@ -210,8 +220,36 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
             openCounts.clear()
         }
 
+        fun resetFaults() {
+            openCounts.clear()
+            deleteBeforeReadOpen.clear()
+            childQueryFailures.clear()
+            childQueryBarriers.clear()
+        }
+
         fun openCountFor(relativePath: String): Int {
-            return openCounts[relativePath.replace('\\', '/')]?.get() ?: 0
+            return openCounts[normalizeRelativePath(relativePath)]?.get() ?: 0
+        }
+
+        fun deleteFileBeforeNextReadOpen(relativePath: String) {
+            deleteBeforeReadOpen += normalizeRelativePath(relativePath)
+        }
+
+        fun failNextChildQuery(relativePath: String, message: String = "simulated child query failure") {
+            childQueryFailures[normalizeRelativePath(relativePath)] = message
+        }
+
+        fun installChildQueryBarrier(relativePath: String) {
+            childQueryBarriers[normalizeRelativePath(relativePath)] = QueryBarrier()
+        }
+
+        fun awaitChildQueryBarrier(relativePath: String, timeoutMs: Long = 5_000): Boolean {
+            val barrier = childQueryBarriers[normalizeRelativePath(relativePath)] ?: return false
+            return barrier.arrived.await(timeoutMs, TimeUnit.MILLISECONDS)
+        }
+
+        fun releaseChildQueryBarrier(relativePath: String) {
+            childQueryBarriers.remove(normalizeRelativePath(relativePath))?.release?.countDown()
         }
 
         private fun rootDir(context: Context): File =
@@ -226,13 +264,55 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
         private var instanceContext: Context? = null
 
         private val openCounts = ConcurrentHashMap<String, AtomicInteger>()
+        private val deleteBeforeReadOpen = ConcurrentHashMap.newKeySet<String>()
+        private val childQueryFailures = ConcurrentHashMap<String, String>()
+        private val childQueryBarriers = ConcurrentHashMap<String, QueryBarrier>()
+
+        private data class QueryBarrier(
+            val arrived: CountDownLatch = CountDownLatch(1),
+            val release: CountDownLatch = CountDownLatch(1),
+        )
 
         private fun recordReadOpen(file: File) {
-            val relativePath = file.canonicalFile
-                .relativeTo(rootDir().canonicalFile)
-                .invariantSeparatorsPath
+            val relativePath = relativePathForFile(file)
             openCounts.computeIfAbsent(relativePath) { AtomicInteger() }.incrementAndGet()
         }
+
+        private fun maybeDeleteBeforeReadOpen(file: File, mode: String) {
+            if (mode.contains('w')) {
+                return
+            }
+            val relativePath = relativePathForFile(file)
+            if (deleteBeforeReadOpen.remove(relativePath)) {
+                deleteRecursively(file)
+            }
+        }
+
+        private fun blockChildQueryIfConfigured(relativePath: String) {
+            val barrier = childQueryBarriers[relativePath] ?: return
+            barrier.arrived.countDown()
+            check(barrier.release.await(10, TimeUnit.SECONDS)) {
+                "timed out waiting to release child query barrier for '$relativePath'"
+            }
+        }
+
+        private fun failChildQueryIfConfigured(relativePath: String) {
+            val message = childQueryFailures.remove(relativePath) ?: return
+            throw FileNotFoundException(message)
+        }
+
+        private fun relativePathForFile(file: File): String {
+            val canonicalFile = file.canonicalFile
+            val canonicalRoot = rootDir().canonicalFile
+            return if (canonicalFile == canonicalRoot) {
+                ""
+            } else {
+                canonicalFile.relativeTo(canonicalRoot).invariantSeparatorsPath
+            }
+        }
+
+        private fun normalizeRelativePath(relativePath: String): String =
+            relativePath.replace('\\', '/').trim('/')
 
         private fun deleteRecursively(file: File): Boolean {
             if (!file.exists()) {
