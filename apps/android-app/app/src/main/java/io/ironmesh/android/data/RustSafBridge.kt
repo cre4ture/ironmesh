@@ -629,7 +629,9 @@ object RustSafBridge {
             DocumentsContract.Document.COLUMN_SIZE,
             DocumentsContract.Document.COLUMN_LAST_MODIFIED,
         )
-        resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+        val cursor = resolver.query(childrenUri, projection, null, null, null)
+            ?: error("Failed to query SAF children for document '$parentDocumentId' at $childrenUri")
+        cursor.use { cursor ->
             val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
             val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
             val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
