@@ -5,6 +5,7 @@ Status: proposed follow-up design for review before implementation
 Related documents:
 
 - `docs/nat-traversal-rendezvous-strategy.md`
+- `docs/iroh-direct-quic-integration-plan.md`
 - `docs/security-architecture.md`
 - `docs/zero-touch-cluster-setup-strategy.md`
 
