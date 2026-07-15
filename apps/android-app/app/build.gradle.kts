@@ -70,6 +70,82 @@ private fun escapeBuildConfigString(value: String): String =
 private fun readTrimmedEnvironmentVariable(name: String): String? =
     System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
 
+private fun sanitizeBranchName(value: String?): String? =
+    value?.trim()?.replace(Regex("[^A-Za-z0-9._-]"), "-")?.replace(Regex("-+"), "-")?.trim('-')
+
+private fun readGitCommandOutput(
+    workspaceRoot: File,
+    vararg args: String,
+    allowFailure: Boolean = false,
+): String? {
+    val process = ProcessBuilder(*args)
+        .directory(workspaceRoot)
+        .redirectErrorStream(true)
+        .start()
+
+    val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+    val exitCode = process.waitFor()
+    if (exitCode != 0 || output.isBlank()) {
+        if (allowFailure) return null
+        throw GradleException("Failed to run git command `${args.joinToString(" ")}` in ${workspaceRoot.absolutePath}")
+    }
+
+    return output
+}
+
+private fun readExactGitTag(workspaceRoot: File): String? =
+    readGitCommandOutput(
+        workspaceRoot,
+        "git",
+        "describe",
+        "--exact-match",
+        "--tags",
+        "HEAD",
+        allowFailure = true,
+    )
+
+private fun readGitShortSha(workspaceRoot: File, length: Int = 8): String? =
+    readGitCommandOutput(workspaceRoot, "git", "rev-parse", "--short=$length", "HEAD")
+
+private fun readGitBranch(workspaceRoot: File): String? =
+    sanitizeBranchName(
+        readGitCommandOutput(
+            workspaceRoot,
+            "git",
+            "symbolic-ref",
+            "--short",
+            "-q",
+            "HEAD",
+            allowFailure = true,
+        ),
+    )
+
+private fun formatVersionMetadata(
+    workspaceRoot: File,
+    gitBuildRevision: String,
+    isReleaseBuild: Boolean,
+): String {
+    if (isReleaseBuild) {
+        val releaseTag = readExactGitTag(workspaceRoot) ?: gitBuildRevision
+        return "release:$releaseTag"
+    }
+
+    val branchFromEnv = sanitizeBranchName(
+        readTrimmedEnvironmentVariable("BUILD_BRANCH_SLUG")
+            ?: readTrimmedEnvironmentVariable("GITHUB_HEAD_REF")
+            ?: readTrimmedEnvironmentVariable("BUILD_BRANCH"),
+    )
+    val branch = branchFromEnv ?: readGitBranch(workspaceRoot) ?: "feature"
+    val shortSha = readTrimmedEnvironmentVariable("BUILD_COMMIT_SHORT")
+        ?: readGitShortSha(workspaceRoot)
+        ?: "unknown"
+    return "branch:$branch:$shortSha"
+}
+
+private fun isGitExactTagBuild(workspaceRoot: File): Boolean {
+    return readExactGitTag(workspaceRoot) != null
+}
+
 private fun parseVersionParts(value: String): List<Int> =
     value.split(".", "-", "_").map { it.toIntOrNull() ?: 0 }
 
@@ -83,6 +159,46 @@ private fun compareVersionParts(a: List<Int>, b: List<Int>): Int {
         }
     }
     return 0
+}
+
+private fun readWorkspacePackageVersionForMetadata(workspaceRoot: File): String {
+    val cargoToml = File(workspaceRoot, "Cargo.toml")
+    if (!cargoToml.isFile) {
+        throw GradleException("Workspace Cargo.toml not found at ${cargoToml.absolutePath}")
+    }
+
+    var inWorkspacePackage = false
+    var workspaceVersion: String? = null
+    cargoToml.useLines { lines ->
+        for (rawLine in lines) {
+            val line = rawLine.trim()
+            if (line.startsWith("[") && line.endsWith("]")) {
+                inWorkspacePackage = line == "[workspace.package]"
+                continue
+            }
+
+            if (!inWorkspacePackage) {
+                continue
+            }
+
+            val match = Regex("""^version\s*=\s*\"([^\"]+)\"$""").matchEntire(line)
+            if (match != null) {
+                workspaceVersion = match.groupValues[1]
+                break
+            }
+        }
+    }
+
+    return workspaceVersion
+        ?: throw GradleException("workspace.package.version not found in ${cargoToml.absolutePath}")
+}
+
+private fun readMajorVersionCode(version: String): Int {
+    val major = parseVersionParts(version).firstOrNull() ?: 0
+    if (major < 0) {
+        throw GradleException("Invalid major version in workspace version '$version'")
+    }
+    return major
 }
 
 private fun findLatestSideBySideNdk(sdkDir: File): File? {
@@ -112,7 +228,11 @@ private fun resolveInstalledNdk(
 val workspaceRoot = rootDir.parentFile?.parentFile ?: rootDir
 val workspaceVersion = readWorkspacePackageVersion(workspaceRoot)
 val gitBuildRevision = readGitDescribe(workspaceRoot)
-val longVersion = "${workspaceVersion}\nBuild revision: ${gitBuildRevision}"
+val isReleaseTagBuild = isGitExactTagBuild(workspaceRoot)
+val versionBuildMetadata = formatVersionMetadata(workspaceRoot, gitBuildRevision, isReleaseTagBuild)
+val majorVersionCode = readMajorVersionCode(workspaceVersion)
+val versionCode = majorVersionCode
+val longVersion = "${workspaceVersion}\nBuild metadata: ${versionBuildMetadata}\nBuild revision: ${gitBuildRevision}"
 val internalReleaseSigningEnvironment = mapOf(
     "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE"),
     "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD"),
@@ -159,8 +279,8 @@ android {
         applicationId = "io.ironmesh.android"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = workspaceVersion
+        versionCode = versionCode
+        versionName = "${workspaceVersion} (${versionBuildMetadata})"
         buildConfigField(
             "String",
             "GIT_BUILD_REVISION",
