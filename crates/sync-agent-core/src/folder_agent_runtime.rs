@@ -2316,9 +2316,22 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                 {
                     continue;
                 }
+                let content_hash = entry_hashes.get(file).map(|hash| hash.as_str());
+                if let Some(entry_state) = matching_local_entry_for_remote_file_change(
+                    backend,
+                    options,
+                    file,
+                    content_hash,
+                    state_store,
+                )? {
+                    tracing::info!(
+                        "remote-sync: skipped full snapshot download for {file}; local file already matches remote content"
+                    );
+                    suppressed_uploads.insert(file.clone(), entry_state);
+                    continue;
+                }
                 outcome.changed_path_count += 1;
                 outcome.downloaded_file_count += 1;
-                let content_hash = entry_hashes.get(file).map(|hash| hash.as_str());
                 let entry_state = download_remote_file_with_logging(
                     backend,
                     options,
@@ -3307,5 +3320,145 @@ mod tests {
             BTreeSet::from(["empty-lifecycle".to_string()])
         );
         assert!(remote_index.files.is_empty());
+    }
+
+    #[test]
+    fn apply_remote_snapshot_full_sync_skips_download_when_local_file_matches_remote_hash() {
+        let mut backend = RecordingBackend::default();
+        backend.local_entries.insert(
+            "docs/readme.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 9,
+                modified_unix_ms: 42,
+            },
+        );
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file(
+                "docs/readme.txt",
+                "v1",
+                "fingerprint-docs/readme.txt",
+            )],
+        };
+        let scope = PathScope::new(None);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+
+        let outcome = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("matching file should not be downloaded again");
+
+        assert_eq!(outcome.changed_path_count, 0);
+        assert_eq!(outcome.downloaded_file_count, 0);
+        assert!(backend.operations.is_empty());
+        assert_eq!(
+            suppressed_uploads.get("docs/readme.txt"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 9,
+                modified_unix_ms: 42,
+            })
+        );
+        assert_eq!(
+            remote_index.files,
+            BTreeSet::from(["docs/readme.txt".to_string()])
+        );
+    }
+
+    #[test]
+    fn apply_remote_snapshot_full_sync_is_idempotent_after_initial_download() {
+        let mut backend = RecordingBackend::default();
+        let options = test_runtime_options();
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry::file(
+                "docs/readme.txt",
+                "v1",
+                "fingerprint-docs/readme.txt",
+            )],
+        };
+        let scope = PathScope::new(None);
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut remote_index = RemoteTreeIndex::default();
+
+        let first = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("first full sync should download the remote file");
+
+        assert_eq!(first.changed_path_count, 1);
+        assert_eq!(first.downloaded_file_count, 1);
+        assert_eq!(
+            backend.operations,
+            vec![BackendOperation::DownloadFile {
+                local_path: "docs/readme.txt".to_string(),
+                remote_key: "docs/readme.txt".to_string(),
+            }]
+        );
+
+        backend.operations.clear();
+        suppressed_uploads.clear();
+
+        let second = apply_remote_snapshot(
+            &mut backend,
+            &options,
+            &client,
+            &snapshot,
+            None,
+            None,
+            None,
+            None,
+            &scope,
+            &mut suppressed_uploads,
+            &mut remote_index,
+            None,
+            None,
+        )
+        .expect("second full sync should reuse the already downloaded file");
+
+        assert_eq!(second.changed_path_count, 0);
+        assert_eq!(second.downloaded_file_count, 0);
+        assert!(backend.operations.is_empty());
+        assert_eq!(
+            suppressed_uploads.get("docs/readme.txt"),
+            Some(&LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 0,
+            })
+        );
+        assert_eq!(
+            remote_index.files,
+            BTreeSet::from(["docs/readme.txt".to_string()])
+        );
     }
 }

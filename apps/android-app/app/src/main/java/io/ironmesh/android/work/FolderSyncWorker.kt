@@ -20,14 +20,11 @@ class FolderSyncWorker(
 ) : CoroutineWorker(appContext, params) {
 
     private val repository = IronmeshRepository()
+    private val engine = FolderSyncWorkerEngine()
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         RustSafBridge.initialize(applicationContext)
         RustPreferencesBridge.initialize(applicationContext)
-        if (repository.hasContinuousFolderSyncActive()) {
-            Log.i(TAG, "continuous folder sync is active; skipping one-shot worker run")
-            return@withContext Result.success()
-        }
 
         val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
         val connectionInput = deviceAuth.preferredConnectionInput()
@@ -60,21 +57,26 @@ class FolderSyncWorker(
             return@withContext Result.success()
         }
 
-        val failures = mutableListOf<String>()
-
-        for (profile in eligibleProfiles) {
-            runCatching {
+        val outcome = engine.run(
+            continuousSyncActive = repository.hasContinuousFolderSyncActive(),
+            eligibleProfiles = eligibleProfiles,
+            syncProfile = { profile ->
                 syncProfile(connectionInput, serverCaPem, clientIdentityJson, profile)
-            }.onFailure { error ->
-                failures += "${profile.label}: ${error.message ?: "unknown"}"
+            },
+            onBusy = {
+                Log.i(TAG, "one-shot sync already active; retrying the worker later")
+            },
+            onSkipped = {
+                Log.i(TAG, "continuous folder sync is active; skipping one-shot worker run")
+            },
+            onProfileFailure = { profile, error ->
                 Log.e(TAG, "folder sync failed for profile=${profile.id}", error)
-            }
-        }
+            },
+        )
 
-        if (failures.isEmpty()) {
-            Result.success()
-        } else {
-            Result.retry()
+        when (outcome) {
+            FolderSyncWorkerOutcome.SUCCESS -> Result.success()
+            FolderSyncWorkerOutcome.RETRY -> Result.retry()
         }
     }
 
