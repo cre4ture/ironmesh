@@ -62,6 +62,7 @@ targets:
         product: AppleCore
       - package: AppleFileProviderPackage
         product: AppleFileProviderShared
+      - sdk: AVFoundation.framework
       - sdk: FileProvider.framework
       - sdk: UniformTypeIdentifiers.framework
     preBuildScripts:
@@ -106,6 +107,7 @@ targets:
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAppGroup.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
@@ -138,6 +140,7 @@ targets:
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAppGroup.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosfileprovider
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
@@ -186,6 +189,30 @@ targets:
         CODE_SIGNING_REQUIRED: NO
 
 schemes:
+  IronmeshIosApp:
+    build:
+      targets:
+        IronmeshIosApp: all
+        IronmeshIosFileProviderExtension: all
+    run:
+      config: Debug
+      executable: IronmeshIosApp
+    test:
+      gatherCoverageData: false
+      targets:
+        - IronmeshIosProjectTests
+  IronmeshMacApp:
+    build:
+      targets:
+        IronmeshMacApp: all
+        IronmeshMacFileProviderExtension: all
+    run:
+      config: Debug
+      executable: IronmeshMacApp
+    test:
+      gatherCoverageData: false
+      targets:
+        - IronmeshAppleProjectTests
   IronmeshAppleProject:
     build:
       targets:

@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use client_sdk::{
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ObjectHeadInfo, StoreIndexEntry,
-    VersionGraphSummary, normalize_server_base_url,
+    BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    ObjectHeadInfo, StoreIndexEntry, VersionGraphSummary, enroll_connection_input_blocking,
+    normalize_server_base_url,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,13 @@ pub struct ApplePutResponse {
     pub object_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_graph: Option<VersionGraphSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppleEnrollmentResponse {
+    #[serde(flatten)]
+    pub enrollment: BootstrapEnrollmentResult,
+    pub client_identity_json: String,
 }
 
 #[repr(C)]
@@ -355,6 +363,25 @@ fn move_path(
     app.move_path(from_path, to_path, overwrite)
 }
 
+pub fn enroll_connection_input_json(
+    connection_input: impl AsRef<str>,
+    device_id_override: Option<&str>,
+    device_label_override: Option<&str>,
+) -> Result<String> {
+    let enrollment = enroll_connection_input_blocking(
+        connection_input.as_ref(),
+        device_id_override,
+        device_label_override,
+    )?;
+    let client_identity_json = serde_json::to_string(&enrollment.client_identity_material()?)
+        .context("failed to serialize client identity JSON")?;
+    let response = AppleEnrollmentResponse {
+        enrollment,
+        client_identity_json,
+    };
+    serde_json::to_string(&response).context("failed to serialize Apple enrollment response")
+}
+
 pub fn web_gui_html() -> String {
     web_ui_backend::assets::app_html()
 }
@@ -484,6 +511,29 @@ pub extern "C" fn ironmesh_ios_facade_put_bytes(
         let key = required_c_string(key, "key")?;
         let payload = raw_bytes_to_vec(data, len)?;
         put_json(handle, key, payload)
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_enroll_with_bootstrap(
+    connection_input: *const c_char,
+    device_id_override: *const c_char,
+    device_label_override: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let connection_input = required_c_string(connection_input, "connection_input")?;
+        let device_id_override = optional_c_string(device_id_override)?;
+        let device_label_override = optional_c_string(device_label_override)?;
+        enroll_connection_input_json(
+            connection_input,
+            device_id_override.as_deref(),
+            device_label_override.as_deref(),
+        )
     })
 }
 
@@ -818,6 +868,10 @@ mod tests {
 
     fn test_router(state: TestServerState) -> Router {
         Router::new()
+            .route("/health", get(health))
+            .route("/api/v1/health", get(health))
+            .route("/auth/device/enroll", post(enroll_device))
+            .route("/api/v1/auth/device/enroll", post(enroll_device))
             .route("/api/v1/store/index", get(list_store_index))
             .route("/api/v1/store/delete", post(delete_by_query))
             .route("/api/v1/store/rename", post(rename_path))
@@ -828,8 +882,42 @@ mod tests {
                     .head(head_object)
                     .delete(delete_object),
             )
+            .route("/store/index", get(list_store_index))
+            .route("/store/delete", post(delete_by_query))
+            .route("/store/rename", post(rename_path))
+            .route(
+                "/store/{*key}",
+                put(put_object)
+                    .get(get_object)
+                    .head(head_object)
+                    .delete(delete_object),
+            )
             .route("/api/v1/versions/{*key}", get(list_versions))
+            .route("/versions/{*key}", get(list_versions))
             .with_state(state)
+    }
+
+    async fn health() -> impl IntoResponse {
+        StatusCode::OK
+    }
+
+    async fn enroll_device(
+        State(_state): State<TestServerState>,
+        Json(request): Json<client_sdk::DeviceEnrollmentRequest>,
+    ) -> impl IntoResponse {
+        let response = client_sdk::DeviceEnrollmentResponse {
+            cluster_id: request.cluster_id,
+            device_id: request
+                .device_id
+                .unwrap_or_else(|| common::ClusterId::now_v7().to_string()),
+            label: request.label,
+            public_key_pem: request.public_key_pem,
+            credential_pem: "credential-pem".to_string(),
+            rendezvous_client_identity_pem: Some("rendezvous-client-identity-pem".to_string()),
+            created_at_unix: Some(123),
+            expires_at_unix: Some(456),
+        };
+        (StatusCode::CREATED, Json(response))
     }
 
     async fn put_object(
@@ -1082,6 +1170,95 @@ mod tests {
             ironmesh_ios_bytes_free(value);
             bytes
         }
+    }
+
+    fn build_test_bootstrap(
+        server_base_url: String,
+        cluster_id: common::ClusterId,
+    ) -> ConnectionBootstrap {
+        ConnectionBootstrap {
+            version: 1,
+            cluster_id,
+            rendezvous_urls: Vec::new(),
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![client_sdk::BootstrapEndpoint {
+                url: server_base_url,
+                usage: Some(client_sdk::BootstrapEndpointUse::PublicApi),
+                node_id: None,
+            }],
+            relay_mode: client_sdk::RelayMode::Disabled,
+            trust_roots: client_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: Some("correct horse battery staple".to_string()),
+            device_label: Some("iphone".to_string()),
+            device_id: None,
+        }
+    }
+
+    #[test]
+    fn enroll_connection_input_returns_persisted_bootstrap_and_client_identity_json() {
+        let addr = spawn_test_server();
+        let cluster_id = common::ClusterId::now_v7();
+        let bootstrap = build_test_bootstrap(format!("http://{addr}"), cluster_id);
+        let bootstrap_json = bootstrap
+            .to_json_pretty()
+            .expect("bootstrap should serialize");
+        let bootstrap_json = CString::new(bootstrap_json).expect("bootstrap json should be valid");
+        let mut json_out = ptr::null_mut();
+        let mut error_out = ptr::null_mut();
+        let status = ironmesh_ios_facade_enroll_with_bootstrap(
+            bootstrap_json.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            &mut json_out,
+            &mut error_out,
+        );
+        assert_eq!(status, FFI_OK);
+        assert!(error_out.is_null());
+
+        let response: AppleEnrollmentResponse =
+            serde_json::from_str(&read_string(json_out)).expect("enrollment response should parse");
+        assert_eq!(response.enrollment.cluster_id, cluster_id);
+        assert!(response.enrollment.connection_bootstrap_json.is_some());
+        assert!(response.enrollment.server_base_url.is_some());
+        assert!(!response.client_identity_json.is_empty());
+
+        let client_identity = ClientIdentityMaterial::from_json_str(&response.client_identity_json)
+            .expect("client identity json should parse");
+        assert_eq!(client_identity.cluster_id, cluster_id);
+        assert_eq!(
+            client_identity.credential_pem,
+            Some(response.enrollment.credential_pem.clone())
+        );
+        assert_eq!(
+            client_identity.public_key_pem,
+            response.enrollment.public_key_pem
+        );
+
+        let persisted_bootstrap = ConnectionBootstrap::from_json_str(
+            response
+                .enrollment
+                .connection_bootstrap_json
+                .as_deref()
+                .expect("persisted bootstrap should be present"),
+        )
+        .expect("persisted bootstrap should parse");
+        assert_eq!(persisted_bootstrap.cluster_id, cluster_id);
+        assert_eq!(
+            persisted_bootstrap
+                .device_id
+                .as_ref()
+                .map(ToString::to_string),
+            Some(response.enrollment.device_id)
+        );
+        assert_eq!(
+            persisted_bootstrap.device_label.as_deref(),
+            response.enrollment.label.as_deref()
+        );
+        assert!(persisted_bootstrap.pairing_token.is_none());
     }
 
     #[test]

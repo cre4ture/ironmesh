@@ -18,3 +18,8 @@ ironmesh-client-*.json
 map/
 windows/thumbnail-provider/out/
 .claude
+apps/apple-file-provider/.build
+apps/apple-file-provider/.swiftpm/
+apps/apple-file-provider/RustArtifacts/
+apps/apple-file-provider/.DS_Store
+apps/apple-file-provider/**/xcuserdata/

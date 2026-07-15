@@ -21,6 +21,12 @@ void *ironmesh_ios_facade_create(const char *connection_input,
 
 void ironmesh_ios_facade_free(void *handle);
 
+/**
+ * # Safety
+ *
+ * `value` must be a pointer previously returned by this library via
+ * `CString::into_raw`, and it must not be freed more than once.
+ */
 void ironmesh_ios_string_free(char *value);
 
 void ironmesh_ios_bytes_free(struct IronmeshIosBytes value);
@@ -48,6 +54,12 @@ int ironmesh_ios_facade_put_bytes(void *handle,
                                   uintptr_t len,
                                   char **out_json,
                                   char **out_error);
+
+int ironmesh_ios_facade_enroll_with_bootstrap(const char *connection_input,
+                                              const char *device_id_override,
+                                              const char *device_label_override,
+                                              char **out_json,
+                                              char **out_error);
 
 int ironmesh_ios_facade_delete_path(void *handle, const char *key, char **out_error);
 
