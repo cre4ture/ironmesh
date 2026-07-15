@@ -107,6 +107,7 @@ public struct AppleBootstrapEnrollmentResult: Sendable, Codable, Equatable {
         case connectionBootstrapJSON = "connection_bootstrap_json"
         case deviceID = "device_id"
         case label
+        case deviceLabel = "device_label"
         case publicKeyPEM = "public_key_pem"
         case privateKeyPEM = "private_key_pem"
         case credentialPEM = "credential_pem"
@@ -116,6 +117,57 @@ public struct AppleBootstrapEnrollmentResult: Sendable, Codable, Equatable {
         case createdAtUnix = "created_at_unix"
         case expiresAtUnix = "expires_at_unix"
         case clientIdentityJSON = "client_identity_json"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let label = try container.decodeIfPresent(String.self, forKey: .label)
+        let deviceLabel = try container.decodeIfPresent(String.self, forKey: .deviceLabel)
+
+        self.init(
+            clusterID: try container.decode(String.self, forKey: .clusterID),
+            connectionBootstrapJSON: try container.decodeIfPresent(
+                String.self,
+                forKey: .connectionBootstrapJSON
+            ),
+            deviceID: try container.decode(String.self, forKey: .deviceID),
+            label: label ?? deviceLabel,
+            publicKeyPEM: try container.decode(String.self, forKey: .publicKeyPEM),
+            privateKeyPEM: try container.decode(String.self, forKey: .privateKeyPEM),
+            credentialPEM: try container.decode(String.self, forKey: .credentialPEM),
+            rendezvousClientIdentityPEM: try container.decodeIfPresent(
+                String.self,
+                forKey: .rendezvousClientIdentityPEM
+            ),
+            serverBaseURL: try container.decodeIfPresent(String.self, forKey: .serverBaseURL),
+            serverCAPem: try container.decodeIfPresent(String.self, forKey: .serverCAPem),
+            createdAtUnix: try container.decodeIfPresent(UInt64.self, forKey: .createdAtUnix),
+            expiresAtUnix: try container.decodeIfPresent(UInt64.self, forKey: .expiresAtUnix),
+            clientIdentityJSON: try container.decodeIfPresent(
+                String.self,
+                forKey: .clientIdentityJSON
+            )
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(clusterID, forKey: .clusterID)
+        try container.encodeIfPresent(connectionBootstrapJSON, forKey: .connectionBootstrapJSON)
+        try container.encode(deviceID, forKey: .deviceID)
+        try container.encodeIfPresent(label, forKey: .label)
+        try container.encode(publicKeyPEM, forKey: .publicKeyPEM)
+        try container.encode(privateKeyPEM, forKey: .privateKeyPEM)
+        try container.encode(credentialPEM, forKey: .credentialPEM)
+        try container.encodeIfPresent(
+            rendezvousClientIdentityPEM,
+            forKey: .rendezvousClientIdentityPEM
+        )
+        try container.encodeIfPresent(serverBaseURL, forKey: .serverBaseURL)
+        try container.encodeIfPresent(serverCAPem, forKey: .serverCAPem)
+        try container.encodeIfPresent(createdAtUnix, forKey: .createdAtUnix)
+        try container.encodeIfPresent(expiresAtUnix, forKey: .expiresAtUnix)
+        try container.encodeIfPresent(clientIdentityJSON, forKey: .clientIdentityJSON)
     }
 
     public var resolvedConnectionInput: String? {

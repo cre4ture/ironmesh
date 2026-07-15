@@ -99,4 +99,24 @@ final class AppleCoreTests: XCTestCase {
         XCTAssertEqual(decoded?["credential_pem"] as? String, "credential")
         XCTAssertEqual(decoded?["rendezvous_client_identity_pem"] as? String, "rendezvous")
     }
+
+    func testEnrollmentResultDecodesDeviceLabelAlias() throws {
+        let json = #"""
+        {
+          "cluster_id": "cluster-1",
+          "device_id": "device-1",
+          "device_label": "Phone",
+          "public_key_pem": "public-key",
+          "private_key_pem": "private-key",
+          "credential_pem": "credential"
+        }
+        """#
+
+        let enrollment = try JSONDecoder().decode(
+            AppleBootstrapEnrollmentResult.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(enrollment.label, "Phone")
+    }
 }
