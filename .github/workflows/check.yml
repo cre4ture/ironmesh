@@ -197,6 +197,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Android build metadata
+        run: |
+          REF_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          SAFE_BRANCH="$(printf '%s' "$REF_NAME" | sed -E 's#[^A-Za-z0-9._-]+#-#g' | sed -E 's/-+/-/g' | sed -E 's/^-+|-+$//g')"
+          SAFE_BRANCH="${SAFE_BRANCH:-main}"
+          BUILD_SUFFIX="${SAFE_BRANCH}-${GITHUB_SHA:0:8}"
+          echo "BUILD_BRANCH=${REF_NAME}" >> "$GITHUB_ENV"
+          echo "BUILD_BRANCH_SLUG=${SAFE_BRANCH}" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT_SHA=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT_SHORT=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+          echo "BUILD_NAME_SUFFIX=${BUILD_SUFFIX}" >> "$GITHUB_ENV"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -271,7 +285,7 @@ jobs:
       - name: Upload Android debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: android-debug-apk
+          name: android-debug-${{ env.BUILD_NAME_SUFFIX }}
           path: apps/android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
@@ -284,7 +298,7 @@ jobs:
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: android-release-performance-apk
+          name: android-release-performance-${{ env.BUILD_NAME_SUFFIX }}
           path: apps/android-app/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
@@ -299,7 +313,7 @@ jobs:
       - name: Upload Android server-node debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: android-server-node-debug-apk
+          name: android-server-node-debug-${{ env.BUILD_NAME_SUFFIX }}
           path: apps/android-server-node-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
@@ -312,7 +326,7 @@ jobs:
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: android-server-node-release-performance-apk
+          name: android-server-node-release-performance-${{ env.BUILD_NAME_SUFFIX }}
           path: apps/android-server-node-app/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
