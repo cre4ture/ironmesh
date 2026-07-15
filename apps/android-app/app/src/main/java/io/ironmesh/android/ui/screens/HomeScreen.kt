@@ -38,15 +38,15 @@ fun HomeScreen(
     onSelectSection: (MainSection) -> Unit,
 ) {
     val status = state.folderSyncStatus
-    val connectionStatus = state.folderSyncConnectionStatus
+    val connectionStatus = state.appConnectionStatus
     val hasProfiles = state.syncProfiles.isNotEmpty()
     val heroTone = when {
         status.errorProfileCount > 0L -> HeroTone.Error
         !connectionStatus.isConnected() -> HeroTone.Warning
         else -> HeroTone.Good
     }
-    val heroTitle = folderSyncConnectionHeadline(connectionStatus, status, hasProfiles)
-    val heroBody = folderSyncConnectionSummary(connectionStatus, status)
+    val heroTitle = appConnectionHeadline(connectionStatus)
+    val heroBody = appConnectionSummary(connectionStatus)
 
     androidx.compose.foundation.layout.Column(
         modifier = Modifier
@@ -85,7 +85,7 @@ fun HomeScreen(
             )
             MetricPill(
                 label = stringResource(R.string.metric_last_success),
-                value = status.lastSuccessUnixMs?.let(::formatTimestamp) ?: "None",
+                value = connectionStatus.lastSuccessfulConnectionUnixMs?.let(::formatTimestamp) ?: "None",
             )
             MetricPill(
                 label = stringResource(R.string.metric_uploads),

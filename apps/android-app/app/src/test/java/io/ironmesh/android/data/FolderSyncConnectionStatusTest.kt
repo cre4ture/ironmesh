@@ -5,24 +5,24 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class FolderSyncConnectionStatusTest {
+class AppConnectionStatusTest {
     @Test
     fun nextRetryDelayStartsAtTwoSeconds() {
-        assertEquals(2_000L, nextFolderSyncRetryDelayMs(1))
+        assertEquals(2_000L, nextAppConnectionRetryDelayMs(1))
     }
 
     @Test
     fun nextRetryDelayCapsAtSixtySeconds() {
-        assertEquals(60_000L, nextFolderSyncRetryDelayMs(8))
+        assertEquals(60_000L, nextAppConnectionRetryDelayMs(8))
     }
 
     @Test
     fun retryPendingReflectsScheduledRetryState() {
-        val pending = FolderSyncConnectionStatus(
-            state = FOLDER_SYNC_CONNECTION_STATE_RETRY_SCHEDULED,
+        val pending = AppConnectionStatus(
+            state = APP_CONNECTION_STATE_RETRY_SCHEDULED,
             nextRetryUnixMs = 1234L,
         )
-        val idle = FolderSyncConnectionStatus()
+        val idle = AppConnectionStatus()
 
         assertTrue(pending.isRetryPending())
         assertFalse(idle.isRetryPending())

@@ -26,6 +26,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
@@ -120,6 +121,12 @@ pub struct ClientConnectionDiagnostics {
     pub endpoints: Vec<ClientEndpointDiagnostics>,
     #[serde(default)]
     pub last_success_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientConnectionDiagnosticsEvent {
+    pub connection_name: Option<String>,
+    pub diagnostics: ClientConnectionDiagnostics,
 }
 
 #[derive(Clone)]
@@ -343,6 +350,23 @@ impl ClientEndpoint {
             state: self.state.clone(),
         }
     }
+}
+
+fn connection_diagnostics_observer(
+) -> &'static RwLock<Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>> {
+    static OBSERVER: OnceLock<
+        RwLock<Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>>,
+    > = OnceLock::new();
+    OBSERVER.get_or_init(|| RwLock::new(None))
+}
+
+pub fn set_connection_diagnostics_observer(
+    observer: Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>,
+) {
+    let mut slot = connection_diagnostics_observer()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = observer;
 }
 
 impl UploadSessionAffinity {
@@ -1861,6 +1885,20 @@ impl IronMeshClient {
         self.transport_router.diagnostics_snapshot()
     }
 
+    fn publish_connection_diagnostics(&self) {
+        let observer = connection_diagnostics_observer()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        observer(ClientConnectionDiagnosticsEvent {
+            connection_name: self.connection_name.clone(),
+            diagnostics: self.connection_diagnostics(),
+        });
+    }
+
     pub fn uses_relay_transport(&self) -> bool {
         self.transport_router
             .current_endpoint()
@@ -2052,6 +2090,7 @@ impl IronMeshClient {
                             response.status, endpoint.descriptor.locator
                         ),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(
                         "retryable transport response {} from {}",
                         response.status,
@@ -2070,6 +2109,7 @@ impl IronMeshClient {
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         response.body.len(),
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index: index,
                         response,
@@ -2086,6 +2126,7 @@ impl IronMeshClient {
                         },
                         &error.to_string(),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }
@@ -2177,6 +2218,7 @@ impl IronMeshClient {
                             candidate_response.status, endpoint.descriptor.locator
                         ),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(
                         "retryable transport response {} from {}",
                         candidate_response.status,
@@ -2195,6 +2237,7 @@ impl IronMeshClient {
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         candidate_response.body.len(),
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index,
                         response: candidate_response,
@@ -2211,6 +2254,7 @@ impl IronMeshClient {
                         },
                         &error.to_string(),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }
@@ -2788,6 +2832,7 @@ impl IronMeshClient {
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         bytes_hint,
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(response);
                 }
                 Err(error) => {
@@ -2801,6 +2846,7 @@ impl IronMeshClient {
                         },
                         &error.to_string(),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }
@@ -2881,6 +2927,7 @@ impl IronMeshClient {
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         response.body.len(),
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(RelativePathResponse {
                         status: response.status,
                         headers: response.headers,
@@ -2898,6 +2945,7 @@ impl IronMeshClient {
                         },
                         &error.to_string(),
                     );
+                    self.publish_connection_diagnostics();
                     return Err(error);
                 }
             }
@@ -3296,6 +3344,7 @@ impl IronMeshClient {
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         candidate_response.bytes_written as usize,
                     );
+                    self.publish_connection_diagnostics();
                     response = Some(candidate_response);
                     break;
                 }
@@ -3310,6 +3359,7 @@ impl IronMeshClient {
                         },
                         &error.to_string(),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }

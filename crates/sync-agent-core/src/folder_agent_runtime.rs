@@ -38,6 +38,7 @@ pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> R
 pub struct FolderAgentRuntimeOptions {
     pub root_dir: PathBuf,
     pub state_root_dir: Option<PathBuf>,
+    pub connection_name: Option<String>,
     pub local_tree_uri: Option<String>,
     pub server_base_url: Option<String>,
     pub client_bootstrap_json: Option<String>,
@@ -1645,15 +1646,22 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClie
             persist_client_identity(identity)
                 .context("failed to persist renewed folder sync client identity")?;
         }
-        return Ok(client);
+        return Ok(match options.connection_name.as_deref() {
+            Some(connection_name) => client.with_connection_name(connection_name),
+            None => client,
+        });
     }
 
-    build_configured_client(
+    let client = build_configured_client(
         options.server_base_url.as_deref(),
         options.client_bootstrap_json.as_deref(),
         options.server_ca_pem.as_deref(),
         options.client_identity_json.as_deref(),
-    )
+    )?;
+    Ok(match options.connection_name.as_deref() {
+        Some(connection_name) => client.with_connection_name(connection_name),
+        None => client,
+    })
 }
 
 fn install_ctrlc_handler(
@@ -3337,6 +3345,7 @@ mod tests {
         FolderAgentRuntimeOptions {
             root_dir: PathBuf::from("/tmp"),
             state_root_dir: None,
+            connection_name: None,
             local_tree_uri: None,
             server_base_url: None,
             client_bootstrap_json: None,

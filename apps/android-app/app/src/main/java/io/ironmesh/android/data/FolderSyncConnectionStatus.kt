@@ -1,30 +1,31 @@
 package io.ironmesh.android.data
 
-const val FOLDER_SYNC_CONNECTION_STATE_STOPPED = "stopped"
-const val FOLDER_SYNC_CONNECTION_STATE_CONNECTING = "connecting"
-const val FOLDER_SYNC_CONNECTION_STATE_CONNECTED = "connected"
-const val FOLDER_SYNC_CONNECTION_STATE_RECONNECTING = "reconnecting"
-const val FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_NETWORK = "waiting-for-network"
-const val FOLDER_SYNC_CONNECTION_STATE_WAITING_FOR_ENROLLMENT = "waiting-for-enrollment"
-const val FOLDER_SYNC_CONNECTION_STATE_RETRY_SCHEDULED = "retry-scheduled"
-const val FOLDER_SYNC_CONNECTION_STATE_ERROR = "error"
+const val APP_CONNECTION_STATE_STOPPED = "stopped"
+const val APP_CONNECTION_STATE_CONNECTING = "connecting"
+const val APP_CONNECTION_STATE_CONNECTED = "connected"
+const val APP_CONNECTION_STATE_RECONNECTING = "reconnecting"
+const val APP_CONNECTION_STATE_WAITING_FOR_NETWORK = "waiting-for-network"
+const val APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT = "waiting-for-enrollment"
+const val APP_CONNECTION_STATE_RETRY_SCHEDULED = "retry-scheduled"
+const val APP_CONNECTION_STATE_ERROR = "error"
 
 private const val RETRY_BASE_DELAY_MS = 2_000L
 private const val RETRY_MAX_DELAY_MS = 60_000L
 
-data class FolderSyncConnectionStatus(
-    val state: String = FOLDER_SYNC_CONNECTION_STATE_STOPPED,
-    val message: String = "Continuous sync is stopped",
+// App-wide connection status shared by sync, gallery, and other foreground requests.
+data class AppConnectionStatus(
+    val state: String = APP_CONNECTION_STATE_STOPPED,
+    val message: String = "No app connection activity yet",
     val updatedUnixMs: Long = 0L,
     val retryAttemptCount: Long = 0L,
     val nextRetryUnixMs: Long? = null,
     val lastSuccessfulConnectionUnixMs: Long? = null,
     val lastSuccessfulConnectionUrl: String? = null,
-    val failedAttempts: List<FolderSyncFailedConnectionAttempt> = emptyList(),
+    val failedAttempts: List<AppFailedConnectionAttempt> = emptyList(),
 )
 
-data class FolderSyncFailedConnectionAttempt(
-    val profileLabel: String = "",
+data class AppFailedConnectionAttempt(
+    val sourceLabel: String? = null,
     val endpointLocator: String = "",
     val pathKind: String = "",
     val startedUnixMs: Long = 0L,
@@ -35,7 +36,14 @@ data class FolderSyncFailedConnectionAttempt(
     val error: String? = null,
 )
 
-fun nextFolderSyncRetryDelayMs(attempt: Int): Long {
+data class AppConnectionDiagnosticsUpdate(
+    val sourceLabel: String? = null,
+    val lastSuccessfulConnectionUnixMs: Long? = null,
+    val lastSuccessfulConnectionUrl: String? = null,
+    val failedAttempts: List<AppFailedConnectionAttempt> = emptyList(),
+)
+
+fun nextAppConnectionRetryDelayMs(attempt: Int): Long {
     if (attempt <= 1) {
         return RETRY_BASE_DELAY_MS
     }
@@ -44,10 +52,10 @@ fun nextFolderSyncRetryDelayMs(attempt: Int): Long {
     return (RETRY_BASE_DELAY_MS * multiplier).coerceAtMost(RETRY_MAX_DELAY_MS)
 }
 
-fun FolderSyncConnectionStatus.isRetryPending(): Boolean {
-    return state == FOLDER_SYNC_CONNECTION_STATE_RETRY_SCHEDULED || nextRetryUnixMs != null
+fun AppConnectionStatus.isRetryPending(): Boolean {
+    return state == APP_CONNECTION_STATE_RETRY_SCHEDULED || nextRetryUnixMs != null
 }
 
-fun FolderSyncConnectionStatus.isConnected(): Boolean {
-    return state == FOLDER_SYNC_CONNECTION_STATE_CONNECTED
+fun AppConnectionStatus.isConnected(): Boolean {
+    return state == APP_CONNECTION_STATE_CONNECTED
 }

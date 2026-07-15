@@ -57,7 +57,7 @@ fun SyncScreen(
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
-    val connectionStatus = state.folderSyncConnectionStatus
+    val connectionStatus = state.appConnectionStatus
     val hasProfiles = state.syncProfiles.isNotEmpty()
     var showCreateSheet by rememberSaveable { mutableStateOf(false) }
     var detailProfileId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -77,8 +77,8 @@ fun SyncScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         StatusHeroCard(
-            title = folderSyncConnectionHeadline(connectionStatus, state.folderSyncStatus, hasProfiles),
-            subtitle = folderSyncConnectionSummary(connectionStatus, state.folderSyncStatus),
+            title = syncOverviewHeadline(state.folderSyncStatus, hasProfiles),
+            subtitle = syncOverviewSummary(state.folderSyncStatus),
             tone = heroTone,
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -96,7 +96,7 @@ fun SyncScreen(
             }
         }
 
-        SectionCard(title = stringResource(R.string.connection_status)) {
+        SectionCard(title = "App connection") {
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -125,15 +125,6 @@ fun SyncScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-            state.folderSyncStatus.currentActivity
-                .takeIf { it.isNotBlank() && it != connectionStatus.message }
-                ?.let { activity ->
-                    Text(
-                        text = activity,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
             if (connectionStatus.failedAttempts.isNotEmpty()) {
                 Text(
                     text = "Recent failed attempts",
@@ -151,7 +142,7 @@ fun SyncScreen(
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
                             Text(
-                                text = folderSyncFailedAttemptSummary(attempt),
+                                text = appFailedAttemptSummary(attempt),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
