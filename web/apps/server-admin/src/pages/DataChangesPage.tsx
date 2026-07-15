@@ -6,7 +6,7 @@ import {
   type DataChangeEventsCursor,
   type DataChangeEvent
 } from "@ironmesh/api";
-import { StatCard } from "@ironmesh/ui";
+import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
 import {
   Alert,
   Badge,
@@ -315,7 +315,7 @@ function actionBadgeColor(action: DataChangeAction): string {
     case "upload":
       return "blue";
     case "rename":
-      return "teal";
+      return ironmeshPrimaryColor;
     case "copy":
       return "cyan";
     case "delete":

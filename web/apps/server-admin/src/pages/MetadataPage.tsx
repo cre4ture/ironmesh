@@ -9,6 +9,7 @@ import {
   type StorageStatsSample
 } from "@ironmesh/api";
 import {
+  ironmeshPrimaryColor,
   StatCard,
   ZoomableTimeSeriesChart,
   formatTimeSeriesChartTimestamp
@@ -92,7 +93,7 @@ const METADATA_CHART_SERIES: Array<{
     key: "mediaCacheBytes",
     label: "Media cache",
     color: "#2dd4bf",
-    badgeColor: "teal"
+    badgeColor: ironmeshPrimaryColor
   }
 ];
 
@@ -288,7 +289,7 @@ export function MetadataPage() {
       ) : null}
 
       {currentSample ? (
-        <Alert color="teal" variant="light" title="Filesystem-level metadata footprint">
+        <Alert color={ironmeshPrimaryColor} variant="light" title="Filesystem-level metadata footprint">
           This node currently uses {formatBytes(metadataTotalBytes)} for metadata across the
           SQLite state file, manifest directory, and media cache. The largest segment right now is{" "}
           <Code>{dominantMetadataComponent?.label ?? "unknown"}</Code>.

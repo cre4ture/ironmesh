@@ -6,7 +6,7 @@ import {
   type ClientBootstrapClaimView,
   type ClientCredentialView
 } from "@ironmesh/api";
-import { StatCard } from "@ironmesh/ui";
+import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
 import {
   Alert,
   Badge,
@@ -31,7 +31,7 @@ function bootstrapClaimStatusColor(status: ClientBootstrapClaimStatus): string {
     case "pending":
       return "blue";
     case "redeemed":
-      return "teal";
+      return ironmeshPrimaryColor;
     case "expired":
       return "gray";
   }
@@ -195,7 +195,7 @@ export function ClientCredentialsPage() {
                       <Table.Td>{credential.public_key_fingerprint || "-"}</Table.Td>
                       <Table.Td>{formatUnixTs(credential.created_at_unix)}</Table.Td>
                       <Table.Td>
-                        <Badge color={credential.revoked_at_unix ? "red" : "teal"} variant="light">
+                        <Badge color={credential.revoked_at_unix ? "red" : ironmeshPrimaryColor} variant="light">
                           {credential.revoked_at_unix ? "revoked" : "active"}
                         </Badge>
                       </Table.Td>

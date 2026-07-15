@@ -65,7 +65,7 @@ fun StatusHeroCard(
     actions: @Composable (() -> Unit)? = null,
 ) {
     val colors = when (tone) {
-        HeroTone.Good -> Color(0xFF0D6B5C) to Color.White
+        HeroTone.Good -> MaterialTheme.colorScheme.primary to MaterialTheme.colorScheme.onPrimary
         HeroTone.Warning -> Color(0xFF9A5A00) to Color.White
         HeroTone.Error -> Color(0xFF8C2F24) to Color.White
         HeroTone.Neutral -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurface

@@ -9,6 +9,7 @@ import {
   Text
 } from "@mantine/core";
 import { useCallback, useEffect, useRef, useState, type ReactNode, type UIEvent } from "react";
+import { ironmeshPrimaryColor } from "../../theme/ironmesh-theme";
 
 type LogEntry = {
   captured_at_unix: number;
@@ -148,7 +149,7 @@ export function LogsSurface({
           <Group justify="space-between" align="flex-start">
             <Text fw={700}>{cardTitle}</Text>
             <Group gap="xs">
-              <Badge variant="light" color={logsAutoFollow ? "teal" : "gray"}>
+              <Badge variant="light" color={logsAutoFollow ? ironmeshPrimaryColor : "gray"}>
                 {logsAutoFollow ? "live tail" : "scroll paused"}
               </Badge>
               <Badge variant="light" color={refreshing ? "blue" : "gray"}>
