@@ -161,38 +161,6 @@ private fun compareVersionParts(a: List<Int>, b: List<Int>): Int {
     return 0
 }
 
-private fun readWorkspacePackageVersionForMetadata(workspaceRoot: File): String {
-    val cargoToml = File(workspaceRoot, "Cargo.toml")
-    if (!cargoToml.isFile) {
-        throw GradleException("Workspace Cargo.toml not found at ${cargoToml.absolutePath}")
-    }
-
-    var inWorkspacePackage = false
-    var workspaceVersion: String? = null
-    cargoToml.useLines { lines ->
-        for (rawLine in lines) {
-            val line = rawLine.trim()
-            if (line.startsWith("[") && line.endsWith("]")) {
-                inWorkspacePackage = line == "[workspace.package]"
-                continue
-            }
-
-            if (!inWorkspacePackage) {
-                continue
-            }
-
-            val match = Regex("""^version\s*=\s*\"([^\"]+)\"$""").matchEntire(line)
-            if (match != null) {
-                workspaceVersion = match.groupValues[1]
-                break
-            }
-        }
-    }
-
-    return workspaceVersion
-        ?: throw GradleException("workspace.package.version not found in ${cargoToml.absolutePath}")
-}
-
 private fun readMajorVersionCode(version: String): Int {
     val major = parseVersionParts(version).firstOrNull() ?: 0
     if (major < 0) {
@@ -231,7 +199,7 @@ val gitBuildRevision = readGitDescribe(workspaceRoot)
 val isReleaseTagBuild = isGitExactTagBuild(workspaceRoot)
 val versionBuildMetadata = formatVersionMetadata(workspaceRoot, gitBuildRevision, isReleaseTagBuild)
 val majorVersionCode = readMajorVersionCode(workspaceVersion)
-val versionCode = majorVersionCode
+val androidVersionCode = majorVersionCode
 val longVersion = "${workspaceVersion}\nBuild metadata: ${versionBuildMetadata}\nBuild revision: ${gitBuildRevision}"
 val internalReleaseSigningEnvironment = mapOf(
     "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE"),
@@ -279,7 +247,7 @@ android {
         applicationId = "io.ironmesh.android"
         minSdk = 26
         targetSdk = 34
-        versionCode = versionCode
+        versionCode = androidVersionCode
         versionName = "${workspaceVersion} (${versionBuildMetadata})"
         buildConfigField(
             "String",
