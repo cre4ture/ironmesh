@@ -86,17 +86,18 @@ mod tests {
     }
 }
 use client_sdk::{
-    BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    IronMeshClient, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
-    StoreIndexView, build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    enroll_connection_input_blocking,
+    BootstrapEnrollmentResult, ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent,
+    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, StoreIndexMediaFilter,
+    StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, enroll_connection_input_blocking,
+    set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jstring};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +112,8 @@ use sync_agent_core::{
 use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
+
+const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -134,7 +137,8 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
 fn init_android_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
-        let env_filter = common::logging::env_filter_from_default_env("info");
+        let env_filter =
+            common::logging::env_filter_from_default_env("info,ironmesh_android_connection=debug");
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(common::logging::compact_fmt_layer())
@@ -168,6 +172,29 @@ struct AndroidPreferencesBridgeState {
     class: GlobalRef,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AndroidAppConnectionDiagnosticsUpdate {
+    source_label: Option<String>,
+    last_successful_connection_unix_ms: Option<u64>,
+    last_successful_connection_url: Option<String>,
+    failed_attempts: Vec<AndroidAppFailedConnectionAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AndroidAppFailedConnectionAttempt {
+    source_label: Option<String>,
+    endpoint_locator: String,
+    path_kind: String,
+    started_unix_ms: u64,
+    finished_unix_ms: Option<u64>,
+    method: String,
+    url: String,
+    timeout_ms: Option<u64>,
+    error: Option<String>,
+}
+
 fn android_preferences_bridge_state() -> &'static OnceLock<AndroidPreferencesBridgeState> {
     static STATE: OnceLock<AndroidPreferencesBridgeState> = OnceLock::new();
     &STATE
@@ -175,6 +202,7 @@ fn android_preferences_bridge_state() -> &'static OnceLock<AndroidPreferencesBri
 
 fn initialize_android_preferences_bridge(env: &mut JNIEnv) -> Result<()> {
     if android_preferences_bridge_state().get().is_some() {
+        install_android_connection_diagnostics_bridge();
         return Ok(());
     }
 
@@ -189,6 +217,7 @@ fn initialize_android_preferences_bridge(env: &mut JNIEnv) -> Result<()> {
         .context("failed to globalize RustPreferencesBridge class")?;
     let _ =
         android_preferences_bridge_state().set(AndroidPreferencesBridgeState { vm, class: global });
+    install_android_connection_diagnostics_bridge();
     Ok(())
 }
 
@@ -249,6 +278,218 @@ fn persist_android_client_identity(identity: &ClientIdentityMaterial) -> Result<
         .context("failed to persist updated client identity to Android preferences")?;
         Ok(())
     })
+}
+
+fn persist_android_connection_diagnostics(
+    update: &AndroidAppConnectionDiagnosticsUpdate,
+) -> Result<()> {
+    if android_preferences_bridge_state().get().is_none() {
+        return Ok(());
+    }
+
+    let json = serde_json::to_string(update)
+        .context("failed to serialize android connection diagnostics update")?;
+    with_android_preferences_env(|env, class| {
+        let diagnostics_json = env
+            .new_string(&json)
+            .context("failed to allocate connection diagnostics JSON string")?;
+        env.call_static_method(
+            &class,
+            "updateAppConnectionDiagnosticsJson",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(diagnostics_json.as_ref())],
+        )
+        .context("failed to persist updated Android connection diagnostics")?;
+        Ok(())
+    })
+}
+
+fn install_android_connection_diagnostics_bridge() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        set_connection_diagnostics_observer(Some(Arc::new(|event| {
+            let update = summarize_android_connection_diagnostics(event);
+            log_android_connection_diagnostics(&update);
+            if update.last_successful_connection_unix_ms.is_none()
+                && update.failed_attempts.is_empty()
+            {
+                return;
+            }
+            if let Err(error) = persist_android_connection_diagnostics(&update) {
+                tracing::warn!(
+                    target: ANDROID_CONNECTION_LOG_TARGET,
+                    error = %error,
+                    "failed to persist app connection diagnostics"
+                );
+            }
+        })));
+    });
+}
+
+fn summarize_android_connection_diagnostics(
+    event: ClientConnectionDiagnosticsEvent,
+) -> AndroidAppConnectionDiagnosticsUpdate {
+    let source_label = event
+        .connection_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut last_successful_connection_unix_ms = None;
+    let mut last_successful_connection_url = None;
+    let mut failed_attempts = Vec::new();
+
+    for endpoint in event.diagnostics.endpoints {
+        if let Some(last_success) = endpoint.last_success_unix_ms
+            && last_successful_connection_unix_ms.is_none_or(|current| last_success >= current)
+        {
+            last_successful_connection_unix_ms = Some(last_success);
+            last_successful_connection_url = endpoint
+                .recent_attempts
+                .iter()
+                .rev()
+                .find(|attempt| attempt.outcome == "success")
+                .map(|attempt| attempt.url.clone())
+                .or_else(|| Some(endpoint.locator.clone()));
+        }
+
+        failed_attempts.extend(
+            endpoint
+                .recent_attempts
+                .into_iter()
+                .filter(|attempt| attempt.outcome == "failure")
+                .map(|attempt| AndroidAppFailedConnectionAttempt {
+                    source_label: source_label.clone(),
+                    endpoint_locator: endpoint.locator.clone(),
+                    path_kind: endpoint.path_kind.clone(),
+                    started_unix_ms: attempt.started_unix_ms,
+                    finished_unix_ms: attempt.finished_unix_ms,
+                    method: attempt.method,
+                    url: attempt.url,
+                    timeout_ms: attempt.timeout_ms,
+                    error: attempt.error.map(|error| summarize_android_error(&error)),
+                }),
+        );
+    }
+
+    failed_attempts.sort_by(|left, right| {
+        let left_ts = left.finished_unix_ms.unwrap_or(left.started_unix_ms);
+        let right_ts = right.finished_unix_ms.unwrap_or(right.started_unix_ms);
+        right_ts.cmp(&left_ts)
+    });
+    failed_attempts.truncate(8);
+
+    AndroidAppConnectionDiagnosticsUpdate {
+        source_label,
+        last_successful_connection_unix_ms,
+        last_successful_connection_url,
+        failed_attempts,
+    }
+}
+
+fn summarize_android_error(error: &str) -> String {
+    let normalized = error
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(error);
+    let trimmed = normalized.trim();
+    if trimmed.len() <= 180 {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..177])
+    }
+}
+
+fn android_connection_log_state() -> &'static Mutex<HashMap<String, String>> {
+    static STATE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn log_android_connection_diagnostics(update: &AndroidAppConnectionDiagnosticsUpdate) {
+    let source_label = update
+        .source_label
+        .as_deref()
+        .unwrap_or("android client")
+        .to_string();
+    let last_failure = update.failed_attempts.first();
+    let last_failure_unix_ms =
+        last_failure.map(|attempt| attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms));
+    let latest_event_is_failure = match (
+        last_failure_unix_ms,
+        update.last_successful_connection_unix_ms,
+    ) {
+        (Some(failure_unix_ms), Some(success_unix_ms)) => failure_unix_ms > success_unix_ms,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let current_key = if latest_event_is_failure {
+        let Some(attempt) = last_failure else {
+            return;
+        };
+        format!(
+            "failure|{}|{}|{}|{}|{}|{}",
+            attempt.finished_unix_ms.unwrap_or(attempt.started_unix_ms),
+            attempt.method,
+            attempt.url,
+            attempt.timeout_ms.unwrap_or_default(),
+            attempt.endpoint_locator,
+            attempt.error.as_deref().unwrap_or_default()
+        )
+    } else if let Some(last_success_unix_ms) = update.last_successful_connection_unix_ms {
+        format!(
+            "success|{}|{}",
+            last_success_unix_ms,
+            update
+                .last_successful_connection_url
+                .as_deref()
+                .unwrap_or_default()
+        )
+    } else {
+        return;
+    };
+
+    let mut state = android_connection_log_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state
+        .get(source_label.as_str())
+        .is_some_and(|previous| previous == &current_key)
+    {
+        return;
+    }
+    state.insert(source_label.clone(), current_key);
+    drop(state);
+
+    if latest_event_is_failure {
+        let Some(attempt) = last_failure else {
+            return;
+        };
+        tracing::debug!(
+            target: ANDROID_CONNECTION_LOG_TARGET,
+            source_label = %source_label,
+            outcome = "failure",
+            endpoint_locator = %attempt.endpoint_locator,
+            path_kind = %attempt.path_kind,
+            method = %attempt.method,
+            url = %attempt.url,
+            timeout_ms = ?attempt.timeout_ms,
+            finished_unix_ms = ?attempt.finished_unix_ms,
+            last_successful_connection_unix_ms = ?update.last_successful_connection_unix_ms,
+            last_successful_connection_url = ?update.last_successful_connection_url,
+            failed_attempt_count = update.failed_attempts.len(),
+            error = ?attempt.error,
+            "app connection attempt"
+        );
+        return;
+    }
+
+    tracing::debug!(
+        target: ANDROID_CONNECTION_LOG_TARGET,
+        source_label = %source_label,
+        outcome = "success",
+        last_successful_connection_unix_ms = ?update.last_successful_connection_unix_ms,
+        last_successful_connection_url = ?update.last_successful_connection_url,
+        failed_attempt_count = update.failed_attempts.len(),
+        "app connection attempt"
+    );
 }
 
 fn android_no_backup_files_dir() -> Result<PathBuf> {
@@ -355,6 +596,7 @@ struct AndroidFolderSyncProfileStatus {
     run_mode: String,
     last_success_unix_ms: Option<u64>,
     last_error: Option<String>,
+    connection_diagnostics: Option<ClientConnectionDiagnostics>,
     metrics: FolderAgentRuntimeMetrics,
 }
 
@@ -408,6 +650,7 @@ fn profile_status_from_runtime(
         run_mode: status.run_mode,
         last_success_unix_ms: status.last_success_unix_ms,
         last_error: status.last_error,
+        connection_diagnostics: status.connection_diagnostics,
         metrics: status.metrics,
     }
 }
@@ -1150,7 +1393,11 @@ fn configured_sdk(
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<IronMeshClient> {
-    Ok(configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?.client)
+    Ok(
+        configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?
+            .client
+            .with_connection_name("android foreground"),
+    )
 }
 
 fn configured_client_node(
@@ -1753,6 +2000,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
             state_root_dir: Some(android_folder_sync_state_root()?),
+            connection_name: Some("android sync run once".to_string()),
             local_tree_uri,
             server_base_url,
             client_bootstrap_json,
@@ -1822,6 +2070,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
             state_root_dir: Some(android_folder_sync_state_root()?),
+            connection_name: Some(format!("android sync {}", label)),
             local_tree_uri,
             server_base_url,
             client_bootstrap_json,

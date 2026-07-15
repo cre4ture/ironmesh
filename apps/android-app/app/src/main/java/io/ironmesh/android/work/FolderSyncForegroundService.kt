@@ -14,10 +14,18 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.ironmesh.android.data.RustSafBridge
+import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTED
+import io.ironmesh.android.data.APP_CONNECTION_STATE_CONNECTING
+import io.ironmesh.android.data.APP_CONNECTION_STATE_RECONNECTING
+import io.ironmesh.android.data.APP_CONNECTION_STATE_RETRY_SCHEDULED
+import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
+import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.FolderSyncStorageDiagnosticsHelper
+import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.RustPreferencesBridge
+import io.ironmesh.android.data.nextAppConnectionRetryDelayMs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,6 +48,10 @@ class FolderSyncForegroundService : Service() {
     private var lastLoggedStatusLine: String? = null
     private var lastDesiredSignature: String? = null
     private var waitingSummary: String? = null
+    private var retryJob: Job? = null
+    private var retryAttemptCount = 0L
+    private var nextRetryUnixMs: Long? = null
+    private var hasEstablishedConnection = false
     private var networkCallbackRegistered = false
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -76,6 +88,10 @@ class FolderSyncForegroundService : Service() {
                 stopContinuousSyncAndSelf()
                 return START_NOT_STICKY
             }
+            ACTION_RETRY -> {
+                retryNow("manual retry")
+                return START_STICKY
+            }
             else -> {
                 requestReconcile("service start")
                 return START_STICKY
@@ -85,6 +101,7 @@ class FolderSyncForegroundService : Service() {
 
     override fun onDestroy() {
         statusJob?.cancel()
+        retryJob?.cancel()
         unregisterNetworkCallback()
         repository.stopAllContinuousFolderSync()
         scope.cancel()
@@ -92,6 +109,176 @@ class FolderSyncForegroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun publishConnectionStatus(
+        state: String,
+        message: String,
+        retryCount: Long = retryAttemptCount,
+        nextRetryAt: Long? = nextRetryUnixMs,
+    ) {
+        val normalizedMessage = message.ifBlank { "No app connection activity yet" }
+        val previous = IronmeshPreferences.getAppConnectionStatus(applicationContext)
+        if (
+            previous.state == state &&
+            previous.message == normalizedMessage &&
+            previous.retryAttemptCount == retryCount &&
+            previous.nextRetryUnixMs == nextRetryAt
+        ) {
+            return
+        }
+
+        val snapshot = AppConnectionStatus(
+            state = state,
+            message = normalizedMessage,
+            updatedUnixMs = System.currentTimeMillis(),
+            retryAttemptCount = retryCount,
+            nextRetryUnixMs = nextRetryAt,
+            lastSuccessfulConnectionUnixMs = previous.lastSuccessfulConnectionUnixMs,
+            lastSuccessfulConnectionUrl = previous.lastSuccessfulConnectionUrl,
+            failedAttempts = previous.failedAttempts,
+        )
+        IronmeshPreferences.setAppConnectionStatus(applicationContext, snapshot)
+    }
+
+    private fun clearRetryState(
+        resetAttempts: Boolean = false,
+        resetEstablishedConnection: Boolean = false,
+    ) {
+        retryJob?.cancel()
+        retryJob = null
+        nextRetryUnixMs = null
+        if (resetAttempts) {
+            retryAttemptCount = 0L
+        }
+        if (resetEstablishedConnection) {
+            hasEstablishedConnection = false
+        }
+    }
+
+    private fun retryNow(reason: String) {
+        clearRetryState(resetAttempts = true)
+        publishConnectionStatus(
+            state = connectionAttemptState(),
+            message = connectionAttemptMessage(reason, 0),
+            retryCount = 0L,
+            nextRetryAt = null,
+        )
+        requestReconcile(reason)
+    }
+
+    private fun scheduleRetry(reason: String) {
+        if (retryJob?.isActive == true) {
+            publishConnectionStatus(
+                state = APP_CONNECTION_STATE_RETRY_SCHEDULED,
+                message = buildRetryMessage(reason, nextRetryUnixMs?.let { retryAt ->
+                    (retryAt - System.currentTimeMillis()).coerceAtLeast(1L)
+                } ?: nextAppConnectionRetryDelayMs(retryAttemptCount.toInt().coerceAtLeast(1))),
+                retryCount = retryAttemptCount,
+                nextRetryAt = nextRetryUnixMs,
+            )
+            return
+        }
+
+        retryAttemptCount += 1L
+        val delayMs = nextAppConnectionRetryDelayMs(retryAttemptCount.toInt())
+        nextRetryUnixMs = System.currentTimeMillis() + delayMs
+        publishConnectionStatus(
+            state = APP_CONNECTION_STATE_RETRY_SCHEDULED,
+            message = buildRetryMessage(reason, delayMs),
+            retryCount = retryAttemptCount,
+            nextRetryAt = nextRetryUnixMs,
+        )
+        updateNotification("Retrying sync soon", buildRetryMessage(reason, delayMs))
+        retryJob = scope.launch {
+            delay(delayMs)
+            retryJob = null
+            nextRetryUnixMs = null
+            publishConnectionStatus(
+                state = connectionAttemptState(),
+                message = connectionAttemptMessage(
+                    reason = "retry attempt ${retryAttemptCount}",
+                    profileCount = 0,
+                ),
+                retryCount = retryAttemptCount,
+                nextRetryAt = null,
+            )
+            requestReconcile("retry attempt ${retryAttemptCount}")
+        }
+    }
+
+    private fun connectionAttemptState(): String {
+        return if (hasEstablishedConnection || retryAttemptCount > 0L) {
+            APP_CONNECTION_STATE_RECONNECTING
+        } else {
+            APP_CONNECTION_STATE_CONNECTING
+        }
+    }
+
+    private fun connectionAttemptMessage(
+        reason: String,
+        profileCount: Int,
+    ): String {
+        val action = if (connectionAttemptState() == APP_CONNECTION_STATE_RECONNECTING) {
+            "Reconnecting"
+        } else {
+            "Connecting"
+        }
+        val profileSummary = if (profileCount > 0) {
+            " for $profileCount profile(s)"
+        } else {
+            ""
+        }
+        return when {
+            reason == "manual retry" -> "$action sync service now$profileSummary"
+            reason.startsWith("network") -> "$action sync service after network change$profileSummary"
+            reason.startsWith("retry attempt") -> "$action sync service after retry$profileSummary"
+            else -> "$action sync service$profileSummary"
+        }
+    }
+
+    private fun buildRetryMessage(reason: String, delayMs: Long): String {
+        val normalizedReason = summarizeReason(reason)
+        return "Retrying after ${formatRetryDelay(delayMs)} because $normalizedReason"
+    }
+
+    private fun formatRetryDelay(delayMs: Long): String {
+        val totalSeconds = (delayMs / 1000L).coerceAtLeast(1L)
+        return if (totalSeconds < 60L) {
+            "${totalSeconds}s"
+        } else {
+            val minutes = totalSeconds / 60L
+            val seconds = totalSeconds % 60L
+            if (seconds == 0L) {
+                "${minutes}m"
+            } else {
+                "${minutes}m ${seconds}s"
+            }
+        }
+    }
+
+    private fun currentErrorMessage(status: FolderSyncServiceStatus?): String {
+        return status?.profiles
+            ?.firstOrNull { profile -> profile.state == "error" }
+            ?.lastError
+            ?.takeIf { message -> message.isNotBlank() }
+            ?: status?.currentActivity?.takeIf { activity -> activity.isNotBlank() }
+            ?: status?.serviceMessage?.takeIf { message -> message.isNotBlank() }
+            ?: "failed to start sync"
+    }
+
+    private fun summarizeReason(reason: String): String {
+        val firstLine = reason
+            .lineSequence()
+            .map { line -> line.trim() }
+            .firstOrNull { line -> line.isNotEmpty() }
+            .orEmpty()
+        val normalized = firstLine.ifBlank { "connection error" }
+        return if (normalized.length <= 180) {
+            normalized
+        } else {
+            normalized.take(177) + "..."
+        }
+    }
 
     private suspend fun reconcileProfiles(): Boolean {
         return reconcileMutex.withLock {
@@ -108,6 +295,10 @@ class FolderSyncForegroundService : Service() {
                     repository.stopAllContinuousFolderSync()
                     waitingSummary = null
                     lastDesiredSignature = null
+                    clearRetryState(
+                        resetAttempts = true,
+                        resetEstablishedConnection = true,
+                    )
                     withContext(Dispatchers.Main) {
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
@@ -116,6 +307,7 @@ class FolderSyncForegroundService : Service() {
                 }
 
                 if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+                    clearRetryState(resetAttempts = true)
                     applyDesiredState(
                         desiredSignature = "",
                         desiredProfiles = emptyList(),
@@ -124,6 +316,12 @@ class FolderSyncForegroundService : Service() {
                         clientIdentityJson = clientIdentityJson,
                     )
                     waitingSummary = "Enroll this device before continuous sync can run"
+                    publishConnectionStatus(
+                        state = APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT,
+                        message = requireNotNull(waitingSummary),
+                        retryCount = 0L,
+                        nextRetryAt = null,
+                    )
                     updateNotification("Ironmesh sync paused", requireNotNull(waitingSummary))
                     return@withContext true
                 }
@@ -165,9 +363,17 @@ class FolderSyncForegroundService : Service() {
                 )
 
                 if (allowedProfiles.isEmpty()) {
+                    clearRetryState(resetAttempts = true)
                     updateNotification(
                         "Waiting for allowed network",
                         waitingSummary ?: "No enabled sync profile is allowed on the current network",
+                    )
+                } else {
+                    publishConnectionStatus(
+                        state = connectionAttemptState(),
+                        message = connectionAttemptMessage("service start", allowedProfiles.size),
+                        retryCount = 0L,
+                        nextRetryAt = nextRetryUnixMs,
                     )
                 }
 
@@ -188,6 +394,40 @@ class FolderSyncForegroundService : Service() {
                 }
                 val activeProfileCount = status?.activeProfileCount ?: 0L
                 val waitingMessage = waitingSummary
+                when {
+                    !waitingMessage.isNullOrBlank() && activeProfileCount == 0L -> {
+                        clearRetryState(resetAttempts = true)
+                    }
+                    (status?.errorProfileCount ?: 0L) > 0L -> {
+                        scheduleRetry(currentErrorMessage(status))
+                    }
+                    activeProfileCount > 0L -> {
+                        hasEstablishedConnection = true
+                        clearRetryState(resetAttempts = true)
+                        val connectionState =
+                            if (
+                                (status?.startingProfileCount ?: 0L) > 0L ||
+                                (status?.serviceState == "syncing" && status.lastSuccessUnixMs == null)
+                            ) {
+                                connectionAttemptState()
+                            } else {
+                                APP_CONNECTION_STATE_CONNECTED
+                            }
+                        val connectionMessage = status?.currentActivity
+                            ?.takeIf { it.isNotBlank() }
+                            ?: status?.serviceMessage
+                            ?: "Continuous sync is active"
+                        publishConnectionStatus(
+                            state = connectionState,
+                            message = connectionMessage,
+                            retryCount = 0L,
+                            nextRetryAt = null,
+                        )
+                    }
+                    else -> {
+                        clearRetryState(resetAttempts = true)
+                    }
+                }
                 val (title, detail) = if (!waitingMessage.isNullOrBlank() && activeProfileCount == 0L) {
                     "Waiting for allowed network" to waitingMessage
                 } else {
@@ -232,6 +472,10 @@ class FolderSyncForegroundService : Service() {
             repository.stopAllContinuousFolderSync()
             waitingSummary = null
             lastDesiredSignature = null
+            clearRetryState(
+                resetAttempts = true,
+                resetEstablishedConnection = true,
+            )
             withContext(Dispatchers.Main) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -280,12 +524,26 @@ class FolderSyncForegroundService : Service() {
     }
 
     private fun requestReconcile(reason: String) {
+        if (
+            reason == "manual retry" ||
+            reason.startsWith("retry attempt") ||
+            retryAttemptCount > 0L
+        ) {
+            lastDesiredSignature = null
+        }
+        if (!reason.startsWith("retry attempt")) {
+            retryJob?.cancel()
+            retryJob = null
+            nextRetryUnixMs = null
+        }
         scope.launch {
             val started = runCatching {
                 Log.i(TAG, "reconciling continuous sync: $reason")
                 reconcileProfiles()
             }.getOrElse { error ->
-                updateNotification("Ironmesh sync issue", error.message ?: "Failed to start sync")
+                val retryReason = error.message ?: "Failed to start sync"
+                scheduleRetry(retryReason)
+                updateNotification("Ironmesh sync issue", retryReason)
                 false
             }
             if (started) {
@@ -388,6 +646,7 @@ class FolderSyncForegroundService : Service() {
         private const val CHANNEL_ID = "ironmesh-folder-sync"
         private const val NOTIFICATION_ID = 4001
         private const val ACTION_REFRESH = "io.ironmesh.android.action.FOLDER_SYNC_REFRESH"
+        private const val ACTION_RETRY = "io.ironmesh.android.action.FOLDER_SYNC_RETRY"
         private const val ACTION_STOP = "io.ironmesh.android.action.FOLDER_SYNC_STOP"
 
         fun syncConfigChanged(context: Context) {
@@ -401,6 +660,15 @@ class FolderSyncForegroundService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, FolderSyncForegroundService::class.java))
+        }
+
+        fun retryNow(context: Context) {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, FolderSyncForegroundService::class.java).apply {
+                    action = ACTION_RETRY
+                },
+            )
         }
     }
 }

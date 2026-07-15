@@ -311,6 +311,7 @@ fn run_agent(args: &Args) -> Result<()> {
     let runtime_options = FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
         state_root_dir: args.state_root_dir.clone(),
+        connection_name: Some("ironmesh-folder-agent".to_string()),
         local_tree_uri: None,
         server_base_url: target.server_base_url.clone(),
         client_bootstrap_json: target.client_bootstrap_json.clone(),

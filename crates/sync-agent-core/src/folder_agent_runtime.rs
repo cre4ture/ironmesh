@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
-    RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
+    ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
+    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -38,6 +38,7 @@ pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> R
 pub struct FolderAgentRuntimeOptions {
     pub root_dir: PathBuf,
     pub state_root_dir: Option<PathBuf>,
+    pub connection_name: Option<String>,
     pub local_tree_uri: Option<String>,
     pub server_base_url: Option<String>,
     pub client_bootstrap_json: Option<String>,
@@ -158,6 +159,7 @@ pub struct FolderAgentRuntimeStatus {
     pub run_mode: String,
     pub last_success_unix_ms: Option<u64>,
     pub last_error: Option<String>,
+    pub connection_diagnostics: Option<ClientConnectionDiagnostics>,
     pub metrics: FolderAgentRuntimeMetrics,
 }
 
@@ -195,8 +197,17 @@ impl FolderAgentRuntimeStatus {
             },
             last_success_unix_ms,
             last_error,
+            connection_diagnostics: None,
             metrics,
         }
+    }
+
+    pub fn with_connection_diagnostics(
+        mut self,
+        connection_diagnostics: ClientConnectionDiagnostics,
+    ) -> Self {
+        self.connection_diagnostics = Some(connection_diagnostics);
+        self
     }
 }
 
@@ -785,6 +796,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     };
 
     let client = configured_client(options)?;
+    let status_callback = attach_connection_diagnostics(status_callback, client.clone());
     let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),
         options.depth,
@@ -1484,6 +1496,20 @@ fn emit_status(
     ));
 }
 
+fn attach_connection_diagnostics(
+    callback: Option<FolderAgentStatusCallback>,
+    client: IronMeshClient,
+) -> Option<FolderAgentStatusCallback> {
+    callback.map(|callback| {
+        let diagnostics_client = client.clone();
+        Arc::new(move |status: FolderAgentRuntimeStatus| {
+            callback(
+                status.with_connection_diagnostics(diagnostics_client.connection_diagnostics()),
+            );
+        }) as FolderAgentStatusCallback
+    })
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1620,15 +1646,22 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClie
             persist_client_identity(identity)
                 .context("failed to persist renewed folder sync client identity")?;
         }
-        return Ok(client);
+        return Ok(match options.connection_name.as_deref() {
+            Some(connection_name) => client.with_connection_name(connection_name),
+            None => client,
+        });
     }
 
-    build_configured_client(
+    let client = build_configured_client(
         options.server_base_url.as_deref(),
         options.client_bootstrap_json.as_deref(),
         options.server_ca_pem.as_deref(),
         options.client_identity_json.as_deref(),
-    )
+    )?;
+    Ok(match options.connection_name.as_deref() {
+        Some(connection_name) => client.with_connection_name(connection_name),
+        None => client,
+    })
 }
 
 fn install_ctrlc_handler(
@@ -3312,6 +3345,7 @@ mod tests {
         FolderAgentRuntimeOptions {
             root_dir: PathBuf::from("/tmp"),
             state_root_dir: None,
+            connection_name: None,
             local_tree_uri: None,
             server_base_url: None,
             client_bootstrap_json: None,

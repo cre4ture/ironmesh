@@ -31,6 +31,7 @@
     <string name="metric_errors">Errors</string>
     <string name="sync_overview">Sync overview</string>
     <string name="sync_profiles">Sync profiles</string>
+    <string name="connection_status">Connection status</string>
     <string name="new_profile">New profile</string>
     <string name="profile_label">Profile label</string>
     <string name="remote_prefix_optional">Remote prefix (optional)</string>
@@ -42,6 +43,7 @@
     <string name="remove">Remove</string>
     <string name="edit">Edit</string>
     <string name="details">Details</string>
+    <string name="retry_connection">Retry connection</string>
     <string name="enabled">Enabled</string>
     <string name="disabled">Disabled</string>
     <string name="view_activity">View activity</string>
