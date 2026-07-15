@@ -8,7 +8,7 @@ import {
   Stack,
   Text
 } from "@mantine/core";
-import { JsonBlock } from "@ironmesh/ui";
+import { ironmeshPrimaryColor, JsonBlock } from "@ironmesh/ui";
 import { useState } from "react";
 import { changeAdminPassword } from "@ironmesh/api";
 import { useAdminAccess } from "../lib/admin-access";
@@ -143,7 +143,7 @@ export function AdminAccessDrawer({ opened, onClose }: AdminAccessDrawerProps) {
         </Stack>
 
         <Group gap="sm">
-          <Badge color={sessionStatus?.authenticated ? "teal" : "gray"}>
+          <Badge color={sessionStatus?.authenticated ? ironmeshPrimaryColor : "gray"}>
             {sessionStatus?.authenticated ? "authenticated" : "not authenticated"}
           </Badge>
         </Group>
@@ -188,7 +188,7 @@ export function AdminAccessDrawer({ opened, onClose }: AdminAccessDrawerProps) {
                   Update password
                 </Button>
                 {changePasswordSuccess ? (
-                  <Text c="teal">Password updated successfully.</Text>
+                  <Text c={ironmeshPrimaryColor}>Password updated successfully.</Text>
                 ) : null}
               </Stack>
             </Collapse>

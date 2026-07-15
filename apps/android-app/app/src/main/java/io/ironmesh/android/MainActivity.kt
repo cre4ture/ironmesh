@@ -48,9 +48,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            IronmeshTheme {
-                val vm: MainViewModel = viewModel()
-                val state by vm.uiState
+            val vm: MainViewModel = viewModel()
+            val state by vm.uiState
+            IronmeshTheme(accentColorHex = state.themeAccentColorHex) {
                 val context = LocalContext.current
                 val snackbarHostState = remember { SnackbarHostState() }
                 var lastSnackbarMessage by rememberSaveable { mutableStateOf("") }
@@ -241,6 +241,7 @@ class MainActivity : ComponentActivity() {
                                     onOpenFiles = { openFilesAtIronmeshRoot(vm) },
                                     onOpenWebConsole = onOpenWebConsole,
                                     onClearEnrollment = vm::clearDeviceEnrollment,
+                                    onThemeAccentColorChange = vm::updateThemeAccentColor,
                                     onKeyChange = vm::updateKey,
                                     onPayloadChange = vm::updatePayload,
                                     onPutObject = vm::putObject,

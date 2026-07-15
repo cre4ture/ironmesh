@@ -4,9 +4,16 @@ body,
   min-height: 100%;
 }
 
+:root {
+  --ironmesh-accent-rgb: 20, 184, 166;
+  --ironmesh-accent-soft-rgb: 113, 218, 202;
+  --ironmesh-accent-deep-rgb: 15, 140, 126;
+  --ironmesh-accent-strong-rgb: 12, 114, 103;
+}
+
 :root[data-mantine-color-scheme="light"] {
   --shell-body-background:
-    radial-gradient(circle at top left, rgba(18, 184, 134, 0.12), transparent 35%),
+    radial-gradient(circle at top left, rgba(var(--ironmesh-accent-rgb), 0.12), transparent 35%),
     linear-gradient(180deg, #f7faf9 0%, #eef5f2 100%);
   --shell-header-background: linear-gradient(180deg, #f8fbf9 0%, #f1f6f3 100%);
   --shell-header-border: rgba(24, 39, 34, 0.08);
@@ -18,12 +25,12 @@ body,
 
 :root[data-mantine-color-scheme="dark"] {
   --shell-body-background:
-    radial-gradient(circle at top left, rgba(18, 184, 134, 0.2), transparent 34%),
+    radial-gradient(circle at top left, rgba(var(--ironmesh-accent-rgb), 0.2), transparent 34%),
     linear-gradient(180deg, #07110f 0%, #0a1713 46%, #0d1414 100%);
   --shell-header-background: linear-gradient(180deg, rgba(10, 22, 18, 0.96) 0%, rgba(13, 28, 23, 0.92) 100%);
-  --shell-header-border: rgba(116, 228, 200, 0.12);
+  --shell-header-border: rgba(var(--ironmesh-accent-soft-rgb), 0.12);
   --shell-navbar-background: linear-gradient(180deg, rgba(9, 20, 17, 0.98) 0%, rgba(7, 17, 15, 0.94) 100%);
-  --shell-navbar-border: rgba(116, 228, 200, 0.1);
+  --shell-navbar-border: rgba(var(--ironmesh-accent-soft-rgb), 0.1);
   --shell-navbar-shadow: 0 22px 48px rgba(1, 10, 8, 0.42);
   --shell-backdrop-background: rgba(3, 10, 8, 0.62);
 }
