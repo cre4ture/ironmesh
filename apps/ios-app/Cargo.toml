@@ -10,6 +10,7 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 bytes.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
 common = { path = "../../crates/common" }

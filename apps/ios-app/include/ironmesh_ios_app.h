@@ -19,6 +19,12 @@ void *ironmesh_ios_facade_create(const char *connection_input,
                                  const char *client_identity_json,
                                  char **out_error);
 
+void *ironmesh_ios_facade_create_named(const char *connection_input,
+                                       const char *server_ca_pem,
+                                       const char *client_identity_json,
+                                       const char *connection_name,
+                                       char **out_error);
+
 void ironmesh_ios_facade_free(void *handle);
 
 /**
@@ -42,6 +48,22 @@ int ironmesh_ios_facade_metadata_json(void *handle,
                                       const char *key,
                                       char **out_json,
                                       char **out_error);
+
+int ironmesh_ios_facade_store_index_with_options_json(void *handle,
+                                                      const char *prefix,
+                                                      uintptr_t depth,
+                                                      const char *snapshot,
+                                                      const char *view,
+                                                      intptr_t offset,
+                                                      intptr_t limit,
+                                                      const char *sort,
+                                                      const char *media_filter,
+                                                      char **out_json,
+                                                      char **out_error);
+
+int ironmesh_ios_facade_connection_diagnostics_json(void *handle,
+                                                    char **out_json,
+                                                    char **out_error);
 
 int ironmesh_ios_facade_fetch_bytes(void *handle,
                                     const char *key,
@@ -68,5 +90,11 @@ int ironmesh_ios_facade_move_path(void *handle,
                                   const char *to_path,
                                   int overwrite,
                                   char **out_error);
+
+int ironmesh_ios_facade_start_web_ui(const char *connection_input,
+                                     const char *server_ca_pem,
+                                     const char *client_identity_json,
+                                     char **out_url,
+                                     char **out_error);
 
 #endif  /* IRONMESH_IOS_APP_H */
