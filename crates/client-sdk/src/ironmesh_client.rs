@@ -352,17 +352,16 @@ impl ClientEndpoint {
     }
 }
 
-fn connection_diagnostics_observer()
--> &'static RwLock<Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>> {
-    static OBSERVER: OnceLock<
-        RwLock<Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>>,
-    > = OnceLock::new();
+type ConnectionDiagnosticsObserver =
+    Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>;
+type ConnectionDiagnosticsObserverSlot = RwLock<Option<ConnectionDiagnosticsObserver>>;
+
+fn connection_diagnostics_observer() -> &'static ConnectionDiagnosticsObserverSlot {
+    static OBSERVER: OnceLock<ConnectionDiagnosticsObserverSlot> = OnceLock::new();
     OBSERVER.get_or_init(|| RwLock::new(None))
 }
 
-pub fn set_connection_diagnostics_observer(
-    observer: Option<Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>>,
-) {
+pub fn set_connection_diagnostics_observer(observer: Option<ConnectionDiagnosticsObserver>) {
     let mut slot = connection_diagnostics_observer()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
