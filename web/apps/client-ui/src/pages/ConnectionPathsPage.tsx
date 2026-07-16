@@ -29,6 +29,8 @@ type ConnectionSummary = {
   color: string;
 };
 
+const SNAPSHOT_POLL_MS = 5000;
+
 export function ConnectionPathsPage() {
   const [routes, setRoutes] = useState<ClientConnectionRouteSnapshot | null>(null);
   const [rendezvous, setRendezvous] = useState<ClientRendezvousView | null>(null);
@@ -37,7 +39,48 @@ export function ConnectionPathsPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    void loadInitial();
+    let active = true;
+
+    async function loadCurrentState(showLoading: boolean) {
+      if (showLoading) {
+        setLoading(true);
+      }
+      try {
+        const [nextRoutes, nextRendezvous] = await Promise.all([
+          getClientConnectionRoutes(),
+          getClientRendezvous()
+        ]);
+        if (!active) {
+          return;
+        }
+        setRoutes(nextRoutes);
+        setRendezvous(nextRendezvous);
+        setError(null);
+      } catch (nextError) {
+        if (!active || !showLoading) {
+          return;
+        }
+        setError(
+          nextError instanceof Error
+            ? nextError.message
+            : "Failed loading cached connection path diagnostics"
+        );
+      } finally {
+        if (active && showLoading) {
+          setLoading(false);
+        }
+      }
+    }
+
+    void loadCurrentState(true);
+    const interval = window.setInterval(() => {
+      void loadCurrentState(false);
+    }, SNAPSHOT_POLL_MS);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
   }, []);
 
   const summary = useMemo(() => buildConnectionSummary(routes), [routes]);
@@ -55,37 +98,6 @@ export function ConnectionPathsPage() {
         endpoint.consecutive_failures === 0 &&
         !isCoolingDown(endpoint, snapshotUnixMs)
     ).length ?? 0;
-
-  async function loadInitial() {
-    setLoading(true);
-    setError(null);
-    try {
-      const [nextRoutes, nextRendezvous] = await Promise.all([
-        refreshClientConnectionRoutes(),
-        refreshClientRendezvous()
-      ]);
-      setRoutes(nextRoutes);
-      setRendezvous(nextRendezvous);
-    } catch (nextError) {
-      setError(
-        nextError instanceof Error
-          ? nextError.message
-          : "Failed loading connection path diagnostics"
-      );
-      const [fallbackRoutes, fallbackRendezvous] = await Promise.allSettled([
-        getClientConnectionRoutes(),
-        getClientRendezvous()
-      ]);
-      if (fallbackRoutes.status === "fulfilled") {
-        setRoutes(fallbackRoutes.value);
-      }
-      if (fallbackRendezvous.status === "fulfilled") {
-        setRendezvous(fallbackRendezvous.value);
-      }
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function refreshAll() {
     setRefreshing(true);
@@ -115,7 +127,7 @@ export function ConnectionPathsPage() {
         description="Separate overview of every direct and relay path this embedded client can use to reach the cluster, plus the current route selection state."
         actions={
           <Button variant="default" loading={loading || refreshing} onClick={() => void refreshAll()}>
-            Refresh diagnostics
+            Re-evaluate routes
           </Button>
         }
       />
@@ -431,9 +443,13 @@ function isDirectPath(endpoint: ClientConnectionRouteEndpointSnapshot): boolean 
 }
 
 function routeDisplayLabel(endpoint: ClientConnectionRouteEndpointSnapshot): string {
+  const relayHint =
+    endpoint.path_kind === "relay_tunnel" ? summarizeRelayLocator(endpoint.locator) : null;
   const prefix =
     endpoint.path_kind === "relay_tunnel"
-      ? "Relay"
+      ? relayHint
+        ? `Relay via ${relayHint}`
+        : "Relay"
       : endpoint.path_kind === "direct_quic"
         ? "Direct QUIC"
         : "Direct HTTPS";
@@ -478,6 +494,14 @@ function summarizeUrl(value: string): string {
   } catch {
     return value;
   }
+}
+
+function summarizeRelayLocator(locator: string): string | null {
+  const rendezvousIndex = locator.lastIndexOf("@");
+  if (rendezvousIndex < 0 || rendezvousIndex + 1 >= locator.length) {
+    return null;
+  }
+  return summarizeUrl(locator.slice(rendezvousIndex + 1));
 }
 
 function relayStatusColor(status: "unknown" | "connected" | "disconnected"): string {

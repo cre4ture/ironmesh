@@ -96,8 +96,8 @@
     <string name="home_empty_activity_title">No sync activity yet</string>
     <string name="home_empty_activity_body">Ironmesh will show uploads, downloads and errors here once a profile runs.</string>
     <string name="open_profile_creator">Create profile</string>
-    <string name="connection_paths_refresh">Refresh diagnostics</string>
-    <string name="connection_paths_loading">Refreshing...</string>
+    <string name="connection_paths_refresh">Re-evaluate routes</string>
+    <string name="connection_paths_loading">Re-evaluating...</string>
     <string name="connection_paths_metric_active">Active path</string>
     <string name="connection_paths_metric_direct">Direct methods</string>
     <string name="connection_paths_metric_relay">Relay methods</string>

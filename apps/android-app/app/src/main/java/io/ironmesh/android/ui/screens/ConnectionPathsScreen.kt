@@ -242,11 +242,31 @@ private fun rankedConnectionEndpoints(snapshot: ConnectionRouteSnapshot?): List<
 
 private fun routeDisplayLabel(endpoint: ConnectionRouteEndpointSnapshot): String {
     val prefix = when (endpoint.pathKind) {
-        "relay_tunnel" -> "Relay"
+        "relay_tunnel" -> summarizeRelayLocator(endpoint.locator)?.let { "Relay via $it" } ?: "Relay"
         "direct_quic" -> "Direct QUIC"
         else -> "Direct HTTPS"
     }
     return endpoint.targetNodeId?.let { "$prefix to $it" } ?: prefix
+}
+
+private fun summarizeRelayLocator(locator: String): String? {
+    val rendezvousIndex = locator.lastIndexOf("@")
+    if (rendezvousIndex < 0 || rendezvousIndex + 1 >= locator.length) {
+        return null
+    }
+    return summarizeUrl(locator.substring(rendezvousIndex + 1))
+}
+
+private fun summarizeUrl(value: String): String = try {
+    val uri = java.net.URI(value)
+    val host = uri.host ?: return value
+    if (uri.port > 0) {
+        "$host:${uri.port}"
+    } else {
+        host
+    }
+} catch (_: Exception) {
+    value
 }
 
 private fun connectionMethodStateLine(

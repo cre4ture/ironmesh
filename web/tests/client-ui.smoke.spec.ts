@@ -50,7 +50,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Overall search state")).toBeVisible();
   await expect(page.getByText("Recovering")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Direct HTTPS to node-alpha" }).first()).toBeVisible();
-  await expect(page.getByText("Relay to node-alpha", { exact: true })).toBeVisible();
+  await expect(page.getByText("Relay via rendezvous-a.local:9443 to node-alpha", { exact: true })).toBeVisible();
+  await expect(page.getByText("Relay via rendezvous-b.local:9443 to node-alpha", { exact: true })).toBeVisible();
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
   await expect(page.getByText("Recent client runtime logs", { exact: true })).toBeVisible();
@@ -369,10 +370,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
       apiV1("/ping"),
       apiV1("/health"),
       apiV1("/cluster/status"),
-      apiV1("/connection-routes/refresh"),
+      apiV1("/connection-routes"),
       apiV1("/logs"),
       apiV1("/rendezvous"),
-      apiV1("/rendezvous/refresh"),
       apiV1("/store/list"),
       apiV1("/store/uploads/start")
     ])
@@ -555,7 +555,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const connectionRoutesPayload = {
     generated_at_unix_ms: 1_712_345_600_000,
     active_index: 0,
-    ranked_indices: [0, 2, 1],
+    ranked_indices: [0, 2, 3, 1],
     endpoints: [
       {
         index: 0,
@@ -618,6 +618,27 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         circuit_open_until_unix_ms: null,
         background_probe_in_flight: false,
         last_background_probe_unix_ms: 1_712_345_598_000,
+        last_error: null
+      },
+      {
+        index: 3,
+        path_kind: "relay_tunnel",
+        locator: "relay://node-alpha@https://rendezvous-b.local:9443",
+        bootstrap_rank: 1,
+        target_node_id: "node-alpha",
+        active: false,
+        score: 58.4,
+        ewma_latency_ms: 33.4,
+        ewma_throughput_bytes_per_sec: 120000,
+        consecutive_failures: 0,
+        total_failures: 1,
+        total_successes: 4,
+        last_measurement_unix_ms: 1_712_345_592_000,
+        last_success_unix_ms: 1_712_345_550_000,
+        last_failure_unix_ms: 1_712_345_592_000,
+        circuit_open_until_unix_ms: null,
+        background_probe_in_flight: false,
+        last_background_probe_unix_ms: 1_712_345_592_000,
         last_error: null
       }
     ]
@@ -682,7 +703,10 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         editable: true,
         transport_mode: "direct",
         relay_mode: "preferred",
-        configured_urls: ["https://rendezvous-a.local:9443"],
+        configured_urls: [
+          "https://rendezvous-a.local:9443",
+          "https://rendezvous-b.local:9443"
+        ],
         direct_url: "https://node-alpha.local",
         direct_target_node_id: "node-alpha",
         active_url: null,
@@ -699,6 +723,15 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
             consecutive_failures: 0,
             last_error: null,
             active: false
+          },
+          {
+            url: "https://rendezvous-b.local:9443",
+            status: "disconnected",
+            last_attempt_unix: 1_712_345_598,
+            last_success_unix: 1_712_345_420,
+            consecutive_failures: 2,
+            last_error: "relay probe timed out",
+            active: false
           }
         ]
       });
@@ -710,7 +743,10 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         editable: true,
         transport_mode: "direct",
         relay_mode: "preferred",
-        configured_urls: ["https://rendezvous-a.local:9443"],
+        configured_urls: [
+          "https://rendezvous-a.local:9443",
+          "https://rendezvous-b.local:9443"
+        ],
         direct_url: "https://node-alpha.local",
         direct_target_node_id: "node-alpha",
         active_url: null,
@@ -726,6 +762,15 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
             last_success_unix: 1_712_345_600,
             consecutive_failures: 0,
             last_error: null,
+            active: false
+          },
+          {
+            url: "https://rendezvous-b.local:9443",
+            status: "disconnected",
+            last_attempt_unix: 1_712_345_598,
+            last_success_unix: 1_712_345_420,
+            consecutive_failures: 2,
+            last_error: "relay probe timed out",
             active: false
           }
         ]

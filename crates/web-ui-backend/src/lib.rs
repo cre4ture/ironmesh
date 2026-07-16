@@ -1029,6 +1029,39 @@ fn map_endpoint_statuses(
         .collect()
 }
 
+fn merge_endpoint_statuses(
+    configured_urls: &[String],
+    statuses: Vec<WebClientRendezvousEndpointStatus>,
+) -> Vec<WebClientRendezvousEndpointStatus> {
+    let mut merged = Vec::new();
+    let mut by_url = statuses
+        .into_iter()
+        .map(|status| (normalize_runtime_url(&status.url), status))
+        .collect::<HashMap<_, _>>();
+
+    for configured_url in configured_urls {
+        let normalized_url = normalize_runtime_url(configured_url);
+        if let Some(status) = by_url.remove(&normalized_url) {
+            merged.push(status);
+            continue;
+        }
+        merged.push(WebClientRendezvousEndpointStatus {
+            url: configured_url.clone(),
+            status: "unknown",
+            last_attempt_unix: None,
+            last_success_unix: None,
+            consecutive_failures: 0,
+            last_error: None,
+            active: false,
+        });
+    }
+
+    let mut remaining = by_url.into_values().collect::<Vec<_>>();
+    remaining.sort_by(|left, right| left.url.cmp(&right.url));
+    merged.extend(remaining);
+    merged
+}
+
 fn build_rendezvous_probe_client(
     config: &WebRendezvousRuntimeConfig,
 ) -> Result<Option<RendezvousControlClient>> {
@@ -1111,6 +1144,7 @@ async fn build_rendezvous_view(state: &WebState) -> WebClientRendezvousView {
     let endpoint_statuses = relay_runtime_state
         .map(|snapshot| map_endpoint_statuses(snapshot.endpoint_statuses))
         .unwrap_or_else(|| map_endpoint_statuses(runtime.last_rendezvous_probe_statuses.clone()));
+    let endpoint_statuses = merge_endpoint_statuses(&configured_urls, endpoint_statuses);
 
     WebClientRendezvousView {
         available: runtime.rendezvous.is_some() || relay_client.is_some(),
@@ -1157,9 +1191,7 @@ async fn probe_rendezvous_and_build_view(state: &WebState) -> WebClientRendezvou
         (runtime.sdk.rendezvous_client(), runtime.rendezvous.clone())
     };
 
-    let probe_result = if let Some(relay_client) = relay_client {
-        relay_client.probe_health_endpoints().await
-    } else if let Some(rendezvous_config) = rendezvous_config {
+    let probe_result = if let Some(rendezvous_config) = rendezvous_config {
         match build_rendezvous_probe_client(&rendezvous_config) {
             Ok(Some(client)) => client.probe_health_endpoints().await,
             Ok(None) => Ok(client_sdk::RendezvousRuntimeState {
@@ -1168,6 +1200,8 @@ async fn probe_rendezvous_and_build_view(state: &WebState) -> WebClientRendezvou
             }),
             Err(error) => Err(error),
         }
+    } else if let Some(relay_client) = relay_client {
+        relay_client.probe_health_endpoints().await
     } else {
         Ok(client_sdk::RendezvousRuntimeState {
             active_url: None,
