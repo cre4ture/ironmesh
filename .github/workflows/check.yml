@@ -302,6 +302,15 @@ jobs:
           path: apps/android-app/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
+      - name: Reclaim disk before Android server-node build
+        run: |
+          df -h
+          rm -rf \
+            apps/android-app/.gradle \
+            apps/android-app/app/build \
+            apps/android-app/build
+          df -h
+
       - name: Run Android server-node JVM unit tests
         working-directory: apps/android-server-node-app
         run: ./gradlew --no-daemon :app:testDebugUnitTest
