@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::{NodeId, StorageObjectMeta};
+use futures_util::future::join_all;
 use futures_util::io::{
     AsyncRead, AsyncReadExt as FuturesAsyncReadExt, AsyncWrite,
     AsyncWriteExt as FuturesAsyncWriteExt,
@@ -33,8 +34,8 @@ use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RendezvousControlClient,
-    TransportHeader, TransportRequestHead, TransportStreamKind, build_signed_request_headers,
-    read_buffered_transport_response, read_transport_response_head,
+    TransportHeader, TransportPathKind, TransportRequestHead, TransportStreamKind,
+    build_signed_request_headers, read_buffered_transport_response, read_transport_response_head,
     write_buffered_transport_request, write_transport_request_head,
 };
 use uuid::Uuid;
@@ -218,6 +219,50 @@ struct ClientEndpointState {
     last_background_probe_unix_ms: Option<u64>,
     last_error: Option<String>,
     recent_attempts: Vec<ClientConnectionAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientConnectionRouteSnapshot {
+    pub generated_at_unix_ms: u64,
+    #[serde(default)]
+    pub active_index: Option<usize>,
+    #[serde(default)]
+    pub ranked_indices: Vec<usize>,
+    #[serde(default)]
+    pub endpoints: Vec<ClientConnectionRouteEndpointSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientConnectionRouteEndpointSnapshot {
+    pub index: usize,
+    pub path_kind: TransportPathKind,
+    pub locator: String,
+    pub bootstrap_rank: usize,
+    #[serde(default)]
+    pub target_node_id: Option<NodeId>,
+    #[serde(default)]
+    pub active: bool,
+    pub score: f64,
+    #[serde(default)]
+    pub ewma_latency_ms: Option<f64>,
+    #[serde(default)]
+    pub ewma_throughput_bytes_per_sec: Option<f64>,
+    pub consecutive_failures: u32,
+    pub total_failures: u64,
+    pub total_successes: u64,
+    #[serde(default)]
+    pub last_measurement_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_success_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_failure_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub circuit_open_until_unix_ms: Option<u64>,
+    pub background_probe_in_flight: bool,
+    #[serde(default)]
+    pub last_background_probe_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -505,6 +550,50 @@ impl ClientEndpointRouter {
         };
         let mut state = lock_endpoint_state(&endpoint.state);
         record_endpoint_failure_sample(&mut state, error, true);
+    }
+
+    fn snapshot(&self) -> ClientConnectionRouteSnapshot {
+        let active_index = self.active_index();
+        let ranked_indices = self.rank_indices();
+        let endpoints = self
+            .endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let state = lock_endpoint_state(&endpoint.state);
+                ClientConnectionRouteEndpointSnapshot {
+                    index,
+                    path_kind: match endpoint.descriptor.path_kind {
+                        ClientEndpointPathKind::Direct => TransportPathKind::DirectHttps,
+                        ClientEndpointPathKind::Relay => TransportPathKind::RelayTunnel,
+                    },
+                    locator: endpoint.descriptor.locator.clone(),
+                    bootstrap_rank: endpoint.descriptor.bootstrap_rank,
+                    target_node_id: endpoint.transport.target_node_id(),
+                    active: active_index == Some(index),
+                    score: endpoint_score(index, active_index, &endpoint.descriptor, &state),
+                    ewma_latency_ms: state.ewma_latency_ms,
+                    ewma_throughput_bytes_per_sec: state.ewma_throughput_bytes_per_sec,
+                    consecutive_failures: state.consecutive_failures,
+                    total_failures: state.total_failures,
+                    total_successes: state.total_successes,
+                    last_measurement_unix_ms: state.last_measurement_unix_ms,
+                    last_success_unix_ms: state.last_success_unix_ms,
+                    last_failure_unix_ms: state.last_failure_unix_ms,
+                    circuit_open_until_unix_ms: state.circuit_open_until_unix_ms,
+                    background_probe_in_flight: state.background_probe_in_flight,
+                    last_background_probe_unix_ms: state.last_background_probe_unix_ms,
+                    last_error: state.last_error.clone(),
+                }
+            })
+            .collect();
+
+        ClientConnectionRouteSnapshot {
+            generated_at_unix_ms: unix_ts_ms(),
+            active_index,
+            ranked_indices,
+            endpoints,
+        }
     }
 
     fn record_request_success(
@@ -1878,6 +1967,45 @@ impl IronMeshClient {
     pub fn with_connection_name(mut self, connection_name: impl Into<String>) -> Self {
         self.connection_name = normalize_connection_name(&connection_name.into());
         self
+    }
+
+    pub fn connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
+        self.transport_router.snapshot()
+    }
+
+    pub async fn refresh_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
+        let tasks = self
+            .transport_router
+            .endpoints
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let auth = self.auth.clone();
+                let connection_name = self.connection_name.clone();
+                async move {
+                    let result = probe_endpoint_background_quality(
+                        &endpoint,
+                        &auth,
+                        connection_name.as_deref(),
+                    )
+                    .await;
+                    (index, result)
+                }
+            });
+
+        for (index, result) in join_all(tasks).await {
+            match result {
+                Ok(latency_ms) => self
+                    .transport_router
+                    .record_background_probe_success(index, latency_ms),
+                Err(error) => self
+                    .transport_router
+                    .record_background_probe_failure(index, &error.to_string()),
+            }
+        }
+
+        self.connection_route_snapshot()
     }
 
     pub fn connection_diagnostics(&self) -> ClientConnectionDiagnostics {

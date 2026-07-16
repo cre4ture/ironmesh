@@ -1,6 +1,7 @@
 import { fetchJson } from "../shared/http";
 import type { StoreIndexMedia } from "../shared/store-index";
 import type {
+  ClientConnectionRouteSnapshot,
   ClientLatencyTestResponse,
   ClientRendezvousView,
   ClientUiPingResponse,
@@ -53,6 +54,16 @@ export async function getClientHealth(): Promise<JsonObject> {
 
 export async function getClientClusterStatus(): Promise<JsonObject> {
   return fetchJson<JsonObject>(apiV1("/cluster/status"));
+}
+
+export async function getClientConnectionRoutes(): Promise<ClientConnectionRouteSnapshot> {
+  return fetchJson<ClientConnectionRouteSnapshot>(apiV1("/connection-routes"));
+}
+
+export async function refreshClientConnectionRoutes(): Promise<ClientConnectionRouteSnapshot> {
+  return fetchJson<ClientConnectionRouteSnapshot>(apiV1("/connection-routes/refresh"), {
+    method: "POST"
+  });
 }
 
 export async function getClientRecentLogs(limit = 200): Promise<LogsResponse> {

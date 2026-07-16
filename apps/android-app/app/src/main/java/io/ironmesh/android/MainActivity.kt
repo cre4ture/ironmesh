@@ -33,6 +33,7 @@ import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.components.IronmeshAppShell
+import io.ironmesh.android.ui.screens.ConnectionPathsScreen
 import io.ironmesh.android.ui.screens.HomeScreen
 import io.ironmesh.android.ui.screens.LibraryScreen
 import io.ironmesh.android.ui.screens.OnboardingScreen
@@ -203,6 +204,11 @@ class MainActivity : ComponentActivity() {
                                     onOpenWebConsole = onOpenWebConsole,
                                     onOpenSync = { vm.selectSection(MainSection.SYNC) },
                                     onSelectSection = vm::selectSection,
+                                )
+
+                                MainSection.CONNECTIVITY -> ConnectionPathsScreen(
+                                    state = state,
+                                    onRefresh = vm::refreshConnectionRoutes,
                                 )
 
                                 MainSection.SYNC -> SyncScreen(

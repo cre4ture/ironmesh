@@ -32,6 +32,7 @@ pub use device_auth::{
 };
 pub use ironmesh_client::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent,
+    ClientConnectionRouteEndpointSnapshot, ClientConnectionRouteSnapshot,
     ClientEndpointDiagnostics, IronMeshClient, ObjectHeadInfo, PreferredHeadReason, RequestedRange,
     SnapshotRestoreResponse, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexMediaSummary,
     StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, UploadMode,

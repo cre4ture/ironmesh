@@ -71,12 +71,14 @@ import {
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { ConnectionPathsPage } from "../pages/ConnectionPathsPage";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { LogsPage } from "../pages/LogsPage";
 
 type PageId =
   | "overview"
+  | "connectionPaths"
   | "rendezvous"
   | "latency"
   | "store"
@@ -148,6 +150,12 @@ const pages = [
     label: "Overview",
     icon: IconPlugConnected,
     description: "Connection health, service metadata, and quick cluster summary."
+  },
+  {
+    id: "connectionPaths" as const,
+    label: "Connection paths",
+    icon: IconPlugConnected,
+    description: "See every direct and relay route, which one is active, and whether the router is still re-evaluating candidates."
   },
   {
     id: "rendezvous" as const,
@@ -267,6 +275,8 @@ export function ClientShell() {
           onRefresh={refreshOverview}
         />
       ) : null}
+
+      {activePageId === "connectionPaths" ? <ConnectionPathsPage /> : null}
 
       {activePageId === "rendezvous" ? <RendezvousPage /> : null}
 

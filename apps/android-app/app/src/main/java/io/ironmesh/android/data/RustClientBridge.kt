@@ -105,6 +105,14 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
+    external fun getConnectionRouteSnapshot(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+        refresh: Boolean,
+    ): String
+
+    @JvmStatic
     external fun runFolderSyncOnce(
         connectionInput: String,
         localFolder: String,

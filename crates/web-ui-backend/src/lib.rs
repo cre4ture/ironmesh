@@ -10,14 +10,14 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use client_sdk::{
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
-    IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult, RelayMode,
-    RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions,
-    StoreIndexSortOrder, StoreIndexView, UploadMode,
-    build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
-    ironmesh_client::DownloadRangeRequest,
+    ClientConnectionRouteSnapshot, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    ConnectionBootstrapDiagnosticTargets, IronMeshClient, LatencyProbeComparison,
+    LatencyProbeConfig, LatencyProbeResult, RelayMode, RendezvousClientConfig,
+    RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
+    RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
+    StoreIndexView, UploadMode, build_client_with_optional_identity_from_planned_target,
+    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    compare_direct_and_relay_latency, ironmesh_client::DownloadRangeRequest,
 };
 use common::logging::{LogBuffer, LogBufferEntry};
 use reqwest::Url;
@@ -338,6 +338,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/store/get-binary", get(web_store_get_binary))
         .route("/store/stream-binary", get(web_store_stream_binary))
         .route("/store/put-binary", post(web_store_put_binary))
+        .route("/connection-routes", get(web_connection_routes))
+        .route(
+            "/connection-routes/refresh",
+            post(web_refresh_connection_routes),
+        )
         .route(
             "/rendezvous",
             get(web_rendezvous).put(web_update_rendezvous),
@@ -389,6 +394,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/store/get-binary", get(web_store_get_binary))
         .route("/api/store/stream-binary", get(web_store_stream_binary))
         .route("/api/store/put-binary", post(web_store_put_binary))
+        .route("/api/connection-routes", get(web_connection_routes))
+        .route(
+            "/api/connection-routes/refresh",
+            post(web_refresh_connection_routes),
+        )
         .route(
             "/api/rendezvous",
             get(web_rendezvous).put(web_update_rendezvous),
@@ -2926,6 +2936,26 @@ async fn web_store_stream_binary(
 
 async fn web_rendezvous(State(state): State<WebState>) -> impl IntoResponse {
     (StatusCode::OK, Json(build_rendezvous_view(&state).await)).into_response()
+}
+
+async fn web_connection_routes(State(state): State<WebState>) -> impl IntoResponse {
+    let snapshot: ClientConnectionRouteSnapshot = {
+        let runtime = state.runtime.read().await;
+        runtime.sdk.connection_route_snapshot()
+    };
+    (StatusCode::OK, Json(snapshot)).into_response()
+}
+
+async fn web_refresh_connection_routes(State(state): State<WebState>) -> impl IntoResponse {
+    let sdk = {
+        let runtime = state.runtime.read().await;
+        runtime.sdk.clone()
+    };
+    (
+        StatusCode::OK,
+        Json(sdk.refresh_connection_route_snapshot().await),
+    )
+        .into_response()
 }
 
 async fn web_refresh_rendezvous(State(state): State<WebState>) -> impl IntoResponse {
