@@ -56,4 +56,17 @@ final class IronmeshIosProjectTests: XCTestCase {
             "Bootstrap bundle imported and client identity attached."
         )
     }
+
+    func testBootstrapWithoutIdentityRequiresEnrollment() {
+        let needsEnrollment = IronmeshConnectionDraft(
+            bootstrapInput: "{\"cluster\":true}"
+        )
+        let ready = IronmeshConnectionDraft(
+            bootstrapInput: "{\"cluster\":true}",
+            clientIdentityJSON: "{\"device_id\":\"ios-demo\"}"
+        )
+
+        XCTAssertTrue(needsEnrollment.requiresEnrollment)
+        XCTAssertFalse(ready.requiresEnrollment)
+    }
 }

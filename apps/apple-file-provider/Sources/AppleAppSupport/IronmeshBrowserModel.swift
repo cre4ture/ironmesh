@@ -313,6 +313,13 @@ final class IronmeshBrowserModel: ObservableObject {
         didActivate = true
         refreshDomainState()
 
+        if draft.requiresEnrollment {
+            hasCompletedOnboarding = false
+            statusText = "Enroll this device to continue using the bootstrap bundle."
+            lastErrorMessage = nil
+            return
+        }
+
         if hasCompletedOnboarding {
             refresh()
         } else {
@@ -323,6 +330,15 @@ final class IronmeshBrowserModel: ObservableObject {
     func completeOnboarding() {
         guard draft.isConfigured else {
             let message = "A bootstrap bundle or direct route is required."
+            lastErrorMessage = message
+            statusText = message
+            addAction("Onboarding blocked", detail: message)
+            return
+        }
+
+        if draft.requiresEnrollment {
+            let message = "Enroll this device before continuing with a bootstrap bundle."
+            hasCompletedOnboarding = false
             lastErrorMessage = message
             statusText = message
             addAction("Onboarding blocked", detail: message)
@@ -349,6 +365,15 @@ final class IronmeshBrowserModel: ObservableObject {
     func applyConnectionSettings() {
         guard draft.isConfigured else {
             let message = "A bootstrap bundle or direct route is required."
+            lastErrorMessage = message
+            statusText = message
+            addAction("Settings blocked", detail: message)
+            return
+        }
+
+        if draft.requiresEnrollment {
+            let message = "Enroll this device before reconnecting with a bootstrap bundle."
+            hasCompletedOnboarding = false
             lastErrorMessage = message
             statusText = message
             addAction("Settings blocked", detail: message)
@@ -477,6 +502,9 @@ final class IronmeshBrowserModel: ObservableObject {
         draft.clientIdentityJSON = ""
         draft.serverCAPem = ""
         draft.enrolledDeviceID = ""
+        if draft.requiresEnrollment {
+            hasCompletedOnboarding = false
+        }
         try? syncSharedSettingsFromDraft()
         addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
     }
