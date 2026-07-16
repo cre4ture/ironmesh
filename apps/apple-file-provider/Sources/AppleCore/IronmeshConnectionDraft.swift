@@ -118,7 +118,7 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         return hasClientIdentity ? "Client identity attached." : "No client identity attached."
     }
 
-    func appliedConnectionState(defaultConnectionInput: String) -> AppleStoredConnectionState {
+    public func appliedConnectionState(defaultConnectionInput: String) -> AppleStoredConnectionState {
         AppleStoredConnectionState(
             connectionInput: effectiveConnectionInput.nilIfBlank ?? defaultConnectionInput,
             serverCAPem: serverCAPem.nilIfBlank,
