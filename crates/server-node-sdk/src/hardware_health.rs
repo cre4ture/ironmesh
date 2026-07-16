@@ -907,7 +907,7 @@ async fn collect_inventory_linux(
             detail: "Collected board, CPU, memory, storage, and NIC inventory from Linux sysfs and procfs."
                 .to_string(),
         };
-        return Ok((inventory, collector, storage_targets));
+        Ok((inventory, collector, storage_targets))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1712,7 +1712,7 @@ fn should_skip_block_device(name: &str) -> bool {
 fn current_boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        return read_trimmed_file("/proc/sys/kernel/random/boot_id");
+        read_trimmed_file("/proc/sys/kernel/random/boot_id")
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1724,10 +1724,10 @@ fn current_boot_id() -> Option<String> {
 fn current_uptime_seconds() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        return read_trimmed_file("/proc/uptime")
+        read_trimmed_file("/proc/uptime")
             .and_then(|raw| raw.split_whitespace().next().map(str::to_string))
             .and_then(|raw| raw.parse::<f64>().ok())
-            .map(|value| value.floor() as u64);
+            .map(|value| value.floor() as u64)
     }
 
     #[cfg(not(target_os = "linux"))]
