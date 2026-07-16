@@ -20,6 +20,7 @@ include = [
     "ironmesh_ios_facade_fetch_bytes",
     "ironmesh_ios_facade_put_bytes",
     "ironmesh_ios_facade_enroll_with_bootstrap",
+    "ironmesh_ios_facade_start_web_ui",
     "ironmesh_ios_facade_delete_path",
     "ironmesh_ios_facade_move_path",
 ]

@@ -10,6 +10,11 @@ public protocol AppleManualCBridgeFFI: Sendable {
     ) throws -> AppleRustHandle
 
     func freeHandle(_ handle: AppleRustHandle)
+    func startWebUi(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?
+    ) throws -> String
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data

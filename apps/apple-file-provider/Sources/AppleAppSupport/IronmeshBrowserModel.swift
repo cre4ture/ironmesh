@@ -12,6 +12,8 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var enrolledDeviceID: String?
     @Published var enrolledDeviceLabel: String?
     @Published var isBusy = false
+    @Published var webUiBaseURL: URL?
+    @Published var isStartingWebUi = false
 
     let service: IronmeshFileProviderService
 
@@ -40,6 +42,19 @@ final class IronmeshBrowserModel: ObservableObject {
 
     var hasEnrolledDevice: Bool {
         enrolledDeviceID?.nilIfBlank != nil
+    }
+
+    var galleryMapURL: URL? {
+        guard let webUiBaseURL else {
+            return nil
+        }
+
+        var components = URLComponents(url: webUiBaseURL, resolvingAgainstBaseURL: false)
+        var queryItems = components?.queryItems ?? []
+        queryItems.removeAll { $0.name == "embedded" }
+        queryItems.append(URLQueryItem(name: "embedded", value: "gallery_map"))
+        components?.queryItems = queryItems
+        return components?.url ?? webUiBaseURL
     }
 
     func refresh() {
@@ -89,6 +104,7 @@ final class IronmeshBrowserModel: ObservableObject {
             let configuration = service.currentConnectionConfiguration()
             connectionInput = configuration.connectionInput
             syncStoredState()
+            invalidateGalleryMap()
             statusText = Self.summaryText(
                 configuration: configuration,
                 deviceID: enrolledDeviceID,
@@ -140,6 +156,7 @@ final class IronmeshBrowserModel: ObservableObject {
             self.deviceLabelInput = updatedState.deviceLabel ?? ""
             self.enrolledDeviceID = updatedState.deviceID
             self.enrolledDeviceLabel = updatedState.deviceLabel
+            self.invalidateGalleryMap()
             self.statusText = Self.summaryText(
                 configuration: self.service.currentConnectionConfiguration(),
                 deviceID: updatedState.deviceID,
@@ -154,6 +171,7 @@ final class IronmeshBrowserModel: ObservableObject {
             state.bootstrapInputDraft = bootstrapInput.nilIfBlank
             try service.saveConnectionState(state)
             syncStoredState()
+            invalidateGalleryMap()
             statusText = Self.summaryText(
                 configuration: service.currentConnectionConfiguration(),
                 deviceID: nil,
@@ -161,6 +179,42 @@ final class IronmeshBrowserModel: ObservableObject {
             )
         } catch {
             statusText = error.localizedDescription
+        }
+    }
+
+    func startGalleryMap(force: Bool = false) {
+        let configuration = service.currentConnectionConfiguration()
+        guard !configuration.normalizedConnectionInput.isEmpty,
+              configuration.clientIdentityJSON?.nilIfBlank != nil else {
+            invalidateGalleryMap()
+            statusText = "Enroll this device before opening the gallery map."
+            return
+        }
+        if isStartingWebUi || (!force && webUiBaseURL != nil) {
+            return
+        }
+
+        isStartingWebUi = true
+        if force {
+            webUiBaseURL = nil
+        }
+        statusText = "Starting gallery map..."
+        let service = self.service
+        Task.detached(priority: .userInitiated) {
+            do {
+                let url = try service.startWebUi()
+                await MainActor.run {
+                    self.isStartingWebUi = false
+                    self.webUiBaseURL = url
+                    self.statusText = "Gallery map ready at \(url.absoluteString)"
+                }
+            } catch {
+                await MainActor.run {
+                    self.isStartingWebUi = false
+                    self.webUiBaseURL = nil
+                    self.statusText = error.localizedDescription
+                }
+            }
         }
     }
 
@@ -182,6 +236,10 @@ final class IronmeshBrowserModel: ObservableObject {
         } catch {
             statusText = error.localizedDescription
         }
+    }
+
+    private func invalidateGalleryMap() {
+        webUiBaseURL = nil
     }
 
     private func runBusyTask<Output>(

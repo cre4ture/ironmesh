@@ -61,6 +61,12 @@ int ironmesh_ios_facade_enroll_with_bootstrap(const char *connection_input,
                                               char **out_json,
                                               char **out_error);
 
+int ironmesh_ios_facade_start_web_ui(const char *connection_input,
+                                     const char *server_ca_pem,
+                                     const char *client_identity_json,
+                                     char **out_url,
+                                     char **out_error);
+
 int ironmesh_ios_facade_delete_path(void *handle, const char *key, char **out_error);
 
 int ironmesh_ios_facade_move_path(void *handle,

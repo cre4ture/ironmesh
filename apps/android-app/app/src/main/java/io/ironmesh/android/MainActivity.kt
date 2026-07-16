@@ -34,6 +34,7 @@ import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.components.IronmeshAppShell
 import io.ironmesh.android.ui.screens.HomeScreen
+import io.ironmesh.android.ui.screens.GalleryMapScreen
 import io.ironmesh.android.ui.screens.LibraryScreen
 import io.ironmesh.android.ui.screens.OnboardingScreen
 import io.ironmesh.android.ui.screens.SettingsScreen
@@ -215,6 +216,11 @@ class MainActivity : ComponentActivity() {
                                 MainSection.LIBRARY -> LibraryScreen(
                                     state = state,
                                     vm = vm,
+                                )
+
+                                MainSection.GALLERY_MAP -> GalleryMapScreen(
+                                    state = state,
+                                    onStartGalleryMap = vm::startWebUi,
                                 )
 
                                 MainSection.SETTINGS -> SettingsScreen(

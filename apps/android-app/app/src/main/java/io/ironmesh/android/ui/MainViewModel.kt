@@ -44,6 +44,7 @@ enum class MainSection {
     HOME,
     SYNC,
     LIBRARY,
+    GALLERY_MAP,
     SETTINGS,
 }
 
@@ -288,6 +289,9 @@ class MainViewModel(
             !uiState.value.galleryLoading
         ) {
             refreshGallery()
+        }
+        if (section == MainSection.GALLERY_MAP && uiState.value.webUiUrl.isBlank() && !uiState.value.loading) {
+            startWebUi()
         }
     }
 
@@ -851,6 +855,7 @@ class MainViewModel(
                         bootstrapInput = "",
                         deviceLabelInput = authState.label.orEmpty(),
                         selectedSection = MainSection.HOME,
+                        webUiUrl = "",
                         status = "Device enrolled: ${authState.deviceId}",
                     )
                     FolderSyncScheduler.reschedule(getApplication())

@@ -2,18 +2,34 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ObjectHeadInfo, StoreIndexEntry, VersionGraphSummary, enroll_connection_input_blocking,
-    normalize_server_base_url,
+    IronMeshClient, ObjectHeadInfo, StoreIndexEntry, VersionGraphSummary,
+    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    enroll_connection_input_blocking, normalize_server_base_url,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
+use tokio::task::JoinHandle;
 
 const FFI_OK: c_int = 0;
 const FFI_ERR: c_int = 1;
+
+struct WebUiServer {
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+    local_url: String,
+    task: JoinHandle<()>,
+}
+
+struct ConfiguredIosSdk {
+    client: IronMeshClient,
+    client_identity: Option<ClientIdentityMaterial>,
+}
 
 pub struct IosStorageApp {
     runtime: Runtime,
@@ -105,40 +121,9 @@ impl IosStorageApp {
         server_ca_pem: Option<String>,
         client_identity_json: Option<String>,
     ) -> Result<Self> {
-        let connection_input = normalized_connection_input_string(connection_input)?;
-        let server_ca_pem = normalize_optional_string(server_ca_pem);
-        let client_identity_json = normalize_optional_string(client_identity_json);
-        let client_identity = client_identity_json
-            .as_deref()
-            .map(ClientIdentityMaterial::from_json_str)
-            .transpose()
-            .context("failed to parse iOS client identity JSON")?;
-
-        let client = if connection_input.starts_with('{') {
-            let mut bootstrap = ConnectionBootstrap::from_json_str(&connection_input)
-                .context("failed to parse iOS connection bootstrap JSON")?;
-            if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-                bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-            }
-            match client_identity.as_ref() {
-                Some(identity) => bootstrap.build_client_with_identity(identity)?,
-                None => bootstrap.build_client()?,
-            }
-        } else {
-            match client_identity.as_ref() {
-                Some(identity) => client_sdk::build_http_client_with_identity_from_pem(
-                    server_ca_pem.as_deref(),
-                    &connection_input,
-                    identity,
-                )?,
-                None => client_sdk::build_http_client_from_pem(
-                    server_ca_pem.as_deref(),
-                    &connection_input,
-                )?,
-            }
-        };
-
-        Self::with_client(ClientNode::with_client(client))
+        let configured =
+            configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
+        Self::with_client(ClientNode::with_client(configured.client))
     }
 
     pub fn configured_from_bootstrap(
@@ -293,6 +278,159 @@ impl IosStorageApp {
             content_fingerprint: entry.content_fingerprint,
         })
     }
+}
+
+fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
+    static STATE: OnceLock<Mutex<Option<WebUiServer>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn shared_web_ui_runtime() -> Result<&'static Runtime> {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to create iOS embedded web ui runtime")?;
+    let _ = RUNTIME.set(runtime);
+    RUNTIME
+        .get()
+        .ok_or_else(|| anyhow!("iOS embedded web ui runtime initialization race"))
+}
+
+fn split_connection_input(
+    connection_input: impl Into<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let normalized = normalized_connection_input_string(connection_input)?;
+    if normalized.starts_with('{') {
+        Ok((None, Some(normalized)))
+    } else {
+        Ok((Some(normalized), None))
+    }
+}
+
+fn configured_sdk_build(
+    connection_input: impl Into<String>,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<ConfiguredIosSdk> {
+    let server_ca_pem = normalize_optional_string(server_ca_pem);
+    let client_identity_json = normalize_optional_string(client_identity_json);
+    let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
+    let parsed_identity = client_identity_json
+        .as_deref()
+        .map(|raw| {
+            ClientIdentityMaterial::from_json_str(raw)
+                .context("failed to parse iOS client identity JSON")
+        })
+        .transpose()?;
+
+    if let Some(raw_bootstrap) = client_bootstrap_json.as_deref() {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(raw_bootstrap)
+            .context("failed to parse iOS connection bootstrap JSON")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+
+        return match parsed_identity {
+            Some(identity) => Ok(ConfiguredIosSdk {
+                client: bootstrap.build_client_with_identity(&identity)?,
+                client_identity: Some(identity),
+            }),
+            None => Ok(ConfiguredIosSdk {
+                client: bootstrap.build_client()?,
+                client_identity: None,
+            }),
+        };
+    }
+
+    let server_base_url = server_base_url
+        .ok_or_else(|| anyhow!("missing server_base_url or client_bootstrap_json"))?;
+    let client = match parsed_identity.as_ref() {
+        Some(identity) => build_http_client_with_identity_from_pem(
+            server_ca_pem.as_deref(),
+            &server_base_url,
+            identity,
+        )?,
+        None => build_http_client_from_pem(server_ca_pem.as_deref(), &server_base_url)?,
+    };
+
+    Ok(ConfiguredIosSdk {
+        client,
+        client_identity: parsed_identity,
+    })
+}
+
+fn start_embedded_web_ui(
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<String> {
+    let runtime = shared_web_ui_runtime()?;
+    let connection_input = normalized_connection_input_string(connection_input)?;
+    let server_ca_pem = normalize_optional_string(server_ca_pem);
+    let client_identity_json = normalize_optional_string(client_identity_json);
+    let mut state = web_ui_server_state()
+        .lock()
+        .map_err(|_| anyhow!("iOS web ui state lock poisoned"))?;
+
+    if let Some(existing) = state.as_ref()
+        && existing.connection_input == connection_input
+        && existing.server_ca_pem == server_ca_pem
+        && existing.client_identity_json == client_identity_json
+        && !existing.task.is_finished()
+    {
+        return Ok(existing.local_url.clone());
+    }
+
+    if let Some(previous) = state.take() {
+        previous.task.abort();
+    }
+
+    let listener = runtime
+        .block_on(async { tokio::net::TcpListener::bind(("127.0.0.1", 0)).await })
+        .context("failed to bind iOS embedded web ui listener")?;
+    let address = listener
+        .local_addr()
+        .context("failed to read iOS embedded web ui listener address")?;
+    let local_url = format!("http://localhost:{}/", address.port());
+    let configured = configured_sdk_build(
+        connection_input.clone(),
+        server_ca_pem.clone(),
+        client_identity_json.clone(),
+    )?;
+    let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.client)
+        .with_service_name("ironmesh-ios");
+    let (_, client_bootstrap_json) = split_connection_input(connection_input.clone())?;
+    if let Some(raw_bootstrap) = client_bootstrap_json {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(&raw_bootstrap)
+            .context("failed to parse iOS bootstrap for embedded web ui")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+        web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
+    }
+    if let Some(identity) = configured.client_identity {
+        web_ui_config = web_ui_config.with_client_identity(identity);
+    }
+    let app = web_ui_backend::router(web_ui_config);
+
+    let task = runtime.spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    *state = Some(WebUiServer {
+        connection_input,
+        server_ca_pem,
+        client_identity_json,
+        local_url: local_url.clone(),
+        task,
+    });
+
+    Ok(local_url)
 }
 
 pub fn create_handle(
@@ -534,6 +672,25 @@ pub extern "C" fn ironmesh_ios_facade_enroll_with_bootstrap(
             device_id_override.as_deref(),
             device_label_override.as_deref(),
         )
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_start_web_ui(
+    connection_input: *const c_char,
+    server_ca_pem: *const c_char,
+    client_identity_json: *const c_char,
+    out_url: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_url);
+    clear_error(out_error);
+    run_ffi_string_result(out_url, out_error, || {
+        let connection_input = required_c_string(connection_input, "connection_input")?;
+        let server_ca_pem = optional_c_string(server_ca_pem)?;
+        let client_identity_json = optional_c_string(client_identity_json)?;
+        start_embedded_web_ui(connection_input, server_ca_pem, client_identity_json)
     })
 }
 

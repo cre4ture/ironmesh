@@ -302,14 +302,11 @@ jobs:
           path: apps/android-app/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      - name: Reclaim disk before Android server-node build
+      - name: Reclaim disk after Android app builds
         run: |
-          df -h
-          rm -rf \
-            apps/android-app/.gradle \
-            apps/android-app/app/build \
-            apps/android-app/build
-          df -h
+          rm -rf apps/android-app/app/build
+          rm -rf apps/android-app/build
+          rm -rf apps/android-app/.gradle
 
       - name: Run Android server-node JVM unit tests
         working-directory: apps/android-server-node-app
@@ -325,6 +322,13 @@ jobs:
           name: android-server-node-debug-${{ env.BUILD_NAME_SUFFIX }}
           path: apps/android-server-node-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Reclaim disk after Android server-node debug build
+        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
+        run: |
+          rm -rf apps/android-server-node-app/app/build
+          rm -rf apps/android-server-node-app/build
+          rm -rf apps/android-server-node-app/.gradle
 
       - name: Build Android server-node signed internal release APK for performance testing
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
