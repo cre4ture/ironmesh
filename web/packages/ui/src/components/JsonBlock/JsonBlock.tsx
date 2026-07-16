@@ -1,6 +1,7 @@
 import { ActionIcon, Box, Code, Tooltip } from "@mantine/core";
 import { useClipboard } from "@mantine/hooks";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
+import { ironmeshPrimaryColor } from "../../theme/ironmesh-theme";
 
 type JsonBlockProps = {
   value: unknown;
@@ -15,7 +16,7 @@ export function JsonBlock({ value }: JsonBlockProps) {
       <Tooltip label={clipboard.copied ? "Copied" : "Copy JSON"}>
         <ActionIcon
           aria-label="Copy JSON to clipboard"
-          color={clipboard.copied ? "teal" : "gray"}
+          color={clipboard.copied ? ironmeshPrimaryColor : "gray"}
           onClick={() => clipboard.copy(json)}
           size="sm"
           style={{

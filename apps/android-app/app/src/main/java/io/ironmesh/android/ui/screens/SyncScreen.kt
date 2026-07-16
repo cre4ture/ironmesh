@@ -38,6 +38,7 @@ import io.ironmesh.android.R
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
+import io.ironmesh.android.data.isConnected
 import io.ironmesh.android.ui.FolderSyncActivityFilter
 import io.ironmesh.android.ui.FolderSyncHistoryState
 import io.ironmesh.android.ui.MainUiState
@@ -56,6 +57,8 @@ fun SyncScreen(
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
+    val connectionStatus = state.appConnectionStatus
+    val hasProfiles = state.syncProfiles.isNotEmpty()
     var showCreateSheet by rememberSaveable { mutableStateOf(false) }
     var detailProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -63,7 +66,7 @@ fun SyncScreen(
     val editingProfile = state.syncProfiles.firstOrNull { it.id == editingProfileId }
     val heroTone = when {
         state.folderSyncStatus.errorProfileCount > 0L -> HeroTone.Error
-        state.folderSyncStatus.activeProfileCount == 0L -> HeroTone.Warning
+        !connectionStatus.isConnected() -> HeroTone.Warning
         else -> HeroTone.Good
     }
 
@@ -74,16 +77,88 @@ fun SyncScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         StatusHeroCard(
-            title = displayStatusToken(state.folderSyncStatus.serviceState),
-            subtitle = state.folderSyncStatus.serviceMessage,
+            title = syncOverviewHeadline(state.folderSyncStatus, hasProfiles),
+            subtitle = syncOverviewSummary(state.folderSyncStatus),
             tone = heroTone,
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = { showCreateSheet = true }) {
                     Text(stringResource(R.string.new_profile))
                 }
+                if (shouldShowRetryConnectionAction(connectionStatus, hasProfiles)) {
+                    OutlinedButton(onClick = vm::retryFolderSyncConnection) {
+                        Text(stringResource(R.string.retry_connection))
+                    }
+                }
                 OutlinedButton(onClick = vm::runFolderSyncNow) {
                     Text(stringResource(R.string.sync_now))
+                }
+            }
+        }
+
+        SectionCard(title = "App connection") {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SyncBadge(displayStatusToken(connectionStatus.state))
+                if (connectionStatus.retryAttemptCount > 0L) {
+                    SyncBadge("Retry ${connectionStatus.retryAttemptCount}")
+                }
+                connectionStatus.nextRetryUnixMs?.let { retryAt ->
+                    SyncBadge("Next retry ${formatTimestamp(retryAt)}")
+                }
+                connectionStatus.lastSuccessfulConnectionUnixMs?.let { lastSuccess ->
+                    SyncBadge("Last success ${formatTimestamp(lastSuccess)}")
+                }
+            }
+            Text(
+                text = connectionStatus.message,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            connectionStatus.lastSuccessfulConnectionUrl
+                ?.takeIf { it.isNotBlank() }
+                ?.let { url ->
+                    Text(
+                        text = "Last working route: $url",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            if (connectionStatus.failedAttempts.isNotEmpty()) {
+                Text(
+                    text = "Recent failed attempts",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                connectionStatus.failedAttempts.forEach { attempt ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = appFailedAttemptSummary(attempt),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = attempt.url.ifBlank { attempt.endpointLocator },
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            attempt.error?.takeIf { it.isNotBlank() }?.let { error ->
+                                Text(
+                                    text = error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -7613,6 +7613,7 @@ fn push_rendezvous_direct_candidate(
         kind: CandidateKind::DirectHttps,
         endpoint,
         rtt_ms: None,
+        transport_hints: None,
     });
 }
 
@@ -7814,6 +7815,7 @@ fn peer_connection_candidates(
                 kind: CandidateKind::Relay,
                 endpoint,
                 rtt_ms: None,
+                transport_hints: None,
             });
         }
     }
@@ -7838,6 +7840,7 @@ fn push_ranked_peer_candidate(
         kind: CandidateKind::DirectHttps,
         endpoint,
         rtt_ms,
+        transport_hints: None,
     });
 }
 

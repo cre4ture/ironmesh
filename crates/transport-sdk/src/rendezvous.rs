@@ -967,6 +967,7 @@ mod tests {
                         kind: crate::CandidateKind::ServerReflexive,
                         endpoint: "https://203.0.113.10:7443".to_string(),
                         rtt_ms: None,
+                        transport_hints: None,
                     }]),
                     node_relay_capable: true,
                 })
@@ -1009,6 +1010,7 @@ mod tests {
                 kind: crate::CandidateKind::ServerReflexive,
                 endpoint: "https://203.0.113.10:7443".to_string(),
                 rtt_ms: None,
+                transport_hints: None,
             }])
         );
         assert!(discovery.node_relay_capable);

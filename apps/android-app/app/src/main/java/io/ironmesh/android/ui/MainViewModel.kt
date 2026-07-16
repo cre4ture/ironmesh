@@ -10,6 +10,7 @@ import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.FolderSyncConfig
+import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
 import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncServiceStatus
@@ -17,6 +18,9 @@ import io.ironmesh.android.ui.screens.ThumbnailBitmapCache
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.parseAllowedWifiSsidsInput
+import io.ironmesh.android.work.FolderSyncForegroundService
+import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
+import io.ironmesh.android.ui.theme.normalizeIronmeshAccentColorHex
 import io.ironmesh.android.work.FolderSyncScheduler
 import io.ironmesh.android.work.FolderSyncNetworkGate
 import kotlinx.coroutines.Dispatchers
@@ -120,6 +124,7 @@ data class MainUiState(
     val objectBody: String = "",
     val syncProfiles: List<FolderSyncConfig> = emptyList(),
     val folderSyncStatus: FolderSyncServiceStatus = FolderSyncServiceStatus(),
+    val appConnectionStatus: AppConnectionStatus = AppConnectionStatus(),
     val folderSyncHistory: Map<String, FolderSyncHistoryState> = emptyMap(),
     val newSyncLabel: String = "",
     val newSyncPrefix: String = "",
@@ -140,6 +145,7 @@ data class MainUiState(
     val galleryCurrentDirectoryDocumentId: String = GALLERY_ROOT_DOCUMENT_ID,
     val galleryCurrentDirectoryPath: String = GALLERY_ROOT_PATH,
     val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
+    val themeAccentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     val galleryLoading: Boolean = false,
     val loading: Boolean = false,
 )
@@ -159,11 +165,15 @@ class MainViewModel(
         val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
         val persistedDeviceAuth = IronmeshPreferences.getDeviceAuthState(getApplication())
         val persistedGalleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication())
+        val persistedConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
+        val persistedThemeAccentColor = IronmeshPreferences.getThemeAccentColor(getApplication())
         uiState.value = uiState.value.copy(
             syncProfiles = persistedProfiles,
             deviceAuthState = persistedDeviceAuth,
             deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
             galleryMode = persistedGalleryViewMode,
+            appConnectionStatus = persistedConnectionStatus,
+            themeAccentColorHex = persistedThemeAccentColor,
         )
         FolderSyncScheduler.reschedule(getApplication())
         observeFolderSyncStatus()
@@ -183,6 +193,12 @@ class MainViewModel(
 
     fun updatePayload(value: String) {
         uiState.value = uiState.value.copy(payload = value)
+    }
+
+    fun updateThemeAccentColor(value: String) {
+        val normalized = normalizeIronmeshAccentColorHex(value) ?: return
+        IronmeshPreferences.setThemeAccentColor(getApplication(), normalized)
+        uiState.value = uiState.value.copy(themeAccentColorHex = normalized)
     }
 
     fun putObject() {
@@ -714,6 +730,16 @@ class MainViewModel(
         setStatus("Folder sync scheduled")
     }
 
+    fun retryFolderSyncConnection() {
+        val enabledProfiles = uiState.value.syncProfiles.filter { profile -> profile.enabled }
+        if (enabledProfiles.isEmpty()) {
+            setStatus("No enabled sync profile is configured")
+            return
+        }
+        FolderSyncForegroundService.retryNow(getApplication())
+        setStatus("Requested a sync connection retry")
+    }
+
     fun toggleFolderSyncHistory(profileId: String) {
         val current = uiState.value.folderSyncHistory[profileId] ?: FolderSyncHistoryState()
         updateFolderSyncHistoryState(profileId) { historyState ->
@@ -840,8 +866,10 @@ class MainViewModel(
 
     fun clearDeviceEnrollment() {
         IronmeshPreferences.clearDeviceAuthState(getApplication())
+        IronmeshPreferences.clearAppConnectionStatus(getApplication())
         uiState.value = uiState.value.copy(
             deviceAuthState = DeviceAuthState(),
+            appConnectionStatus = AppConnectionStatus(),
             bootstrapInput = "",
             deviceLabelInput = "",
             selectedSection = MainSection.HOME,
@@ -877,7 +905,11 @@ class MainViewModel(
                     runCatching { repository.getContinuousFolderSyncStatus() }
                         .getOrDefault(FolderSyncServiceStatus())
                 }
-                uiState.value = uiState.value.copy(folderSyncStatus = status)
+                val connectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
+                uiState.value = uiState.value.copy(
+                    folderSyncStatus = status,
+                    appConnectionStatus = connectionStatus,
+                )
                 historyRefreshTick += 1
                 if (historyRefreshTick >= 5) {
                     historyRefreshTick = 0

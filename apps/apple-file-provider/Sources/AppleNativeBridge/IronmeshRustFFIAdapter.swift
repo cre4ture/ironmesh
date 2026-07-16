@@ -9,7 +9,7 @@ struct IronmeshRustFFIError: LocalizedError {
     }
 }
 
-final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, @unchecked Sendable {
+final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnroller, @unchecked Sendable {
     func createHandle(
         connectionInput: String,
         serverCAPem: String?,
@@ -142,6 +142,41 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, @unchecked Sendable {
         }
 
         try throwIfNeeded(status: status, errorPointer: errorPointer)
+    }
+
+    func enrollConnectionInput(
+        _ connectionInput: String,
+        deviceID: String?,
+        label: String?
+    ) throws -> AppleBootstrapEnrollmentResult {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(connectionInput) { connectionPointer in
+            withOptionalCString(deviceID) { deviceIDPointer in
+                withOptionalCString(label) { labelPointer in
+                    ironmesh_ios_facade_enroll_with_bootstrap(
+                        connectionPointer,
+                        deviceIDPointer,
+                        labelPointer,
+                        &jsonPointer,
+                        &errorPointer
+                    )
+                }
+            }
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no enrollment JSON.")
+        }
+
+        let json = consumeString(jsonPointer)
+        let data = Data(json.utf8)
+        do {
+            return try JSONDecoder().decode(AppleBootstrapEnrollmentResult.self, from: data)
+        } catch {
+            throw IronmeshRustFFIError(message: "Failed to decode enrollment JSON: \(error.localizedDescription)")
+        }
     }
 }
 

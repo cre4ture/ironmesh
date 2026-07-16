@@ -31,6 +31,7 @@
     <string name="metric_errors">Errors</string>
     <string name="sync_overview">Sync overview</string>
     <string name="sync_profiles">Sync profiles</string>
+    <string name="connection_status">Connection status</string>
     <string name="new_profile">New profile</string>
     <string name="profile_label">Profile label</string>
     <string name="remote_prefix_optional">Remote prefix (optional)</string>
@@ -42,6 +43,7 @@
     <string name="remove">Remove</string>
     <string name="edit">Edit</string>
     <string name="details">Details</string>
+    <string name="retry_connection">Retry connection</string>
     <string name="enabled">Enabled</string>
     <string name="disabled">Disabled</string>
     <string name="view_activity">View activity</string>
@@ -57,12 +59,21 @@
     <string name="library_refresh">Refresh</string>
     <string name="settings_device">Device</string>
     <string name="settings_permissions">Permissions</string>
+    <string name="settings_appearance">Appearance</string>
     <string name="settings_storage">Storage and files</string>
     <string name="settings_advanced">Advanced</string>
     <string name="rename_device_hint">Rename this device by updating its label and re-enrolling when needed.</string>
     <string name="clear_device_identity">Clear device identity</string>
     <string name="open_files">Open Files</string>
     <string name="version">Version</string>
+    <string name="theme_color_body">Choose the app accent color. Changes apply immediately and stay on this device.</string>
+    <string name="theme_color_preview">Current accent</string>
+    <string name="theme_color_hex_label">Accent hex color</string>
+    <string name="theme_color_presets">Quick picks</string>
+    <string name="theme_color_red">Red</string>
+    <string name="theme_color_green">Green</string>
+    <string name="theme_color_blue">Blue</string>
+    <string name="theme_color_reset">Reset accent color</string>
     <string name="advanced_transport_test">Transport test</string>
     <string name="key">Key</string>
     <string name="payload">Payload</string>

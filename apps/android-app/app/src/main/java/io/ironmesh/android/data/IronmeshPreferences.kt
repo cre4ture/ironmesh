@@ -5,12 +5,16 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import io.ironmesh.android.ui.GalleryViewMode
+import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
+import io.ironmesh.android.ui.theme.normalizeIronmeshAccentColorHex
 
 object IronmeshPreferences {
     private const val PREFS_NAME = "ironmesh_prefs"
     private const val PREF_SYNC_CONFIGS = "folder_sync_configs"
     private const val PREF_DEVICE_AUTH_STATE = "device_auth_state"
     private const val PREF_GALLERY_VIEW_MODE = "gallery_view_mode"
+    private const val PREF_APP_CONNECTION_STATUS = "app_connection_status"
+    private const val PREF_THEME_ACCENT_COLOR = "theme_accent_color"
 
     private val moshi: Moshi by lazy {
         Moshi.Builder()
@@ -25,6 +29,10 @@ object IronmeshPreferences {
 
     private val deviceAuthStateAdapter by lazy {
         moshi.adapter(DeviceAuthState::class.java)
+    }
+
+    private val appConnectionStatusAdapter by lazy {
+        moshi.adapter(AppConnectionStatus::class.java)
     }
 
     private fun prefs(context: Context) =
@@ -64,5 +72,41 @@ object IronmeshPreferences {
 
     fun setGalleryViewMode(context: Context, mode: GalleryViewMode) {
         prefs(context).edit().putString(PREF_GALLERY_VIEW_MODE, mode.name).apply()
+    }
+
+    fun getAppConnectionStatus(context: Context): AppConnectionStatus {
+        val raw = prefs(context).getString(PREF_APP_CONNECTION_STATUS, null)
+            ?: return AppConnectionStatus()
+        return runCatching {
+            appConnectionStatusAdapter.fromJson(raw) ?: AppConnectionStatus()
+        }.getOrDefault(AppConnectionStatus())
+    }
+
+    fun setAppConnectionStatus(context: Context, status: AppConnectionStatus) {
+        val payload = appConnectionStatusAdapter.toJson(status)
+        prefs(context).edit().putString(PREF_APP_CONNECTION_STATUS, payload).apply()
+    }
+
+    fun clearAppConnectionStatus(context: Context) {
+        prefs(context).edit().remove(PREF_APP_CONNECTION_STATUS).apply()
+    }
+
+    fun getThemeAccentColor(context: Context): String {
+        val raw = prefs(context).getString(PREF_THEME_ACCENT_COLOR, null)
+        return normalizeIronmeshAccentColorHex(raw) ?: DEFAULT_IRONMESH_ACCENT_COLOR_HEX
+    }
+
+    fun setThemeAccentColor(
+        context: Context,
+        colorHex: String,
+    ) {
+        val normalized = normalizeIronmeshAccentColorHex(colorHex) ?: DEFAULT_IRONMESH_ACCENT_COLOR_HEX
+        val editor = prefs(context).edit()
+        if (normalized == DEFAULT_IRONMESH_ACCENT_COLOR_HEX) {
+            editor.remove(PREF_THEME_ACCENT_COLOR)
+        } else {
+            editor.putString(PREF_THEME_ACCENT_COLOR, normalized)
+        }
+        editor.apply()
     }
 }

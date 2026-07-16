@@ -7,20 +7,26 @@ struct IronmeshBundleConfiguration {
     let domainIdentifier: String
     let domainDisplayName: String
     let connectionInput: String
+    let appGroupIdentifier: String?
 
     init(bundle: Bundle = .main) {
         let info = bundle.infoDictionary ?? [:]
         domainIdentifier = (info["IronmeshDomainIdentifier"] as? String)?.nilIfBlank ?? "dev.ironmesh.default"
         domainDisplayName = (info["IronmeshDomainDisplayName"] as? String)?.nilIfBlank ?? "IronMesh"
         connectionInput = (info["IronmeshConnectionInput"] as? String)?.nilIfBlank ?? "127.0.0.1:18080"
+        appGroupIdentifier = (info["IronmeshAppGroupIdentifier"] as? String)?.nilIfBlank
     }
 
-    var connectionConfiguration: AppleConnectionConfiguration {
+    var defaultConnectionConfiguration: AppleConnectionConfiguration {
         AppleConnectionConfiguration(connectionInput: connectionInput)
     }
 
     var domain: NSFileProviderDomain {
         NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(rawValue: domainIdentifier), displayName: domainDisplayName)
+    }
+
+    func makeSettingsStore() -> AppleConnectionSettingsStore {
+        AppleConnectionSettingsStore(suiteName: appGroupIdentifier)
     }
 }
 
@@ -85,16 +91,20 @@ final class IronmeshFileProviderService: @unchecked Sendable {
 
     private let bridge: AppleCFacadeBridge
     private let cache: IronmeshIdentifierPathCache
+    private let settingsStore: AppleConnectionSettingsStore
     private let lock = NSLock()
     private var connected = false
+    private var connectedConfiguration: AppleConnectionConfiguration?
 
     init(
         configuration: IronmeshBundleConfiguration = IronmeshBundleConfiguration(),
-        ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter()
+        ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(),
+        settingsStore: AppleConnectionSettingsStore? = nil
     ) {
         self.configuration = configuration
         bridge = AppleCFacadeBridge(ffi: ffi)
         cache = IronmeshIdentifierPathCache(domainIdentifier: configuration.domainIdentifier)
+        self.settingsStore = settingsStore ?? configuration.makeSettingsStore()
     }
 
     func rootItem() -> AppleBridgeItem {
@@ -148,19 +158,53 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         }
     }
 
+    func currentConnectionConfiguration() -> AppleConnectionConfiguration {
+        let stored = settingsStore.load()
+        return stored?.effectiveConfiguration(fallback: configuration.defaultConnectionConfiguration)
+            ?? configuration.defaultConnectionConfiguration
+    }
+
+    func storedConnectionState() -> AppleStoredConnectionState {
+        settingsStore.load() ?? AppleStoredConnectionState(
+            connectionInput: configuration.defaultConnectionConfiguration.connectionInput
+        )
+    }
+
+    func saveConnectionState(_ state: AppleStoredConnectionState, reconnect: Bool = true) throws {
+        try settingsStore.save(state)
+        if reconnect {
+            resetConnection()
+        }
+    }
+
+    func clearStoredConnectionState() {
+        settingsStore.clear()
+        resetConnection()
+    }
+
     private func connectIfNeeded() throws {
+        let configuration = currentConnectionConfiguration()
         lock.lock()
         let alreadyConnected = connected
+        let currentConfiguration = connectedConfiguration
         lock.unlock()
 
-        if alreadyConnected {
+        if alreadyConnected, currentConfiguration == configuration {
             return
         }
 
-        _ = try bridge.connect(configuration.connectionConfiguration)
+        _ = try bridge.connect(configuration)
 
         lock.lock()
         connected = true
+        connectedConfiguration = configuration
+        lock.unlock()
+    }
+
+    private func resetConnection() {
+        lock.lock()
+        connected = false
+        connectedConfiguration = nil
         lock.unlock()
     }
 

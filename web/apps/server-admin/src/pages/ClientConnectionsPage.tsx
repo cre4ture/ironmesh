@@ -7,7 +7,7 @@ import {
   type ClientConnectionSummary,
   type ClientConnectionTransport
 } from "@ironmesh/api";
-import { StatCard } from "@ironmesh/ui";
+import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
 import {
   Alert,
   Badge,
@@ -351,7 +351,7 @@ function transportBadgeColor(transport: ClientConnectionTransport): string {
     case "http_request":
       return "blue";
     case "direct_transport":
-      return "teal";
+      return ironmeshPrimaryColor;
     case "relay_transport":
       return "grape";
   }

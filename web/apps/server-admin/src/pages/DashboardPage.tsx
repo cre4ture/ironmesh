@@ -38,6 +38,7 @@ import {
   Tooltip as MantineTooltip
 } from "@mantine/core";
 import {
+  ironmeshPrimaryColor,
   StatCard,
   ZoomableTimeSeriesChart,
   formatTimeSeriesChartTimestamp
@@ -105,7 +106,7 @@ const STORAGE_CHART_SERIES: Array<{
     key: "latestSnapshotUniqueChunkBytes",
     label: "Latest snapshot unique",
     color: "#34d399",
-    badgeColor: "teal"
+    badgeColor: ironmeshPrimaryColor
   }
 ];
 
@@ -431,7 +432,7 @@ export function DashboardPage() {
                   {clusterSummary?.local_node_id ?? (loading ? "loading" : "unknown")}
                 </Badge>
                 <Badge
-                  color={localNode?.reachability.relay_required ? "teal" : "blue"}
+                  color={localNode?.reachability.relay_required ? ironmeshPrimaryColor : "blue"}
                   variant="light"
                 >
                   {localNode?.reachability.relay_required ? "relay-required" : "direct-capable"}
@@ -507,7 +508,7 @@ export function DashboardPage() {
               <Text fw={700}>Rendezvous participation</Text>
               <Group gap="sm">
                 <Badge
-                  color={rendezvousConfig?.registration_enabled ? "teal" : "gray"}
+                  color={rendezvousConfig?.registration_enabled ? ironmeshPrimaryColor : "gray"}
                   variant="light"
                 >
                   {rendezvousConfig?.registration_enabled ? "registration enabled" : "registration disabled"}
@@ -996,7 +997,7 @@ export function DashboardPage() {
                         <Table.Tr key={node.node_id}>
                           <Table.Td>{node.node_id}</Table.Td>
                           <Table.Td>
-                            <Badge color={node.status === "online" ? "teal" : "gray"} variant="light">
+                            <Badge color={node.status === "online" ? ironmeshPrimaryColor : "gray"} variant="light">
                               {node.status}
                             </Badge>
                           </Table.Td>
@@ -1080,7 +1081,7 @@ export function DashboardPage() {
                   </Button>
                 </Group>
                 {mediaCacheClearResult ? (
-                  <Alert color="teal" variant="light" title="Media cache cleared">
+                  <Alert color={ironmeshPrimaryColor} variant="light" title="Media cache cleared">
                     Cleared {mediaCacheClearResult.deleted_metadata_records} metadata records and{" "}
                     {mediaCacheClearResult.deleted_thumbnail_files} generated thumbnails (
                     {formatBytes(mediaCacheClearResult.deleted_thumbnail_bytes)}) at{" "}
@@ -1211,7 +1212,7 @@ function startupStatusColor(status: string | undefined): string {
     case "running":
       return "orange";
     case "completed":
-      return "teal";
+      return ironmeshPrimaryColor;
     case "skipped_no_gaps":
       return "blue";
     case "scheduled":

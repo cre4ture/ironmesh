@@ -2,6 +2,10 @@
 
 Status: Concrete repo-mapped implementation plan for the target architecture
 
+Follow-up for the additive `iroh` direct QUIC + hole punching migration:
+
+- `docs/iroh-direct-quic-integration-plan.md`
+
 ## 1. Ground rules
 
 - This is a direct replacement plan, not a migration plan.

@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
-use transport_sdk::{ClientIdentityMaterial, RendezvousClientConfig};
+use transport_sdk::{ClientIdentityMaterial, RendezvousClientConfig, TransportPathKind};
 
 use crate::latency_probe::LatencyProbeConfig;
 use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
@@ -151,7 +151,7 @@ pub fn build_http_client_with_identity_from_planned_target(
     target: &PlannedConnectionBootstrapTarget,
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
-    if let Some(server_base_url) = target.server_base_url.as_deref() {
+    if let Some(server_base_url) = planned_target_direct_http_base_url(target)? {
         return build_http_client_with_identity_from_pem_with_target_node_id(
             target
                 .server_ca_pem
@@ -230,7 +230,13 @@ pub fn build_http_client_from_planned_targets(
     let mut build_errors = Vec::new();
 
     for target in targets {
-        let Some(server_base_url) = target.server_base_url.as_deref() else {
+        let Some(server_base_url) = (match planned_target_direct_http_base_url(target) {
+            Ok(server_base_url) => server_base_url,
+            Err(error) => {
+                build_errors.push(error.to_string());
+                continue;
+            }
+        }) else {
             continue;
         };
 
@@ -269,7 +275,7 @@ pub fn build_client_with_optional_identity_from_planned_target(
     match identity {
         Some(identity) => build_http_client_with_identity_from_planned_target(target, identity),
         None => {
-            if let Some(server_base_url) = target.server_base_url.as_deref() {
+            if let Some(server_base_url) = planned_target_direct_http_base_url(target)? {
                 return build_http_client_from_pem_with_target_node_id(
                     target
                         .server_ca_pem
@@ -431,6 +437,7 @@ fn order_clients_by_startup_probe(
 }
 
 async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+    let target_label = startup_probe_target_label(client);
     if let Some(rendezvous) = client.rendezvous_client()
         && let Some(diagnostic) = rendezvous.client_identity_expiry_diagnostic()
     {
@@ -448,7 +455,12 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
         }),
     )
     .await
-    .context("startup signed latency probe timed out")??;
+    .with_context(|| {
+        format!(
+            "startup signed latency probe timed out after {:?} for {target_label}",
+            STARTUP_PROBE_TIMEOUT
+        )
+    })??;
 
     let latency_ms = result
         .summary
@@ -459,14 +471,33 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
 }
 
 async fn probe_direct_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+    let target_label = startup_probe_target_label(client);
     let started_at = Instant::now();
     let response = tokio::time::timeout(STARTUP_PROBE_TIMEOUT, client.get_relative_path("/health"))
         .await
-        .context("startup direct health probe timed out")??;
+        .with_context(|| {
+            format!(
+                "startup direct health probe timed out after {:?} for {target_label}",
+                STARTUP_PROBE_TIMEOUT
+            )
+        })??;
     if !response.status.is_success() {
-        bail!("health probe returned {}", response.status);
+        bail!(
+            "health probe returned {} for {}",
+            response.status,
+            target_label
+        );
     }
     Ok(started_at.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn startup_probe_target_label(client: &IronMeshClient) -> String {
+    client
+        .connection_diagnostics()
+        .endpoints
+        .first()
+        .map(|endpoint| endpoint.locator.clone())
+        .unwrap_or_else(|| "<unknown-target>".to_string())
 }
 
 fn format_build_error_suffix(errors: &[String]) -> String {
@@ -475,6 +506,43 @@ fn format_build_error_suffix(errors: &[String]) -> String {
     } else {
         format!(": {}", errors.join(" | "))
     }
+}
+
+fn planned_target_direct_http_base_url(
+    target: &PlannedConnectionBootstrapTarget,
+) -> Result<Option<&str>> {
+    match target.path_kind {
+        TransportPathKind::DirectHttps => {
+            target.server_base_url.as_deref().map(Some).ok_or_else(|| {
+                anyhow!("direct HTTPS client transport target is missing server_base_url")
+            })
+        }
+        TransportPathKind::DirectQuic => bail!(
+            "direct QUIC client transport target {} is not supported until a native QUIC transport is implemented",
+            planned_target_label(target)
+        ),
+        TransportPathKind::RelayTunnel => {
+            if target.server_base_url.is_some() {
+                bail!(
+                    "relay-backed client transport target {} unexpectedly includes server_base_url",
+                    planned_target_label(target)
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn planned_target_label(target: &PlannedConnectionBootstrapTarget) -> String {
+    target
+        .server_base_url
+        .clone()
+        .or_else(|| {
+            target
+                .target_node_id
+                .map(|node_id| format!("node {node_id}"))
+        })
+        .unwrap_or_else(|| format!("{:?}", target.path_kind))
 }
 
 fn preferred_socket_addrs_for_url(url: &Url) -> Option<(String, Vec<SocketAddr>)> {
@@ -652,5 +720,92 @@ mod tests {
                 .to_string()
                 .contains("requires rendezvous_client_identity_pem")
         );
+    }
+
+    #[test]
+    fn build_http_client_with_identity_from_planned_target_rejects_direct_quic() {
+        let identity = sample_identity();
+        let error = match build_http_client_with_identity_from_planned_target(
+            &PlannedConnectionBootstrapTarget {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                relay_mode: RelayMode::Fallback,
+                path_kind: TransportPathKind::DirectQuic,
+                server_base_url: Some("https://node-a.example:4433".to_string()),
+                target_node_id: Some(NodeId::new_v4()),
+                server_ca_pem: None,
+                cluster_ca_pem: None,
+                rendezvous_ca_pem: None,
+                pairing_token: None,
+                device_label: None,
+                device_id: None,
+            },
+            &identity,
+        ) {
+            Ok(_) => panic!("direct QUIC target should fail closed until transport exists"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(
+            "direct QUIC client transport target https://node-a.example:4433 is not supported"
+        ));
+    }
+
+    #[test]
+    fn build_client_with_optional_identity_from_planned_target_rejects_direct_quic_without_identity()
+     {
+        let error = match build_client_with_optional_identity_from_planned_target(
+            &PlannedConnectionBootstrapTarget {
+                cluster_id: Uuid::now_v7(),
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                relay_mode: RelayMode::Fallback,
+                path_kind: TransportPathKind::DirectQuic,
+                server_base_url: Some("https://node-a.example:4433".to_string()),
+                target_node_id: Some(NodeId::new_v4()),
+                server_ca_pem: None,
+                cluster_ca_pem: None,
+                rendezvous_ca_pem: None,
+                pairing_token: None,
+                device_label: None,
+                device_id: None,
+            },
+            None,
+        ) {
+            Ok(_) => panic!("direct QUIC target should fail closed without identity as well"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(
+            "direct QUIC client transport target https://node-a.example:4433 is not supported"
+        ));
+    }
+
+    #[test]
+    fn build_http_client_from_planned_targets_rejects_direct_quic_when_no_http_targets_exist() {
+        let error =
+            match build_http_client_from_planned_targets(&[PlannedConnectionBootstrapTarget {
+                cluster_id: Uuid::now_v7(),
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                relay_mode: RelayMode::Fallback,
+                path_kind: TransportPathKind::DirectQuic,
+                server_base_url: Some("https://node-a.example:4433".to_string()),
+                target_node_id: Some(NodeId::new_v4()),
+                server_ca_pem: None,
+                cluster_ca_pem: None,
+                rendezvous_ca_pem: None,
+                pairing_token: None,
+                device_label: None,
+                device_id: None,
+            }]) {
+                Ok(_) => panic!("direct QUIC target should not be built as HTTP"),
+                Err(error) => error,
+            };
+
+        assert!(error.to_string().contains(
+            "direct QUIC client transport target https://node-a.example:4433 is not supported"
+        ));
     }
 }
