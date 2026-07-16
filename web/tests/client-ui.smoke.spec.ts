@@ -49,7 +49,12 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
   await expect(page.getByText("Recent client runtime logs", { exact: true })).toBeVisible();
   await expect(page.getByText("2023-11-14T22:13:20.000Z INFO client_sdk client transport ready")).toBeVisible();
-  await expect(page.getByText("connection refused")).toBeVisible();
+  await expect(
+    page.getByText(
+      "2023-11-14T22:13:22.000Z ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health"
+    )
+  ).toBeVisible();
+  await expect(page.getByText("2023-11-14T22:13:22.000Z caused by: connection refused")).toBeVisible();
 
   await page.getByText("Store", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
@@ -585,7 +590,10 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
           },
           {
             captured_at_unix: 1_700_000_002,
-            line: "ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health: connection refused"
+            line: [
+              "ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health",
+              "caused by: connection refused"
+            ].join("\n")
           }
         ]
       });

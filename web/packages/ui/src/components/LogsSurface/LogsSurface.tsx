@@ -46,9 +46,7 @@ export function LogsSurface({
   const logsScrollReadyRef = useRef(false);
   const logEntries = logs?.entries ?? [];
   const latestLogEntry = logEntries.length > 0 ? logEntries[logEntries.length - 1] : null;
-  const renderedLogEntries = logEntries.map(
-    (entry) => `${formatUnixTs(entry.captured_at_unix)} ${entry.line}`
-  );
+  const renderedLogEntries = logEntries.flatMap(renderLogEntry);
 
   const refresh = useCallback(async (options?: { background?: boolean }) => {
     const background = options?.background ?? false;
@@ -189,4 +187,15 @@ function formatUnixTs(unixTs?: number | null): string {
   }
 
   return new Date(unixTs * 1000).toISOString();
+}
+
+function renderLogEntry(entry: LogEntry): string[] {
+  const prefix = formatUnixTs(entry.captured_at_unix);
+  const lines = entry.line.replace(/\r\n?/g, "\n").split("\n");
+
+  while (lines.length > 1 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  return lines.map((line) => (line.length > 0 ? `${prefix} ${line}` : prefix));
 }
