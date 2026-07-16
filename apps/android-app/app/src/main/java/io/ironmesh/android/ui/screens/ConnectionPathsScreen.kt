@@ -257,16 +257,18 @@ private fun summarizeRelayLocator(locator: String): String? {
     return summarizeUrl(locator.substring(rendezvousIndex + 1))
 }
 
-private fun summarizeUrl(value: String): String = try {
-    val uri = java.net.URI(value)
-    val host = uri.host ?: return value
-    if (uri.port > 0) {
-        "$host:${uri.port}"
-    } else {
-        host
+private fun summarizeUrl(value: String): String {
+    return try {
+        val uri = java.net.URI(value)
+        val host = uri.host ?: value
+        if (uri.port > 0) {
+            "$host:${uri.port}"
+        } else {
+            host
+        }
+    } catch (_: Exception) {
+        value
     }
-} catch (_: Exception) {
-    value
 }
 
 private fun connectionMethodStateLine(

@@ -1631,15 +1631,20 @@ mod tests {
                 "expected refreshed targets to include reflexive candidate: {targets:#?}"
             );
 
-            let relay_target = targets
+            let relay_targets = targets
                 .iter()
-                .find(|target| target.path_kind == transport_sdk::TransportPathKind::RelayTunnel)
-                .context("expected refreshed targets to include a relay target")?;
+                .filter(|target| target.path_kind == transport_sdk::TransportPathKind::RelayTunnel)
+                .collect::<Vec<_>>();
+            assert_eq!(relay_targets.len(), 2, "expected one relay target per rendezvous URL");
+            let relay_rendezvous_urls = relay_targets
+                .iter()
+                .map(|target| target.rendezvous_urls.clone())
+                .collect::<Vec<_>>();
             assert_eq!(
-                relay_target.rendezvous_urls,
+                relay_rendezvous_urls,
                 vec![
-                    format!("{rendezvous_url_a}/"),
-                    format!("{rendezvous_url_b}/"),
+                    vec![format!("{rendezvous_url_a}/")],
+                    vec![format!("{rendezvous_url_b}/")],
                 ]
             );
 
