@@ -83,6 +83,9 @@ ci-required-macos:
     just ci-required
     just ci-ios
 
+ios-app-run:
+    apps/apple-file-provider/scripts/run-ios-simulator-app.sh
+
 web-install:
     cd web && pnpm install
 
