@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
+import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.AppConnectionStatus
@@ -24,6 +25,7 @@ import io.ironmesh.android.ui.theme.normalizeIronmeshAccentColorHex
 import io.ironmesh.android.work.FolderSyncScheduler
 import io.ironmesh.android.work.FolderSyncNetworkGate
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -42,6 +44,7 @@ enum class GalleryViewMode {
 
 enum class MainSection {
     HOME,
+    CONNECTIVITY,
     SYNC,
     LIBRARY,
     GALLERY_MAP,
@@ -63,6 +66,7 @@ private const val GALLERY_PAGE_KEEP_RADIUS = 2
 private const val GALLERY_FLATTENED_DEPTH = 64
 private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
 private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
+private const val CONNECTION_ROUTE_SNAPSHOT_POLL_MS = 5_000L
 
 data class FolderSyncHistoryState(
     val expanded: Boolean = false,
@@ -137,6 +141,10 @@ data class MainUiState(
     val newSyncAllowRoaming: Boolean = false,
     val newSyncAllowedWifiSsids: String = "",
     val selectedSection: MainSection = MainSection.HOME,
+    val connectionRoutes: ConnectionRouteSnapshot? = null,
+    val connectionRoutesLoading: Boolean = false,
+    val connectionRoutesError: String? = null,
+    val connectionRoutesLastLoadedUnixMs: Long = 0L,
     val webUiUrl: String = "",
     val galleryMode: GalleryViewMode = GalleryViewMode.FLATTENED_ALL_IMAGES,
     val galleryCollection: GalleryCollectionState? = null,
@@ -158,6 +166,7 @@ class MainViewModel(
     private val repository = IronmeshRepository()
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
+    private var connectionRoutesMonitorJob: Job? = null
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
@@ -279,6 +288,11 @@ class MainViewModel(
 
     fun selectSection(section: MainSection) {
         uiState.value = uiState.value.copy(selectedSection = section)
+        if (section == MainSection.CONNECTIVITY) {
+            startConnectionRoutesMonitor()
+        } else {
+            stopConnectionRoutesMonitor()
+        }
         if (section == MainSection.SYNC) {
             refreshExpandedFolderSyncHistory(force = true)
         }
@@ -292,6 +306,20 @@ class MainViewModel(
         }
         if (section == MainSection.GALLERY_MAP && uiState.value.webUiUrl.isBlank() && !uiState.value.loading) {
             startWebUi()
+        }
+    }
+
+    fun refreshConnectionRoutes() {
+        stopConnectionRoutesMonitor()
+        viewModelScope.launch {
+            loadConnectionRoutes(
+                refresh = true,
+                showLoading = true,
+                statusOnFailure = true,
+            )
+            if (uiState.value.selectedSection == MainSection.CONNECTIVITY) {
+                startConnectionRoutesMonitor()
+            }
         }
     }
 
@@ -849,11 +877,15 @@ class MainViewModel(
             }
                 .onSuccess { authState ->
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
+                    stopConnectionRoutesMonitor()
                     uiState.value = uiState.value.copy(
                         loading = false,
                         deviceAuthState = authState,
                         bootstrapInput = "",
                         deviceLabelInput = authState.label.orEmpty(),
+                        connectionRoutes = null,
+                        connectionRoutesError = null,
+                        connectionRoutesLastLoadedUnixMs = 0L,
                         selectedSection = MainSection.HOME,
                         webUiUrl = "",
                         status = "Device enrolled: ${authState.deviceId}",
@@ -872,11 +904,16 @@ class MainViewModel(
     fun clearDeviceEnrollment() {
         IronmeshPreferences.clearDeviceAuthState(getApplication())
         IronmeshPreferences.clearAppConnectionStatus(getApplication())
+        stopConnectionRoutesMonitor()
         uiState.value = uiState.value.copy(
             deviceAuthState = DeviceAuthState(),
             appConnectionStatus = AppConnectionStatus(),
             bootstrapInput = "",
             deviceLabelInput = "",
+            connectionRoutes = null,
+            connectionRoutesLoading = false,
+            connectionRoutesError = null,
+            connectionRoutesLastLoadedUnixMs = 0L,
             selectedSection = MainSection.HOME,
             webUiUrl = "",
             status = "Cleared local device credential",
@@ -1171,6 +1208,88 @@ class MainViewModel(
 
     private fun currentServerCaPem(): String? {
         return currentDeviceAuthState().serverCaPem?.takeIf { it.isNotBlank() }
+    }
+
+    private fun startConnectionRoutesMonitor() {
+        if (connectionRoutesMonitorJob?.isActive == true) {
+            return
+        }
+        connectionRoutesMonitorJob = viewModelScope.launch {
+            loadConnectionRoutes(
+                refresh = false,
+                showLoading = uiState.value.connectionRoutes == null,
+                statusOnFailure = false,
+            )
+            while (isActive) {
+                delay(CONNECTION_ROUTE_SNAPSHOT_POLL_MS)
+                if (uiState.value.connectionRoutesLoading) {
+                    continue
+                }
+                loadConnectionRoutes(
+                    refresh = false,
+                    showLoading = false,
+                    statusOnFailure = false,
+                )
+            }
+        }
+    }
+
+    private fun stopConnectionRoutesMonitor() {
+        connectionRoutesMonitorJob?.cancel()
+        connectionRoutesMonitorJob = null
+    }
+
+    private suspend fun loadConnectionRoutes(
+        refresh: Boolean,
+        showLoading: Boolean,
+        statusOnFailure: Boolean,
+    ) {
+        val connectionInput = currentConnectionInput()
+        val clientIdentityJson = currentClientIdentityJson()
+        if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
+            uiState.value = uiState.value.copy(
+                connectionRoutesLoading = false,
+                connectionRoutesError = "Enroll this device to inspect connection paths.",
+            )
+            return
+        }
+
+        if (showLoading) {
+            uiState.value = uiState.value.copy(
+                connectionRoutesLoading = true,
+                connectionRoutesError = null,
+            )
+        }
+
+        runCatching {
+            withContext(Dispatchers.IO) {
+                repository.getConnectionRouteSnapshot(
+                    connectionInput = connectionInput,
+                    serverCaPem = currentServerCaPem(),
+                    clientIdentityJson = clientIdentityJson,
+                    refresh = refresh,
+                )
+            }
+        }
+            .onSuccess { snapshot ->
+                uiState.value = uiState.value.copy(
+                    connectionRoutes = snapshot,
+                    connectionRoutesLoading = false,
+                    connectionRoutesError = null,
+                    connectionRoutesLastLoadedUnixMs = System.currentTimeMillis(),
+                )
+            }
+            .onFailure { error ->
+                uiState.value = uiState.value.copy(
+                    connectionRoutesLoading = false,
+                    connectionRoutesError = error.message ?: "Failed to load connection paths",
+                    status = if (statusOnFailure) {
+                        "Error: ${error.message}"
+                    } else {
+                        uiState.value.status
+                    },
+                )
+            }
     }
 
     private fun galleryImageItemFromEntry(entry: StoreIndexEntry): GalleryImageItem? {
