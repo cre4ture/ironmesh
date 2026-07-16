@@ -1,4 +1,4 @@
-﻿---
+---
 name: release-commit
 description: Cut a new Ironmesh release commit and tag. Use when Codex needs to prepare a release in this repository by making GitHub Actions green, bumping the workspace version, refreshing the system-tests lockfile, updating the Debian changelog, and committing, tagging, and pushing the release.
 ---
