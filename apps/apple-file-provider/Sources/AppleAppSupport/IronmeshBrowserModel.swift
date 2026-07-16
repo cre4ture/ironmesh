@@ -1,4 +1,5 @@
 import AppleCore
+import Combine
 import FileProvider
 import Foundation
 
@@ -25,50 +26,7 @@ extension IronmeshConnectionDraft {
     }
 }
 
-enum IronmeshDomainRegistrationState: Equatable, Sendable {
-    case unchecked
-    case checking
-    case registered(displayName: String)
-    case missing
-    case failed(String)
-
-    var title: String {
-        switch self {
-        case .unchecked:
-            return "Domain not checked yet"
-        case .checking:
-            return "Checking File Provider domain"
-        case .registered:
-            return "Domain registered"
-        case .missing:
-            return "Domain not registered"
-        case .failed:
-            return "Domain check failed"
-        }
-    }
-
-    var detail: String {
-        switch self {
-        case .unchecked:
-            return "Use Sync to register the Files provider domain."
-        case .checking:
-            return "Inspecting currently registered provider domains."
-        case .registered(let displayName):
-            return "Files can expose the provider as \(displayName)."
-        case .missing:
-            return "Register the domain to hand off browsing into Files."
-        case .failed(let message):
-            return message
-        }
-    }
-
-    var isRegistered: Bool {
-        if case .registered = self {
-            return true
-        }
-        return false
-    }
-}
+typealias IronmeshDomainRegistrationState = AppleFileProviderDomainRegistrationState
 
 struct IronmeshRecentAction: Equatable, Identifiable, Sendable {
     let title: String
@@ -184,6 +142,7 @@ final class IronmeshBrowserModel: ObservableObject {
     private let remoteSession: IronmeshRemoteSession
     private let settingsStore: AppleConnectionSettingsStore
     private let enroller: AppleBootstrapEnroller
+    private let fileProviderDomains: AppleFileProviderDomainCoordinator
     private let userDefaults: UserDefaults
     private let draftStorageKey = "IronmeshIosApp.connectionDraft"
     private let onboardingStorageKey = "IronmeshIosApp.hasCompletedOnboarding"
@@ -196,11 +155,13 @@ final class IronmeshBrowserModel: ObservableObject {
         userDefaults: UserDefaults = .standard,
         settingsStore: AppleConnectionSettingsStore? = nil,
         enroller: AppleBootstrapEnroller = IronmeshRustFFIAdapter(connectionName: "ios app shell"),
+        fileProviderDomains: AppleFileProviderDomainCoordinator = AppleFileProviderDomainCoordinator(),
         remoteSession: IronmeshRemoteSession = IronmeshRemoteSession()
     ) {
         self.userDefaults = userDefaults
         self.enroller = enroller
         self.remoteSession = remoteSession
+        self.fileProviderDomains = fileProviderDomains
         let bundleConfiguration = IronmeshBundleConfiguration(bundle: .main)
         let defaults = IronmeshConnectionDraft(bundleConfiguration: bundleConfiguration)
         bundleDefaults = defaults
@@ -284,7 +245,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     var filesIntegrationNote: String {
-        "The Files handoff uses the installed File Provider extension. Applied connection changes and enrollment now persist through the shared app group so Files and the in-app browser stay aligned."
+        "The current iOS slice shares connection state with the File Provider extension and registers a Files domain. It does not run a background sync agent or local mirror yet."
     }
 
     var orderedConnectionEndpoints: [IronmeshConnectionEndpointStatus] {
@@ -421,28 +382,33 @@ final class IronmeshBrowserModel: ObservableObject {
     func registerDomain() {
         let identifier = draft.domainIdentifier.nilIfBlank ?? bundleDefaults.domainIdentifier
         let displayName = draft.domainDisplayName.nilIfBlank ?? bundleDefaults.domainDisplayName
-        let domain = NSFileProviderDomain(
-            identifier: NSFileProviderDomainIdentifier(rawValue: identifier),
-            displayName: displayName
-        )
 
         beginOperation()
-        NSFileProviderManager.add(domain) { error in
-            Task { @MainActor in
-                defer { self.endOperation() }
+        Task {
+            let result = await fileProviderDomains.register(
+                identifier: identifier,
+                displayName: displayName
+            )
 
-                if let error {
-                    self.lastErrorMessage = error.localizedDescription
-                    self.statusText = error.localizedDescription
-                    self.domainState = .failed(error.localizedDescription)
-                    self.addAction("Domain registration failed", detail: error.localizedDescription)
-                    return
-                }
+            defer { self.endOperation() }
 
+            self.domainState = result.state
+            switch result.state {
+            case .registered:
                 self.lastErrorMessage = nil
-                self.statusText = "Registered File Provider domain \(identifier)."
-                self.addAction("Registered File Provider domain", detail: identifier)
-                self.refreshDomainState()
+                if result.wasCreated {
+                    self.statusText = "Registered File Provider domain \(identifier)."
+                    self.addAction("Registered File Provider domain", detail: identifier)
+                } else {
+                    self.statusText = "File Provider domain \(identifier) is already registered."
+                    self.addAction("Confirmed File Provider domain", detail: identifier)
+                }
+            case .failed(let message):
+                self.lastErrorMessage = message
+                self.statusText = message
+                self.addAction("Domain registration failed", detail: message)
+            case .unchecked, .checking, .missing:
+                break
             }
         }
     }
@@ -451,22 +417,10 @@ final class IronmeshBrowserModel: ObservableObject {
         let expectedIdentifier = draft.domainIdentifier.nilIfBlank ?? bundleDefaults.domainIdentifier
         domainState = .checking
 
-        NSFileProviderManager.getDomainsWithCompletionHandler { domains, error in
-            let errorMessage = error?.localizedDescription
-            let displayName = domains.first(where: { $0.identifier.rawValue == expectedIdentifier })?.displayName
-            Task { @MainActor in
-                if let errorMessage {
-                    self.domainState = .failed(errorMessage)
-                    return
-                }
-
-                guard let displayName else {
-                    self.domainState = .missing
-                    return
-                }
-
-                self.domainState = .registered(displayName: displayName)
-            }
+        Task {
+            self.domainState = await fileProviderDomains.refresh(
+                expectedIdentifier: expectedIdentifier
+            )
         }
     }
 
