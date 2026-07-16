@@ -110,6 +110,7 @@ use x509_parser::prelude::FromDer;
 
 mod cluster;
 mod embedded_rendezvous;
+mod hardware_health;
 mod listing;
 mod replication;
 mod s3_frontend;
@@ -254,6 +255,7 @@ struct ServerState {
     log_buffer: Arc<LogBuffer>,
     runtime_log_control: RuntimeLogControl,
     process_stats_runtime: Arc<StdMutex<ProcessStatsRuntime>>,
+    hardware_health_runtime: Arc<Mutex<hardware_health::HardwareHealthRuntime>>,
 }
 
 #[derive(Clone)]
@@ -6374,6 +6376,9 @@ async fn run_inner(
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
         runtime_log_control,
         process_stats_runtime: Arc::new(StdMutex::new(ProcessStatsRuntime::default())),
+        hardware_health_runtime: Arc::new(Mutex::new(
+            hardware_health::HardwareHealthRuntime::load(&config.data_dir),
+        )),
     };
     seed_process_temperature_stats_for_tests(&state);
 
@@ -6420,6 +6425,7 @@ async fn start_background_runtimes(
     spawn_local_availability_refresher(state.clone(), startup_phase_anchor);
     spawn_storage_stats_refresher(state.clone());
     spawn_process_stats_sampler(state.clone());
+    hardware_health::spawn_hardware_health_sampler(state.clone());
     spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
 
@@ -6671,6 +6677,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             get(node_certificate_status),
         )
         .route("/auth/host/dependencies", get(host_dependency_status))
+        .route(
+            "/auth/hardware/health",
+            get(hardware_health::hardware_health_current),
+        )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
     let public_maps_api = Router::new()
