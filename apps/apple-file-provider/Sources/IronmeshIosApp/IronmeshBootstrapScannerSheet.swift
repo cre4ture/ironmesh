@@ -74,7 +74,8 @@ private struct IronmeshBootstrapScannerView: UIViewControllerRepresentable {
     }
 }
 
-private final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+@MainActor
+private final class ScannerViewController: UIViewController, @preconcurrency AVCaptureMetadataOutputObjectsDelegate {
     private let captureSession = AVCaptureSession()
     private let onCodeScanned: (String) -> Void
     private let onError: (String) -> Void
@@ -121,17 +122,13 @@ private final class ScannerViewController: UIViewController, AVCaptureMetadataOu
         }
     }
 
-    func metadataOutput(
+    nonisolated func metadataOutput(
         _ output: AVCaptureMetadataOutput,
         didOutput metadataObjects: [AVMetadataObject],
         from connection: AVCaptureConnection
     ) {
         _ = output
         _ = connection
-
-        guard !hasReportedCode else {
-            return
-        }
 
         guard let value = metadataObjects
             .compactMap({ $0 as? AVMetadataMachineReadableCodeObject })
@@ -142,9 +139,15 @@ private final class ScannerViewController: UIViewController, AVCaptureMetadataOu
             return
         }
 
-        hasReportedCode = true
-        captureSession.stopRunning()
-        onCodeScanned(value)
+        Task { @MainActor [weak self] in
+            guard let self, !self.hasReportedCode else {
+                return
+            }
+
+            self.hasReportedCode = true
+            self.captureSession.stopRunning()
+            self.onCodeScanned(value)
+        }
     }
 
     private func configureCamera() {

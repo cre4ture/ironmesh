@@ -55,13 +55,6 @@
 			remoteGlobalIDString = 4ED9573DAC30D96830CFD46E;
 			remoteInfo = IronmeshMacApp;
 		};
-		37F7EE86454EF0AA1E2830BA /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = EF0C3BABBB66E445EE36D4B9 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = FC2702FC78F437CFD22D714F;
-			remoteInfo = IronmeshIosApp;
-		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
@@ -300,7 +293,6 @@
 			buildRules = (
 			);
 			dependencies = (
-				99BB79389F861FB7445B1144 /* PBXTargetDependency */,
 			);
 			name = IronmeshIosProjectTests;
 			packageProductDependencies = (
@@ -625,11 +617,6 @@
 			target = 4ED9573DAC30D96830CFD46E /* IronmeshMacApp */;
 			targetProxy = 12FA89B442EAB3D62123DB56 /* PBXContainerItemProxy */;
 		};
-		99BB79389F861FB7445B1144 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = FC2702FC78F437CFD22D714F /* IronmeshIosApp */;
-			targetProxy = 37F7EE86454EF0AA1E2830BA /* PBXContainerItemProxy */;
-		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -809,7 +796,7 @@
 		42E7C2F9C9F584AB7AF5D179 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
+				BUNDLE_LOADER = "";
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosProjectTests-Info.plist";
@@ -822,7 +809,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.ios.tests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/IronmeshIosApp.app/IronmeshIosApp";
+				TEST_HOST = "";
 			};
 			name = Debug;
 		};
@@ -849,7 +836,7 @@
 		56B86372DF7B4513C95FC4F4 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
+				BUNDLE_LOADER = "";
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosProjectTests-Info.plist";
@@ -862,7 +849,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.ios.tests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/IronmeshIosApp.app/IronmeshIosApp";
+				TEST_HOST = "";
 			};
 			name = Release;
 		};
