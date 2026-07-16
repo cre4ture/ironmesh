@@ -69,6 +69,20 @@ ci-required:
     just ci-web-smoke
     just test-system-nightly
 
+ci-ios:
+    cargo test -p ios-app
+    cd apps/apple-file-provider && swift test
+    DEST="$$(IRONMESH_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp apps/apple-file-provider/scripts/prepare-ios-simulator.sh apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj IronmeshIosProject)" && \
+        xcodebuild test \
+            -project apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj \
+            -scheme IronmeshIosProject \
+            -destination "$$DEST" \
+            -destination-timeout 180
+
+ci-required-macos:
+    just ci-required
+    just ci-ios
+
 web-install:
     cd web && pnpm install
 

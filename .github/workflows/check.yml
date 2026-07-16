@@ -330,6 +330,208 @@ jobs:
           path: apps/android-server-node-app/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
+  ios-build:
+    runs-on: macos-latest
+    needs: workspace-check
+    env:
+      IRONMESH_IOS_SIGNING_CERT_B64: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_B64 }}
+      IRONMESH_IOS_SIGNING_CERT_PASSWORD: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_PASSWORD }}
+      IRONMESH_IOS_APP_PROFILE_B64: ${{ secrets.IRONMESH_IOS_APP_PROFILE_B64 }}
+      IRONMESH_IOS_EXTENSION_PROFILE_B64: ${{ secrets.IRONMESH_IOS_EXTENSION_PROFILE_B64 }}
+      IRONMESH_IOS_EXPORT_METHOD: ${{ vars.IRONMESH_IOS_EXPORT_METHOD }}
+      IOS_APP_SCHEME: IronmeshIosApp
+      IOS_ARCHIVE_PATH: ${{ runner.temp }}/IronmeshIosApp.xcarchive
+      IOS_DERIVED_DATA_PATH: ${{ runner.temp }}/ironmesh-ios-derived-data
+      IOS_EXPORT_OPTIONS_PATH: ${{ runner.temp }}/ironmesh-ios-export-options.plist
+      IOS_EXPORT_PATH: ${{ runner.temp }}/ironmesh-ios-export
+      IOS_PROJECT_PATH: apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj
+      IOS_TEST_SCHEME: IronmeshIosProject
+      IOS_XCRESULT_PATH: ${{ runner.temp }}/IronmeshIosProject.xcresult
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare iOS build metadata
+        run: |
+          REF_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          SAFE_BRANCH="$(printf '%s' "$REF_NAME" | sed -E 's#[^A-Za-z0-9._-]+#-#g' | sed -E 's/-+/-/g' | sed -E 's/^-+|-+$//g')"
+          SAFE_BRANCH="${SAFE_BRANCH:-main}"
+          BUILD_SUFFIX="${SAFE_BRANCH}-${GITHUB_SHA:0:8}"
+          echo "BUILD_BRANCH=${REF_NAME}" >> "$GITHUB_ENV"
+          echo "BUILD_BRANCH_SLUG=${SAFE_BRANCH}" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT_SHA=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT_SHORT=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+          echo "BUILD_NAME_SUFFIX=${BUILD_SUFFIX}" >> "$GITHUB_ENV"
+
+      - name: Determine iOS signing mode
+        run: |
+          if [ -n "$IRONMESH_IOS_SIGNING_CERT_B64" ] && [ -n "$IRONMESH_IOS_SIGNING_CERT_PASSWORD" ] && [ -n "$IRONMESH_IOS_APP_PROFILE_B64" ] && [ -n "$IRONMESH_IOS_EXTENSION_PROFILE_B64" ]; then
+            echo "IOS_SIGNED_EXPORT_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "IOS_SIGNED_EXPORT_ENABLED=false" >> "$GITHUB_ENV"
+          fi
+
+          EXPORT_METHOD="${IRONMESH_IOS_EXPORT_METHOD:-development}"
+          echo "IRONMESH_IOS_EXPORT_METHOD=${EXPORT_METHOD}" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web workspace dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust toolchain with Apple targets
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-17
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcrun simctl list devices available
+
+      - name: Run iOS Rust facade tests
+        run: cargo test -p ios-app
+
+      - name: Run shared Apple Swift package tests
+        working-directory: apps/apple-file-provider
+        run: swift test
+
+      - name: Resolve iOS Simulator destination
+        run: |
+          DESTINATION="$(IRONMESH_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp IRONMESH_IOS_SIMULATOR_RESET=1 apps/apple-file-provider/scripts/prepare-ios-simulator.sh "$IOS_PROJECT_PATH" "$IOS_TEST_SCHEME")"
+          echo "IOS_SIMULATOR_DESTINATION=${DESTINATION}" >> "$GITHUB_ENV"
+
+      - name: Run iOS simulator tests
+        run: |
+          rm -rf "$IOS_XCRESULT_PATH" "$IOS_DERIVED_DATA_PATH"
+          xcodebuild test \
+            -project "$IOS_PROJECT_PATH" \
+            -scheme "$IOS_TEST_SCHEME" \
+            -destination "$IOS_SIMULATOR_DESTINATION" \
+            -destination-timeout 180 \
+            -derivedDataPath "$IOS_DERIVED_DATA_PATH" \
+            -resultBundlePath "$IOS_XCRESULT_PATH"
+
+      - name: Setup iOS signing assets
+        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        run: apps/apple-file-provider/scripts/setup-ios-signing.sh "$GITHUB_ENV"
+
+      - name: Archive iOS release app
+        run: |
+          rm -rf "$IOS_ARCHIVE_PATH" "$IOS_EXPORT_PATH"
+          if [ "$IOS_SIGNED_EXPORT_ENABLED" = "true" ]; then
+            xcodebuild archive \
+              -project "$IOS_PROJECT_PATH" \
+              -scheme "$IOS_APP_SCHEME" \
+              -configuration Release \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath "$IOS_DERIVED_DATA_PATH" \
+              -archivePath "$IOS_ARCHIVE_PATH" \
+              CODE_SIGN_STYLE=Automatic \
+              CODE_SIGN_IDENTITY="$IRONMESH_IOS_SIGNING_IDENTITY" \
+              CODE_SIGNING_ALLOWED=YES \
+              CODE_SIGNING_REQUIRED=YES \
+              DEVELOPMENT_TEAM="$IRONMESH_IOS_DEVELOPMENT_TEAM" \
+              OTHER_CODE_SIGN_FLAGS="--keychain $IRONMESH_IOS_KEYCHAIN_PATH"
+          else
+            xcodebuild archive \
+              -project "$IOS_PROJECT_PATH" \
+              -scheme "$IOS_APP_SCHEME" \
+              -configuration Release \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath "$IOS_DERIVED_DATA_PATH" \
+              -archivePath "$IOS_ARCHIVE_PATH" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO
+          fi
+
+      - name: Write iOS export options
+        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        run: |
+          cat >"$IOS_EXPORT_OPTIONS_PATH" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>compileBitcode</key>
+            <false/>
+            <key>method</key>
+            <string>${IRONMESH_IOS_EXPORT_METHOD}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>dev.ironmesh.apple.iosapp</key>
+              <string>${IRONMESH_IOS_APP_PROFILE_UUID}</string>
+              <key>dev.ironmesh.apple.iosfileprovider</key>
+              <string>${IRONMESH_IOS_EXTENSION_PROFILE_UUID}</string>
+            </dict>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>teamID</key>
+            <string>${IRONMESH_IOS_DEVELOPMENT_TEAM}</string>
+            <key>thinning</key>
+            <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export signed iOS IPA
+        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$IOS_ARCHIVE_PATH" \
+            -exportPath "$IOS_EXPORT_PATH" \
+            -exportOptionsPlist "$IOS_EXPORT_OPTIONS_PATH" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $IRONMESH_IOS_KEYCHAIN_PATH"
+
+      - name: Upload signed iOS IPA for manual installs
+        if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-manual-install-${{ env.BUILD_NAME_SUFFIX }}
+          path: |
+            ${{ env.IOS_EXPORT_PATH }}/*.ipa
+            ${{ env.IOS_ARCHIVE_PATH }}/dSYMs
+          if-no-files-found: error
+
+      - name: Upload unsigned iOS release archive
+        if: env.IOS_SIGNED_EXPORT_ENABLED != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-archive-unsigned-${{ env.BUILD_NAME_SUFFIX }}
+          path: ${{ env.IOS_ARCHIVE_PATH }}
+          if-no-files-found: error
+
+      - name: Upload iOS diagnostics artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics-${{ env.BUILD_NAME_SUFFIX }}
+          path: |
+            ${{ env.IOS_XCRESULT_PATH }}
+            ${{ env.IOS_ARCHIVE_PATH }}
+            ${{ env.IOS_EXPORT_PATH }}
+          if-no-files-found: ignore
+
   android-instrumentation-tests:
     runs-on: ubuntu-latest
     needs: workspace-check

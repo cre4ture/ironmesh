@@ -174,7 +174,6 @@ targets:
     sources:
       - path: Tests/IronmeshIosProjectTests
     dependencies:
-      - target: IronmeshIosApp
       - package: AppleFileProviderPackage
         product: AppleCore
       - package: AppleFileProviderPackage
@@ -187,6 +186,8 @@ targets:
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
+        BUNDLE_LOADER: ""
+        TEST_HOST: ""
 
 schemes:
   IronmeshIosApp:
@@ -232,8 +233,7 @@ schemes:
   IronmeshIosProject:
     build:
       targets:
-        IronmeshIosApp: all
-        IronmeshIosFileProviderExtension: all
+        IronmeshIosProjectTests: all
     test:
       gatherCoverageData: false
       targets:
