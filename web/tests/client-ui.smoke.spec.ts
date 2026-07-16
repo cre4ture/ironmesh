@@ -315,6 +315,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Fullscreen map" }).click();
   await expect(page.getByRole("button", { name: "Exit fullscreen map" })).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  expect(
+    await page
+      .locator('[aria-label="Geotagged gallery map"]')
+      .evaluate((element) => element.parentElement?.tagName)
+  ).toBe("BODY");
   const mapMarkerButton = page.getByRole("button", { name: "Open map marker for gallery/cat.png" });
   await expect(mapMarkerButton).toBeVisible();
   expect(
