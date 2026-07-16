@@ -1084,17 +1084,10 @@ async fn run_smartctl_snapshot(
 
     let mut findings = Vec::new();
     if smart_passed == Some(false) {
-        findings.push(storage_finding(
+        findings.push(smart_overall_failed_finding(
             device,
             generated_at_unix,
-            "smart_overall_failed",
-            "critical",
-            "smart",
-            "SMART reports that this storage device is failing.",
-            json!({
-                "device_path": device_path,
-                "smart_passed": smart_passed,
-            }),
+            smart_passed,
         ));
     }
     if reallocated_sector_count.unwrap_or(0) > 0 {
@@ -1199,6 +1192,41 @@ fn storage_finding(
         summary: summary.to_string(),
         evidence,
     }
+}
+
+fn smart_overall_failed_finding(
+    device: &HardwareStorageDevice,
+    generated_at_unix: u64,
+    smart_passed: Option<bool>,
+) -> HardwareHealthFinding {
+    storage_finding(
+        device,
+        generated_at_unix,
+        "smart_overall_failed",
+        "critical",
+        "smart",
+        "SMART reports that this storage device is failing.",
+        json!({
+            "smart_passed": smart_passed,
+        }),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn sort_storage_devices_with_targets(
+    mut entries_with_paths: Vec<(HardwareStorageDevice, String)>,
+) -> (Vec<HardwareStorageDevice>, Vec<(usize, String)>) {
+    entries_with_paths
+        .sort_by(|(left, _), (right, _)| left.block_device_name.cmp(&right.block_device_name));
+
+    let mut devices = Vec::with_capacity(entries_with_paths.len());
+    let mut smart_targets = Vec::with_capacity(entries_with_paths.len());
+    for (index, (device, device_path)) in entries_with_paths.into_iter().enumerate() {
+        devices.push(device);
+        smart_targets.push((index, device_path));
+    }
+
+    (devices, smart_targets)
 }
 
 fn empty_inventory() -> HardwareInventory {
@@ -1335,10 +1363,9 @@ fn collect_memory_info_linux() -> HardwareMemoryInfo {
 
 #[cfg(target_os = "linux")]
 fn collect_storage_devices_linux() -> (Vec<HardwareStorageDevice>, Vec<(usize, String)>) {
-    let mut devices = Vec::new();
-    let mut smart_targets = Vec::new();
+    let mut entries_with_paths = Vec::new();
     let Ok(entries) = fs::read_dir("/sys/block") else {
-        return (devices, smart_targets);
+        return sort_storage_devices_with_targets(entries_with_paths);
     };
 
     for entry in entries.flatten() {
@@ -1409,34 +1436,34 @@ fn collect_storage_devices_linux() -> (Vec<HardwareStorageDevice>, Vec<(usize, S
             serial_material.unwrap_or_default(),
         );
 
-        let index = devices.len();
-        devices.push(HardwareStorageDevice {
-            component_ref: format!("disk:{name}"),
-            component_instance_id: stable_hash_id("storage", &[stable_material.as_str()]),
-            lifecycle: HardwareComponentLifecycle {
-                first_seen_at_unix: 0,
-                last_seen_at_unix: 0,
-                sighting_count: 0,
+        entries_with_paths.push((
+            HardwareStorageDevice {
+                component_ref: format!("disk:{name}"),
+                component_instance_id: stable_hash_id("storage", &[stable_material.as_str()]),
+                lifecycle: HardwareComponentLifecycle {
+                    first_seen_at_unix: 0,
+                    last_seen_at_unix: 0,
+                    sighting_count: 0,
+                },
+                block_device_name: name.clone(),
+                vendor,
+                model,
+                firmware_version,
+                capacity_bytes,
+                interface_type,
+                bus_type,
+                is_rotational,
+                logical_sector_size_bytes,
+                physical_sector_size_bytes,
+                pci_slot,
+                driver,
+                smart: None,
             },
-            block_device_name: name.clone(),
-            vendor,
-            model,
-            firmware_version,
-            capacity_bytes,
-            interface_type,
-            bus_type,
-            is_rotational,
-            logical_sector_size_bytes,
-            physical_sector_size_bytes,
-            pci_slot,
-            driver,
-            smart: None,
-        });
-        smart_targets.push((index, device_path));
+            device_path,
+        ));
     }
 
-    devices.sort_by(|left, right| left.block_device_name.cmp(&right.block_device_name));
-    (devices, smart_targets)
+    sort_storage_devices_with_targets(entries_with_paths)
 }
 
 #[cfg(target_os = "linux")]
@@ -1787,6 +1814,31 @@ fn smart_temperature_celsius(value: &serde_json::Value) -> Option<f32> {
 mod tests {
     use super::*;
 
+    fn test_storage_device(block_device_name: &str) -> HardwareStorageDevice {
+        HardwareStorageDevice {
+            component_ref: format!("disk:{block_device_name}"),
+            component_instance_id: format!("storage-{block_device_name}"),
+            lifecycle: HardwareComponentLifecycle {
+                first_seen_at_unix: 0,
+                last_seen_at_unix: 0,
+                sighting_count: 0,
+            },
+            block_device_name: block_device_name.to_string(),
+            vendor: None,
+            model: None,
+            firmware_version: None,
+            capacity_bytes: None,
+            interface_type: "solid_state_block".to_string(),
+            bus_type: None,
+            is_rotational: Some(false),
+            logical_sector_size_bytes: None,
+            physical_sector_size_bytes: None,
+            pci_slot: None,
+            driver: None,
+            smart: None,
+        }
+    }
+
     #[test]
     fn sanitize_error_code_classifies_common_errors() {
         assert_eq!(
@@ -1820,6 +1872,40 @@ mod tests {
             )
             .map(|value| value.round() as i32),
             Some(27)
+        );
+    }
+
+    #[test]
+    fn smart_overall_failed_finding_omits_device_path_from_evidence() {
+        let finding = smart_overall_failed_finding(&test_storage_device("sda"), 42, Some(false));
+
+        assert_eq!(finding.finding_code, "smart_overall_failed");
+        assert_eq!(finding.evidence, json!({ "smart_passed": false }));
+        assert!(finding.evidence.get("device_path").is_none());
+    }
+
+    #[test]
+    fn sort_storage_devices_with_targets_rebuilds_indices_after_sorting() {
+        let (devices, smart_targets) = sort_storage_devices_with_targets(vec![
+            (test_storage_device("vdb"), "/dev/vdb".to_string()),
+            (test_storage_device("sda"), "/dev/sda".to_string()),
+            (test_storage_device("nvme1n1"), "/dev/nvme1n1".to_string()),
+        ]);
+
+        assert_eq!(
+            devices
+                .iter()
+                .map(|device| device.block_device_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nvme1n1", "sda", "vdb"]
+        );
+        assert_eq!(
+            smart_targets,
+            vec![
+                (0, "/dev/nvme1n1".to_string()),
+                (1, "/dev/sda".to_string()),
+                (2, "/dev/vdb".to_string()),
+            ]
         );
     }
 }
