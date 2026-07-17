@@ -4,7 +4,7 @@ import {
   type HostDependencyReport,
   type HostDependencyStatus
 } from "@ironmesh/api";
-import { StatCard } from "@ironmesh/ui";
+import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
 import { Alert, Badge, Button, Card, Grid, Group, Stack, Text } from "@mantine/core";
 import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
@@ -47,7 +47,7 @@ export function DependenciesPage() {
           Fix the missing checks below before expecting server-side video thumbnail generation to work.
         </Alert>
       ) : report ? (
-        <Alert color="teal" title="Host dependency checks passed">
+        <Alert color={ironmeshPrimaryColor} title="Host dependency checks passed">
           This node has the currently known runtime dependencies needed for built-in image processing and server-side
           video metadata or thumbnail generation.
         </Alert>
@@ -136,7 +136,7 @@ function DependencyCheckCard({ check }: { check: HostDependencyCheck }) {
 function dependencyBadgeColor(status: HostDependencyStatus): string {
   switch (status) {
     case "ready":
-      return "teal";
+      return ironmeshPrimaryColor;
     case "missing":
       return "red";
     case "builtin":

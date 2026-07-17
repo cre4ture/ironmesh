@@ -9,7 +9,13 @@ struct IronmeshRustFFIError: LocalizedError {
     }
 }
 
-final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, @unchecked Sendable {
+final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnroller, @unchecked Sendable {
+    private let connectionName: String?
+
+    init(connectionName: String? = "ios file provider") {
+        self.connectionName = normalizedOptionalString(connectionName)
+    }
+
     func createHandle(
         connectionInput: String,
         serverCAPem: String?,
@@ -19,12 +25,15 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, @unchecked Sendable {
         let handle = withOptionalCString(connectionInput) { connectionPointer in
             withOptionalCString(serverCAPem) { serverPointer in
                 withOptionalCString(clientIdentityJSON) { identityPointer in
-                    ironmesh_ios_facade_create(
-                        connectionPointer,
-                        serverPointer,
-                        identityPointer,
-                        &errorPointer
-                    )
+                    withOptionalCString(connectionName) { connectionNamePointer in
+                        ironmesh_ios_facade_create_named(
+                            connectionPointer,
+                            serverPointer,
+                            identityPointer,
+                            connectionNamePointer,
+                            &errorPointer
+                        )
+                    }
                 }
             }
         }
@@ -38,6 +47,34 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, @unchecked Sendable {
 
     func freeHandle(_ handle: AppleRustHandle) {
         ironmesh_ios_facade_free(handle)
+    }
+
+    func startWebUi(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?
+    ) throws -> String {
+        var urlPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(connectionInput) { connectionPointer in
+            withOptionalCString(serverCAPem) { serverPointer in
+                withOptionalCString(clientIdentityJSON) { identityPointer in
+                    ironmesh_ios_facade_start_web_ui(
+                        connectionPointer,
+                        serverPointer,
+                        identityPointer,
+                        &urlPointer,
+                        &errorPointer
+                    )
+                }
+            }
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let urlPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no Web UI URL.")
+        }
+        return consumeString(urlPointer)
     }
 
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String {
@@ -143,6 +180,85 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, @unchecked Sendable {
 
         try throwIfNeeded(status: status, errorPointer: errorPointer)
     }
+
+    func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_connection_diagnostics_json(
+            handle,
+            &jsonPointer,
+            &errorPointer
+        )
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no diagnostics JSON.")
+        }
+        return consumeString(jsonPointer)
+    }
+
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?
+    ) throws -> String {
+        var urlPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(connectionInput) { connectionPointer in
+            withOptionalCString(serverCAPem) { serverPointer in
+                withOptionalCString(clientIdentityJSON) { identityPointer in
+                    ironmesh_ios_facade_start_web_ui(
+                        connectionPointer,
+                        serverPointer,
+                        identityPointer,
+                        &urlPointer,
+                        &errorPointer
+                    )
+                }
+            }
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let urlPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no web UI URL.")
+        }
+        return consumeString(urlPointer)
+    }
+
+    func enrollConnectionInput(
+        _ connectionInput: String,
+        deviceID: String?,
+        label: String?
+    ) throws -> AppleBootstrapEnrollmentResult {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(connectionInput) { connectionPointer in
+            withOptionalCString(deviceID) { deviceIDPointer in
+                withOptionalCString(label) { labelPointer in
+                    ironmesh_ios_facade_enroll_with_bootstrap(
+                        connectionPointer,
+                        deviceIDPointer,
+                        labelPointer,
+                        &jsonPointer,
+                        &errorPointer
+                    )
+                }
+            }
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no enrollment JSON.")
+        }
+
+        let json = consumeString(jsonPointer)
+        let data = Data(json.utf8)
+        do {
+            return try JSONDecoder().decode(AppleBootstrapEnrollmentResult.self, from: data)
+        } catch {
+            throw IronmeshRustFFIError(message: "Failed to decode enrollment JSON: \(error.localizedDescription)")
+        }
+    }
 }
 
 private func throwIfNeeded(status: Int32, errorPointer: UnsafeMutablePointer<CChar>?) throws {
@@ -170,4 +286,11 @@ private func withOptionalCString<Result>(
         return body(nil)
     }
     return value.withCString { body($0) }
+}
+
+private func normalizedOptionalString(_ value: String?) -> String? {
+    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+        return nil
+    }
+    return value
 }

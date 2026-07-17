@@ -13538,6 +13538,9 @@ async fn build_test_state(
         process_stats_runtime: Arc::new(std::sync::Mutex::new(
             super::ProcessStatsRuntime::default(),
         )),
+        hardware_health_runtime: Arc::new(Mutex::new(
+            super::hardware_health::HardwareHealthRuntime::load(&root),
+        )),
     };
 
     if seed_gap {
@@ -14724,6 +14727,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
                 kind: transport_sdk::CandidateKind::DirectHttps,
                 endpoint: "https://internal.example/".to_string(),
                 rtt_ms: None,
+                transport_hints: None,
             }],
             labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
             capacity_bytes: Some(100),
@@ -14939,6 +14943,7 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
                 kind: transport_sdk::CandidateKind::DirectHttps,
                 endpoint: "https://internal.example".to_string(),
                 rtt_ms: None,
+                transport_hints: None,
             }],
             labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
             capacity_bytes: Some(100),

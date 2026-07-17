@@ -6,7 +6,9 @@
     <script>
       try {
         const storageKey = "ironmesh-color-scheme";
+        const accentStorageKey = "ironmesh-accent-color";
         const storedColorScheme = window.localStorage.getItem(storageKey);
+        const storedAccent = window.localStorage.getItem(accentStorageKey);
         const colorScheme =
           storedColorScheme === "light" || storedColorScheme === "dark" || storedColorScheme === "auto"
             ? storedColorScheme
@@ -18,6 +20,27 @@
               : "light"
             : colorScheme;
         document.documentElement.setAttribute("data-mantine-color-scheme", computedColorScheme);
+
+        const normalizedAccent = /^#?([\da-f]{6})$/i.test(storedAccent ?? "")
+          ? `#${storedAccent.replace(/^#/, "").toLowerCase()}`
+          : /^#?([\da-f]{3})$/i.test(storedAccent ?? "")
+            ? `#${storedAccent
+                .replace(/^#/, "")
+                .split("")
+                .map((channel) => `${channel}${channel}`)
+                .join("")
+                .toLowerCase()}`
+            : "#14b8a6";
+        const red = Number.parseInt(normalizedAccent.slice(1, 3), 16);
+        const green = Number.parseInt(normalizedAccent.slice(3, 5), 16);
+        const blue = Number.parseInt(normalizedAccent.slice(5, 7), 16);
+        const mixChannel = (value, target, amount) => Math.round(value + (target - value) * amount);
+        const toRgb = (r, g, b) => `${r}, ${g}, ${b}`;
+        document.documentElement.style.setProperty("--ironmesh-accent-rgb", toRgb(red, green, blue));
+        document.documentElement.style.setProperty(
+          "--ironmesh-accent-soft-rgb",
+          toRgb(mixChannel(red, 255, 0.52), mixChannel(green, 255, 0.52), mixChannel(blue, 255, 0.52))
+        );
       } catch {}
     </script>
     <link rel="icon" type="image/svg+xml" href="/ironmesh-favicon.svg" />

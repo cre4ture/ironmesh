@@ -11,7 +11,7 @@ import {
   type S3AccessKeyView,
   type S3BucketVersioningStatus
 } from "@ironmesh/api";
-import { JsonBlock, StatCard } from "@ironmesh/ui";
+import { ironmeshPrimaryColor, JsonBlock, StatCard } from "@ironmesh/ui";
 import {
   Alert,
   Badge,
@@ -56,7 +56,7 @@ function joinScopeValues(values: string[], emptyLabel: string): string {
 }
 
 function accessKeyStatusColor(accessKey: S3AccessKeyView): string {
-  return accessKey.revoked_at_unix ? "red" : "teal";
+  return accessKey.revoked_at_unix ? "red" : ironmeshPrimaryColor;
 }
 
 function bucketModeLabel(readOnly: boolean): string {
@@ -301,7 +301,7 @@ export function S3ControlPlanePage() {
         </Alert>
       ) : null}
       {latestCreatedAccessKey ? (
-        <Alert color="teal" title="New S3 access key issued">
+        <Alert color={ironmeshPrimaryColor} title="New S3 access key issued">
           <Stack gap="sm">
             <Text c="dimmed">
               The secret is shown here once. Capture it now before you refresh or navigate away.
@@ -359,7 +359,7 @@ export function S3ControlPlanePage() {
             <Stack gap="md">
               <Group justify="space-between">
                 <Text fw={700}>Listener and replication status</Text>
-                <Badge color={status?.tls_enabled ? "teal" : "gray"} variant="light">
+                <Badge color={status?.tls_enabled ? ironmeshPrimaryColor : "gray"} variant="light">
                   {status?.tls_enabled ? "tls enabled" : "tls pending"}
                 </Badge>
               </Group>
@@ -597,7 +597,7 @@ export function S3ControlPlanePage() {
                       </Table.Td>
                       <Table.Td><Code>{bucket.root_prefix}</Code></Table.Td>
                       <Table.Td>
-                        <Badge color={bucket.versioning_status === "enabled" ? "teal" : "gray"} variant="light">
+                        <Badge color={bucket.versioning_status === "enabled" ? ironmeshPrimaryColor : "gray"} variant="light">
                           {bucket.versioning_status}
                         </Badge>
                       </Table.Td>

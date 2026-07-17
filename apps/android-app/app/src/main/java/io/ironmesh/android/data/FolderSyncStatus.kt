@@ -33,7 +33,38 @@ data class FolderSyncProfileStatus(
     val runMode: String = "",
     val lastSuccessUnixMs: Long? = null,
     val lastError: String? = null,
+    val connectionDiagnostics: FolderSyncProfileConnectionDiagnostics? = null,
     val metrics: FolderSyncRuntimeMetrics = FolderSyncRuntimeMetrics(),
+)
+
+data class FolderSyncProfileConnectionDiagnostics(
+    val endpoints: List<FolderSyncConnectionEndpointStatus> = emptyList(),
+    val lastSuccessUnixMs: Long? = null,
+)
+
+data class FolderSyncConnectionEndpointStatus(
+    val pathKind: String = "",
+    val locator: String = "",
+    val requestBaseUrl: String = "",
+    val active: Boolean = false,
+    val consecutiveFailures: Long = 0L,
+    val totalFailures: Long = 0L,
+    val totalSuccesses: Long = 0L,
+    val lastAttemptUnixMs: Long? = null,
+    val lastSuccessUnixMs: Long? = null,
+    val lastFailureUnixMs: Long? = null,
+    val lastError: String? = null,
+    val recentAttempts: List<FolderSyncConnectionAttemptStatus> = emptyList(),
+)
+
+data class FolderSyncConnectionAttemptStatus(
+    val startedUnixMs: Long = 0L,
+    val finishedUnixMs: Long? = null,
+    val method: String = "",
+    val url: String = "",
+    val timeoutMs: Long? = null,
+    val outcome: String = "",
+    val error: String? = null,
 )
 
 data class FolderSyncRuntimeMetrics(

@@ -113,6 +113,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
+  await expect(
+    page.getByText("For a smartphone, use the bootstrap claim from this page when available, or scan the QR code below.")
+  ).toBeVisible();
   await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
   await expect(page.locator("pre").filter({ hasText: '"relay_mode": "relay-preferred"' })).toBeVisible();
   await expect(page.getByAltText("Client bootstrap QR code")).toBeVisible();
@@ -485,6 +488,57 @@ test("server-admin provisioning forces a bright theme while the QR is visible an
   await page.getByText("Dashboard", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.locator(":root")).toHaveAttribute("data-mantine-color-scheme", "dark");
+});
+
+test("server-admin provisioning can copy and download the issued bootstrap claim", async ({ page }) => {
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await installServerAdminMocks(page);
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Provisioning", { exact: true }).click();
+
+  const copyBootstrapClaimButton = page.getByRole("button", {
+    name: "Copy bootstrap claim to clipboard"
+  });
+  const downloadBootstrapClaimButton = page.getByRole("button", {
+    name: "Download bootstrap claim"
+  });
+  const downloadBootstrapBundleButton = page.getByRole("button", {
+    name: "Download bootstrap bundle"
+  });
+
+  await expect(copyBootstrapClaimButton).toBeDisabled();
+  await expect(downloadBootstrapClaimButton).toBeDisabled();
+  await expect(downloadBootstrapBundleButton).toBeDisabled();
+
+  await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
+  await expect(page.locator("pre").filter({ hasText: '"relay_mode": "relay-preferred"' })).toBeVisible();
+
+  await expect(copyBootstrapClaimButton).toBeEnabled();
+  await expect(downloadBootstrapClaimButton).toBeEnabled();
+  await expect(downloadBootstrapBundleButton).toBeEnabled();
+
+  await copyBootstrapClaimButton.click();
+  await expect
+    .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+    .toContain('"k": "im-claim-example"');
+
+  const claimDownloadPromise = page.waitForEvent("download");
+  await downloadBootstrapClaimButton.click();
+  const claimDownload = await claimDownloadPromise;
+  expect(claimDownload.suggestedFilename()).toBe("ironmesh-client-bootstrap-claim-cluster-alpha.json");
+
+  const bundleDownloadPromise = page.waitForEvent("download");
+  await downloadBootstrapBundleButton.click();
+  const bundleDownload = await bundleDownloadPromise;
+  expect(bundleDownload.suggestedFilename()).toBe("ironmesh-client-bootstrap-cluster-alpha.json");
 });
 
 test("server-admin gallery derives child folders from nested media entries", async ({ page }) => {

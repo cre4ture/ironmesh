@@ -465,6 +465,167 @@ export type ServerHealthResponse = {
   revision?: string;
 };
 
+export type HardwareHealthCollectorState = "ready" | "degraded" | "unavailable";
+
+export type HardwareHealthSeverity = "info" | "warn" | "critical";
+
+export type HardwareHealthCollectorStatus = {
+  collector_id: string;
+  label: string;
+  state: HardwareHealthCollectorState;
+  available: boolean;
+  last_collected_at_unix?: number | null;
+  last_error_code?: string | null;
+  detail: string;
+};
+
+export type HardwareComponentLifecycle = {
+  first_seen_at_unix: number;
+  last_seen_at_unix: number;
+  sighting_count: number;
+};
+
+export type HardwareSystemInfo = {
+  vendor?: string | null;
+  product_name?: string | null;
+  product_version?: string | null;
+  board_vendor?: string | null;
+  board_name?: string | null;
+  board_version?: string | null;
+  bios_vendor?: string | null;
+  bios_version?: string | null;
+  bios_date?: string | null;
+};
+
+export type HardwareCpuPackage = {
+  component_ref: string;
+  component_instance_id: string;
+  lifecycle: HardwareComponentLifecycle;
+  vendor_id?: string | null;
+  model_name?: string | null;
+  family?: string | null;
+  model?: string | null;
+  stepping?: string | null;
+  microcode?: string | null;
+  nominal_frequency_mhz?: number | null;
+  logical_cpu_count: number;
+  physical_core_count?: number | null;
+};
+
+export type HardwareMemoryInfo = {
+  installed_bytes: number;
+  page_size_bytes?: number | null;
+  details_complete: boolean;
+};
+
+export type HardwareStorageSmartInfo = {
+  smart_available: boolean;
+  smart_passed?: boolean | null;
+  temperature_celsius?: number | null;
+  power_on_hours?: number | null;
+  power_cycle_count?: number | null;
+  unsafe_shutdown_count?: number | null;
+  percentage_used?: number | null;
+  available_spare_percent?: number | null;
+  available_spare_threshold_percent?: number | null;
+  data_units_read?: number | null;
+  data_units_written?: number | null;
+  media_errors?: number | null;
+  error_log_entries?: number | null;
+  reallocated_sector_count?: number | null;
+  pending_sector_count?: number | null;
+  offline_uncorrectable_sector_count?: number | null;
+  crc_error_count?: number | null;
+};
+
+export type HardwareStorageDevice = {
+  component_ref: string;
+  component_instance_id: string;
+  lifecycle: HardwareComponentLifecycle;
+  block_device_name: string;
+  vendor?: string | null;
+  model?: string | null;
+  firmware_version?: string | null;
+  capacity_bytes?: number | null;
+  interface_type: string;
+  bus_type?: string | null;
+  is_rotational?: boolean | null;
+  logical_sector_size_bytes?: number | null;
+  physical_sector_size_bytes?: number | null;
+  pci_slot?: string | null;
+  driver?: string | null;
+  smart?: HardwareStorageSmartInfo | null;
+};
+
+export type HardwareNetworkInterface = {
+  component_ref: string;
+  component_instance_id: string;
+  lifecycle: HardwareComponentLifecycle;
+  interface_name: string;
+  oper_state?: string | null;
+  carrier?: boolean | null;
+  speed_mbps?: number | null;
+  driver?: string | null;
+  pci_slot?: string | null;
+  vendor_id?: string | null;
+  device_id?: string | null;
+};
+
+export type HardwareInventory = {
+  host_os: string;
+  architecture: string;
+  kernel_version?: string | null;
+  system: HardwareSystemInfo;
+  cpu_packages: HardwareCpuPackage[];
+  memory: HardwareMemoryInfo;
+  storage_devices: HardwareStorageDevice[];
+  network_interfaces: HardwareNetworkInterface[];
+};
+
+export type HardwareNodeLifecycle = {
+  node_first_seen_at_unix: number;
+  inventory_last_changed_at_unix: number;
+  boot_id?: string | null;
+  booted_at_unix?: number | null;
+  uptime_seconds?: number | null;
+  cumulative_observed_uptime_seconds: number;
+};
+
+export type HardwareHealthFinding = {
+  source: string;
+  category: string;
+  finding_code: string;
+  severity: HardwareHealthSeverity;
+  component_ref?: string | null;
+  component_instance_id?: string | null;
+  first_seen_at_unix: number;
+  last_seen_at_unix: number;
+  occurrence_count: number;
+  summary: string;
+  evidence: Record<string, unknown>;
+};
+
+export type HardwareHealthReport = {
+  reporting_node_id: string;
+  generated_at_unix: number;
+  ironmesh_version: string;
+  ironmesh_revision: string;
+  hardware_profile_id: string;
+  inventory: HardwareInventory;
+  node_lifecycle: HardwareNodeLifecycle;
+  collectors: HardwareHealthCollectorStatus[];
+  findings: HardwareHealthFinding[];
+  health_notes: string[];
+};
+
+export type HardwareHealthCurrentResponse = {
+  report?: HardwareHealthReport | null;
+  collecting: boolean;
+  last_attempt_unix?: number | null;
+  last_success_unix?: number | null;
+  last_error?: string | null;
+};
+
 export type StorageStatsSample = {
   collected_at_unix: number;
   latest_snapshot_id?: string | null;

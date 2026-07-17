@@ -97,6 +97,7 @@ fun LibraryScreen(
     state: MainUiState,
     vm: MainViewModel,
 ) {
+    val connectionStatus = state.appConnectionStatus
     val totalGalleryItems = state.galleryCollection?.totalItemCount ?: 0
     var fullscreenIndex by remember(state.galleryMode, state.galleryCurrentDirectoryPath, totalGalleryItems) {
         mutableStateOf<Int?>(null)
@@ -185,6 +186,50 @@ fun LibraryScreen(
                         onClick = { vm.updateGallerySort(GallerySortOption.NAME) },
                         label = { Text("Name") },
                     )
+                }
+            }
+
+            item(key = "gallery-connection") {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    tonalElevation = 2.dp,
+                    shape = RoundedCornerShape(22.dp),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = appConnectionHeadline(connectionStatus),
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            text = appConnectionSummary(connectionStatus),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        connectionStatus.lastSuccessfulConnectionUrl
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { url ->
+                                Text(
+                                    text = "Last working route: $url",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        connectionStatus.failedAttempts.take(3).forEach { attempt ->
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = appFailedAttemptSummary(attempt),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    text = attempt.url.ifBlank { attempt.endpointLocator },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
                 }
             }
 

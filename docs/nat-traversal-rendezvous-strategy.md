@@ -3,6 +3,7 @@
 Status: Implemented pre-release architecture direction for Ironmesh connectivity across NATed clients and server nodes
 
 Implementation checklist: `docs/nat-traversal-implementation-checklist.md`
+Direct QUIC + hole punching follow-up: `docs/iroh-direct-quic-integration-plan.md`
 
 ## 1. Problem
 

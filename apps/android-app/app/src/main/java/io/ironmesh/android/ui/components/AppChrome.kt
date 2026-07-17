@@ -154,16 +154,20 @@ private data class ShellItem(
 
 private fun shellItems(): List<ShellItem> = listOf(
     ShellItem(MainSection.HOME, R.string.nav_home),
+    ShellItem(MainSection.CONNECTIVITY, R.string.nav_connectivity),
     ShellItem(MainSection.SYNC, R.string.nav_sync),
     ShellItem(MainSection.LIBRARY, R.string.nav_library),
+    ShellItem(MainSection.GALLERY_MAP, R.string.nav_gallery_map),
     ShellItem(MainSection.SETTINGS, R.string.nav_settings),
 )
 
 private fun titleForSection(section: MainSection): Int {
     return when (section) {
         MainSection.HOME -> R.string.nav_home
+        MainSection.CONNECTIVITY -> R.string.nav_connectivity
         MainSection.SYNC -> R.string.nav_sync
         MainSection.LIBRARY -> R.string.nav_library
+        MainSection.GALLERY_MAP -> R.string.nav_gallery_map
         MainSection.SETTINGS -> R.string.nav_settings
     }
 }

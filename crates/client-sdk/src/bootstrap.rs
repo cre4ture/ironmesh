@@ -175,6 +175,56 @@ fn known_rendezvous_urls(rendezvous_urls: &[String]) -> String {
     }
 }
 
+fn normalized_unique_rendezvous_urls(rendezvous_urls: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for rendezvous_url in rendezvous_urls {
+        let normalized_url = normalize_rendezvous_base_url(rendezvous_url)?;
+        if seen.insert(normalized_url.clone()) {
+            normalized.push(normalized_url);
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn relay_targets_for_node_ids(
+    bootstrap: &ConnectionBootstrap,
+    rendezvous_urls: &[String],
+    target_node_ids: impl IntoIterator<Item = NodeId>,
+) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
+    let rendezvous_urls = normalized_unique_rendezvous_urls(rendezvous_urls)?;
+    let mut relay_targets = Vec::new();
+    let mut seen_node_ids = BTreeSet::new();
+
+    for target_node_id in target_node_ids {
+        if !seen_node_ids.insert(target_node_id.to_string()) {
+            continue;
+        }
+
+        for rendezvous_url in &rendezvous_urls {
+            relay_targets.push(PlannedConnectionBootstrapTarget {
+                cluster_id: bootstrap.cluster_id,
+                rendezvous_urls: vec![rendezvous_url.clone()],
+                rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
+                relay_mode: bootstrap.relay_mode,
+                path_kind: TransportPathKind::RelayTunnel,
+                server_base_url: None,
+                target_node_id: Some(target_node_id),
+                server_ca_pem: bootstrap.trust_roots.public_api_ca_pem.clone(),
+                cluster_ca_pem: bootstrap.trust_roots.cluster_ca_pem.clone(),
+                rendezvous_ca_pem: bootstrap.trust_roots.rendezvous_ca_pem.clone(),
+                pairing_token: bootstrap.pairing_token.clone(),
+                device_label: bootstrap.device_label.clone(),
+                device_id: bootstrap.device_id.clone(),
+            });
+        }
+    }
+
+    Ok(relay_targets)
+}
+
 impl ConnectionBootstrap {
     pub fn from_json_str(raw: &str) -> Result<Self> {
         let bundle = serde_json::from_str::<Self>(raw).context("failed to parse bootstrap JSON")?;
@@ -263,31 +313,13 @@ impl ConnectionBootstrap {
                 }
                 Vec::new()
             } else {
-                let mut relay_targets = Vec::new();
-                let mut seen_node_ids = BTreeSet::new();
-                for target in &direct_targets {
-                    let Some(target_node_id) = target.target_node_id else {
-                        continue;
-                    };
-                    if !seen_node_ids.insert(target_node_id.to_string()) {
-                        continue;
-                    }
-                    relay_targets.push(PlannedConnectionBootstrapTarget {
-                        cluster_id: self.cluster_id,
-                        rendezvous_urls: self.rendezvous_urls.clone(),
-                        rendezvous_mtls_required: self.rendezvous_mtls_required,
-                        relay_mode: self.relay_mode,
-                        path_kind: TransportPathKind::RelayTunnel,
-                        server_base_url: None,
-                        target_node_id: Some(target_node_id),
-                        server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
-                        cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
-                        rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
-                        pairing_token: self.pairing_token.clone(),
-                        device_label: self.device_label.clone(),
-                        device_id: self.device_id.clone(),
-                    });
-                }
+                let relay_targets = relay_targets_for_node_ids(
+                    self,
+                    &self.rendezvous_urls,
+                    direct_targets
+                        .iter()
+                        .filter_map(|target| target.target_node_id),
+                )?;
                 if relay_targets.is_empty() && self.relay_mode == RelayMode::Required {
                     bail!(
                         "bootstrap requires relay connectivity but does not identify any target node_id for public API endpoints"
@@ -1100,36 +1132,16 @@ fn refreshed_relay_targets(
         return Ok(Vec::new());
     }
 
-    let mut relay_targets = Vec::new();
-    let mut seen_node_ids = BTreeSet::new();
-
-    for target in static_direct_targets {
-        let Some(target_node_id) = target.target_node_id else {
-            continue;
-        };
-        if !seen_node_ids.insert(target_node_id.to_string()) {
-            continue;
-        }
-        if !relay_capable_nodes.contains(&target_node_id) {
-            continue;
-        }
-
-        relay_targets.push(PlannedConnectionBootstrapTarget {
-            cluster_id: bootstrap.cluster_id,
-            rendezvous_urls: rendezvous_urls.to_vec(),
-            rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
-            relay_mode: bootstrap.relay_mode,
-            path_kind: TransportPathKind::RelayTunnel,
-            server_base_url: None,
-            target_node_id: Some(target_node_id),
-            server_ca_pem: bootstrap.trust_roots.public_api_ca_pem.clone(),
-            cluster_ca_pem: bootstrap.trust_roots.cluster_ca_pem.clone(),
-            rendezvous_ca_pem: bootstrap.trust_roots.rendezvous_ca_pem.clone(),
-            pairing_token: bootstrap.pairing_token.clone(),
-            device_label: bootstrap.device_label.clone(),
-            device_id: bootstrap.device_id.clone(),
-        });
-    }
+    let relay_targets = relay_targets_for_node_ids(
+        bootstrap,
+        rendezvous_urls,
+        static_direct_targets.iter().filter_map(|target| {
+            let target_node_id = target.target_node_id?;
+            relay_capable_nodes
+                .contains(&target_node_id)
+                .then_some(target_node_id)
+        }),
+    )?;
 
     if relay_targets.is_empty() && bootstrap.relay_mode == RelayMode::Required {
         bail!(
@@ -1619,6 +1631,34 @@ mod tests {
     }
 
     #[test]
+    fn planned_targets_expand_each_rendezvous_url_into_a_distinct_relay_route() {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.rendezvous_urls = vec![
+            "https://rendezvous-a.example".to_string(),
+            "https://rendezvous-b.example".to_string(),
+        ];
+
+        let planned = bootstrap
+            .planned_targets()
+            .expect("planned targets should build");
+
+        assert_eq!(planned.len(), 3);
+        assert_eq!(planned[0].path_kind, TransportPathKind::DirectHttps);
+        assert_eq!(planned[1].path_kind, TransportPathKind::RelayTunnel);
+        assert_eq!(planned[2].path_kind, TransportPathKind::RelayTunnel);
+        assert_eq!(
+            planned[1].rendezvous_urls,
+            vec!["https://rendezvous-a.example/".to_string()]
+        );
+        assert_eq!(
+            planned[2].rendezvous_urls,
+            vec!["https://rendezvous-b.example/".to_string()]
+        );
+        assert_eq!(planned[1].target_node_id, planned[0].target_node_id);
+        assert_eq!(planned[2].target_node_id, planned[0].target_node_id);
+    }
+
+    #[test]
     fn relay_required_without_rendezvous_urls_is_rejected() {
         let mut bootstrap = sample_bootstrap();
         bootstrap.relay_mode = RelayMode::Required;
@@ -1936,16 +1976,19 @@ mod tests {
                                         kind: CandidateKind::DirectHttps,
                                         endpoint: "https://public.example".to_string(),
                                         rtt_ms: Some(8),
+                                        transport_hints: None,
                                     },
                                     ConnectionCandidate {
                                         kind: CandidateKind::ServerReflexive,
                                         endpoint: "https://203.0.113.10:7443".to_string(),
                                         rtt_ms: Some(12),
+                                        transport_hints: None,
                                     },
                                     ConnectionCandidate {
                                         kind: CandidateKind::Relay,
                                         endpoint: "https://relay.example/session/123".to_string(),
                                         rtt_ms: Some(20),
+                                        transport_hints: None,
                                     },
                                 ]),
                                 node_relay_capable: true,
@@ -2043,7 +2086,7 @@ mod tests {
                 .clone(),
             vec![Some(expected_node_id.clone())]
         );
-        assert_eq!(targets.len(), 3);
+        assert_eq!(targets.len(), 4);
 
         assert_eq!(targets[0].path_kind, TransportPathKind::DirectHttps);
         assert_eq!(
@@ -2063,10 +2106,14 @@ mod tests {
         assert_eq!(targets[2].target_node_id, Some(target_node_id));
         assert_eq!(
             targets[2].rendezvous_urls,
-            vec![
-                format!("http://{seed_addr}/"),
-                format!("http://{peer_addr}/"),
-            ]
+            vec![format!("http://{seed_addr}/")]
+        );
+
+        assert_eq!(targets[3].path_kind, TransportPathKind::RelayTunnel);
+        assert_eq!(targets[3].target_node_id, Some(target_node_id));
+        assert_eq!(
+            targets[3].rendezvous_urls,
+            vec![format!("http://{peer_addr}/")]
         );
 
         seed_server.abort();

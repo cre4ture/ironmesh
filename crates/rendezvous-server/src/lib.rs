@@ -264,6 +264,7 @@ fn synthesize_server_reflexive_candidate(
         kind: CandidateKind::ServerReflexive,
         endpoint: server_reflexive_endpoint(observed_source_addr.ip(), port),
         rtt_ms: None,
+        transport_hints: None,
     })
 }
 
@@ -1269,6 +1270,7 @@ mod tests {
                 kind: CandidateKind::ServerReflexive,
                 endpoint: "https://127.0.0.1:7443".to_string(),
                 rtt_ms: None,
+                transport_hints: None,
             }]
         );
 
@@ -1404,6 +1406,7 @@ mod tests {
                 kind: CandidateKind::ServerReflexive,
                 endpoint: "https://203.0.113.10:7443".to_string(),
                 rtt_ms: None,
+                transport_hints: None,
             }])
         );
         assert!(response.node_relay_capable);

@@ -1,22 +1,30 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use client_sdk::{
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ObjectHeadInfo, StoreIndexEntry,
-    VersionGraphSummary, normalize_server_base_url,
+    BootstrapEnrollmentResult, ClientConnectionAttempt, ClientConnectionDiagnostics,
+    ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, VersionGraphSummary,
+    enroll_connection_input_blocking, normalize_server_base_url,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
+use tokio::task::JoinHandle;
 
 const FFI_OK: c_int = 0;
 const FFI_ERR: c_int = 1;
 
 pub struct IosStorageApp {
     runtime: Runtime,
+    sdk: client_sdk::IronMeshClient,
     client: ClientNode,
+    client_identity: Option<ClientIdentityMaterial>,
+    connection_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +87,139 @@ pub struct ApplePutResponse {
     pub version_graph: Option<VersionGraphSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppleEnrollmentResponse {
+    #[serde(flatten)]
+    pub enrollment: BootstrapEnrollmentResult,
+    pub client_identity_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AppleConnectionAttempt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
+    pub endpoint_locator: String,
+    pub path_kind: String,
+    pub started_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix_ms: Option<u64>,
+    pub method: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AppleEndpointDiagnostics {
+    pub path_kind: String,
+    pub locator: String,
+    pub request_base_url: String,
+    pub active: bool,
+    pub consecutive_failures: u32,
+    pub total_failures: u64,
+    pub total_successes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub recent_attempts: Vec<AppleConnectionAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AppleConnectionDiagnosticsResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_name: Option<String>,
+    #[serde(default)]
+    pub endpoints: Vec<AppleEndpointDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix_ms: Option<u64>,
+}
+
+struct WebUiServer {
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+    local_url: String,
+    task: JoinHandle<()>,
+}
+
+impl AppleConnectionAttempt {
+    fn from_client_attempt(
+        endpoint_locator: &str,
+        path_kind: &str,
+        value: ClientConnectionAttempt,
+    ) -> Self {
+        Self {
+            source_label: None,
+            endpoint_locator: endpoint_locator.to_string(),
+            path_kind: path_kind.to_string(),
+            started_unix_ms: value.started_unix_ms,
+            finished_unix_ms: value.finished_unix_ms,
+            method: value.method,
+            url: value.url,
+            timeout_ms: value.timeout_ms,
+            outcome: value.outcome,
+            error: value.error,
+        }
+    }
+}
+
+impl AppleEndpointDiagnostics {
+    fn from_client_endpoint(value: ClientEndpointDiagnostics) -> Self {
+        let endpoint_locator = value.locator.clone();
+        let path_kind = value.path_kind.clone();
+        Self {
+            path_kind: path_kind.clone(),
+            locator: endpoint_locator.clone(),
+            request_base_url: value.request_base_url,
+            active: value.active,
+            consecutive_failures: value.consecutive_failures,
+            total_failures: value.total_failures,
+            total_successes: value.total_successes,
+            last_attempt_unix_ms: value.last_attempt_unix_ms,
+            last_success_unix_ms: value.last_success_unix_ms,
+            last_failure_unix_ms: value.last_failure_unix_ms,
+            last_error: value.last_error,
+            recent_attempts: value
+                .recent_attempts
+                .into_iter()
+                .map(|attempt| {
+                    AppleConnectionAttempt::from_client_attempt(
+                        &endpoint_locator,
+                        &path_kind,
+                        attempt,
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl AppleConnectionDiagnosticsResponse {
+    fn from_snapshot(
+        connection_name: Option<String>,
+        diagnostics: ClientConnectionDiagnostics,
+    ) -> Self {
+        Self {
+            connection_name,
+            endpoints: diagnostics
+                .endpoints
+                .into_iter()
+                .map(AppleEndpointDiagnostics::from_client_endpoint)
+                .collect(),
+            last_success_unix_ms: diagnostics.last_success_unix_ms,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct IronmeshIosBytes {
@@ -89,24 +230,26 @@ pub struct IronmeshIosBytes {
 
 impl IosStorageApp {
     pub fn new(connection_input: impl Into<String>) -> Result<Self> {
-        Self::configured(connection_input, None, None)
+        Self::configured(connection_input, None, None, None)
     }
 
     pub fn configured(
         connection_input: impl Into<String>,
         server_ca_pem: Option<String>,
         client_identity_json: Option<String>,
+        connection_name: Option<String>,
     ) -> Result<Self> {
         let connection_input = normalized_connection_input_string(connection_input)?;
         let server_ca_pem = normalize_optional_string(server_ca_pem);
         let client_identity_json = normalize_optional_string(client_identity_json);
+        let connection_name = normalize_optional_string(connection_name);
         let client_identity = client_identity_json
             .as_deref()
             .map(ClientIdentityMaterial::from_json_str)
             .transpose()
             .context("failed to parse iOS client identity JSON")?;
 
-        let client = if connection_input.starts_with('{') {
+        let mut sdk = if connection_input.starts_with('{') {
             let mut bootstrap = ConnectionBootstrap::from_json_str(&connection_input)
                 .context("failed to parse iOS connection bootstrap JSON")?;
             if let Some(server_ca_pem) = server_ca_pem.as_ref() {
@@ -130,20 +273,43 @@ impl IosStorageApp {
             }
         };
 
-        Self::with_client(ClientNode::with_client(client))
+        if let Some(name) = connection_name.as_ref() {
+            sdk = sdk.with_connection_name(name.clone());
+        }
+
+        Self::with_sdk(sdk, client_identity, connection_name)
     }
 
     pub fn configured_from_bootstrap(
         bootstrap_json: impl Into<String>,
         client_identity_json: Option<String>,
     ) -> Result<Self> {
-        Self::configured(bootstrap_json, None, client_identity_json)
+        Self::configured(bootstrap_json, None, client_identity_json, None)
     }
 
     pub fn with_client(client: ClientNode) -> Result<Self> {
+        let sdk = client_sdk::IronMeshClient::from_direct_base_url("http://127.0.0.1:0/");
         Ok(Self {
             runtime: build_runtime()?,
+            sdk,
             client,
+            client_identity: None,
+            connection_name: None,
+        })
+    }
+
+    pub fn with_sdk(
+        sdk: client_sdk::IronMeshClient,
+        client_identity: Option<ClientIdentityMaterial>,
+        connection_name: Option<String>,
+    ) -> Result<Self> {
+        let client = ClientNode::with_client(sdk.clone());
+        Ok(Self {
+            runtime: build_runtime()?,
+            sdk,
+            client,
+            client_identity,
+            connection_name,
         })
     }
 
@@ -191,6 +357,26 @@ impl IosStorageApp {
 
     pub fn web_gui_html(&self) -> String {
         web_ui_backend::assets::app_html()
+    }
+
+    pub fn connection_diagnostics(&self) -> AppleConnectionDiagnosticsResponse {
+        AppleConnectionDiagnosticsResponse::from_snapshot(
+            self.connection_name.clone(),
+            self.sdk.connection_diagnostics(),
+        )
+    }
+
+    pub fn store_index_with_options(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: StoreIndexRequestOptions,
+    ) -> Result<StoreIndexResponse> {
+        self.runtime.block_on(
+            self.sdk
+                .store_index_with_options(prefix, depth, snapshot, options),
+        )
     }
 
     async fn put_async(&self, key: String, data: Vec<u8>) -> Result<ApplePutResponse> {
@@ -287,12 +473,106 @@ impl IosStorageApp {
     }
 }
 
+fn web_ui_runtime() -> Result<&'static Runtime> {
+    static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to create iOS web ui runtime: {error:#}"))
+    });
+    match runtime {
+        Ok(runtime) => Ok(runtime),
+        Err(message) => bail!("{message}"),
+    }
+}
+
+fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
+    static STATE: OnceLock<Mutex<Option<WebUiServer>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn start_embedded_web_ui(
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<String> {
+    let runtime = web_ui_runtime()?;
+    let connection_input = normalized_connection_input_string(connection_input)?;
+    let server_ca_pem = normalize_optional_string(server_ca_pem);
+    let client_identity_json = normalize_optional_string(client_identity_json);
+
+    let mut state = web_ui_server_state()
+        .lock()
+        .map_err(|_| anyhow!("web ui state lock poisoned"))?;
+    if let Some(existing) = state.as_ref()
+        && existing.connection_input == connection_input
+        && existing.server_ca_pem == server_ca_pem
+        && existing.client_identity_json == client_identity_json
+        && !existing.task.is_finished()
+    {
+        return Ok(existing.local_url.clone());
+    }
+
+    if let Some(previous) = state.take() {
+        previous.task.abort();
+    }
+
+    let listener = runtime
+        .block_on(async { tokio::net::TcpListener::bind(("127.0.0.1", 0)).await })
+        .context("failed to bind iOS embedded web ui listener")?;
+    let address = listener
+        .local_addr()
+        .context("failed to inspect iOS embedded web ui listener address")?;
+    let local_url = format!("http://127.0.0.1:{}/", address.port());
+
+    let configured = IosStorageApp::configured(
+        connection_input.clone(),
+        server_ca_pem.clone(),
+        client_identity_json.clone(),
+        Some("ios-web-ui".to_string()),
+    )?;
+    let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.sdk.clone())
+        .with_service_name("ironmesh-ios");
+    if connection_input.starts_with('{') {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(&connection_input)
+            .context("failed to parse iOS bootstrap for embedded web ui")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+        web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
+    }
+    if let Some(identity) = configured.client_identity.clone() {
+        web_ui_config = web_ui_config.with_client_identity(identity);
+    }
+    let app = web_ui_backend::router(web_ui_config);
+    let task = runtime.spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    *state = Some(WebUiServer {
+        connection_input,
+        server_ca_pem,
+        client_identity_json,
+        local_url: local_url.clone(),
+        task,
+    });
+
+    Ok(local_url)
+}
+
 pub fn create_handle(
     connection_input: impl Into<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
+    connection_name: Option<String>,
 ) -> Result<*mut c_void> {
-    let facade = IosStorageApp::configured(connection_input, server_ca_pem, client_identity_json)?;
+    let facade = IosStorageApp::configured(
+        connection_input,
+        server_ca_pem,
+        client_identity_json,
+        connection_name,
+    )?;
     Ok(Box::into_raw(Box::new(facade)) as *mut c_void)
 }
 
@@ -327,6 +607,38 @@ fn metadata_json(handle: *mut c_void, key: impl AsRef<str>) -> Result<String> {
 }
 
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn store_index_with_options_json(
+    handle: *mut c_void,
+    prefix: Option<&str>,
+    depth: usize,
+    snapshot: Option<&str>,
+    view: Option<&str>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    sort: Option<&str>,
+    media_filter: Option<&str>,
+) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    let options = StoreIndexRequestOptions {
+        view: parse_store_index_view(view)?,
+        cursor: None,
+        page_size: None,
+        offset,
+        limit,
+        sort: parse_store_index_sort_order(sort)?,
+        media_filter: parse_store_index_media_filter(media_filter)?,
+        synthesize_missing_folder_markers: matches!(view, Some("tree"))
+            && offset.is_none()
+            && limit.is_none()
+            && sort.is_none()
+            && media_filter.is_none(),
+    };
+    serde_json::to_string(&app.store_index_with_options(prefix, depth, snapshot, options)?)
+        .context("failed to serialize Apple store index response")
+}
+
+#[allow(unsafe_code)]
 fn fetch_bytes(handle: *mut c_void, key: impl AsRef<str>) -> Result<Vec<u8>> {
     let app = unsafe { handle_to_app(handle)? };
     app.fetch(key)
@@ -355,6 +667,32 @@ fn move_path(
     app.move_path(from_path, to_path, overwrite)
 }
 
+#[allow(unsafe_code)]
+fn connection_diagnostics_json(handle: *mut c_void) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    serde_json::to_string(&app.connection_diagnostics())
+        .context("failed to serialize Apple connection diagnostics")
+}
+
+pub fn enroll_connection_input_json(
+    connection_input: impl AsRef<str>,
+    device_id_override: Option<&str>,
+    device_label_override: Option<&str>,
+) -> Result<String> {
+    let enrollment = enroll_connection_input_blocking(
+        connection_input.as_ref(),
+        device_id_override,
+        device_label_override,
+    )?;
+    let client_identity_json = serde_json::to_string(&enrollment.client_identity_material()?)
+        .context("failed to serialize client identity JSON")?;
+    let response = AppleEnrollmentResponse {
+        enrollment,
+        client_identity_json,
+    };
+    serde_json::to_string(&response).context("failed to serialize Apple enrollment response")
+}
+
 pub fn web_gui_html() -> String {
     web_ui_backend::assets::app_html()
 }
@@ -367,12 +705,36 @@ pub extern "C" fn ironmesh_ios_facade_create(
     client_identity_json: *const c_char,
     out_error: *mut *mut c_char,
 ) -> *mut c_void {
+    ironmesh_ios_facade_create_named(
+        connection_input,
+        server_ca_pem,
+        client_identity_json,
+        ptr::null(),
+        out_error,
+    )
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_create_named(
+    connection_input: *const c_char,
+    server_ca_pem: *const c_char,
+    client_identity_json: *const c_char,
+    connection_name: *const c_char,
+    out_error: *mut *mut c_char,
+) -> *mut c_void {
     clear_error(out_error);
     let result = (|| -> Result<*mut c_void> {
         let connection_input = required_c_string(connection_input, "connection_input")?;
         let server_ca_pem = optional_c_string(server_ca_pem)?;
         let client_identity_json = optional_c_string(client_identity_json)?;
-        create_handle(connection_input, server_ca_pem, client_identity_json)
+        let connection_name = optional_c_string(connection_name)?;
+        create_handle(
+            connection_input,
+            server_ca_pem,
+            client_identity_json,
+            connection_name,
+        )
     })();
 
     match result {
@@ -454,6 +816,65 @@ pub extern "C" fn ironmesh_ios_facade_metadata_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
+    handle: *mut c_void,
+    prefix: *const c_char,
+    depth: usize,
+    snapshot: *const c_char,
+    view: *const c_char,
+    offset: isize,
+    limit: isize,
+    sort: *const c_char,
+    media_filter: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let prefix = optional_c_string(prefix)?;
+        let snapshot = optional_c_string(snapshot)?;
+        let view = optional_c_string(view)?;
+        let sort = optional_c_string(sort)?;
+        let media_filter = optional_c_string(media_filter)?;
+        let offset = if offset < 0 {
+            None
+        } else {
+            Some(offset as usize)
+        };
+        let limit = if limit < 0 {
+            None
+        } else {
+            Some(limit as usize)
+        };
+        store_index_with_options_json(
+            handle,
+            prefix.as_deref(),
+            depth,
+            snapshot.as_deref(),
+            view.as_deref(),
+            offset,
+            limit,
+            sort.as_deref(),
+            media_filter.as_deref(),
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_connection_diagnostics_json(
+    handle: *mut c_void,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || connection_diagnostics_json(handle))
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
     handle: *mut c_void,
     key: *const c_char,
@@ -489,6 +910,29 @@ pub extern "C" fn ironmesh_ios_facade_put_bytes(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_enroll_with_bootstrap(
+    connection_input: *const c_char,
+    device_id_override: *const c_char,
+    device_label_override: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let connection_input = required_c_string(connection_input, "connection_input")?;
+        let device_id_override = optional_c_string(device_id_override)?;
+        let device_label_override = optional_c_string(device_label_override)?;
+        enroll_connection_input_json(
+            connection_input,
+            device_id_override.as_deref(),
+            device_label_override.as_deref(),
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_delete_path(
     handle: *mut c_void,
     key: *const c_char,
@@ -516,6 +960,26 @@ pub extern "C" fn ironmesh_ios_facade_move_path(
             required_c_string(from_path, "from_path")?,
             required_c_string(to_path, "to_path")?,
             overwrite != 0,
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_start_web_ui(
+    connection_input: *const c_char,
+    server_ca_pem: *const c_char,
+    client_identity_json: *const c_char,
+    out_url: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_url);
+    clear_error(out_error);
+    run_ffi_string_result(out_url, out_error, || {
+        start_embedded_web_ui(
+            required_c_string(connection_input, "connection_input")?,
+            optional_c_string(server_ca_pem)?,
+            optional_c_string(client_identity_json)?,
         )
     })
 }
@@ -602,6 +1066,34 @@ fn normalized_connection_input_string(connection_input: impl Into<String>) -> Re
     }
 
     Ok(normalize_server_base_url(trimmed)?.to_string())
+}
+
+fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("raw") => Ok(Some(StoreIndexView::Raw)),
+        Some("tree") => Ok(Some(StoreIndexView::Tree)),
+        Some(other) => bail!("unsupported store index view: {other}"),
+        None => Ok(None),
+    }
+}
+
+fn parse_store_index_sort_order(value: Option<&str>) -> Result<Option<StoreIndexSortOrder>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("path_asc") => Ok(Some(StoreIndexSortOrder::PathAsc)),
+        Some("captured_desc") => Ok(Some(StoreIndexSortOrder::CapturedDesc)),
+        Some(other) => bail!("unsupported store index sort order: {other}"),
+        None => Ok(None),
+    }
+}
+
+fn parse_store_index_media_filter(value: Option<&str>) -> Result<Option<StoreIndexMediaFilter>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("all") => Ok(Some(StoreIndexMediaFilter::All)),
+        Some("image") => Ok(Some(StoreIndexMediaFilter::Image)),
+        Some("video") => Ok(Some(StoreIndexMediaFilter::Video)),
+        Some(other) => bail!("unsupported store index media filter: {other}"),
+        None => Ok(None),
+    }
 }
 
 fn required_c_string(value: *const c_char, name: &str) -> Result<String> {
@@ -818,6 +1310,10 @@ mod tests {
 
     fn test_router(state: TestServerState) -> Router {
         Router::new()
+            .route("/health", get(health))
+            .route("/api/v1/health", get(health))
+            .route("/auth/device/enroll", post(enroll_device))
+            .route("/api/v1/auth/device/enroll", post(enroll_device))
             .route("/api/v1/store/index", get(list_store_index))
             .route("/api/v1/store/delete", post(delete_by_query))
             .route("/api/v1/store/rename", post(rename_path))
@@ -828,8 +1324,42 @@ mod tests {
                     .head(head_object)
                     .delete(delete_object),
             )
+            .route("/store/index", get(list_store_index))
+            .route("/store/delete", post(delete_by_query))
+            .route("/store/rename", post(rename_path))
+            .route(
+                "/store/{*key}",
+                put(put_object)
+                    .get(get_object)
+                    .head(head_object)
+                    .delete(delete_object),
+            )
             .route("/api/v1/versions/{*key}", get(list_versions))
+            .route("/versions/{*key}", get(list_versions))
             .with_state(state)
+    }
+
+    async fn health() -> impl IntoResponse {
+        StatusCode::OK
+    }
+
+    async fn enroll_device(
+        State(_state): State<TestServerState>,
+        Json(request): Json<client_sdk::DeviceEnrollmentRequest>,
+    ) -> impl IntoResponse {
+        let response = client_sdk::DeviceEnrollmentResponse {
+            cluster_id: request.cluster_id,
+            device_id: request
+                .device_id
+                .unwrap_or_else(|| common::ClusterId::now_v7().to_string()),
+            label: request.label,
+            public_key_pem: request.public_key_pem,
+            credential_pem: "credential-pem".to_string(),
+            rendezvous_client_identity_pem: Some("rendezvous-client-identity-pem".to_string()),
+            created_at_unix: Some(123),
+            expires_at_unix: Some(456),
+        };
+        (StatusCode::CREATED, Json(response))
     }
 
     async fn put_object(
@@ -1082,6 +1612,95 @@ mod tests {
             ironmesh_ios_bytes_free(value);
             bytes
         }
+    }
+
+    fn build_test_bootstrap(
+        server_base_url: String,
+        cluster_id: common::ClusterId,
+    ) -> ConnectionBootstrap {
+        ConnectionBootstrap {
+            version: 1,
+            cluster_id,
+            rendezvous_urls: Vec::new(),
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![client_sdk::BootstrapEndpoint {
+                url: server_base_url,
+                usage: Some(client_sdk::BootstrapEndpointUse::PublicApi),
+                node_id: None,
+            }],
+            relay_mode: client_sdk::RelayMode::Disabled,
+            trust_roots: client_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: Some("correct horse battery staple".to_string()),
+            device_label: Some("iphone".to_string()),
+            device_id: None,
+        }
+    }
+
+    #[test]
+    fn enroll_connection_input_returns_persisted_bootstrap_and_client_identity_json() {
+        let addr = spawn_test_server();
+        let cluster_id = common::ClusterId::now_v7();
+        let bootstrap = build_test_bootstrap(format!("http://{addr}"), cluster_id);
+        let bootstrap_json = bootstrap
+            .to_json_pretty()
+            .expect("bootstrap should serialize");
+        let bootstrap_json = CString::new(bootstrap_json).expect("bootstrap json should be valid");
+        let mut json_out = ptr::null_mut();
+        let mut error_out = ptr::null_mut();
+        let status = ironmesh_ios_facade_enroll_with_bootstrap(
+            bootstrap_json.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            &mut json_out,
+            &mut error_out,
+        );
+        assert_eq!(status, FFI_OK);
+        assert!(error_out.is_null());
+
+        let response: AppleEnrollmentResponse =
+            serde_json::from_str(&read_string(json_out)).expect("enrollment response should parse");
+        assert_eq!(response.enrollment.cluster_id, cluster_id);
+        assert!(response.enrollment.connection_bootstrap_json.is_some());
+        assert!(response.enrollment.server_base_url.is_some());
+        assert!(!response.client_identity_json.is_empty());
+
+        let client_identity = ClientIdentityMaterial::from_json_str(&response.client_identity_json)
+            .expect("client identity json should parse");
+        assert_eq!(client_identity.cluster_id, cluster_id);
+        assert_eq!(
+            client_identity.credential_pem,
+            Some(response.enrollment.credential_pem.clone())
+        );
+        assert_eq!(
+            client_identity.public_key_pem,
+            response.enrollment.public_key_pem
+        );
+
+        let persisted_bootstrap = ConnectionBootstrap::from_json_str(
+            response
+                .enrollment
+                .connection_bootstrap_json
+                .as_deref()
+                .expect("persisted bootstrap should be present"),
+        )
+        .expect("persisted bootstrap should parse");
+        assert_eq!(persisted_bootstrap.cluster_id, cluster_id);
+        assert_eq!(
+            persisted_bootstrap
+                .device_id
+                .as_ref()
+                .map(ToString::to_string),
+            Some(response.enrollment.device_id)
+        );
+        assert_eq!(
+            persisted_bootstrap.device_label.as_deref(),
+            response.enrollment.label.as_deref()
+        );
+        assert!(persisted_bootstrap.pairing_token.is_none());
     }
 
     #[test]

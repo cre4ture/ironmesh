@@ -12,7 +12,8 @@ import {
   type GalleryBasemapConfig,
   type GalleryEntry,
   type GalleryLoadEntriesOptions,
-  type GalleryMediaRequests
+  type GalleryMediaRequests,
+  type GallerySurfaceViewMode
 } from "@ironmesh/ui";
 import { useCallback } from "react";
 
@@ -57,7 +58,11 @@ const CLIENT_GALLERY_BASEMAPS: GalleryBasemapConfig[] = [
   }
 ];
 
-export function GalleryPage() {
+type GalleryPageProps = {
+  initialViewMode?: GallerySurfaceViewMode;
+};
+
+export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
   const loadSnapshots = useCallback(() => listSnapshots(), []);
   const loadEntries = useCallback(
     (
@@ -98,6 +103,7 @@ export function GalleryPage() {
       />
       <GallerySurface
         previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
+        initialViewMode={initialViewMode}
         allowedMediaKinds={["image", "video"]}
         basemaps={CLIENT_GALLERY_BASEMAPS}
         loadSnapshots={loadSnapshots}

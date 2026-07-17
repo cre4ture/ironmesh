@@ -1,4 +1,4 @@
-import { IconActivity, IconArrowsTransferUp, IconCertificate, IconCloud, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconActivity, IconArrowsTransferUp, IconCertificate, IconCloud, IconCpu, IconDashboard, IconDatabase, IconFileText, IconFolder, IconHistory, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { RepairPage } from "../pages/RepairPage";
 import { SetupPage } from "../pages/SetupPage";
@@ -9,6 +9,7 @@ import { CertificatesPage } from "../pages/CertificatesPage";
 import { ControlPlanePage } from "../pages/ControlPlanePage";
 import { DataChangesPage } from "../pages/DataChangesPage";
 import { DependenciesPage } from "../pages/DependenciesPage";
+import { HardwarePage } from "../pages/HardwarePage";
 import { LogsPage } from "../pages/LogsPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { ExplorerPage } from "../pages/ExplorerPage";
@@ -106,6 +107,13 @@ export const serverAdminRoutes = [
     description: "Check host runtime dependencies such as ffprobe and ffmpeg before media-heavy test rounds.",
     icon: IconServerCog,
     element: <DependenciesPage />
+  },
+  {
+    id: "hardware",
+    label: "Hardware",
+    description: "Inspect exact node hardware inventory, lifecycle age signals, and normalized hardware or runtime findings without exposing user data.",
+    icon: IconCpu,
+    element: <HardwarePage />
   },
   {
     id: "control-plane",

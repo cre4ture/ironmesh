@@ -25,6 +25,7 @@ import type {
   DataScrubHistoryResponse,
   DataScrubScope,
   DataScrubTriggerResponse,
+  HardwareHealthCurrentResponse,
   HostDependencyReport,
   LogsResponse,
   ManagedControlPlanePromotionPackage,
@@ -652,6 +653,14 @@ export async function getHostDependencyReport(
   adminTokenOverride?: string
 ): Promise<HostDependencyReport> {
   return fetchAdminJson<HostDependencyReport>(apiV1("/auth/host/dependencies"), {
+    adminTokenOverride
+  });
+}
+
+export async function getHardwareHealth(
+  adminTokenOverride?: string
+): Promise<HardwareHealthCurrentResponse> {
+  return fetchAdminJson<HardwareHealthCurrentResponse>(apiV1("/auth/hardware/health"), {
     adminTokenOverride
   });
 }

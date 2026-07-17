@@ -114,11 +114,13 @@ mod tests {
                     kind: CandidateKind::Relay,
                     endpoint: "https://relay.example".to_string(),
                     rtt_ms: Some(30),
+                    transport_hints: None,
                 },
                 ConnectionCandidate {
                     kind: CandidateKind::DirectHttps,
                     endpoint: "https://node.example".to_string(),
                     rtt_ms: Some(10),
+                    transport_hints: None,
                 },
             ],
         )
@@ -141,11 +143,13 @@ mod tests {
                     kind: CandidateKind::DirectQuic,
                     endpoint: "https://node.example:4433".to_string(),
                     rtt_ms: Some(10),
+                    transport_hints: None,
                 },
                 ConnectionCandidate {
                     kind: CandidateKind::Relay,
                     endpoint: "https://relay.example".to_string(),
                     rtt_ms: Some(20),
+                    transport_hints: None,
                 },
             ],
         )
@@ -167,6 +171,7 @@ mod tests {
                 kind: CandidateKind::Relay,
                 endpoint: "https://relay.example".to_string(),
                 rtt_ms: Some(10),
+                transport_hints: None,
             }],
         );
 
@@ -182,6 +187,7 @@ mod tests {
                 kind: CandidateKind::ServerReflexive,
                 endpoint: "https://reflexive.example:4433".to_string(),
                 rtt_ms: Some(10),
+                transport_hints: None,
             }],
         )
         .expect("a direct HTTPS session plan should be selected");

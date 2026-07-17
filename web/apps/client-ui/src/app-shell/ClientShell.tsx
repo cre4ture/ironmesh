@@ -31,6 +31,7 @@ import {
 } from "@tabler/icons-react";
 import {
   ColorSchemeControl,
+  ironmeshPrimaryColor,
   JsonBlock,
   NavigationShell,
   PageHeader,
@@ -70,12 +71,14 @@ import {
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { ConnectionPathsPage } from "../pages/ConnectionPathsPage";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { LogsPage } from "../pages/LogsPage";
 
 type PageId =
   | "overview"
+  | "connectionPaths"
   | "rendezvous"
   | "latency"
   | "store"
@@ -83,6 +86,13 @@ type PageId =
   | "gallery"
   | "cluster"
   | "logs";
+type EmbeddedSurface = "gallery_map";
+type GalleryLaunchViewMode = "grid" | "map";
+type ShellLaunchState = {
+  activePageId: PageId;
+  embeddedSurface: EmbeddedSurface | null;
+  galleryViewMode: GalleryLaunchViewMode | null;
+};
 type BinaryUploadQueueStatus =
   | "queued"
   | "starting"
@@ -149,6 +159,12 @@ const pages = [
     description: "Connection health, service metadata, and quick cluster summary."
   },
   {
+    id: "connectionPaths" as const,
+    label: "Connection paths",
+    icon: IconPlugConnected,
+    description: "See every direct and relay route, which one is active, and whether the router is still re-evaluating candidates."
+  },
+  {
     id: "rendezvous" as const,
     label: "Rendezvous",
     icon: IconPlugConnected,
@@ -193,7 +209,8 @@ const pages = [
 ];
 
 export function ClientShell() {
-  const [activePageId, setActivePageId] = useState<PageId>("overview");
+  const launchState = resolveShellLaunchState();
+  const [activePageId, setActivePageId] = useState<PageId>(() => launchState.activePageId);
   const [ping, setPing] = useState<ClientUiPingResponse | null>(null);
   const [health, setHealth] = useState<JsonObject | null>(null);
   const [clusterStatus, setClusterStatus] = useState<JsonObject | null>(null);
@@ -205,6 +222,10 @@ export function ClientShell() {
   useEffect(() => {
     void refreshOverview();
   }, []);
+
+  if (launchState.embeddedSurface === "gallery_map") {
+    return <GalleryPage initialViewMode="map" />;
+  }
 
   async function refreshOverview() {
     setOverviewLoading(true);
@@ -249,7 +270,7 @@ export function ClientShell() {
           ) : null}
           <ColorSchemeControl />
           {ping ? <Badge variant="light">{ping.service}</Badge> : null}
-          <Badge color="teal" variant="filled">
+          <Badge color={ironmeshPrimaryColor} variant="filled">
             Transport-aware
           </Badge>
         </>
@@ -267,6 +288,8 @@ export function ClientShell() {
         />
       ) : null}
 
+      {activePageId === "connectionPaths" ? <ConnectionPathsPage /> : null}
+
       {activePageId === "rendezvous" ? <RendezvousPage /> : null}
 
       {activePageId === "latency" ? <LatencyPage /> : null}
@@ -282,7 +305,9 @@ export function ClientShell() {
         />
       ) : null}
 
-      {activePageId === "gallery" ? <GalleryPage /> : null}
+      {activePageId === "gallery" ? (
+        <GalleryPage initialViewMode={launchState.galleryViewMode ?? undefined} />
+      ) : null}
 
       {activePageId === "cluster" ? (
         <ClusterPage
@@ -296,6 +321,57 @@ export function ClientShell() {
       {activePageId === "logs" ? <LogsPage /> : null}
     </NavigationShell>
   );
+}
+
+function resolveShellLaunchState(): ShellLaunchState {
+  if (typeof window === "undefined") {
+    return {
+      activePageId: "overview",
+      embeddedSurface: null,
+      galleryViewMode: null
+    };
+  }
+
+  const searchParams = new URLSearchParams(window.location.search);
+  const embeddedSurface = parseEmbeddedSurface(searchParams.get("embedded"));
+  const activePageId = parsePageId(searchParams.get("page")) ?? "overview";
+  const galleryViewMode = parseGalleryLaunchViewMode(searchParams.get("gallery_view"));
+
+  return {
+    activePageId: embeddedSurface === "gallery_map" ? "gallery" : activePageId,
+    embeddedSurface,
+    galleryViewMode: embeddedSurface === "gallery_map" ? "map" : galleryViewMode
+  };
+}
+
+function parsePageId(value: string | null): PageId | null {
+  switch (value) {
+    case "overview":
+    case "rendezvous":
+    case "latency":
+    case "store":
+    case "explorer":
+    case "gallery":
+    case "cluster":
+    case "logs":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function parseEmbeddedSurface(value: string | null): EmbeddedSurface | null {
+  return value === "gallery_map" ? value : null;
+}
+
+function parseGalleryLaunchViewMode(value: string | null): GalleryLaunchViewMode | null {
+  switch (value) {
+    case "grid":
+    case "map":
+      return value;
+    default:
+      return null;
+  }
 }
 
 function useBinaryUploadQueue(): BinaryUploadController {
@@ -726,7 +802,7 @@ function OverviewPage({
             <Stack gap="sm">
               <Text fw={700}>Connection summary</Text>
               <Group gap="sm">
-                <Badge color="teal" variant="light">
+                <Badge color={ironmeshPrimaryColor} variant="light">
                   {onlineNodes ?? 0} online
                 </Badge>
                 <Badge color={offlineNodes ? "yellow" : "gray"} variant="light">
@@ -769,7 +845,7 @@ function OverviewPage({
             <Stack gap="sm">
               <Text fw={700}>Active route</Text>
               <Group gap="sm">
-                <Badge color={connectionStatus?.transport_mode === "relay" ? "teal" : "blue"} variant="light">
+                <Badge color={connectionStatus?.transport_mode === "relay" ? ironmeshPrimaryColor : "blue"} variant="light">
                   {connectionSummary.routeMode}
                 </Badge>
                 {connectionStatus?.transport_mode === "relay" && connectionStatus.active_url ? (
@@ -937,12 +1013,12 @@ function RendezvousPage() {
         </Alert>
       ) : null}
       {rendezvous?.editable && rendezvous.persistence_source === "android_preferences" ? (
-        <Alert color="teal" title="Persisted to Android preferences">
+        <Alert color={ironmeshPrimaryColor} title="Persisted to Android preferences">
           Rendezvous URL edits are written back into the Android app's persisted bootstrap state and will be reused after restart.
         </Alert>
       ) : null}
       {rendezvous?.editable && rendezvous.persistence_source === "bootstrap_file" ? (
-        <Alert color="teal" title="Persisted to bootstrap file">
+        <Alert color={ironmeshPrimaryColor} title="Persisted to bootstrap file">
           Rendezvous URL edits are written back into the bootstrap file that launched this web session.
         </Alert>
       ) : null}
@@ -1005,7 +1081,7 @@ function RendezvousPage() {
                 <Badge color={rendezvous?.mtls_required ? "blue" : "gray"} variant="light">
                   {rendezvous?.mtls_required ? "mTLS required" : "mTLS optional"}
                 </Badge>
-                <Badge color={rendezvous?.transport_mode === "relay" ? "teal" : "gray"} variant="light">
+                <Badge color={rendezvous?.transport_mode === "relay" ? ironmeshPrimaryColor : "gray"} variant="light">
                   {rendezvous?.transport_mode === "relay" ? "relay active" : "direct active"}
                 </Badge>
               </Group>
@@ -1057,7 +1133,7 @@ function RendezvousPage() {
                           <Group gap="xs">
                             <Code>{endpoint.url}</Code>
                             {endpoint.active ? (
-                              <Badge color="teal" variant="filled">
+                              <Badge color={ironmeshPrimaryColor} variant="filled">
                                 active
                               </Badge>
                             ) : null}
@@ -1271,7 +1347,7 @@ function LatencyPage() {
                               </Stack>
                             </Table.Td>
                             <Table.Td>
-                              <Badge color={target.transport_mode === "relay" ? "teal" : "blue"} variant="light">
+                              <Badge color={target.transport_mode === "relay" ? ironmeshPrimaryColor : "blue"} variant="light">
                                 {target.transport_mode}
                               </Badge>
                             </Table.Td>
@@ -1563,7 +1639,7 @@ function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
                     <Badge color="blue" variant="light">
                       {binaryUploadSummary.activeFiles} active
                     </Badge>
-                    <Badge color="teal" variant="light">
+                    <Badge color={ironmeshPrimaryColor} variant="light">
                       {binaryUploadSummary.completedFiles} complete
                     </Badge>
                     <Badge color={binaryUploadSummary.canceledFiles > 0 ? "yellow" : "gray"} variant="light">
@@ -2226,7 +2302,7 @@ function binaryUploadHeaderColor(
     return "blue";
   }
   if (summary.completedFiles > 0 && summary.completedFiles === summary.totalFiles) {
-    return "teal";
+    return ironmeshPrimaryColor;
   }
   return "gray";
 }
@@ -2260,7 +2336,7 @@ function binaryUploadStatusColor(status: BinaryUploadQueueStatus): string {
     return "gray";
   }
   if (status === "complete") {
-    return "teal";
+    return ironmeshPrimaryColor;
   }
   if (status === "canceled") {
     return "yellow";

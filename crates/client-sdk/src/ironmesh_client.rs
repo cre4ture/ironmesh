@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::{NodeId, StorageObjectMeta};
+use futures_util::future::join_all;
 use futures_util::io::{
     AsyncRead, AsyncReadExt as FuturesAsyncReadExt, AsyncWrite,
     AsyncWriteExt as FuturesAsyncWriteExt,
@@ -26,14 +27,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RendezvousControlClient,
-    TransportHeader, TransportRequestHead, TransportStreamKind, build_signed_request_headers,
-    read_buffered_transport_response, read_transport_response_head,
+    TransportHeader, TransportPathKind, TransportRequestHead, TransportStreamKind,
+    build_signed_request_headers, read_buffered_transport_response, read_transport_response_head,
     write_buffered_transport_request, write_transport_request_head,
 };
 use uuid::Uuid;
@@ -53,6 +55,8 @@ const CLIENT_ROUTE_CIRCUIT_BASE_BACKOFF_MS: u64 = 1_500;
 const CLIENT_ROUTE_CIRCUIT_MAX_BACKOFF_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_STALE_MS: u64 = 30_000;
 const CLIENT_ROUTE_BACKGROUND_REFRESH_MIN_INTERVAL_MS: u64 = 5_000;
+const CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT: usize = 8;
 const CLIENT_DIRECT_MULTIPLEX_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 
@@ -74,6 +78,57 @@ pub struct IronMeshClient {
     auth: ClientRequestAuth,
     connection_name: Option<String>,
     upload_session_affinities: Arc<Mutex<HashMap<String, UploadSessionAffinity>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientConnectionAttempt {
+    pub started_unix_ms: u64,
+    pub finished_unix_ms: Option<u64>,
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    pub outcome: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientEndpointDiagnostics {
+    pub path_kind: String,
+    pub locator: String,
+    pub request_base_url: String,
+    pub active: bool,
+    pub consecutive_failures: u32,
+    pub total_failures: u64,
+    pub total_successes: u64,
+    #[serde(default)]
+    pub last_attempt_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_success_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_failure_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub recent_attempts: Vec<ClientConnectionAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientConnectionDiagnostics {
+    #[serde(default)]
+    pub endpoints: Vec<ClientEndpointDiagnostics>,
+    #[serde(default)]
+    pub last_success_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientConnectionDiagnosticsEvent {
+    pub connection_name: Option<String>,
+    pub diagnostics: ClientConnectionDiagnostics,
 }
 
 #[derive(Clone)]
@@ -113,6 +168,14 @@ struct ClientEndpointRouter {
     active_index: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Copy)]
+struct ClientRequestAttemptContext<'a> {
+    method: &'a Method,
+    url: &'a Url,
+    timeout: Option<Duration>,
+    started_unix_ms: u64,
+}
+
 #[derive(Clone)]
 struct ClientEndpoint {
     descriptor: ClientEndpointDescriptor,
@@ -133,6 +196,15 @@ enum ClientEndpointPathKind {
     Relay,
 }
 
+impl ClientEndpointPathKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ClientEndpointState {
     ewma_latency_ms: Option<f64>,
@@ -147,6 +219,51 @@ struct ClientEndpointState {
     background_probe_in_flight: bool,
     last_background_probe_unix_ms: Option<u64>,
     last_error: Option<String>,
+    recent_attempts: Vec<ClientConnectionAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientConnectionRouteSnapshot {
+    pub generated_at_unix_ms: u64,
+    #[serde(default)]
+    pub active_index: Option<usize>,
+    #[serde(default)]
+    pub ranked_indices: Vec<usize>,
+    #[serde(default)]
+    pub endpoints: Vec<ClientConnectionRouteEndpointSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientConnectionRouteEndpointSnapshot {
+    pub index: usize,
+    pub path_kind: TransportPathKind,
+    pub locator: String,
+    pub bootstrap_rank: usize,
+    #[serde(default)]
+    pub target_node_id: Option<NodeId>,
+    #[serde(default)]
+    pub active: bool,
+    pub score: f64,
+    #[serde(default)]
+    pub ewma_latency_ms: Option<f64>,
+    #[serde(default)]
+    pub ewma_throughput_bytes_per_sec: Option<f64>,
+    pub consecutive_failures: u32,
+    pub total_failures: u64,
+    pub total_successes: u64,
+    #[serde(default)]
+    pub last_measurement_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_success_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_failure_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub circuit_open_until_unix_ms: Option<u64>,
+    pub background_probe_in_flight: bool,
+    #[serde(default)]
+    pub last_background_probe_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -268,6 +385,33 @@ impl ClientEndpoint {
     fn rewrite_url(&self, url: &Url) -> Result<Url> {
         self.transport.rewrite_url(url)
     }
+
+    fn with_bootstrap_rank(&self, bootstrap_rank: usize) -> Self {
+        Self {
+            descriptor: ClientEndpointDescriptor {
+                bootstrap_rank,
+                ..self.descriptor.clone()
+            },
+            transport: self.transport.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
+type ConnectionDiagnosticsObserver =
+    Arc<dyn Fn(ClientConnectionDiagnosticsEvent) + Send + Sync + 'static>;
+type ConnectionDiagnosticsObserverSlot = RwLock<Option<ConnectionDiagnosticsObserver>>;
+
+fn connection_diagnostics_observer() -> &'static ConnectionDiagnosticsObserverSlot {
+    static OBSERVER: OnceLock<ConnectionDiagnosticsObserverSlot> = OnceLock::new();
+    OBSERVER.get_or_init(|| RwLock::new(None))
+}
+
+pub fn set_connection_diagnostics_observer(observer: Option<ConnectionDiagnosticsObserver>) {
+    let mut slot = connection_diagnostics_observer()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = observer;
 }
 
 impl UploadSessionAffinity {
@@ -360,24 +504,6 @@ impl ClientEndpointRouter {
             .collect()
     }
 
-    fn record_success(&self, index: usize, latency_ms: f64, bytes_transferred: usize) {
-        let Some(endpoint) = self.endpoints.get(index) else {
-            return;
-        };
-        let mut state = lock_endpoint_state(&endpoint.state);
-        record_endpoint_success_sample(&mut state, latency_ms, bytes_transferred, false);
-        drop(state);
-        self.set_active_index(index);
-    }
-
-    fn record_failure(&self, index: usize, error: &str) {
-        let Some(endpoint) = self.endpoints.get(index) else {
-            return;
-        };
-        let mut state = lock_endpoint_state(&endpoint.state);
-        record_endpoint_failure_sample(&mut state, error, false);
-    }
-
     fn claim_background_probe_candidates(&self) -> Vec<(usize, ClientEndpoint)> {
         if self.endpoints.len() <= 1 {
             return Vec::new();
@@ -403,6 +529,14 @@ impl ClientEndpointRouter {
         claimed
     }
 
+    fn record_failure(&self, index: usize, error: &str) {
+        let Some(endpoint) = self.endpoints.get(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, false);
+    }
+
     fn record_background_probe_success(&self, index: usize, latency_ms: f64) {
         let Some(endpoint) = self.endpoints.get(index) else {
             return;
@@ -417,6 +551,137 @@ impl ClientEndpointRouter {
         };
         let mut state = lock_endpoint_state(&endpoint.state);
         record_endpoint_failure_sample(&mut state, error, true);
+    }
+
+    fn snapshot(&self) -> ClientConnectionRouteSnapshot {
+        let active_index = self.active_index();
+        let ranked_indices = self.rank_indices();
+        let endpoints = self
+            .endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let state = lock_endpoint_state(&endpoint.state);
+                ClientConnectionRouteEndpointSnapshot {
+                    index,
+                    path_kind: match endpoint.descriptor.path_kind {
+                        ClientEndpointPathKind::Direct => TransportPathKind::DirectHttps,
+                        ClientEndpointPathKind::Relay => TransportPathKind::RelayTunnel,
+                    },
+                    locator: endpoint.descriptor.locator.clone(),
+                    bootstrap_rank: endpoint.descriptor.bootstrap_rank,
+                    target_node_id: endpoint.transport.target_node_id(),
+                    active: active_index == Some(index),
+                    score: endpoint_score(index, active_index, &endpoint.descriptor, &state),
+                    ewma_latency_ms: state.ewma_latency_ms,
+                    ewma_throughput_bytes_per_sec: state.ewma_throughput_bytes_per_sec,
+                    consecutive_failures: state.consecutive_failures,
+                    total_failures: state.total_failures,
+                    total_successes: state.total_successes,
+                    last_measurement_unix_ms: state.last_measurement_unix_ms,
+                    last_success_unix_ms: state.last_success_unix_ms,
+                    last_failure_unix_ms: state.last_failure_unix_ms,
+                    circuit_open_until_unix_ms: state.circuit_open_until_unix_ms,
+                    background_probe_in_flight: state.background_probe_in_flight,
+                    last_background_probe_unix_ms: state.last_background_probe_unix_ms,
+                    last_error: state.last_error.clone(),
+                }
+            })
+            .collect();
+
+        ClientConnectionRouteSnapshot {
+            generated_at_unix_ms: unix_ts_ms(),
+            active_index,
+            ranked_indices,
+            endpoints,
+        }
+    }
+
+    fn record_request_success(
+        &self,
+        index: usize,
+        attempt: ClientRequestAttemptContext<'_>,
+        latency_ms: f64,
+        bytes_transferred: usize,
+    ) {
+        let Some(endpoint) = self.endpoints.get(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_success_sample(&mut state, latency_ms, bytes_transferred, false);
+        record_endpoint_attempt(
+            &mut state,
+            ClientConnectionAttempt {
+                started_unix_ms: attempt.started_unix_ms,
+                finished_unix_ms: Some(unix_ts_ms()),
+                method: attempt.method.to_string(),
+                url: attempt_display_url(endpoint, attempt.url),
+                timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
+                outcome: "success".to_string(),
+                error: None,
+            },
+        );
+        drop(state);
+        self.set_active_index(index);
+    }
+
+    fn record_request_failure(
+        &self,
+        index: usize,
+        attempt: ClientRequestAttemptContext<'_>,
+        error: &str,
+    ) {
+        let Some(endpoint) = self.endpoints.get(index) else {
+            return;
+        };
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, false);
+        record_endpoint_attempt(
+            &mut state,
+            ClientConnectionAttempt {
+                started_unix_ms: attempt.started_unix_ms,
+                finished_unix_ms: Some(unix_ts_ms()),
+                method: attempt.method.to_string(),
+                url: attempt_display_url(endpoint, attempt.url),
+                timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
+                outcome: "failure".to_string(),
+                error: Some(error.to_string()),
+            },
+        );
+    }
+
+    fn diagnostics_snapshot(&self) -> ClientConnectionDiagnostics {
+        let active_index = self.active_index();
+        let endpoints = self
+            .endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let state = lock_endpoint_state(&endpoint.state);
+                ClientEndpointDiagnostics {
+                    path_kind: endpoint.descriptor.path_kind.as_str().to_string(),
+                    locator: endpoint.descriptor.locator.clone(),
+                    request_base_url: endpoint.transport.request_base_url().to_string(),
+                    active: active_index == Some(index),
+                    consecutive_failures: state.consecutive_failures,
+                    total_failures: state.total_failures,
+                    total_successes: state.total_successes,
+                    last_attempt_unix_ms: state.last_measurement_unix_ms,
+                    last_success_unix_ms: state.last_success_unix_ms,
+                    last_failure_unix_ms: state.last_failure_unix_ms,
+                    last_error: state.last_error.clone(),
+                    recent_attempts: state.recent_attempts.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let last_success_unix_ms = endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.last_success_unix_ms)
+            .max();
+        ClientConnectionDiagnostics {
+            endpoints,
+            last_success_unix_ms,
+        }
     }
 }
 
@@ -520,6 +785,30 @@ fn record_endpoint_failure_sample(
     if background_probe {
         state.background_probe_in_flight = false;
     }
+}
+
+fn record_endpoint_attempt(state: &mut ClientEndpointState, attempt: ClientConnectionAttempt) {
+    if state.recent_attempts.len() >= CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT {
+        let drop_count = state
+            .recent_attempts
+            .len()
+            .saturating_sub(CLIENT_ROUTE_RECENT_ATTEMPT_LIMIT - 1);
+        state.recent_attempts.drain(0..drop_count);
+    }
+    state.recent_attempts.push(attempt);
+}
+
+fn attempt_display_url(endpoint: &ClientEndpoint, url: &Url) -> String {
+    match endpoint.descriptor.path_kind {
+        ClientEndpointPathKind::Direct => url.to_string(),
+        ClientEndpointPathKind::Relay => {
+            format!("{}{}", endpoint.descriptor.locator, path_and_query(url))
+        }
+    }
+}
+
+fn duration_to_u64_ms(duration: Duration) -> Option<u64> {
+    duration.as_millis().try_into().ok()
 }
 
 fn background_probe_due(state: &ClientEndpointState, now_unix_ms: u64) -> bool {
@@ -1102,16 +1391,26 @@ async fn probe_endpoint_background_quality(
         })?;
     let headers = request_auth_headers_for_auth(auth, &method, &url, connection_name)?;
     let started_at = std::time::Instant::now();
-    let response = execute_buffered_request_for_transport(
-        &endpoint.transport,
-        auth,
-        TransportRequestOptions::new(connection_name, None),
-        &method,
-        &url,
-        &headers,
-        &[],
+    let response = tokio::time::timeout(
+        CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT,
+        execute_buffered_request_for_transport(
+            &endpoint.transport,
+            auth,
+            TransportRequestOptions::new(connection_name, None),
+            &method,
+            &url,
+            &headers,
+            &[],
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "background health probe timed out after {} ms for {}",
+            CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT.as_millis(),
+            endpoint.descriptor.locator
+        )
+    })??;
     if !response.status.is_success() {
         bail!(
             "background health probe returned {} from {}",
@@ -1654,13 +1953,13 @@ impl IronMeshClient {
                 _ => bail!("cannot combine client transports with incompatible auth modes"),
             }
 
-            let transport = client
+            let endpoint = client
                 .transport_router
                 .endpoints
                 .first()
-                .map(|endpoint| endpoint.transport.clone())
+                .cloned()
                 .ok_or_else(|| anyhow!("cannot combine an empty client transport router"))?;
-            endpoints.push(ClientEndpoint::new(transport, bootstrap_rank));
+            endpoints.push(endpoint.with_bootstrap_rank(bootstrap_rank));
         }
 
         Ok(Self {
@@ -1679,6 +1978,63 @@ impl IronMeshClient {
     pub fn with_connection_name(mut self, connection_name: impl Into<String>) -> Self {
         self.connection_name = normalize_connection_name(&connection_name.into());
         self
+    }
+
+    pub fn connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
+        self.transport_router.snapshot()
+    }
+
+    pub async fn refresh_connection_route_snapshot(&self) -> ClientConnectionRouteSnapshot {
+        let tasks = self
+            .transport_router
+            .endpoints
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let auth = self.auth.clone();
+                let connection_name = self.connection_name.clone();
+                async move {
+                    let result = probe_endpoint_background_quality(
+                        &endpoint,
+                        &auth,
+                        connection_name.as_deref(),
+                    )
+                    .await;
+                    (index, result)
+                }
+            });
+
+        for (index, result) in join_all(tasks).await {
+            match result {
+                Ok(latency_ms) => self
+                    .transport_router
+                    .record_background_probe_success(index, latency_ms),
+                Err(error) => self
+                    .transport_router
+                    .record_background_probe_failure(index, &error.to_string()),
+            }
+        }
+
+        self.connection_route_snapshot()
+    }
+
+    pub fn connection_diagnostics(&self) -> ClientConnectionDiagnostics {
+        self.transport_router.diagnostics_snapshot()
+    }
+
+    fn publish_connection_diagnostics(&self) {
+        let observer = connection_diagnostics_observer()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        observer(ClientConnectionDiagnosticsEvent {
+            connection_name: self.connection_name.clone(),
+            diagnostics: self.connection_diagnostics(),
+        });
     }
 
     pub fn uses_relay_transport(&self) -> bool {
@@ -1843,6 +2199,7 @@ impl IronMeshClient {
                 }
             };
             let started_at = std::time::Instant::now();
+            let started_unix_ms = unix_ts_ms();
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
@@ -1858,13 +2215,20 @@ impl IronMeshClient {
             .await
             {
                 Ok(response) if is_retryable_transport_status(response.status) => {
-                    self.transport_router.record_failure(
+                    self.transport_router.record_request_failure(
                         index,
+                        ClientRequestAttemptContext {
+                            method: &method,
+                            url: &endpoint_url,
+                            timeout: direct_failover_timeout,
+                            started_unix_ms,
+                        },
                         &format!(
                             "retryable HTTP {} from {}",
                             response.status, endpoint.descriptor.locator
                         ),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(
                         "retryable transport response {} from {}",
                         response.status,
@@ -1872,19 +2236,35 @@ impl IronMeshClient {
                     ));
                 }
                 Ok(response) => {
-                    self.transport_router.record_success(
+                    self.transport_router.record_request_success(
                         index,
+                        ClientRequestAttemptContext {
+                            method: &method,
+                            url: &endpoint_url,
+                            timeout: direct_failover_timeout,
+                            started_unix_ms,
+                        },
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         response.body.len(),
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index: index,
                         response,
                     });
                 }
                 Err(error) => {
-                    self.transport_router
-                        .record_failure(index, &error.to_string());
+                    self.transport_router.record_request_failure(
+                        index,
+                        ClientRequestAttemptContext {
+                            method: &method,
+                            url: &endpoint_url,
+                            timeout: direct_failover_timeout,
+                            started_unix_ms,
+                        },
+                        &error.to_string(),
+                    );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }
@@ -1945,6 +2325,7 @@ impl IronMeshClient {
                 }
             };
             let started_at = std::time::Instant::now();
+            let started_unix_ms = unix_ts_ms();
             match execute_streaming_object_write_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
@@ -1962,13 +2343,20 @@ impl IronMeshClient {
                 Ok(candidate_response)
                     if is_retryable_transport_status(candidate_response.status) =>
                 {
-                    self.transport_router.record_failure(
+                    self.transport_router.record_request_failure(
                         route_index,
+                        ClientRequestAttemptContext {
+                            method: &Method::PUT,
+                            url: &endpoint_url,
+                            timeout: direct_failover_timeout,
+                            started_unix_ms,
+                        },
                         &format!(
                             "retryable HTTP {} from {}",
                             candidate_response.status, endpoint.descriptor.locator
                         ),
                     );
+                    self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(
                         "retryable transport response {} from {}",
                         candidate_response.status,
@@ -1976,19 +2364,35 @@ impl IronMeshClient {
                     ));
                 }
                 Ok(candidate_response) => {
-                    self.transport_router.record_success(
+                    self.transport_router.record_request_success(
                         route_index,
+                        ClientRequestAttemptContext {
+                            method: &Method::PUT,
+                            url: &endpoint_url,
+                            timeout: direct_failover_timeout,
+                            started_unix_ms,
+                        },
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         candidate_response.body.len(),
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(RoutedBufferedTransportResponse {
                         route_index,
                         response: candidate_response,
                     });
                 }
                 Err(error) => {
-                    self.transport_router
-                        .record_failure(route_index, &error.to_string());
+                    self.transport_router.record_request_failure(
+                        route_index,
+                        ClientRequestAttemptContext {
+                            method: &Method::PUT,
+                            url: &endpoint_url,
+                            timeout: direct_failover_timeout,
+                            started_unix_ms,
+                        },
+                        &error.to_string(),
+                    );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }
@@ -2537,6 +2941,7 @@ impl IronMeshClient {
                 }
             };
             let started_at = std::time::Instant::now();
+            let started_unix_ms = unix_ts_ms();
             match execute_streaming_read_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
@@ -2554,16 +2959,32 @@ impl IronMeshClient {
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.parse::<usize>().ok())
                         .unwrap_or_default();
-                    self.transport_router.record_success(
+                    self.transport_router.record_request_success(
                         index,
+                        ClientRequestAttemptContext {
+                            method: &method,
+                            url: &endpoint_url,
+                            timeout: None,
+                            started_unix_ms,
+                        },
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         bytes_hint,
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(response);
                 }
                 Err(error) => {
-                    self.transport_router
-                        .record_failure(index, &error.to_string());
+                    self.transport_router.record_request_failure(
+                        index,
+                        ClientRequestAttemptContext {
+                            method: &method,
+                            url: &endpoint_url,
+                            timeout: None,
+                            started_unix_ms,
+                        },
+                        &error.to_string(),
+                    );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }
@@ -2617,6 +3038,7 @@ impl IronMeshClient {
                 }
             };
             let started_at = std::time::Instant::now();
+            let started_unix_ms = unix_ts_ms();
             let Some(request_body_stream) = body_stream.take() else {
                 bail!("streamed relative-path request body was already consumed");
             };
@@ -2632,11 +3054,18 @@ impl IronMeshClient {
             .await
             {
                 Ok(response) => {
-                    self.transport_router.record_success(
+                    self.transport_router.record_request_success(
                         index,
+                        ClientRequestAttemptContext {
+                            method: &method,
+                            url: &endpoint_url,
+                            timeout: None,
+                            started_unix_ms,
+                        },
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         response.body.len(),
                     );
+                    self.publish_connection_diagnostics();
                     return Ok(RelativePathResponse {
                         status: response.status,
                         headers: response.headers,
@@ -2644,8 +3073,17 @@ impl IronMeshClient {
                     });
                 }
                 Err(error) => {
-                    self.transport_router
-                        .record_failure(index, &error.to_string());
+                    self.transport_router.record_request_failure(
+                        index,
+                        ClientRequestAttemptContext {
+                            method: &method,
+                            url: &endpoint_url,
+                            timeout: None,
+                            started_unix_ms,
+                        },
+                        &error.to_string(),
+                    );
+                    self.publish_connection_diagnostics();
                     return Err(error);
                 }
             }
@@ -3021,6 +3459,7 @@ impl IronMeshClient {
                 }
             };
             let started_at = std::time::Instant::now();
+            let started_unix_ms = unix_ts_ms();
             match execute_streaming_object_read_request_for_transport(
                 &endpoint.transport,
                 &self.auth,
@@ -3032,17 +3471,33 @@ impl IronMeshClient {
             .await
             {
                 Ok(candidate_response) => {
-                    self.transport_router.record_success(
+                    self.transport_router.record_request_success(
                         index,
+                        ClientRequestAttemptContext {
+                            method: &Method::GET,
+                            url: &endpoint_url,
+                            timeout: None,
+                            started_unix_ms,
+                        },
                         started_at.elapsed().as_secs_f64() * 1000.0,
                         candidate_response.bytes_written as usize,
                     );
+                    self.publish_connection_diagnostics();
                     response = Some(candidate_response);
                     break;
                 }
                 Err(error) => {
-                    self.transport_router
-                        .record_failure(index, &error.to_string());
+                    self.transport_router.record_request_failure(
+                        index,
+                        ClientRequestAttemptContext {
+                            method: &Method::GET,
+                            url: &endpoint_url,
+                            timeout: None,
+                            started_unix_ms,
+                        },
+                        &error.to_string(),
+                    );
+                    self.publish_connection_diagnostics();
                     last_error = Some(error);
                 }
             }

@@ -33,7 +33,9 @@ import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.components.IronmeshAppShell
+import io.ironmesh.android.ui.screens.ConnectionPathsScreen
 import io.ironmesh.android.ui.screens.HomeScreen
+import io.ironmesh.android.ui.screens.GalleryMapScreen
 import io.ironmesh.android.ui.screens.LibraryScreen
 import io.ironmesh.android.ui.screens.OnboardingScreen
 import io.ironmesh.android.ui.screens.SettingsScreen
@@ -48,9 +50,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            IronmeshTheme {
-                val vm: MainViewModel = viewModel()
-                val state by vm.uiState
+            val vm: MainViewModel = viewModel()
+            val state by vm.uiState
+            IronmeshTheme(accentColorHex = state.themeAccentColorHex) {
                 val context = LocalContext.current
                 val snackbarHostState = remember { SnackbarHostState() }
                 var lastSnackbarMessage by rememberSaveable { mutableStateOf("") }
@@ -199,9 +201,15 @@ class MainActivity : ComponentActivity() {
                                 MainSection.HOME -> HomeScreen(
                                     state = state,
                                     onRunSyncNow = vm::runFolderSyncNow,
+                                    onRetryConnection = vm::retryFolderSyncConnection,
                                     onOpenWebConsole = onOpenWebConsole,
                                     onOpenSync = { vm.selectSection(MainSection.SYNC) },
                                     onSelectSection = vm::selectSection,
+                                )
+
+                                MainSection.CONNECTIVITY -> ConnectionPathsScreen(
+                                    state = state,
+                                    onRefresh = vm::refreshConnectionRoutes,
                                 )
 
                                 MainSection.SYNC -> SyncScreen(
@@ -214,6 +222,11 @@ class MainActivity : ComponentActivity() {
                                 MainSection.LIBRARY -> LibraryScreen(
                                     state = state,
                                     vm = vm,
+                                )
+
+                                MainSection.GALLERY_MAP -> GalleryMapScreen(
+                                    state = state,
+                                    onStartGalleryMap = vm::startWebUi,
                                 )
 
                                 MainSection.SETTINGS -> SettingsScreen(
@@ -241,6 +254,7 @@ class MainActivity : ComponentActivity() {
                                     onOpenFiles = { openFilesAtIronmeshRoot(vm) },
                                     onOpenWebConsole = onOpenWebConsole,
                                     onClearEnrollment = vm::clearDeviceEnrollment,
+                                    onThemeAccentColorChange = vm::updateThemeAccentColor,
                                     onKeyChange = vm::updateKey,
                                     onPayloadChange = vm::updatePayload,
                                     onPutObject = vm::putObject,
