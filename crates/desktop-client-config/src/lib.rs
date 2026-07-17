@@ -959,6 +959,7 @@ pub fn launch_os_integration_instance(
     instance: &OsIntegrationInstance,
     package_root: &Path,
 ) -> LaunchOutcome {
+    #[cfg(any(windows, target_os = "linux"))]
     let launched_at_unix_ms = unix_ts_ms();
     #[cfg(any(windows, target_os = "linux"))]
     {

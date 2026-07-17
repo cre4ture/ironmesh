@@ -360,6 +360,23 @@ class IronmeshRepository {
         )
     }
 
+    fun getConnectionRouteSnapshot(
+        connectionInput: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+        refresh: Boolean = true,
+    ): ConnectionRouteSnapshot {
+        return decodeJson(
+            RustClientBridge.getConnectionRouteSnapshot(
+                normalizedConnectionInput(connectionInput),
+                serverCaPem,
+                normalizedClientIdentityJson(clientIdentityJson),
+                refresh,
+            ),
+            ConnectionRouteSnapshot::class.java,
+        )
+    }
+
     suspend fun runFolderSyncOnce(
         connectionInput: String,
         localFolder: String,

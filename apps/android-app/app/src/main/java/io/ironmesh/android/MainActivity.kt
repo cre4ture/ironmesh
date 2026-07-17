@@ -33,7 +33,9 @@ import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainViewModel
 import io.ironmesh.android.ui.components.IronmeshAppShell
+import io.ironmesh.android.ui.screens.ConnectionPathsScreen
 import io.ironmesh.android.ui.screens.HomeScreen
+import io.ironmesh.android.ui.screens.GalleryMapScreen
 import io.ironmesh.android.ui.screens.LibraryScreen
 import io.ironmesh.android.ui.screens.OnboardingScreen
 import io.ironmesh.android.ui.screens.SettingsScreen
@@ -205,6 +207,11 @@ class MainActivity : ComponentActivity() {
                                     onSelectSection = vm::selectSection,
                                 )
 
+                                MainSection.CONNECTIVITY -> ConnectionPathsScreen(
+                                    state = state,
+                                    onRefresh = vm::refreshConnectionRoutes,
+                                )
+
                                 MainSection.SYNC -> SyncScreen(
                                     state = state,
                                     vm = vm,
@@ -215,6 +222,11 @@ class MainActivity : ComponentActivity() {
                                 MainSection.LIBRARY -> LibraryScreen(
                                     state = state,
                                     vm = vm,
+                                )
+
+                                MainSection.GALLERY_MAP -> GalleryMapScreen(
+                                    state = state,
+                                    onStartGalleryMap = vm::startWebUi,
                                 )
 
                                 MainSection.SETTINGS -> SettingsScreen(

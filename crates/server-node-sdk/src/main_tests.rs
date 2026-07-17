@@ -13272,6 +13272,9 @@ async fn build_test_state(
         process_stats_runtime: Arc::new(std::sync::Mutex::new(
             super::ProcessStatsRuntime::default(),
         )),
+        hardware_health_runtime: Arc::new(Mutex::new(
+            super::hardware_health::HardwareHealthRuntime::load(&root),
+        )),
     };
 
     if seed_gap {

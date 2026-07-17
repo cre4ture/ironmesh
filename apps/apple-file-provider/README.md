@@ -19,6 +19,9 @@ This directory is the in-repo Apple-side starting point for IronMesh.
 - Run the shared Swift package tests with `swift test`.
 - Use `xcodebuild` against `IronmeshAppleFileProvider.xcodeproj` and the `IronmeshAppleProject` scheme for the four app/extension targets.
 - Use the `IronmeshIosProject` scheme with an iOS Simulator destination for the runnable XCTest slice.
+- The CI helpers `scripts/resolve-ios-simulator-destination.sh` and `scripts/prepare-ios-simulator.sh` pick a currently available simulator destination and wait for it to become launch-ready before `xcodebuild test`.
+- For a local simulator build/install/launch loop, run `scripts/run-ios-simulator-app.sh` or `just ios-app-run`.
+- GitHub Actions can also archive the `IronmeshIosApp` Release build and, when Apple signing secrets are configured, export a downloadable `.ipa` for manual device installs.
 
 ## Intended next step
 

@@ -45,11 +45,23 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Direct", { exact: true })).toBeVisible();
   await expect(page.getByText("node-alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("https://node-alpha.local", { exact: true })).toBeVisible();
+  await page.getByText("Connection paths", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Connection Paths" })).toBeVisible();
+  await expect(page.getByText("Overall search state")).toBeVisible();
+  await expect(page.getByText("Recovering")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Direct HTTPS to node-alpha" }).first()).toBeVisible();
+  await expect(page.getByText("Relay via rendezvous-a.local:9443 to node-alpha", { exact: true })).toBeVisible();
+  await expect(page.getByText("Relay via rendezvous-b.local:9443 to node-alpha", { exact: true })).toBeVisible();
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
   await expect(page.getByText("Recent client runtime logs", { exact: true })).toBeVisible();
   await expect(page.getByText("2023-11-14T22:13:20.000Z INFO client_sdk client transport ready")).toBeVisible();
-  await expect(page.getByText("connection refused")).toBeVisible();
+  await expect(
+    page.getByText(
+      "2023-11-14T22:13:22.000Z ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health"
+    )
+  ).toBeVisible();
+  await expect(page.getByText("2023-11-14T22:13:22.000Z caused by: connection refused")).toBeVisible();
 
   await page.getByText("Store", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
@@ -303,7 +315,14 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Fullscreen map" }).click();
   await expect(page.getByRole("button", { name: "Exit fullscreen map" })).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+  const mapMarkerButton = page.getByRole("button", { name: "Open map marker for gallery/cat.png" });
+  await expect(mapMarkerButton).toBeVisible();
+  expect(
+    await mapMarkerButton.evaluate(
+      (element) => element.closest(".maplibregl-canvas-container") !== null
+    )
+  ).toBe(true);
+  await mapMarkerButton.click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
@@ -363,6 +382,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
       apiV1("/ping"),
       apiV1("/health"),
       apiV1("/cluster/status"),
+      apiV1("/connection-routes"),
       apiV1("/logs"),
       apiV1("/rendezvous"),
       apiV1("/store/list"),
@@ -544,6 +564,97 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const storeEntries = options?.storeEntries ?? createMockStoreEntries();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
+  const connectionRoutesPayload = {
+    generated_at_unix_ms: 1_712_345_600_000,
+    active_index: 0,
+    ranked_indices: [0, 2, 3, 1],
+    endpoints: [
+      {
+        index: 0,
+        path_kind: "direct_https",
+        locator: "https://node-alpha.local",
+        bootstrap_rank: 0,
+        target_node_id: "node-alpha",
+        active: true,
+        score: 18.2,
+        ewma_latency_ms: 18.2,
+        ewma_throughput_bytes_per_sec: 225000,
+        consecutive_failures: 0,
+        total_failures: 0,
+        total_successes: 12,
+        last_measurement_unix_ms: 1_712_345_600_000,
+        last_success_unix_ms: 1_712_345_600_000,
+        last_failure_unix_ms: null,
+        circuit_open_until_unix_ms: null,
+        background_probe_in_flight: false,
+        last_background_probe_unix_ms: 1_712_345_580_000,
+        last_error: null
+      },
+      {
+        index: 1,
+        path_kind: "direct_https",
+        locator: "https://node-beta.local",
+        bootstrap_rank: 1,
+        target_node_id: "node-beta",
+        active: false,
+        score: 604.4,
+        ewma_latency_ms: 104.4,
+        ewma_throughput_bytes_per_sec: null,
+        consecutive_failures: 2,
+        total_failures: 3,
+        total_successes: 1,
+        last_measurement_unix_ms: 1_712_345_590_000,
+        last_success_unix_ms: 1_712_345_300_000,
+        last_failure_unix_ms: 1_712_345_590_000,
+        circuit_open_until_unix_ms: 1_712_345_620_000,
+        background_probe_in_flight: false,
+        last_background_probe_unix_ms: 1_712_345_590_000,
+        last_error: "health probe returned 503"
+      },
+      {
+        index: 2,
+        path_kind: "relay_tunnel",
+        locator: "relay://node-alpha@https://rendezvous-a.local:9443",
+        bootstrap_rank: 0,
+        target_node_id: "node-alpha",
+        active: false,
+        score: 43.6,
+        ewma_latency_ms: 18.6,
+        ewma_throughput_bytes_per_sec: 160000,
+        consecutive_failures: 0,
+        total_failures: 0,
+        total_successes: 7,
+        last_measurement_unix_ms: 1_712_345_598_000,
+        last_success_unix_ms: 1_712_345_598_000,
+        last_failure_unix_ms: null,
+        circuit_open_until_unix_ms: null,
+        background_probe_in_flight: false,
+        last_background_probe_unix_ms: 1_712_345_598_000,
+        last_error: null
+      },
+      {
+        index: 3,
+        path_kind: "relay_tunnel",
+        locator: "relay://node-alpha@https://rendezvous-b.local:9443",
+        bootstrap_rank: 1,
+        target_node_id: "node-alpha",
+        active: false,
+        score: 58.4,
+        ewma_latency_ms: 33.4,
+        ewma_throughput_bytes_per_sec: 120000,
+        consecutive_failures: 0,
+        total_failures: 1,
+        total_successes: 4,
+        last_measurement_unix_ms: 1_712_345_592_000,
+        last_success_unix_ms: 1_712_345_550_000,
+        last_failure_unix_ms: 1_712_345_592_000,
+        circuit_open_until_unix_ms: null,
+        background_probe_in_flight: false,
+        last_background_probe_unix_ms: 1_712_345_592_000,
+        last_error: null
+      }
+    ]
+  };
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -576,6 +687,13 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       });
     }
 
+    if (
+      (pathname === apiV1("/connection-routes") && method === "GET") ||
+      (pathname === apiV1("/connection-routes/refresh") && method === "POST")
+    ) {
+      return json(route, connectionRoutesPayload);
+    }
+
     if (pathname === apiV1("/logs") && method === "GET") {
       return json(route, {
         entries: [
@@ -585,19 +703,25 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
           },
           {
             captured_at_unix: 1_700_000_002,
-            line: "ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health: connection refused"
+            line: [
+              "ERROR web_ui_backend health request failed: failed connecting to https://node-alpha.local/api/v1/health",
+              "caused by: connection refused"
+            ].join("\n")
           }
         ]
       });
     }
 
-    if (pathname === apiV1("/rendezvous") && method === "GET") {
+    if (pathname === apiV1("/rendezvous/refresh") && method === "POST") {
       return json(route, {
         available: true,
         editable: true,
         transport_mode: "direct",
         relay_mode: "preferred",
-        configured_urls: ["https://rendezvous-a.local:9443"],
+        configured_urls: [
+          "https://rendezvous-a.local:9443",
+          "https://rendezvous-b.local:9443"
+        ],
         direct_url: "https://node-alpha.local",
         direct_target_node_id: "node-alpha",
         active_url: null,
@@ -613,6 +737,55 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
             last_success_unix: 1_712_345_600,
             consecutive_failures: 0,
             last_error: null,
+            active: false
+          },
+          {
+            url: "https://rendezvous-b.local:9443",
+            status: "disconnected",
+            last_attempt_unix: 1_712_345_598,
+            last_success_unix: 1_712_345_420,
+            consecutive_failures: 2,
+            last_error: "relay probe timed out",
+            active: false
+          }
+        ]
+      });
+    }
+
+    if (pathname === apiV1("/rendezvous") && method === "GET") {
+      return json(route, {
+        available: true,
+        editable: true,
+        transport_mode: "direct",
+        relay_mode: "preferred",
+        configured_urls: [
+          "https://rendezvous-a.local:9443",
+          "https://rendezvous-b.local:9443"
+        ],
+        direct_url: "https://node-alpha.local",
+        direct_target_node_id: "node-alpha",
+        active_url: null,
+        active_target_node_id: null,
+        mtls_required: true,
+        persistence_source: "bootstrap_file",
+        last_probe_error: null,
+        endpoint_statuses: [
+          {
+            url: "https://rendezvous-a.local:9443",
+            status: "connected",
+            last_attempt_unix: 1_712_345_600,
+            last_success_unix: 1_712_345_600,
+            consecutive_failures: 0,
+            last_error: null,
+            active: false
+          },
+          {
+            url: "https://rendezvous-b.local:9443",
+            status: "disconnected",
+            last_attempt_unix: 1_712_345_598,
+            last_success_unix: 1_712_345_420,
+            consecutive_failures: 2,
+            last_error: "relay probe timed out",
             active: false
           }
         ]

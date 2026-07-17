@@ -24,6 +24,35 @@ export type ClientUiRuntimeInfo = {
   service_name?: string;
 };
 
+export type ClientConnectionRouteEndpointSnapshot = {
+  index: number;
+  path_kind: "direct_https" | "direct_quic" | "relay_tunnel";
+  locator: string;
+  bootstrap_rank: number;
+  target_node_id?: string | null;
+  active: boolean;
+  score: number;
+  ewma_latency_ms?: number | null;
+  ewma_throughput_bytes_per_sec?: number | null;
+  consecutive_failures: number;
+  total_failures: number;
+  total_successes: number;
+  last_measurement_unix_ms?: number | null;
+  last_success_unix_ms?: number | null;
+  last_failure_unix_ms?: number | null;
+  circuit_open_until_unix_ms?: number | null;
+  background_probe_in_flight: boolean;
+  last_background_probe_unix_ms?: number | null;
+  last_error?: string | null;
+};
+
+export type ClientConnectionRouteSnapshot = {
+  generated_at_unix_ms: number;
+  active_index?: number | null;
+  ranked_indices: number[];
+  endpoints: ClientConnectionRouteEndpointSnapshot[];
+};
+
 export type LatencyProbeAssessment = "healthy" | "warn" | "degraded";
 
 export type LatencyProbeSample = {

@@ -24,6 +24,7 @@ import {
   Textarea,
   useMantineColorScheme
 } from "@mantine/core";
+import { useClipboard } from "@mantine/hooks";
 import { JsonBlock, ironmeshColorSchemeStorageKey } from "@ironmesh/ui";
 import QRCode from "qrcode";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -93,6 +94,7 @@ function normalizeRendezvousUrl(value: string): string {
 export function BootstrapBundlesPage() {
   const { adminTokenOverride } = useAdminAccess();
   const { colorScheme } = useMantineColorScheme();
+  const bootstrapClaimClipboard = useClipboard({ timeout: 1500 });
   const [deviceLabel, setDeviceLabel] = useState("desktop-client");
   const [expiresInSecs, setExpiresInSecs] = useState<number | string>(3600);
   const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
@@ -114,6 +116,12 @@ export function BootstrapBundlesPage() {
   const bootstrapBundle: BootstrapBundle | null = issuedBootstrap?.bootstrap_bundle ?? fallbackBootstrapBundle;
   const bootstrapClaim: BootstrapClaim | null = issuedBootstrap?.bootstrap_claim ?? null;
   const bundleEndpointCount = bootstrapBundle?.direct_endpoints?.length ?? 0;
+  const bootstrapClaimClusterId =
+    bootstrapClaim?.cluster_id ?? (typeof bootstrapClaim?.c === "string" ? bootstrapClaim.c : null);
+  const bootstrapClaimJson = useMemo(
+    () => (bootstrapClaim ? JSON.stringify(bootstrapClaim, null, 2) : null),
+    [bootstrapClaim]
+  );
   const bootstrapQrPayload = useMemo(
     () => {
       if (bootstrapClaim) {
@@ -309,18 +317,41 @@ export function BootstrapBundlesPage() {
     }
   }
 
-  function handleDownloadBootstrapBundle() {
-    if (!bootstrapBundle) {
-      return;
-    }
-    const payload = JSON.stringify(bootstrapBundle, null, 2);
+  function downloadJson(payload: string, filename: string) {
     const blob = new Blob([payload], { type: "application/json" });
     const url = window.URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `ironmesh-client-bootstrap-${bootstrapBundle.cluster_id ?? "bundle"}.json`;
+    link.download = filename;
     link.click();
     window.URL.revokeObjectURL(url);
+  }
+
+  function handleCopyBootstrapClaim() {
+    if (!bootstrapClaimJson) {
+      return;
+    }
+    bootstrapClaimClipboard.copy(bootstrapClaimJson);
+  }
+
+  function handleDownloadBootstrapClaim() {
+    if (!bootstrapClaimJson) {
+      return;
+    }
+    downloadJson(
+      bootstrapClaimJson,
+      `ironmesh-client-bootstrap-claim-${bootstrapClaimClusterId ?? "claim"}.json`
+    );
+  }
+
+  function handleDownloadBootstrapBundle() {
+    if (!bootstrapBundle) {
+      return;
+    }
+    downloadJson(
+      JSON.stringify(bootstrapBundle, null, 2),
+      `ironmesh-client-bootstrap-${bootstrapBundle.cluster_id ?? "bundle"}.json`
+    );
   }
 
   async function handleIssueJoinEnrollment() {
@@ -403,12 +434,31 @@ export function BootstrapBundlesPage() {
                 </Button>
                 <Button
                   variant="default"
+                  color={bootstrapClaimClipboard.copied ? "teal" : undefined}
+                  onClick={handleCopyBootstrapClaim}
+                  disabled={!bootstrapClaimJson}
+                >
+                  Copy bootstrap claim to clipboard
+                </Button>
+                <Button
+                  variant="default"
+                  onClick={handleDownloadBootstrapClaim}
+                  disabled={!bootstrapClaimJson}
+                >
+                  Download bootstrap claim
+                </Button>
+                <Button
+                  variant="default"
                   onClick={handleDownloadBootstrapBundle}
                   disabled={!bootstrapBundle}
                 >
                   Download bootstrap bundle
                 </Button>
               </Group>
+              <Text size="sm" c="dimmed">
+                For a smartphone, use the bootstrap claim from this page when available, or scan the
+                QR code below.
+              </Text>
               <Text size="sm" c="dimmed">
                 Current bundle summary: cluster {String(bootstrapBundle?.cluster_id ?? "unknown")}, relay mode{" "}
                 {String(bootstrapBundle?.relay_mode ?? "unknown")}, direct endpoints {bundleEndpointCount}.

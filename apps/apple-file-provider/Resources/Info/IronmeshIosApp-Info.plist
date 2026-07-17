@@ -28,6 +28,11 @@
     <string>dev.ironmesh.default</string>
     <key>NSCameraUsageDescription</key>
     <string>IronMesh uses the camera to scan bootstrap claim QR codes during device enrollment.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UISupportedInterfaceOrientations</key>

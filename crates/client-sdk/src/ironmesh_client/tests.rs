@@ -2975,6 +2975,61 @@ async fn background_probe_reprioritizes_recovered_direct_endpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
+    let stalled_delay_ms = duration_to_u64_ms(CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT)
+        .expect("probe timeout should fit into u64")
+        + 250;
+    let (stalled_url, stalled_state, stalled_server) =
+        spawn_direct_http_route_server(stalled_delay_ms, "stalled").await;
+    let (healthy_url, healthy_state, healthy_server) =
+        spawn_direct_http_route_server(0, "healthy").await;
+
+    let client = IronMeshClient::combine(vec![
+        IronMeshClient::from_direct_base_url(stalled_url.clone()),
+        IronMeshClient::from_direct_base_url(healthy_url.clone()),
+    ])
+    .expect("combined direct client should build");
+
+    let snapshot = tokio::time::timeout(
+        CLIENT_ROUTE_BACKGROUND_PROBE_TIMEOUT + Duration::from_secs(1),
+        client.refresh_connection_route_snapshot(),
+    )
+    .await
+    .expect("route snapshot refresh should not hang on a stalled health probe");
+
+    let stalled_endpoint = snapshot
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.locator == stalled_url)
+        .expect("stalled endpoint should appear in the snapshot");
+    let healthy_endpoint = snapshot
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.locator == healthy_url)
+        .expect("healthy endpoint should appear in the snapshot");
+
+    assert_eq!(stalled_state.health_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(healthy_state.health_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(stalled_endpoint.total_failures, 1);
+    assert!(!stalled_endpoint.background_probe_in_flight);
+    assert!(
+        stalled_endpoint
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")),
+        "stalled endpoint should record a timeout error, got {:?}",
+        stalled_endpoint.last_error
+    );
+    assert_eq!(healthy_endpoint.total_successes, 1);
+    assert!(healthy_endpoint.last_error.is_none());
+
+    stalled_server.abort();
+    let _ = stalled_server.await;
+    healthy_server.abort();
+    let _ = healthy_server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_probe_reprioritizes_recovered_relay_endpoint() {
     let reserved_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

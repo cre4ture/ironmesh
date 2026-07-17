@@ -222,6 +222,10 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // Avoid duplicating the large Rust debug library during symbol stripping in CI.
+            keepDebugSymbols += "**/libandroid_server_node_app.so"
+        }
     }
 
     sourceSets {

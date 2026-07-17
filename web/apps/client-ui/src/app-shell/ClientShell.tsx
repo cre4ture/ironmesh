@@ -71,12 +71,14 @@ import {
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { ConnectionPathsPage } from "../pages/ConnectionPathsPage";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { LogsPage } from "../pages/LogsPage";
 
 type PageId =
   | "overview"
+  | "connectionPaths"
   | "rendezvous"
   | "latency"
   | "store"
@@ -84,6 +86,13 @@ type PageId =
   | "gallery"
   | "cluster"
   | "logs";
+type EmbeddedSurface = "gallery_map";
+type GalleryLaunchViewMode = "grid" | "map";
+type ShellLaunchState = {
+  activePageId: PageId;
+  embeddedSurface: EmbeddedSurface | null;
+  galleryViewMode: GalleryLaunchViewMode | null;
+};
 type BinaryUploadQueueStatus =
   | "queued"
   | "starting"
@@ -150,6 +159,12 @@ const pages = [
     description: "Connection health, service metadata, and quick cluster summary."
   },
   {
+    id: "connectionPaths" as const,
+    label: "Connection paths",
+    icon: IconPlugConnected,
+    description: "See every direct and relay route, which one is active, and whether the router is still re-evaluating candidates."
+  },
+  {
     id: "rendezvous" as const,
     label: "Rendezvous",
     icon: IconPlugConnected,
@@ -194,7 +209,8 @@ const pages = [
 ];
 
 export function ClientShell() {
-  const [activePageId, setActivePageId] = useState<PageId>("overview");
+  const launchState = resolveShellLaunchState();
+  const [activePageId, setActivePageId] = useState<PageId>(() => launchState.activePageId);
   const [ping, setPing] = useState<ClientUiPingResponse | null>(null);
   const [health, setHealth] = useState<JsonObject | null>(null);
   const [clusterStatus, setClusterStatus] = useState<JsonObject | null>(null);
@@ -206,6 +222,10 @@ export function ClientShell() {
   useEffect(() => {
     void refreshOverview();
   }, []);
+
+  if (launchState.embeddedSurface === "gallery_map") {
+    return <GalleryPage initialViewMode="map" />;
+  }
 
   async function refreshOverview() {
     setOverviewLoading(true);
@@ -268,6 +288,8 @@ export function ClientShell() {
         />
       ) : null}
 
+      {activePageId === "connectionPaths" ? <ConnectionPathsPage /> : null}
+
       {activePageId === "rendezvous" ? <RendezvousPage /> : null}
 
       {activePageId === "latency" ? <LatencyPage /> : null}
@@ -283,7 +305,9 @@ export function ClientShell() {
         />
       ) : null}
 
-      {activePageId === "gallery" ? <GalleryPage /> : null}
+      {activePageId === "gallery" ? (
+        <GalleryPage initialViewMode={launchState.galleryViewMode ?? undefined} />
+      ) : null}
 
       {activePageId === "cluster" ? (
         <ClusterPage
@@ -297,6 +321,57 @@ export function ClientShell() {
       {activePageId === "logs" ? <LogsPage /> : null}
     </NavigationShell>
   );
+}
+
+function resolveShellLaunchState(): ShellLaunchState {
+  if (typeof window === "undefined") {
+    return {
+      activePageId: "overview",
+      embeddedSurface: null,
+      galleryViewMode: null
+    };
+  }
+
+  const searchParams = new URLSearchParams(window.location.search);
+  const embeddedSurface = parseEmbeddedSurface(searchParams.get("embedded"));
+  const activePageId = parsePageId(searchParams.get("page")) ?? "overview";
+  const galleryViewMode = parseGalleryLaunchViewMode(searchParams.get("gallery_view"));
+
+  return {
+    activePageId: embeddedSurface === "gallery_map" ? "gallery" : activePageId,
+    embeddedSurface,
+    galleryViewMode: embeddedSurface === "gallery_map" ? "map" : galleryViewMode
+  };
+}
+
+function parsePageId(value: string | null): PageId | null {
+  switch (value) {
+    case "overview":
+    case "rendezvous":
+    case "latency":
+    case "store":
+    case "explorer":
+    case "gallery":
+    case "cluster":
+    case "logs":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function parseEmbeddedSurface(value: string | null): EmbeddedSurface | null {
+  return value === "gallery_map" ? value : null;
+}
+
+function parseGalleryLaunchViewMode(value: string | null): GalleryLaunchViewMode | null {
+  switch (value) {
+    case "grid":
+    case "map":
+      return value;
+    default:
+      return null;
+  }
 }
 
 function useBinaryUploadQueue(): BinaryUploadController {

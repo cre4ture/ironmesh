@@ -8,6 +8,7 @@ For branch `main`, require these status checks:
 - `rustfmt`
 - `clippy`
 - `unit-tests`
+- `ios-build`
 - `coverage`
 - `system-tests`
 
@@ -49,6 +50,40 @@ Pass or fail rule:
 - `coverage` must stay at or above the `--fail-under-lines 70` floor.
 - `unit-tests` already excludes `tests/system-tests` implicitly because the workspace root excludes that crate; nightly system coverage belongs only to the `system-tests` lane.
 - On Linux, `unit-tests` now also covers the packaged config-app handoff regression through `apps/config-app/tests/package_handoff.rs`, because that integration test is part of the normal `cargo test --workspace` run on `ubuntu-latest`.
+- The `ios-build` lane is macOS-only. Reproduce it locally with:
+
+```bash
+just ci-ios
+```
+
+- On macOS, `just ci-required-macos` reproduces the full required set including the iOS lane.
+
+## iOS CI artifacts
+
+The `ios-build` lane runs on `macos-latest` and covers:
+
+- `cargo test -p ios-app`
+- `swift test` in `apps/apple-file-provider`
+- `xcodebuild test` for the `IronmeshIosProject` scheme on a dynamically selected iPhone simulator, with an explicit boot-and-wait step to avoid flaky first-launch failures on macOS runners
+- a `Release` archive for `IronmeshIosApp`
+
+The `IronmeshIosProject` XCTest bundle is intentionally unhosted: it links only the shared Apple modules and no longer depends on launching `IronmeshIosApp` in the simulator.
+
+Artifact behavior:
+
+- When Apple signing secrets are not configured, CI uploads an unsigned `Release` `.xcarchive` for inspection.
+- When Apple signing secrets are configured, CI also exports a downloadable `.ipa` for manual device installation with `Release` performance characteristics.
+
+Configure these repository secrets for signed iOS artifacts:
+
+- `IRONMESH_IOS_SIGNING_CERT_B64` — base64-encoded `.p12` signing certificate
+- `IRONMESH_IOS_SIGNING_CERT_PASSWORD` — password for that `.p12`
+- `IRONMESH_IOS_APP_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosapp`
+- `IRONMESH_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosfileprovider`
+
+Optional repository variable:
+
+- `IRONMESH_IOS_EXPORT_METHOD` — defaults to `development`; set to `ad-hoc` when you want shareable sideload builds for registered devices.
 
 Useful per-lane shortcuts:
 

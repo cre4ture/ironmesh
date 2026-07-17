@@ -63,6 +63,7 @@ import {
 } from "../store-paths";
 
 export type { GalleryBasemapConfig } from "./GalleryBasemapMap";
+export type GallerySurfaceViewMode = GalleryViewMode;
 
 type GallerySortOrder = "captured_desc" | "path_asc";
 type GalleryMediaKind = "image" | "video";
@@ -224,6 +225,7 @@ type GalleryWorldMarkerPoint = ClusterableScreenPoint<GalleryEntry>;
 type GallerySurfaceProps = {
   intro?: string;
   previewHint: string;
+  initialViewMode?: GalleryViewMode;
   basemaps?: GalleryBasemapConfig[] | null;
   allowedMediaKinds?: GalleryMediaKind[];
   loadSnapshots: () => Promise<GallerySnapshot[]>;
@@ -249,6 +251,7 @@ type GallerySurfaceProps = {
 export function GallerySurface({
   intro,
   previewHint,
+  initialViewMode,
   basemaps,
   allowedMediaKinds,
   loadSnapshots,
@@ -263,7 +266,7 @@ export function GallerySurface({
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [showMetadata, setShowMetadata] = useState(loadStoredShowMetadata);
   const { ref: galleryGridRef, width: galleryGridWidth } = useElementSize();
-  const [viewMode, setViewMode] = useState(loadStoredViewMode);
+  const [viewMode, setViewMode] = useState(() => loadInitialViewMode(initialViewMode));
   const [activeBasemapId, setActiveBasemapId] = useState(loadStoredBasemapId);
   const [activeMapProjection, setActiveMapProjection] = useState(loadStoredMapProjection);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
@@ -3557,6 +3560,10 @@ function loadStoredViewMode(): GalleryViewMode {
   }
 
   return parseViewMode(window.localStorage.getItem(GALLERY_VIEW_MODE_STORAGE_KEY));
+}
+
+function loadInitialViewMode(initialViewMode?: GalleryViewMode): GalleryViewMode {
+  return initialViewMode ? parseViewMode(initialViewMode) : loadStoredViewMode();
 }
 
 function loadStoredBasemapId(): string {
