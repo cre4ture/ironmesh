@@ -17,6 +17,8 @@ import {
 } from "@ironmesh/ui";
 import { useCallback } from "react";
 
+const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
+
 const CLIENT_GALLERY_BASEMAP_MANIFEST_KEY =
   "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json";
 const CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY =
@@ -74,16 +76,25 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
     []
   );
   const getMediaRequests = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null, versionId?: string | null): GalleryMediaRequests => ({
-      thumbnail: entry.media?.thumbnail?.url
-        ? {
-            url: entry.media.thumbnail.url
-          }
-        : null,
-      original: {
-        url: binaryMediaUrl(entry.path, snapshotId, versionId)
-      }
-    }),
+    (entry: GalleryEntry, snapshotId: string | null, versionId?: string | null): GalleryMediaRequests => {
+      const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
+      return {
+        thumbnail: thumbnailUrl
+          ? {
+              url: thumbnailUrl
+            }
+          : null,
+        fullscreen:
+          thumbnailUrl && entry.media?.media_type !== "video"
+            ? {
+                url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+              }
+            : null,
+        original: {
+          url: binaryMediaUrl(entry.path, snapshotId, versionId)
+        }
+      };
+    },
     []
   );
   const retryMediaEntry = useCallback(
@@ -149,4 +160,11 @@ function logicalMapVectorTileUrlTemplate(manifestKey: string): string {
 
 function logicalMapGlyphUrlTemplate(): string {
   return "/api/v1/maps/fonts/{fontstack}/{range}.pbf";
+}
+
+function withThumbnailProfile(url: string, profile: string): string {
+  const baseOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  const resolved = new URL(url, baseOrigin);
+  resolved.searchParams.set("profile", profile);
+  return `${resolved.pathname}${resolved.search}${resolved.hash}`;
 }

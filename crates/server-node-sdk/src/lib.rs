@@ -230,8 +230,9 @@ use storage::{
     ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord,
     S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
     StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
-    VersionConsistencyState, media_cache_retry_due, metadata_db_logical_table_count,
-    promote_cached_media_metadata_to_incomplete,
+    VersionConsistencyState, grid_thumbnail_profile, media_cache_retry_due,
+    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
+    thumbnail_profile_from_query,
 };
 
 tokio::task_local! {
@@ -11746,6 +11747,7 @@ struct MediaThumbnailQuery {
     snapshot: Option<String>,
     version: Option<String>,
     read_mode: Option<String>,
+    profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -15358,6 +15360,34 @@ async fn ensure_media_artifact_with_remote_import(
     Ok(Some(local_metadata))
 }
 
+async fn hydrate_missing_chunks_for_media_preview(
+    state: &ServerState,
+    key: &str,
+    snapshot_id: Option<&str>,
+    version_id: Option<&str>,
+    manifest_hash: &str,
+    total_size_bytes: usize,
+) -> Result<bool> {
+    let missing_chunks = {
+        let store = read_store(state, "media_thumbnail.plan_missing_chunks").await;
+        store
+            .missing_chunks_for_manifest_range(manifest_hash, 0, total_size_bytes)
+            .await?
+    };
+
+    if missing_chunks.is_empty() {
+        return Ok(true);
+    }
+
+    let Some(subject) = read_through_replication_subject(key, snapshot_id, version_id) else {
+        return Ok(false);
+    };
+
+    hydrate_missing_chunks_for_range(state, &subject, &missing_chunks).await?;
+    request_local_availability_refresh(state);
+    Ok(true)
+}
+
 async fn hydrate_missing_chunks_for_range(
     state: &ServerState,
     subject: &str,
@@ -15888,8 +15918,13 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         Some(value) => value,
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
+    let thumbnail_profile = match thumbnail_profile_from_query(query.profile.as_deref()) {
+        Some(profile) => profile,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
     let version_label = query.version.as_deref().unwrap_or("<latest>");
+    let include_thumbnail = thumbnail_profile == grid_thumbnail_profile();
 
     let request_started_at = Instant::now();
     let resolve_started_at = Instant::now();
@@ -15942,7 +15977,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         query.snapshot.as_deref(),
         query.version.as_deref(),
         &manifest_hash,
-        true,
+        include_thumbnail,
     )
     .await
     {
@@ -15972,77 +16007,189 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let Some(thumbnail) = metadata.thumbnail.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    if include_thumbnail {
+        let Some(thumbnail) = metadata.thumbnail.as_ref() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
 
-    let path_lookup_started_at = Instant::now();
-    let (thumbnail_path, path_lookup_waited_ms) = {
-        let store = read_store(state, "media_thumbnail.path_lookup").await;
-        (
-            store.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile),
-            store.waited_ms(),
+        let path_lookup_started_at = Instant::now();
+        let (thumbnail_path, path_lookup_waited_ms) = {
+            let store = read_store(state, "media_thumbnail.path_lookup").await;
+            (
+                store.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile),
+                store.waited_ms(),
+            )
+        };
+        let path_lookup_ms = path_lookup_started_at.elapsed().as_millis();
+        if path_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
+            || path_lookup_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
+        {
+            warn!(
+                request_id = %request_id,
+                key = %query.key,
+                snapshot = snapshot_label,
+                version = version_label,
+                content_fingerprint = %metadata.content_fingerprint,
+                thumbnail_profile = %thumbnail.profile,
+                lock_waited_ms = path_lookup_waited_ms,
+                phase_ms = path_lookup_ms,
+                "slow media thumbnail path lookup"
+            );
+        }
+
+        let file_read_started_at = Instant::now();
+        let payload = match tokio::fs::read(&thumbnail_path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Err(err) => {
+                tracing::error!(
+                    key = %query.key,
+                    path = %thumbnail_path.display(),
+                    error = %err,
+                    "failed to read generated thumbnail"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let file_read_ms = file_read_started_at.elapsed().as_millis();
+        let total_ms = request_started_at.elapsed().as_millis();
+        if file_read_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
+            || total_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
+        {
+            warn!(
+                request_id = %request_id,
+                key = %query.key,
+                snapshot = snapshot_label,
+                version = version_label,
+                manifest_hash = %manifest_hash,
+                content_fingerprint = %metadata.content_fingerprint,
+                thumbnail_profile = %thumbnail.profile,
+                file_read_ms,
+                total_ms,
+                payload_bytes = payload.len(),
+                "slow media thumbnail response"
+            );
+        }
+
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            payload,
         )
-    };
-    let path_lookup_ms = path_lookup_started_at.elapsed().as_millis();
-    if path_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
-        || path_lookup_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
-    {
-        warn!(
-            request_id = %request_id,
-            key = %query.key,
-            snapshot = snapshot_label,
-            version = version_label,
-            content_fingerprint = %metadata.content_fingerprint,
-            thumbnail_profile = %thumbnail.profile,
-            lock_waited_ms = path_lookup_waited_ms,
-            phase_ms = path_lookup_ms,
-            "slow media thumbnail path lookup"
-        );
+            .into_response();
     }
 
-    let file_read_started_at = Instant::now();
-    let payload = match tokio::fs::read(&thumbnail_path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return StatusCode::NOT_FOUND.into_response();
+    if metadata.media_type.as_deref() != Some("image") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let media_cache_worker = {
+        let store = read_store(state, "media_thumbnail.clone_worker").await;
+        store.media_cache_worker()
+    };
+
+    let profile_payload = match media_cache_worker
+        .ensure_image_thumbnail_profile_payload(&manifest_hash, thumbnail_profile)
+        .await
+    {
+        Ok(Some(payload)) => Some(payload),
+        Ok(None) => {
+            let descriptor = {
+                let store = read_store(state, "media_thumbnail.describe_object").await;
+                match store
+                    .describe_object(
+                        &query.key,
+                        query.snapshot.as_deref(),
+                        query.version.as_deref(),
+                        read_mode,
+                    )
+                    .await
+                {
+                    Ok(descriptor) => descriptor,
+                    Err(StoreReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+                    Err(StoreReadError::Corrupt(msg)) => {
+                        tracing::error!(
+                            key = %query.key,
+                            error = %msg,
+                            "corrupt object while describing media thumbnail source"
+                        );
+                        return StatusCode::CONFLICT.into_response();
+                    }
+                    Err(StoreReadError::Internal(err)) => {
+                        tracing::error!(
+                            key = %query.key,
+                            error = %err,
+                            "internal error while describing media thumbnail source"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            };
+
+            match hydrate_missing_chunks_for_media_preview(
+                state,
+                &query.key,
+                query.snapshot.as_deref(),
+                query.version.as_deref(),
+                &descriptor.manifest_hash,
+                descriptor.total_size_bytes,
+            )
+            .await
+            {
+                Ok(true) => match media_cache_worker
+                    .ensure_image_thumbnail_profile_payload(&manifest_hash, thumbnail_profile)
+                    .await
+                {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        tracing::error!(
+                            key = %query.key,
+                            manifest_hash = %manifest_hash,
+                            thumbnail_profile = thumbnail_profile.name,
+                            error = %err,
+                            "failed to generate mobile viewer thumbnail after hydration"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                },
+                Ok(false) => None,
+                Err(err) => {
+                    tracing::error!(
+                        key = %query.key,
+                        manifest_hash = %manifest_hash,
+                        thumbnail_profile = thumbnail_profile.name,
+                        error = %err,
+                        "failed to hydrate missing chunks for mobile viewer thumbnail"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
         }
         Err(err) => {
             tracing::error!(
                 key = %query.key,
-                path = %thumbnail_path.display(),
+                manifest_hash = %manifest_hash,
+                thumbnail_profile = thumbnail_profile.name,
                 error = %err,
-                "failed to read generated thumbnail"
+                "failed to generate image thumbnail profile"
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let file_read_ms = file_read_started_at.elapsed().as_millis();
-    let total_ms = request_started_at.elapsed().as_millis();
-    if file_read_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
-        || total_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
-    {
-        warn!(
-            request_id = %request_id,
-            key = %query.key,
-            snapshot = snapshot_label,
-            version = version_label,
-            manifest_hash = %manifest_hash,
-            content_fingerprint = %metadata.content_fingerprint,
-            thumbnail_profile = %thumbnail.profile,
-            file_read_ms,
-            total_ms,
-            payload_bytes = payload.len(),
-            "slow media thumbnail response"
-        );
-    }
 
     (
         [
             (header::CONTENT_TYPE, "image/jpeg"),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
-        payload,
+        match profile_payload {
+            Some(payload) => payload,
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
     )
         .into_response()
 }

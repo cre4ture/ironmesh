@@ -17,6 +17,8 @@ import { useCallback } from "react";
 import { MapDatasetImportCard } from "../components/MapDatasetImportCard";
 import { useAdminAccess } from "../lib/admin-access";
 
+const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
+
 const ADMIN_GALLERY_BASEMAP_MANIFEST_KEY =
   "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json";
 const ADMIN_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY =
@@ -92,16 +94,23 @@ export function GalleryPage() {
       snapshotId: string | null,
       versionId?: string | null
     ): GalleryMediaRequests => {
+      const thumbnailUrl = entry.media?.thumbnail?.url ?? null;
       const original = {
         url: adminBinaryObjectUrl(entry.path, snapshotId, versionId)
       };
 
       return {
-        thumbnail: entry.media?.thumbnail?.url
+        thumbnail: thumbnailUrl
           ? {
-              url: entry.media.thumbnail.url
+              url: thumbnailUrl
             }
           : null,
+        fullscreen:
+          thumbnailUrl && entry.media?.media_type !== "video"
+            ? {
+                url: withThumbnailProfile(thumbnailUrl, MOBILE_VIEWER_THUMBNAIL_PROFILE)
+              }
+            : null,
         original
       };
     },
@@ -175,4 +184,11 @@ function logicalMapVectorTileUrlTemplate(manifestKey: string): string {
 
 function logicalMapGlyphUrlTemplate(): string {
   return "/api/v1/maps/fonts/{fontstack}/{range}.pbf";
+}
+
+function withThumbnailProfile(url: string, profile: string): string {
+  const baseOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  const resolved = new URL(url, baseOrigin);
+  resolved.searchParams.set("profile", profile);
+  return `${resolved.pathname}${resolved.search}${resolved.hash}`;
 }
