@@ -41,7 +41,6 @@ Out of scope for the first implementation:
 - ACLs and bucket policies
 - STS session tokens
 - presigned URLs
-- virtual-hosted-style buckets
 - object lock / legal hold / retention
 - SSE-S3 / SSE-KMS
 - event notifications
@@ -339,7 +338,8 @@ normal object-scoped operations only.
 
 ### Target route set
 
-Implement a path-style S3 surface only:
+Implement a path-style S3 surface first, with virtual-hosted-style bucket
+routing mapped onto the same bucket/object operations:
 
 - `GET /` -> `ListBuckets`
 - `PUT /{bucket}` -> `CreateBucket`
@@ -1263,7 +1263,6 @@ Verification:
 ### Slice 6: Optional compatibility extensions
 
 - presigned URLs
-- virtual-hosted-style bucket routing
 - richer relay/gateway deployment packaging
 
 ## Open Questions

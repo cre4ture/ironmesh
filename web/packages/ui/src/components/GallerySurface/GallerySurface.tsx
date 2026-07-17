@@ -45,6 +45,7 @@ import {
   type ScreenPointCluster
 } from "./gallery-marker-clusters";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   MediaLightboxModal,
   type MediaLightboxItem,
@@ -2144,6 +2145,8 @@ function GalleryWorldMap({
   const [clusterDialogEntries, setClusterDialogEntries] = useState<GalleryEntry[] | null>(null);
   const { ref: mapViewportRef, width: mapViewportWidth, height: mapViewportHeight } =
     useElementSize();
+  const fullscreenPortalTarget =
+    isFullscreen && typeof document !== "undefined" ? document.body : null;
   const worldMapMarkerPoints = useMemo<GalleryWorldMarkerPoint[]>(() => {
     const width = mapViewportWidth > 0 ? mapViewportWidth : 1000;
     const height = mapViewportHeight > 0 ? mapViewportHeight : 560;
@@ -2360,6 +2363,9 @@ function GalleryWorldMap({
       ) : null}
     </div>
   );
+  const renderedMapViewport = fullscreenPortalTarget
+    ? createPortal(mapViewport, fullscreenPortalTarget)
+    : mapViewport;
 
   return (
     <>
@@ -2402,7 +2408,7 @@ function GalleryWorldMap({
             </Group>
           </div>
 
-          {mapViewport}
+          {renderedMapViewport}
         </Stack>
       </Card>
 

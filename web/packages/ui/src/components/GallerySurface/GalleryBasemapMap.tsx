@@ -168,6 +168,8 @@ export function GalleryBasemapMap({
   const mapRef = useRef<maplibregl.Map | null>(null);
   const cameraStateRef = useRef<MapCameraState | null>(null);
   const viewportFrameRef = useRef<number | null>(null);
+  const fullscreenPortalTarget =
+    isFullscreen && typeof document !== "undefined" ? document.body : null;
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [isInteracting, setIsInteracting] = useState(false);
@@ -333,7 +335,8 @@ export function GalleryBasemapMap({
     basemap.kind === "hybrid" ? basemap.rasterTileUrlTemplate : null,
     basemap.kind === "hybrid" ? basemap.vectorMetadataUrl : null,
     basemap.kind === "hybrid" ? basemap.vectorTileUrlTemplate : null,
-    basemap.kind === "hybrid" ? basemap.glyphsUrlTemplate : null
+    basemap.kind === "hybrid" ? basemap.glyphsUrlTemplate : null,
+    isFullscreen
   ]);
 
   useEffect(() => {
@@ -645,6 +648,9 @@ export function GalleryBasemapMap({
       ) : null}
     </div>
   );
+  const renderedMapViewport = fullscreenPortalTarget
+    ? createPortal(mapViewport, fullscreenPortalTarget)
+    : mapViewport;
 
   return (
     <>
@@ -679,7 +685,7 @@ export function GalleryBasemapMap({
             </Group>
           </div>
 
-          {mapViewport}
+          {renderedMapViewport}
         </Stack>
       </Card>
 

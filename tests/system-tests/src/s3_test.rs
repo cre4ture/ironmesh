@@ -114,6 +114,31 @@ mod tests {
             .strip_prefix("http://")
             .or_else(|| s3_base_url.trim_end_matches('/').strip_prefix("https://"))
             .context("S3 base URL must start with http:// or https://")?;
+        send_signed_s3_request_with_host(
+            client,
+            s3_base_url,
+            host,
+            method,
+            path_and_query,
+            access_key_id,
+            secret_material,
+            extra_headers,
+            body,
+        )
+        .await
+    }
+
+    async fn send_signed_s3_request_with_host(
+        client: &reqwest::Client,
+        s3_base_url: &str,
+        host: &str,
+        method: Method,
+        path_and_query: &str,
+        access_key_id: &str,
+        secret_material: &str,
+        extra_headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response> {
         let url = format!("{}{path_and_query}", s3_base_url.trim_end_matches('/'));
         let parsed_url = reqwest::Url::parse(&url)
             .with_context(|| format!("failed parsing signed S3 request URL {url}"))?;
@@ -134,8 +159,7 @@ mod tests {
             "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
             s3_test_sha256_hex(canonical_request.as_bytes())
         );
-        let signing_key =
-            s3_test_derive_signing_key(secret_material, &date_scope, region, service);
+        let signing_key = s3_test_derive_signing_key(secret_material, &date_scope, region, service);
         let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
             &signing_key,
             string_to_sign.as_bytes(),
@@ -228,8 +252,7 @@ mod tests {
             "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
             s3_test_sha256_hex(canonical_request.as_bytes())
         );
-        let signing_key =
-            s3_test_derive_signing_key(secret_material, &date_scope, region, service);
+        let signing_key = s3_test_derive_signing_key(secret_material, &date_scope, region, service);
         let signature = s3_test_hex_encode(&s3_test_hmac_sha256(
             &signing_key,
             string_to_sign.as_bytes(),
@@ -826,6 +849,165 @@ mod tests {
             assert_eq!(get_deleted.status(), StatusCode::NOT_FOUND);
             let deleted_xml = get_deleted.text().await?;
             assert!(deleted_xml.contains("<Code>NoSuchKey</Code>"));
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_serves_virtual_hosted_signed_crud_and_listing() -> Result<()> {
+        let public_bind = "127.0.0.1:19464";
+        let s3_bind = "127.0.0.1:19465";
+        let s3_public_url = "http://s3.localhost:19465";
+        let data_dir = fresh_data_dir("s3-virtual-hosted-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-virtual-hosted-runtime-node",
+            1,
+            None,
+            None,
+            &[
+                ("IRONMESH_S3_BIND", s3_bind),
+                ("IRONMESH_S3_PUBLIC_URL", s3_public_url),
+            ],
+        )
+        .await?;
+
+        let http = reqwest::Client::builder()
+            .build()
+            .context("failed building system test HTTP client")?;
+        let public_base = format!("http://{public_bind}");
+        let s3_request_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "photos.example",
+                    "root_prefix": "tenant/photos",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-virtual-hosted",
+                    "bucket_scope": ["photos.example"],
+                    "prefix_scope": ["tenant/photos/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_request_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let virtual_host = "photos.example.s3.localhost:19465";
+
+            let head_bucket = send_signed_s3_request_with_host(
+                &http,
+                &s3_request_base,
+                virtual_host,
+                Method::HEAD,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(head_bucket.status(), StatusCode::OK);
+
+            let list_objects = send_signed_s3_request_with_host(
+                &http,
+                &s3_request_base,
+                virtual_host,
+                Method::GET,
+                "/?list-type=2",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(list_objects.status(), StatusCode::OK);
+            let list_objects_xml = list_objects.text().await?;
+            assert!(list_objects_xml.contains("<Name>photos.example</Name>"));
+
+            let payload = b"virtual hosted system payload".to_vec();
+            let put_object = send_signed_s3_request_with_host(
+                &http,
+                &s3_request_base,
+                virtual_host,
+                Method::PUT,
+                "/hello.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[("content-type", "text/plain")],
+                payload.clone(),
+            )
+            .await?;
+            assert_eq!(put_object.status(), StatusCode::OK);
+
+            let get_object = send_signed_s3_request_with_host(
+                &http,
+                &s3_request_base,
+                virtual_host,
+                Method::GET,
+                "/hello.txt",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(get_object.status(), StatusCode::OK);
+            assert_eq!(get_object.bytes().await?.as_ref(), payload.as_slice());
+
+            let list_after_put = send_signed_s3_request_with_host(
+                &http,
+                &s3_request_base,
+                virtual_host,
+                Method::GET,
+                "/?list-type=2&prefix=hello",
+                &access_key_id,
+                &secret_access_key,
+                &[],
+                Vec::new(),
+            )
+            .await?;
+            assert_eq!(list_after_put.status(), StatusCode::OK);
+            let list_after_put_xml = list_after_put.text().await?;
+            assert!(list_after_put_xml.contains("<Key>hello.txt</Key>"));
 
             Ok(())
         }

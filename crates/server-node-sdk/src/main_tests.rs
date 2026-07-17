@@ -1329,7 +1329,26 @@ fn s3_signed_request(
     extra_headers: &[(&str, &str)],
     body: Bytes,
 ) -> Request<Body> {
-    let host = "s3.local";
+    s3_signed_request_with_host(
+        method,
+        uri,
+        "s3.local",
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+    )
+}
+
+fn s3_signed_request_with_host(
+    method: Method,
+    uri: &str,
+    host: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> Request<Body> {
     let amz_date = "20260705T120000Z";
     let date_scope = "20260705";
     let region = "us-east-1";
@@ -1412,9 +1431,10 @@ fn s3_presigned_request(
     extra_headers: &[(&str, &str)],
     body: Bytes,
 ) -> Request<Body> {
-    s3_presigned_request_at(
+    s3_presigned_request_with_host_at(
         method,
         uri,
+        "s3.local",
         access_key_id,
         secret_material,
         extra_headers,
@@ -1435,7 +1455,31 @@ fn s3_presigned_request_at(
     signed_at_unix: i64,
     expires_secs: u64,
 ) -> Request<Body> {
-    let host = "s3.local";
+    s3_presigned_request_with_host_at(
+        method,
+        uri,
+        "s3.local",
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+        signed_at_unix,
+        expires_secs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn s3_presigned_request_with_host_at(
+    method: Method,
+    uri: &str,
+    host: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+    signed_at_unix: i64,
+    expires_secs: u64,
+) -> Request<Body> {
     let (amz_date, date_scope) = sigv4_timestamp_components(signed_at_unix);
     let region = "us-east-1";
     let service = "s3";
@@ -1540,9 +1584,33 @@ fn s3_transport_request(
     extra_headers: &[(&str, &str)],
     body: Bytes,
 ) -> transport_sdk::BufferedTransportRequest {
-    let request = s3_signed_request(
+    s3_transport_request_with_host(
         method.clone(),
         external_uri,
+        transport_uri,
+        "s3.local",
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn s3_transport_request_with_host(
+    method: Method,
+    external_uri: &str,
+    transport_uri: &str,
+    host: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> transport_sdk::BufferedTransportRequest {
+    let request = s3_signed_request_with_host(
+        method.clone(),
+        external_uri,
+        host,
         access_key_id,
         secret_material,
         extra_headers,
@@ -3071,6 +3139,163 @@ run_on_main_metadata_backends!(
     s3_listener_supports_bucket_listing_and_object_crud_impl,
     s3_listener_supports_bucket_listing_and_object_crud,
     s3_listener_supports_bucket_listing_and_object_crud_turso
+);
+
+async fn s3_listener_supports_virtual_hosted_bucket_routing_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    state.s3.public_url = Some("http://s3.local".to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-virtual-hosted-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+    let host = "photos.example.s3.local";
+
+    let head_bucket = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::HEAD,
+            "/",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+
+    let empty_listing = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::GET,
+            "/?list-type=2",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty_listing.status(), StatusCode::OK);
+    let empty_listing_body = to_bytes(empty_listing.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let empty_listing_xml = String::from_utf8(empty_listing_body.to_vec()).unwrap();
+    assert!(empty_listing_xml.contains("<Name>photos.example</Name>"));
+    assert!(!empty_listing_xml.contains("<Key>"));
+
+    let payload = Bytes::from_static(b"virtual-hosted payload");
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::PUT,
+            "/hello.txt",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            payload.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let get_object = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::GET,
+            "/hello.txt",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), payload.as_ref());
+
+    let list_objects = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::GET,
+            "/?list-type=2&prefix=hello",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    let list_objects_body = to_bytes(list_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_objects_xml = String::from_utf8(list_objects_body.to_vec()).unwrap();
+    assert!(list_objects_xml.contains("<Key>hello.txt</Key>"));
+
+    let delete_object = app
+        .oneshot(s3_signed_request_with_host(
+            Method::DELETE,
+            "/hello.txt",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_virtual_hosted_bucket_routing_impl,
+    s3_listener_supports_virtual_hosted_bucket_routing,
+    s3_listener_supports_virtual_hosted_bucket_routing_turso
 );
 
 async fn s3_listener_supports_bucket_create_and_delete_impl(backend: MainTestBackend) {
@@ -5179,6 +5404,128 @@ run_on_main_metadata_backends!(
     s3_version_listing_supports_delimiter_impl,
     s3_version_listing_supports_delimiter,
     s3_version_listing_supports_delimiter_turso
+);
+
+async fn s3_transport_executes_virtual_hosted_listener_requests_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    state.s3.public_url = Some("http://s3.local".to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-transport-virtual-hosted-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let scope =
+        super::transport_service::TransportExecutionScope::Internal(super::InternalCaller {
+            node_id: NodeId::new_v4(),
+            cluster_id: state.cluster_id,
+        });
+    let host = "photos.example.s3.local";
+
+    let put_object_request = s3_transport_request_with_host(
+        Method::PUT,
+        "/transport.txt",
+        "/s3/transport.txt",
+        host,
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[("content-type", "text/plain")],
+        Bytes::from_static(b"transported through virtual host"),
+    );
+    let put_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &put_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(put_object.status, StatusCode::OK.as_u16());
+
+    let list_objects_request = s3_transport_request_with_host(
+        Method::GET,
+        "/?list-type=2&prefix=transport",
+        "/s3/?list-type=2&prefix=transport",
+        host,
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let list_objects = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &list_objects_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(list_objects.status, StatusCode::OK.as_u16());
+    let list_objects_xml = String::from_utf8(list_objects.body).unwrap();
+    assert!(list_objects_xml.contains("<Key>transport.txt</Key>"));
+
+    let get_object_request = s3_transport_request_with_host(
+        Method::GET,
+        "/transport.txt",
+        "/s3/transport.txt",
+        host,
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let get_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &get_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(get_object.status, StatusCode::OK.as_u16());
+    assert_eq!(
+        get_object.body.as_slice(),
+        b"transported through virtual host"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_transport_executes_virtual_hosted_listener_requests_impl,
+    s3_transport_executes_virtual_hosted_listener_requests,
+    s3_transport_executes_virtual_hosted_listener_requests_turso
 );
 
 async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
