@@ -35,7 +35,7 @@ binary build; it does not change the binary package dependencies.
 
 ```bash
 sudo apt update
-sudo apt install build-essential pkg-config libfuse3-dev dh-sysuser
+sudo apt install build-essential pkg-config libfuse3-dev dh-sysuser clang
 sudo apt install -t focal-backports debhelper
 ./scripts/build-local-debs.sh --no-check-build-deps -- -j1
 ```
