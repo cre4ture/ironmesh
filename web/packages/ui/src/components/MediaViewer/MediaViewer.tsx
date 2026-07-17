@@ -33,6 +33,7 @@ export type MediaPreviewRequest = {
 
 export type MediaPreviewRequests = {
   thumbnail?: MediaPreviewRequest | null;
+  fullscreen?: MediaPreviewRequest | null;
   original: MediaPreviewRequest;
 };
 
@@ -104,6 +105,7 @@ const LIGHTBOX_STRIP_RADIUS = 3;
 const MEDIA_IMAGE_ZOOM_MIN_SCALE = 1;
 const MEDIA_IMAGE_ZOOM_MAX_SCALE = 6;
 const MEDIA_IMAGE_WHEEL_ZOOM_SENSITIVITY = 0.0018;
+const MOBILE_VIEWER_PREVIEW_MEDIA_QUERY = "(max-width: 48em) and (pointer: coarse)";
 
 type MediaSourceDimensions = {
   width: number;
@@ -148,7 +150,11 @@ export function MediaLightboxModal({
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < itemCount - 1;
   const selectedItemPreviewSignature = selectedItem
-    ? mediaPreviewRequestSignature(selectedItem.requests.original)
+    ? [
+        mediaPreviewRequestSignature(selectedItem.requests.thumbnail),
+        mediaPreviewRequestSignature(selectedItem.requests.fullscreen),
+        mediaPreviewRequestSignature(selectedItem.requests.original)
+      ].join("::")
     : "";
   const stripIndexes = useMemo(
     () => buildLightboxStripIndexes(selectedIndex, itemCount, LIGHTBOX_STRIP_RADIUS),
@@ -543,16 +549,18 @@ function MediaLightboxImage({
   onNavigateNext
 }: MediaLightboxImageProps) {
   const thumbnailRequest = item.requests.thumbnail ?? null;
-  const thumbnail = useResolvedMediaPreviewRequest(thumbnailRequest);
+  const fullscreenRequest = item.requests.fullscreen ?? null;
   const originalRequest = item.requests.original;
   const originalPreviewUnsupported = isBrowserInlineImagePreviewUnsupported(
     item.description || item.alt,
     item.mimeType
   );
-  const original = useResolvedMediaPreviewRequest(originalRequest);
+  const prefersMobileViewerPreview = usePreferMobileViewerPreview();
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
-  const [originalFailed, setOriginalFailed] = useState(false);
-  const [originalLoaded, setOriginalLoaded] = useState(false);
+  const [displayFailed, setDisplayFailed] = useState(false);
+  const [displayLoaded, setDisplayLoaded] = useState(false);
+  const [upgradeFailed, setUpgradeFailed] = useState(false);
+  const [upgradeLoaded, setUpgradeLoaded] = useState(false);
   const [sourceDimensions, setSourceDimensions] = useState<MediaSourceDimensions | null>(() =>
     resolveMediaSourceDimensions(item.width, item.height)
   );
@@ -562,8 +570,23 @@ function MediaLightboxImage({
     offsetY: 0
   });
   const [isDragging, setIsDragging] = useState(false);
+  const useFullscreenRequest =
+    Boolean(fullscreenRequest) && prefersMobileViewerPreview && !originalPreviewUnsupported;
+  const displayRequest = useFullscreenRequest
+    ? fullscreenRequest
+    : originalPreviewUnsupported
+      ? null
+      : originalRequest;
+  const shouldRequestOriginalUpgrade =
+    useFullscreenRequest && zoomState.scale > MEDIA_IMAGE_ZOOM_MIN_SCALE + 0.001;
+  const upgradeRequest = shouldRequestOriginalUpgrade ? originalRequest : null;
+  const thumbnail = useResolvedMediaPreviewRequest(thumbnailRequest);
+  const display = useResolvedMediaPreviewRequest(displayRequest);
+  const upgrade = useResolvedMediaPreviewRequest(upgradeRequest);
   const thumbnailSignature = mediaPreviewRequestSignature(thumbnailRequest);
+  const displaySignature = mediaPreviewRequestSignature(displayRequest);
   const originalSignature = mediaPreviewRequestSignature(originalRequest);
+  const upgradeSignature = mediaPreviewRequestSignature(upgradeRequest);
   const interactiveRef = useRef<HTMLDivElement | null>(null);
   const pointerDragRef = useRef<MediaLightboxPointerDragState | null>(null);
 
@@ -572,8 +595,16 @@ function MediaLightboxImage({
   }, [thumbnailSignature]);
 
   useEffect(() => {
-    setOriginalFailed(false);
-    setOriginalLoaded(false);
+    setDisplayFailed(false);
+    setDisplayLoaded(false);
+  }, [displaySignature]);
+
+  useEffect(() => {
+    setUpgradeFailed(false);
+    setUpgradeLoaded(false);
+  }, [upgradeSignature]);
+
+  useEffect(() => {
     setSourceDimensions(resolveMediaSourceDimensions(item.width, item.height));
     setZoomState({
       scale: MEDIA_IMAGE_ZOOM_MIN_SCALE,
@@ -585,13 +616,13 @@ function MediaLightboxImage({
   }, [originalSignature]);
 
   const thumbnailVisible = Boolean(thumbnail.resolvedSrc) && !thumbnail.failed && !thumbnailFailed;
-  const originalVisible =
-    !originalPreviewUnsupported &&
-    Boolean(original.resolvedSrc) &&
-    !original.failed &&
-    !originalFailed;
-  const fullImageUnavailable = !originalPreviewUnsupported && (original.failed || originalFailed);
-  const originalPending = !originalPreviewUnsupported && !fullImageUnavailable && !originalLoaded;
+  const displayVisible = Boolean(display.resolvedSrc) && !display.failed && !displayFailed;
+  const upgradeVisible = Boolean(upgrade.resolvedSrc) && !upgrade.failed && !upgradeFailed;
+  const displayUnavailable = Boolean(displayRequest) && (display.failed || displayFailed);
+  const displayPending = Boolean(displayRequest) && !displayUnavailable && !displayLoaded;
+  const upgradePending = Boolean(upgradeRequest) && !upgrade.failed && !upgradeFailed && !upgradeLoaded;
+  const thumbnailFallbackVisible =
+    !displayVisible && !upgradeVisible && displayUnavailable && thumbnailVisible;
   const thumbnailLoadFailed = Boolean(thumbnailRequest) && (thumbnail.failed || thumbnailFailed);
   const thumbnailNotice = thumbnailLoadFailed
     ? {
@@ -606,6 +637,18 @@ function MediaLightboxImage({
       : "Browser cannot preview the original image format"
     : null;
   const imageTransform = `translate(${zoomState.offsetX}px, ${zoomState.offsetY}px) scale(${zoomState.scale})`;
+  const fallbackBadgeLabel = inlineFallbackNotice
+    ? inlineFallbackNotice
+    : thumbnailFallbackVisible
+      ? useFullscreenRequest
+        ? "Optimized fullscreen image unavailable, showing thumbnail"
+        : "Full image unavailable, showing thumbnail"
+      : null;
+  const loadingLabel = useFullscreenRequest
+    ? displayPending
+      ? "Loading mobile-optimized image"
+      : "Loading full-resolution image"
+    : "Loading original image";
 
   function measureZoomMetrics() {
     const container = interactiveRef.current;
@@ -817,7 +860,7 @@ function MediaLightboxImage({
               width: "100%",
               height: "100%",
               objectFit: "contain",
-              filter: originalPending ? "none" : "blur(0px)",
+              filter: displayPending && !displayVisible ? "none" : "blur(0px)",
               background: "var(--mantine-color-dark-9)",
               transform: imageTransform,
               transformOrigin: "center center"
@@ -835,35 +878,66 @@ function MediaLightboxImage({
             <MediaThumbnailPlaceholder
               kind="image"
               info={thumbnailNotice}
-              showLoader={originalPending && !originalVisible}
+              showLoader={displayPending && !displayVisible}
               fullHeight
             />
           </div>
         )}
 
-        {originalVisible ? (
+        {displayVisible ? (
           <img
-            key={originalSignature}
-            src={original.resolvedSrc ?? undefined}
+            key={displaySignature}
+            src={display.resolvedSrc ?? undefined}
             alt={item.alt}
             loading="eager"
             decoding="async"
             draggable={false}
             onLoad={(event) => {
-              setOriginalLoaded(true);
+              setDisplayLoaded(true);
               updateSourceDimensions(
                 event.currentTarget.naturalWidth,
                 event.currentTarget.naturalHeight
               );
             }}
-            onError={() => setOriginalFailed(true)}
+            onError={() => setDisplayFailed(true)}
             style={{
               position: "absolute",
               inset: 0,
               width: "100%",
               height: "100%",
               objectFit: "contain",
-              opacity: originalLoaded ? 1 : 0,
+              opacity: displayLoaded ? 1 : 0,
+              transition: "opacity 180ms ease",
+              background: "transparent",
+              transform: imageTransform,
+              transformOrigin: "center center"
+            }}
+          />
+        ) : null}
+
+        {upgradeVisible ? (
+          <img
+            key={upgradeSignature}
+            src={upgrade.resolvedSrc ?? undefined}
+            alt={item.alt}
+            loading="eager"
+            decoding="async"
+            draggable={false}
+            onLoad={(event) => {
+              setUpgradeLoaded(true);
+              updateSourceDimensions(
+                event.currentTarget.naturalWidth,
+                event.currentTarget.naturalHeight
+              );
+            }}
+            onError={() => setUpgradeFailed(true)}
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              objectFit: "contain",
+              opacity: upgradeLoaded ? 1 : 0,
               transition: "opacity 180ms ease",
               background: "transparent",
               transform: imageTransform,
@@ -873,7 +947,7 @@ function MediaLightboxImage({
         ) : null}
       </div>
 
-      {originalPending ? (
+      {displayPending || upgradePending ? (
         <div
           style={{
             position: "absolute",
@@ -882,12 +956,12 @@ function MediaLightboxImage({
           }}
         >
           <Badge color="dark" variant="filled">
-            Loading original image
+            {loadingLabel}
           </Badge>
         </div>
       ) : null}
 
-      {fullImageUnavailable || inlineFallbackNotice ? (
+      {fallbackBadgeLabel ? (
         <div
           style={{
             position: "absolute",
@@ -895,10 +969,8 @@ function MediaLightboxImage({
             bottom: 16
           }}
         >
-          <Badge color={fullImageUnavailable ? "yellow" : "gray"} variant="filled">
-            {fullImageUnavailable
-              ? "Full image unavailable, showing thumbnail"
-              : inlineFallbackNotice}
+          <Badge color={inlineFallbackNotice ? "gray" : "yellow"} variant="filled">
+            {fallbackBadgeLabel}
           </Badge>
         </div>
       ) : null}
@@ -1379,6 +1451,29 @@ function resolveContainedMediaSize(
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(Math.max(value, minimum), maximum);
+}
+
+function usePreferMobileViewerPreview(): boolean {
+  const [matches, setMatches] = useState(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return false;
+    }
+    return window.matchMedia(MOBILE_VIEWER_PREVIEW_MEDIA_QUERY).matches;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+
+    const mediaQuery = window.matchMedia(MOBILE_VIEWER_PREVIEW_MEDIA_QUERY);
+    const update = () => setMatches(mediaQuery.matches);
+    update();
+    mediaQuery.addEventListener("change", update);
+    return () => mediaQuery.removeEventListener("change", update);
+  }, []);
+
+  return matches;
 }
 
 function isTextInputTarget(target: EventTarget | null): boolean {

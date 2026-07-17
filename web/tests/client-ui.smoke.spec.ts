@@ -489,6 +489,65 @@ test("client-ui gallery lightbox skips unsupported iOS originals and keeps the t
   expect(mockState.requestedPaths()).not.toContain(apiV1("/store/stream-binary"));
 });
 
+test("client-ui gallery lightbox prefers the mobile viewer thumbnail on narrow touch viewports", async ({
+  page
+}) => {
+  test.setTimeout(45_000);
+
+  await page.addInitScript((forcedQuery) => {
+    const originalMatchMedia = window.matchMedia.bind(window);
+    window.matchMedia = (query: string) => {
+      const result = originalMatchMedia(query);
+      if (query !== forcedQuery) {
+        return result;
+      }
+
+      return {
+        matches: true,
+        media: result.media,
+        onchange: result.onchange,
+        addListener: result.addListener?.bind(result) ?? (() => undefined),
+        removeListener: result.removeListener?.bind(result) ?? (() => undefined),
+        addEventListener: result.addEventListener.bind(result),
+        removeEventListener: result.removeEventListener.bind(result),
+        dispatchEvent: result.dispatchEvent.bind(result)
+      } as MediaQueryList;
+    };
+  }, "(max-width: 48em) and (pointer: coarse)");
+
+  await installClientUiMocks(page);
+
+  const mediaRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      url.pathname === apiV1("/media/thumbnail") ||
+      url.pathname === "/media/thumbnail" ||
+      url.pathname === apiV1("/store/stream-binary")
+    ) {
+      mediaRequests.push(`${url.pathname}${url.search}`);
+    }
+  });
+
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByText("gallery/cat.png", { exact: true }).click();
+  await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
+
+  await expect
+    .poll(() =>
+      mediaRequests.some(
+        (requestPath) =>
+          requestPath === `${apiV1("/media/thumbnail")}?key=gallery%2Fcat.png&profile=mobile_viewer` ||
+          requestPath === `/media/thumbnail?key=gallery%2Fcat.png&profile=mobile_viewer`
+      )
+    )
+    .toBe(true);
+});
+
 test("client-ui gallery virtual pages do not keep oversized spacer heights after sidebar resizing", async ({
   page
 }) => {
