@@ -60,9 +60,9 @@ private struct IronmeshMainShellView: View {
                     Label("Library", systemImage: "books.vertical")
                 }
 
-            IronmeshSyncView()
+            IronmeshFilesView()
                 .tabItem {
-                    Label("Sync", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
+                    Label("Files", systemImage: "folder.badge.gearshape")
                 }
 
             IronmeshSettingsView()
@@ -93,6 +93,20 @@ private struct IronmeshOnboardingGateView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
 
+                        if model.draft.requiresEnrollment {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("This bootstrap bundle must enroll the device before the app can browse the cluster.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+
+                                Button("Enroll device") {
+                                    model.enrollDevice(completesOnboarding: true)
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
                         IronmeshMultilineField(
                             title: "Bootstrap bundle",
                             text: draftBinding(\.bootstrapInput),
@@ -114,20 +128,8 @@ private struct IronmeshOnboardingGateView: View {
                                 Spacer()
                             }
 
-                            HStack {
-                                if model.draft.requiresEnrollment {
-                                    Button("Continue without enrollment") {
-                                        model.completeOnboarding()
-                                    }
-                                    .buttonStyle(.bordered)
-
-                                    Spacer()
-
-                                    Button("Enroll device") {
-                                        model.enrollDevice(completesOnboarding: true)
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                } else {
+                            if !model.draft.requiresEnrollment {
+                                HStack {
                                     Spacer()
 
                                     Button("Continue") {
@@ -406,7 +408,7 @@ private struct IronmeshLibraryView: View {
     }
 }
 
-private struct IronmeshSyncView: View {
+private struct IronmeshFilesView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
     @State private var showsFilesPicker = false
 
@@ -420,12 +422,14 @@ private struct IronmeshSyncView: View {
                         tone: model.domainState.isRegistered ? .good : .warning
                     ) {
                         HStack {
-                            Button("Register domain") {
-                                model.registerDomain()
+                            if !model.domainState.isRegistered {
+                                Button("Register domain") {
+                                    model.registerDomain()
+                                }
+                                .buttonStyle(.borderedProminent)
                             }
-                            .buttonStyle(.borderedProminent)
 
-                            Button("Check domain") {
+                            Button(model.domainState.isRegistered ? "Refresh status" : "Check domain") {
                                 model.refreshDomainState()
                             }
                             .buttonStyle(.bordered)
@@ -437,7 +441,7 @@ private struct IronmeshSyncView: View {
                         }
                     }
 
-                    IronmeshCard(title: "Files & domain integration", subtitle: "Pragmatic iOS handoff without inventing a local mirror.") {
+                    IronmeshCard(title: "Files & domain integration", subtitle: "This slice registers the File Provider domain and shares connection state with the extension.") {
                         IronmeshKeyValueRow(label: "Display name", value: model.draft.domainDisplayName)
                         IronmeshKeyValueRow(label: "Identifier", value: model.draft.domainIdentifier)
                         Text(model.filesIntegrationNote)
@@ -555,7 +559,13 @@ private struct IronmeshSettingsView: View {
                         IronmeshInlineNote(text: normalizedConnectionInput)
                     }
 
-                    Button("Apply and reconnect") {
+                    if model.draft.requiresEnrollment {
+                        IronmeshInlineNote(
+                            text: "This bootstrap bundle requires device enrollment before the app can reconnect."
+                        )
+                    }
+
+                    Button(model.draft.requiresEnrollment ? "Go to enrollment" : "Apply and reconnect") {
                         model.applyConnectionSettings()
                     }
                 }
@@ -594,6 +604,12 @@ private struct IronmeshSettingsView: View {
                         prompt: "Paste bootstrap JSON here or import it from a QR code."
                     )
 
+                    if model.draft.requiresEnrollment {
+                        IronmeshInlineNote(
+                            text: "Enrollment will mint client identity material for this bootstrap bundle."
+                        )
+                    }
+
                     HStack {
                         Button("Scan QR") {
                             showsScanner = true
@@ -601,7 +617,7 @@ private struct IronmeshSettingsView: View {
                         .buttonStyle(.bordered)
 
                         if model.draft.hasBootstrapPayload {
-                            Button("Enroll device") {
+                            Button(model.draft.requiresEnrollment ? "Enroll device" : "Re-enroll device") {
                                 model.enrollDevice()
                             }
                             .buttonStyle(.borderedProminent)
