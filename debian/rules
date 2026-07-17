@@ -7,14 +7,10 @@ export CARGO_HOME := $(CURDIR)/debian/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target/debian
 export CARGO_NET_OFFLINE := true
 
-CARGO_BIN := $(shell for candidate in /usr/bin/cargo-1.91 /usr/bin/cargo-1.89 /usr/bin/cargo-1.85 /usr/bin/cargo; do \
-	if [ -x "$$candidate" ]; then printf '%s' "$$candidate"; exit 0; fi; \
-done; command -v cargo)
-RUSTC_BIN := $(shell for candidate in /usr/bin/rustc-1.91 /usr/bin/rustc-1.89 /usr/bin/rustc-1.85 /usr/bin/rustc; do \
-	if [ -x "$$candidate" ]; then printf '%s' "$$candidate"; exit 0; fi; \
-done; command -v rustc)
-CLANG_BIN := $(shell command -v clang)
-CLANGXX_BIN := $(shell command -v clang++)
+CARGO_BIN := $(firstword $(wildcard /usr/bin/cargo-1.91 /usr/bin/cargo-1.89 /usr/bin/cargo-1.85 /usr/bin/cargo $(HOME)/.cargo/bin/cargo))
+RUSTC_BIN := $(firstword $(wildcard /usr/bin/rustc-1.91 /usr/bin/rustc-1.89 /usr/bin/rustc-1.85 /usr/bin/rustc $(HOME)/.cargo/bin/rustc))
+CLANG_BIN := $(firstword $(wildcard /usr/bin/clang))
+CLANGXX_BIN := $(firstword $(wildcard /usr/bin/clang++))
 
 export CC := $(CLANG_BIN)
 export CXX := $(CLANGXX_BIN)
