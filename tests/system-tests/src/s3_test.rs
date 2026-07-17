@@ -20,6 +20,9 @@ mod tests {
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use reqwest::{Method, StatusCode};
     use sha2::{Digest, Sha256};
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::time::Duration;
     use time::OffsetDateTime;
@@ -453,6 +456,268 @@ mod tests {
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             .build();
         AwsS3Client::from_conf(config)
+    }
+
+    struct AwsCliTestProfile {
+        config_file: PathBuf,
+        credentials_file: PathBuf,
+    }
+
+    fn write_aws_cli_test_profile(
+        root: &Path,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> Result<AwsCliTestProfile> {
+        let config_file = root.join("aws-config");
+        let credentials_file = root.join("aws-credentials");
+
+        // Force path-style addressing so the CLI can target the local IronMesh endpoint.
+        fs::write(
+            &config_file,
+            "[default]\nregion = us-east-1\noutput = json\ns3 =\n  addressing_style = path\n",
+        )
+        .with_context(|| format!("failed writing AWS CLI config {}", config_file.display()))?;
+        fs::write(
+            &credentials_file,
+            format!(
+                "[default]\naws_access_key_id = {access_key_id}\naws_secret_access_key = {secret_access_key}\n"
+            ),
+        )
+        .with_context(|| {
+            format!(
+                "failed writing AWS CLI credentials {}",
+                credentials_file.display()
+            )
+        })?;
+
+        Ok(AwsCliTestProfile {
+            config_file,
+            credentials_file,
+        })
+    }
+
+    async fn run_aws_cli_command(
+        profile: &AwsCliTestProfile,
+        endpoint_url: &str,
+        args: &[OsString],
+    ) -> Result<Vec<u8>> {
+        let rendered_args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let output = Command::new("aws")
+            .env_remove("AWS_ACCESS_KEY_ID")
+            .env_remove("AWS_SECRET_ACCESS_KEY")
+            .env_remove("AWS_SESSION_TOKEN")
+            .env_remove("AWS_PROFILE")
+            .env_remove("AWS_CONFIG_FILE")
+            .env_remove("AWS_SHARED_CREDENTIALS_FILE")
+            .env_remove("AWS_ENDPOINT_URL")
+            .env_remove("AWS_ENDPOINT_URL_S3")
+            .env("AWS_PROFILE", "default")
+            .env("AWS_CONFIG_FILE", &profile.config_file)
+            .env("AWS_SHARED_CREDENTIALS_FILE", &profile.credentials_file)
+            .env("AWS_DEFAULT_REGION", "us-east-1")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_PAGER", "")
+            .arg("--endpoint-url")
+            .arg(endpoint_url)
+            .args(args)
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to spawn aws CLI for `{rendered_args}`; install awscli and ensure `aws` is on PATH"
+                )
+            })?;
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!(
+                "aws CLI command failed: aws --endpoint-url {endpoint_url} {rendered_args}; status={:?}; stdout={stdout:?}; stderr={stderr:?}",
+                output.status.code(),
+            );
+        }
+
+        Ok(output.stdout)
+    }
+
+    async fn run_aws_cli_json(
+        profile: &AwsCliTestProfile,
+        endpoint_url: &str,
+        args: &[OsString],
+    ) -> Result<serde_json::Value> {
+        let stdout = run_aws_cli_command(profile, endpoint_url, args).await?;
+        serde_json::from_slice(&stdout).context("failed parsing AWS CLI JSON output")
+    }
+
+    async fn exercise_aws_cli_s3_crud(
+        endpoint_url: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        bucket_name: &str,
+        object_key: &str,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        let cli_dir = fresh_data_dir("s3-aws-cli-runtime");
+        let profile = write_aws_cli_test_profile(&cli_dir, access_key_id, secret_access_key)?;
+        let upload_path = cli_dir.join("upload.bin");
+        let download_path = cli_dir.join("download.bin");
+        fs::write(&upload_path, &body)
+            .with_context(|| format!("failed writing upload payload {}", upload_path.display()))?;
+
+        let list_buckets = run_aws_cli_json(
+            &profile,
+            endpoint_url,
+            &[
+                OsString::from("s3api"),
+                OsString::from("list-buckets"),
+            ],
+        )
+        .await?;
+        let buckets = list_buckets
+            .get("Buckets")
+            .and_then(|value| value.as_array())
+            .context("AWS CLI list-buckets output missing Buckets array")?;
+        assert!(buckets.iter().any(|bucket| {
+            bucket.get("Name").and_then(|value| value.as_str()) == Some(bucket_name)
+        }));
+
+        let put_object = run_aws_cli_json(
+            &profile,
+            endpoint_url,
+            &[
+                OsString::from("s3api"),
+                OsString::from("put-object"),
+                OsString::from("--bucket"),
+                OsString::from(bucket_name),
+                OsString::from("--key"),
+                OsString::from(object_key),
+                OsString::from("--body"),
+                upload_path.as_os_str().to_os_string(),
+                OsString::from("--content-type"),
+                OsString::from("application/octet-stream"),
+            ],
+        )
+        .await?;
+        let put_version_id = json_string(&put_object, "VersionId")?;
+        assert!(json_string(&put_object, "ETag")?.starts_with('"'));
+        assert!(!put_version_id.is_empty());
+
+        let head_object = run_aws_cli_json(
+            &profile,
+            endpoint_url,
+            &[
+                OsString::from("s3api"),
+                OsString::from("head-object"),
+                OsString::from("--bucket"),
+                OsString::from(bucket_name),
+                OsString::from("--key"),
+                OsString::from(object_key),
+            ],
+        )
+        .await?;
+        assert_eq!(
+            head_object
+                .get("ContentLength")
+                .and_then(|value| value.as_u64()),
+            Some(body.len() as u64)
+        );
+        assert_eq!(
+            head_object
+                .get("ContentType")
+                .and_then(|value| value.as_str()),
+            Some("application/octet-stream")
+        );
+
+        let get_object = run_aws_cli_json(
+            &profile,
+            endpoint_url,
+            &[
+                OsString::from("s3api"),
+                OsString::from("get-object"),
+                OsString::from("--bucket"),
+                OsString::from(bucket_name),
+                OsString::from("--key"),
+                OsString::from(object_key),
+                download_path.as_os_str().to_os_string(),
+            ],
+        )
+        .await?;
+        assert_eq!(json_string(&get_object, "VersionId")?, put_version_id);
+        let downloaded_body = fs::read(&download_path).with_context(|| {
+            format!(
+                "failed reading AWS CLI downloaded payload {}",
+                download_path.display()
+            )
+        })?;
+        assert_eq!(downloaded_body, body);
+
+        let list_objects = run_aws_cli_json(
+            &profile,
+            endpoint_url,
+            &[
+                OsString::from("s3api"),
+                OsString::from("list-objects-v2"),
+                OsString::from("--bucket"),
+                OsString::from(bucket_name),
+                OsString::from("--prefix"),
+                OsString::from(object_key),
+            ],
+        )
+        .await?;
+        assert!(
+            list_objects
+                .get("Contents")
+                .and_then(|value| value.as_array())
+                .is_some_and(|contents| contents.iter().any(|object| {
+                    object.get("Key").and_then(|value| value.as_str()) == Some(object_key)
+                }))
+        );
+
+        let delete_object = run_aws_cli_json(
+            &profile,
+            endpoint_url,
+            &[
+                OsString::from("s3api"),
+                OsString::from("delete-object"),
+                OsString::from("--bucket"),
+                OsString::from(bucket_name),
+                OsString::from("--key"),
+                OsString::from(object_key),
+            ],
+        )
+        .await?;
+        assert!(delete_object
+            .get("DeleteMarker")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false));
+        assert!(!json_string(&delete_object, "VersionId")?.is_empty());
+
+        let list_objects_after_delete = run_aws_cli_json(
+            &profile,
+            endpoint_url,
+            &[
+                OsString::from("s3api"),
+                OsString::from("list-objects-v2"),
+                OsString::from("--bucket"),
+                OsString::from(bucket_name),
+                OsString::from("--prefix"),
+                OsString::from(object_key),
+            ],
+        )
+        .await?;
+        assert!(
+            list_objects_after_delete
+                .get("Contents")
+                .and_then(|value| value.as_array())
+                .is_none_or(|contents| contents.iter().all(|object| {
+                    object.get("Key").and_then(|value| value.as_str()) != Some(object_key)
+                }))
+        );
+
+        Ok(())
     }
 
     async fn exercise_aws_sdk_s3_crud(
@@ -1083,6 +1348,94 @@ mod tests {
                 "sdk-listener.example",
                 "sdk/native-listener.bin",
                 sdk_payload,
+            )
+            .await?;
+
+            Ok(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_s3_listener_supports_aws_cli_client() -> Result<()> {
+        let public_bind = "127.0.0.1:19598";
+        let s3_bind = "127.0.0.1:19599";
+        let data_dir = fresh_data_dir("s3-listener-aws-cli-runtime");
+        let mut server = start_authenticated_server_with_env_options(
+            public_bind,
+            &data_dir,
+            "s3-aws-cli-runtime-node",
+            1,
+            None,
+            None,
+            &[("IRONMESH_S3_BIND", s3_bind)],
+        )
+        .await?;
+
+        let http = reqwest::Client::new();
+        let public_base = format!("http://{public_bind}");
+        let s3_base = format!("http://{s3_bind}");
+
+        let result: Result<()> = async {
+            let create_bucket_response = http
+                .post(format!("{public_base}/auth/s3/buckets"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "bucket_name": "cli-listener.example",
+                    "root_prefix": "tenant/cli-listener",
+                    "versioning_status": "enabled",
+                    "read_only": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_bucket_response.status(), StatusCode::CREATED);
+
+            let create_access_key_response = http
+                .post(format!("{public_base}/auth/s3/access-keys"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .json(&serde_json::json!({
+                    "description": "system-test-s3-listener-aws-cli",
+                    "bucket_scope": ["cli-listener.example"],
+                    "prefix_scope": ["tenant/cli-listener/"],
+                    "allow_list": true,
+                    "allow_read": true,
+                    "allow_write": true,
+                    "allow_delete": true,
+                    "allow_manage": false
+                }))
+                .send()
+                .await?;
+            assert_eq!(create_access_key_response.status(), StatusCode::CREATED);
+            let create_access_key_json: serde_json::Value =
+                create_access_key_response.json().await?;
+            let access_key_id = json_string(&create_access_key_json, "access_key_id")?;
+            let secret_access_key = json_string(&create_access_key_json, "secret_access_key")?;
+
+            wait_for_signed_s3_status(
+                &http,
+                &s3_base,
+                Method::GET,
+                "/",
+                &access_key_id,
+                &secret_access_key,
+                StatusCode::OK,
+            )
+            .await?;
+
+            let cli_payload = (0..((192 * 1024) + 73))
+                .map(|index| ((index * 17) % 251) as u8)
+                .collect::<Vec<_>>();
+            exercise_aws_cli_s3_crud(
+                &s3_base,
+                &access_key_id,
+                &secret_access_key,
+                "cli-listener.example",
+                "cli/native-listener.bin",
+                cli_payload,
             )
             .await?;
 
