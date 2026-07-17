@@ -12,7 +12,11 @@ import {
   type GalleryLoadEntriesOptions,
   type GalleryMediaRequests
 } from "@ironmesh/ui";
+import { Stack } from "@mantine/core";
 import { useCallback } from "react";
+import { MapDatasetImportCard } from "../components/MapDatasetImportCard";
+import { useAdminAccess } from "../lib/admin-access";
+
 const ADMIN_GALLERY_BASEMAP_MANIFEST_KEY =
   "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json";
 const ADMIN_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY =
@@ -55,17 +59,33 @@ const ADMIN_GALLERY_BASEMAPS: GalleryBasemapConfig[] = [
 ];
 
 export function GalleryPage() {
-  const loadSnapshots = useCallback(() => listAdminSnapshots(), []);
+  const { adminTokenOverride } = useAdminAccess();
+  const normalizedAdminTokenOverride = adminTokenOverride.trim();
+
+  const loadSnapshots = useCallback(
+    () => listAdminSnapshots(normalizedAdminTokenOverride || undefined),
+    [normalizedAdminTokenOverride]
+  );
   const loadEntries = useCallback(
     (
       prefix: string,
       depth: number,
       snapshotId: string | null,
       options?: GalleryLoadEntriesOptions
-    ) => listAdminStoreEntries(prefix, depth, snapshotId, undefined, options),
-    []
+    ) =>
+      listAdminStoreEntries(
+        prefix,
+        depth,
+        snapshotId,
+        normalizedAdminTokenOverride || undefined,
+        options
+      ),
+    [normalizedAdminTokenOverride]
   );
-  const loadVersions = useCallback((key: string) => getAdminVersionGraph(key), []);
+  const loadVersions = useCallback(
+    (key: string) => getAdminVersionGraph(key, normalizedAdminTokenOverride || undefined),
+    [normalizedAdminTokenOverride]
+  );
   const getMediaRequests = useCallback(
     (
       entry: GalleryEntry,
@@ -89,28 +109,31 @@ export function GalleryPage() {
   );
   const retryMediaEntry = useCallback(
     (entry: GalleryEntry, snapshotId: string | null) =>
-      retryAdminMediaCacheEntry(entry.path, undefined, {
+      retryAdminMediaCacheEntry(entry.path, normalizedAdminTokenOverride || undefined, {
         snapshot: snapshotId,
         version: typeof entry.version === "string" ? entry.version : null
       }),
-    []
+    [normalizedAdminTokenOverride]
   );
-
   return (
-    <GallerySurface
-      intro="Browse the node-side store index through admin-authenticated snapshot, index, and media routes. The gallery stays shared with the client surface and uses the current admin session for protected previews."
-      previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
-      allowedMediaKinds={["image", "video"]}
-      basemaps={ADMIN_GALLERY_BASEMAPS}
-      loadSnapshots={loadSnapshots}
-      loadEntries={loadEntries}
-      getMediaRequests={getMediaRequests}
-      loadVersions={loadVersions}
-      restoreVersion={(key, versionId, targetPath) =>
-        restoreAdminStoreVersion(key, versionId, targetPath)
-      }
-      retryMediaEntry={retryMediaEntry}
-    />
+    <Stack gap="lg">
+      <MapDatasetImportCard />
+
+      <GallerySurface
+        intro="Browse the node-side store index through admin-authenticated snapshot, index, and media routes. The gallery stays shared with the client surface and uses the current admin session for protected previews."
+        previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
+        allowedMediaKinds={["image", "video"]}
+        basemaps={ADMIN_GALLERY_BASEMAPS}
+        loadSnapshots={loadSnapshots}
+        loadEntries={loadEntries}
+        getMediaRequests={getMediaRequests}
+        loadVersions={loadVersions}
+        restoreVersion={(key, versionId, targetPath) =>
+          restoreAdminStoreVersion(key, versionId, targetPath)
+        }
+        retryMediaEntry={retryMediaEntry}
+      />
+    </Stack>
   );
 }
 

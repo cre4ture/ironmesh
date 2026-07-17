@@ -1,7 +1,10 @@
 # Map Viewer Data Installation
 
-This is the manual administrator flow for installing the self-hosted map data
-used by the gallery map view.
+The Server Admin gallery page provides the recommended administrator workflow
+for installing self-hosted map data. It downloads and splits each MBTiles
+dataset without first writing the full source file to local disk, ingests the
+incoming bytes directly as IronMesh chunks, and finalizes the part objects and
+manifest under `sys/maps/`.
 
 The current Ironmesh map viewer expects split MapTiler MBTiles artifacts stored
 under `sys/maps/` in the cluster object namespace, plus one manifest per logical
@@ -71,7 +74,41 @@ MapTiler's **Copy CLI command** option instead of downloading through the
 browser. Reserve extra local disk space: while splitting, the original files and
 the split output may coexist.
 
-## 3. Split the MBTiles Files
+## 3. Import from the Server Admin UI
+
+Open the Server Admin gallery page on a configured cluster server node. Paste
+either the MapTiler HTTPS URL or the complete command copied from MapTiler, for
+example:
+
+```bash
+wget -c https://data.maptiler.com/download/<account-token>/maptiler-satellite-2017-11-02-planet.mbtiles
+```
+
+Set the desired part size in GiB and start the import. The UI accepts 1-64 GiB;
+the server also accepts values down to 256 MiB for API clients. The selected
+part size determines the final `sys/maps/<dataset>.mbtiles-part-<suffix>`
+objects and the automatically generated manifest. It is not restricted to the
+legacy 10 GiB layout.
+
+The server requires an HTTP range-capable source. It streams one configured
+part at a time into 8 MiB IronMesh chunks, so the full MBTiles file is never
+held in a temporary local file. The status card shows overall progress, the
+active part, finalized parts, retry state, and the last error.
+
+Progress is atomically persisted after at most 64 MiB of newly ingested data.
+After a server-node restart, an active import resumes from the last persisted
+checkpoint. The source URL is persisted in the node state directory because it
+contains the MapTiler account token needed to resume; restrict access to that
+directory to server-node administrators.
+
+Use the standard MapTiler filenames above if the existing gallery basemap
+selection should discover the dataset automatically. The generated manifest is
+published only after all parts have been finalized.
+
+## 4. Manual Split and Upload Fallback
+
+Use this manual procedure only when the Server Admin import cannot reach the
+MapTiler source directly.
 
 Split each MBTiles file into 10 GiB parts. Run the commands from the directory
 where the part files should be written:
@@ -103,7 +140,7 @@ The repo manifests assume the default `split` suffixes:
 Do not change the part size, suffix format, or filenames unless you also
 regenerate the corresponding manifest JSON.
 
-## 4. Upload the Parts to the Cluster
+## 5. Upload the Parts to the Cluster
 
 Upload every generated part object under:
 
@@ -138,7 +175,7 @@ Or mount the cluster and copy into the mounted namespace.
 Keep the upload process running until all parts have finished syncing before
 unmounting or shutting down the client.
 
-## 5. Upload the Manifests
+## 6. Upload the Manifests
 
 Upload the two manifest files shipped with this repository:
 
@@ -157,7 +194,7 @@ sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json
 The manifests are in `docs/examples/` in this repo. If an older note refers to
 `docs/assets/examples/`, use `docs/examples/` instead.
 
-## 6. Verify the Map View
+## 7. Verify the Map View
 
 Check that the cluster contains the expected objects.
 The CLI for this is described here, but you can also do it differently.

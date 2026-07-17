@@ -13066,6 +13066,11 @@ async fn build_test_state(
             }),
             upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
+            map_dataset_import: Arc::new(Mutex::new(
+                super::map_dataset_import::MapDatasetImportRuntime::empty(
+                    root.join("state").join("map_dataset_import.json"),
+                ),
+            )),
             storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
             storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
             metadata_db_distribution_runtime: Arc::new(std::sync::Mutex::new(

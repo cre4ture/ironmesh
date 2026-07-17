@@ -112,6 +112,7 @@ mod cluster;
 mod embedded_rendezvous;
 mod hardware_health;
 mod listing;
+mod map_dataset_import;
 mod replication;
 mod s3_frontend;
 mod setup;
@@ -264,6 +265,7 @@ struct ServerStorageRuntime {
     upload_sessions: Arc<TracedRwLock<UploadSessionStore>>,
     upload_sessions_dirty: Arc<AtomicUsize>,
     upload_sessions_persist_notify: Arc<Notify>,
+    map_dataset_import: Arc<Mutex<map_dataset_import::MapDatasetImportRuntime>>,
     storage_stats_history_retention_secs: u64,
     storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
     metadata_db_distribution_runtime: Arc<StdMutex<MetadataDbLogicalDistributionRuntime>>,
@@ -6216,6 +6218,30 @@ async fn run_inner(
         load_upload_sessions_phase_started_at,
     );
 
+    let load_map_dataset_import_phase_started_at =
+        log_server_startup_phase_begin("load_map_dataset_import", startup_phase_anchor);
+    let map_dataset_import_runtime = match map_dataset_import::load_runtime(&config.data_dir).await
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to load map dataset import state; starting empty"
+            );
+            map_dataset_import::MapDatasetImportRuntime::empty(
+                config
+                    .data_dir
+                    .join("state")
+                    .join("map_dataset_import.json"),
+            )
+        }
+    };
+    log_server_startup_phase_end(
+        "load_map_dataset_import",
+        startup_phase_anchor,
+        load_map_dataset_import_phase_started_at,
+    );
+
     let map_perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
     if map_perf_logging_enabled {
         info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
@@ -6276,6 +6302,7 @@ async fn run_inner(
             upload_sessions: new_upload_sessions_rwlock(upload_session_store),
             upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
             upload_sessions_persist_notify: Arc::new(Notify::new()),
+            map_dataset_import: Arc::new(Mutex::new(map_dataset_import_runtime)),
             storage_stats_history_retention_secs,
             storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
             metadata_db_distribution_runtime: Arc::new(StdMutex::new(
@@ -6409,6 +6436,7 @@ async fn start_background_runtimes(
     startup_phase_anchor: Instant,
 ) {
     spawn_upload_session_store_persister(state.clone());
+    map_dataset_import::spawn_resume_if_needed(state.clone()).await;
     let refresh_local_node_storage_phase_started_at =
         log_server_startup_phase_begin("refresh_local_node_storage", startup_phase_anchor);
     refresh_local_node_storage(state).await;
@@ -6584,6 +6612,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/data-changes", get(list_data_change_events))
+        .route(
+            "/auth/maps/import",
+            get(map_dataset_import::admin_status).post(map_dataset_import::start_admin_import),
+        )
         .route(
             "/auth/storage/stats/metadata-db/logical",
             get(metadata_db_logical_distribution_status)
