@@ -78,8 +78,9 @@ use transport_sdk::{
     CandidateKind, ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
     ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
-    ClientBootstrapClaimTrust, ClientEnrollmentRequest, ConnectionCandidate, MultiplexConfig,
-    MultiplexMode, MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
+    ClientBootstrapClaimTrust, ClientEnrollmentRequest, ConnectionCandidate, DirectQuicEndpoint,
+    DirectQuicEndpointConfig, DirectQuicSession, MultiplexConfig, MultiplexMode,
+    MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
     NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
     RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelSession, RelayTunnelSessionKind,
@@ -87,7 +88,8 @@ use transport_sdk::{
     RendezvousControlClient, SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability,
     TransportHeader, TransportPathKind, TransportRequestHead, TransportResponseHead,
     TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
-    credential_fingerprint, perform_transport_client_handshake, perform_transport_server_handshake,
+    credential_fingerprint, endpoint_id_from_candidate, load_or_create_secret_key,
+    perform_transport_client_handshake, perform_transport_server_handshake,
     read_buffered_transport_response, read_transport_request_head, read_transport_response_head,
     verify_signed_request_headers, write_buffered_transport_request,
     write_buffered_transport_response, write_transport_response_head,
@@ -105,6 +107,7 @@ const PROCESS_STATS_SAMPLE_INTERVAL_SECS: u64 = 2;
 const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
+const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -330,6 +333,7 @@ struct ServerNetworkRuntime {
     node_enrollment_auto_renew_state: Arc<Mutex<NodeEnrollmentAutoRenewState>>,
     outbound_clients: Arc<RwLock<OutboundClients>>,
     peer_relay_sessions: PeerRelaySessionPool,
+    direct_quic: Option<ServerDirectQuicRuntime>,
 }
 
 #[derive(Clone)]
@@ -710,15 +714,35 @@ struct PeerRelaySessionPool {
     sessions: Arc<Mutex<HashMap<NodeId, CachedPeerRelaySession>>>,
 }
 
+#[derive(Clone, Default)]
+struct PeerDirectQuicSessionPool {
+    sessions: Arc<Mutex<HashMap<NodeId, CachedPeerDirectQuicSession>>>,
+}
+
 #[derive(Clone)]
 struct CachedPeerRelaySession {
     session: Arc<MultiplexedSession>,
     relay_session: RelayTunnelSession,
 }
 
+#[derive(Clone)]
+struct CachedPeerDirectQuicSession {
+    session: Arc<DirectQuicSession>,
+}
+
 struct EstablishedPeerRelaySession {
     session: MultiplexedSession,
     relay_session: RelayTunnelSession,
+}
+
+struct EstablishedPeerDirectQuicSession {
+    session: DirectQuicSession,
+}
+
+#[derive(Clone)]
+struct ServerDirectQuicRuntime {
+    endpoint: Arc<DirectQuicEndpoint>,
+    peer_sessions: PeerDirectQuicSessionPool,
 }
 
 #[derive(Clone)]
@@ -1091,6 +1115,10 @@ impl Drop for ClientMutationOperationLease {
 
 fn upload_sessions_path(data_dir: &FsPath) -> PathBuf {
     data_dir.join("state").join("upload_sessions.json")
+}
+
+fn direct_quic_secret_key_path(data_dir: &FsPath) -> PathBuf {
+    data_dir.join("state").join("direct_quic_secret_key.txt")
 }
 
 async fn load_upload_session_store(data_dir: &FsPath) -> Result<UploadSessionStore> {
@@ -4186,6 +4214,71 @@ async fn clear_peer_relay_sessions(state: &ServerState) {
     }
 }
 
+fn current_direct_quic_runtime(state: &ServerState) -> Option<ServerDirectQuicRuntime> {
+    state.network.direct_quic.clone()
+}
+
+async fn cached_peer_direct_quic_session(
+    state: &ServerState,
+    node_id: NodeId,
+) -> Option<CachedPeerDirectQuicSession> {
+    current_direct_quic_runtime(state)?
+        .peer_sessions
+        .sessions
+        .lock()
+        .await
+        .get(&node_id)
+        .cloned()
+}
+
+async fn invalidate_peer_direct_quic_session(state: &ServerState, node_id: NodeId) {
+    let Some(direct_quic) = current_direct_quic_runtime(state) else {
+        return;
+    };
+
+    let removed = direct_quic
+        .peer_sessions
+        .sessions
+        .lock()
+        .await
+        .remove(&node_id);
+    if let Some(removed) = removed {
+        tracing::debug!(
+            peer_node_id = %node_id,
+            remote_endpoint_id = %removed.session.remote_endpoint_id,
+            "invalidated cached direct QUIC peer session"
+        );
+    }
+}
+
+async fn clear_peer_direct_quic_sessions(state: &ServerState) {
+    let Some(direct_quic) = current_direct_quic_runtime(state) else {
+        return;
+    };
+
+    let cleared = {
+        let mut sessions = direct_quic.peer_sessions.sessions.lock().await;
+        let cleared = sessions.len();
+        sessions.clear();
+        cleared
+    };
+    if cleared > 0 {
+        tracing::debug!(
+            cleared_sessions = cleared,
+            "cleared cached direct QUIC peer sessions"
+        );
+    }
+}
+
+async fn shutdown_direct_quic_runtime(state: &ServerState) {
+    let Some(direct_quic) = current_direct_quic_runtime(state) else {
+        return;
+    };
+
+    clear_peer_direct_quic_sessions(state).await;
+    direct_quic.endpoint.close().await;
+}
+
 async fn replace_outbound_clients(state: &ServerState, outbound_clients: OutboundClients) {
     *state.network.outbound_clients.write().await = outbound_clients;
     clear_peer_relay_sessions(state).await;
@@ -4216,6 +4309,49 @@ fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
         .rendezvous_urls
         .lock()
         .expect("rendezvous URL mutex poisoned") = urls;
+}
+
+async fn try_start_direct_quic_runtime(
+    config: &ServerNodeConfig,
+) -> Option<ServerDirectQuicRuntime> {
+    let secret_key_path = direct_quic_secret_key_path(&config.data_dir);
+    let secret_key = match load_or_create_secret_key(&secret_key_path) {
+        Ok(secret_key) => secret_key,
+        Err(err) => {
+            warn!(
+                error = %err,
+                node_id = %config.node_id,
+                secret_key_path = %secret_key_path.display(),
+                "failed preparing direct QUIC identity; continuing without direct QUIC"
+            );
+            return None;
+        }
+    };
+
+    match DirectQuicEndpoint::bind(DirectQuicEndpointConfig::new(secret_key)).await {
+        Ok(endpoint) => {
+            let endpoint_id = endpoint.endpoint_id();
+            info!(
+                node_id = %config.node_id,
+                endpoint_id = %endpoint_id,
+                secret_key_path = %secret_key_path.display(),
+                "server node direct QUIC endpoint started"
+            );
+            Some(ServerDirectQuicRuntime {
+                endpoint: Arc::new(endpoint),
+                peer_sessions: PeerDirectQuicSessionPool::default(),
+            })
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                node_id = %config.node_id,
+                secret_key_path = %secret_key_path.display(),
+                "failed starting direct QUIC endpoint; continuing without direct QUIC"
+            );
+            None
+        }
+    }
 }
 
 fn current_advertised_direct_endpoints(state: &ServerState) -> Vec<BootstrapEndpoint> {
@@ -4340,20 +4476,96 @@ fn direct_endpoint_urls_by_usage(
         .collect()
 }
 
+fn direct_https_candidate(endpoint: String, rtt_ms: Option<u32>) -> ConnectionCandidate {
+    ConnectionCandidate {
+        kind: CandidateKind::DirectHttps,
+        endpoint,
+        rtt_ms,
+        transport_hints: None,
+    }
+}
+
+fn normalize_connection_candidate(candidate: &ConnectionCandidate) -> Result<ConnectionCandidate> {
+    let mut normalized = candidate.clone();
+    normalized.endpoint = match normalized.kind {
+        CandidateKind::DirectQuic => {
+            let endpoint = normalized.endpoint.trim().trim_end_matches('/').to_string();
+            if endpoint.is_empty() {
+                bail!("direct QUIC candidate endpoint must not be blank");
+            }
+            endpoint
+        }
+        CandidateKind::DirectHttps | CandidateKind::ServerReflexive | CandidateKind::Relay => {
+            normalize_optional_url(Some(normalized.endpoint.as_str()))
+                .ok_or_else(|| anyhow!("candidate endpoint must not be blank"))?
+        }
+    };
+    normalized.validate()?;
+    Ok(normalized)
+}
+
+fn connection_candidate_dedupe_key(candidate: &ConnectionCandidate) -> Result<String> {
+    Ok(match candidate.kind {
+        CandidateKind::DirectHttps => format!("direct_https:{}", candidate.endpoint),
+        CandidateKind::DirectQuic => {
+            format!("direct_quic:{}", endpoint_id_from_candidate(candidate)?)
+        }
+        CandidateKind::ServerReflexive => format!("server_reflexive:{}", candidate.endpoint),
+        CandidateKind::Relay => format!("relay:{}", candidate.endpoint),
+    })
+}
+
+fn normalize_connection_candidates(
+    candidates: &[ConnectionCandidate],
+) -> Result<Vec<ConnectionCandidate>> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+
+    for candidate in candidates {
+        let candidate = normalize_connection_candidate(candidate)?;
+        let dedupe_key = connection_candidate_dedupe_key(&candidate)?;
+        if seen.insert(dedupe_key) {
+            normalized.push(candidate);
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn local_direct_quic_candidate(
+    direct_quic: Option<&ServerDirectQuicRuntime>,
+) -> Option<ConnectionCandidate> {
+    direct_quic.map(|runtime| runtime.endpoint.candidate())
+}
+
 fn node_reachability_from_direct_endpoints(
     direct_endpoints: &[BootstrapEndpoint],
     relay_required: bool,
+    direct_quic: Option<&ServerDirectQuicRuntime>,
 ) -> NodeReachability {
     let public_direct_urls =
         direct_endpoint_urls_by_usage(direct_endpoints, BootstrapEndpointUse::PublicApi);
     let peer_direct_urls =
         direct_endpoint_urls_by_usage(direct_endpoints, BootstrapEndpointUse::PeerApi);
+    let mut peer_direct_candidates = peer_direct_urls
+        .iter()
+        .filter_map(|endpoint| {
+            normalize_optional_url(Some(endpoint.as_str()))
+                .map(|endpoint| direct_https_candidate(endpoint, None))
+        })
+        .collect::<Vec<_>>();
+    if let Some(candidate) = local_direct_quic_candidate(direct_quic) {
+        peer_direct_candidates.push(candidate);
+    }
+    let peer_direct_candidates =
+        normalize_connection_candidates(&peer_direct_candidates).unwrap_or(peer_direct_candidates);
 
     NodeReachability {
         public_api_url: public_direct_urls.first().cloned(),
         public_direct_urls,
         peer_api_url: peer_direct_urls.first().cloned(),
         peer_direct_urls,
+        peer_direct_candidates,
         relay_required,
     }
 }
@@ -5906,9 +6118,11 @@ async fn run_inner(
         &config.advertised_direct_endpoints,
         config.node_id,
     )?;
+    let direct_quic_runtime = try_start_direct_quic_runtime(&config).await;
     let local_reachability = node_reachability_from_direct_endpoints(
         &advertised_direct_endpoints,
         config.relay_mode == RelayMode::Required,
+        direct_quic_runtime.as_ref(),
     );
 
     let repair_config = config.repair_config();
@@ -6004,7 +6218,7 @@ async fn run_inner(
         reachability: local_reachability.clone(),
         capabilities: NodeCapabilities {
             public_api: !local_reachability.public_api_urls().is_empty(),
-            peer_api: !local_reachability.peer_api_urls().is_empty(),
+            peer_api: local_reachability.has_peer_transport(),
             relay_tunnel: config.rendezvous_registration_enabled
                 && config.relay_mode != RelayMode::Disabled,
         },
@@ -6349,6 +6563,7 @@ async fn run_inner(
                 rendezvous_controls,
             })),
             peer_relay_sessions: PeerRelaySessionPool::default(),
+            direct_quic: direct_quic_runtime,
         },
         maintenance: ServerMaintenanceRuntime {
             inflight_requests: Arc::new(AtomicUsize::new(0)),
@@ -6428,6 +6643,7 @@ async fn start_background_runtimes(
     hardware_health::spawn_hardware_health_sampler(state.clone());
     spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
+    spawn_direct_quic_multiplex_agent(state.clone());
 
     let load_repair_attempts_phase_started_at =
         log_server_startup_phase_begin("load_repair_attempts", startup_phase_anchor);
@@ -7119,6 +7335,7 @@ async fn run_server_listeners(
             if let Some(task) = embedded_rendezvous_task.take() {
                 task.await.context("embedded rendezvous supervisor task join failure")?;
             }
+            shutdown_direct_quic_runtime(&state).await;
             if let Err(err) = persist_upload_session_store_now(&state).await {
                 warn!(error = %err, "failed to persist upload session state during shutdown");
             }
@@ -7146,6 +7363,7 @@ async fn run_server_listeners(
     if let Some(task) = embedded_rendezvous_task {
         task.abort();
     }
+    shutdown_direct_quic_runtime(&state).await;
     if let Err(err) = persist_upload_session_store_now(&state).await {
         warn!(error = %err, "failed to persist upload session state during shutdown");
     }
@@ -7559,7 +7777,7 @@ fn build_rendezvous_presence_registration(
     local_descriptor: Option<&NodeDescriptor>,
 ) -> PresenceRegistration {
     let mut direct_candidates = Vec::new();
-    let mut seen_endpoints = BTreeSet::new();
+    let mut seen_candidates = BTreeSet::new();
     let direct_endpoints = current_advertised_direct_endpoints(state);
     let public_direct_urls =
         direct_endpoint_urls_by_usage(&direct_endpoints, BootstrapEndpointUse::PublicApi);
@@ -7569,16 +7787,28 @@ fn build_rendezvous_presence_registration(
     let peer_api_url = peer_direct_urls.first().cloned();
 
     for peer_direct_url in &peer_direct_urls {
-        push_rendezvous_direct_candidate(
+        push_rendezvous_candidate(
             &mut direct_candidates,
-            &mut seen_endpoints,
-            Some(peer_direct_url.as_str()),
+            &mut seen_candidates,
+            direct_https_candidate(peer_direct_url.clone(), None),
         );
+    }
+    if let Some(candidate) = local_direct_quic_candidate(state.network.direct_quic.as_ref()) {
+        push_rendezvous_candidate(&mut direct_candidates, &mut seen_candidates, candidate);
     }
 
     let mut capabilities = Vec::new();
-    if !direct_candidates.is_empty() {
+    if direct_candidates
+        .iter()
+        .any(|candidate| candidate.kind == CandidateKind::DirectHttps)
+    {
         capabilities.push(TransportCapability::DirectHttps);
+    }
+    if direct_candidates
+        .iter()
+        .any(|candidate| candidate.kind == CandidateKind::DirectQuic)
+    {
+        capabilities.push(TransportCapability::DirectQuic);
     }
     if state.network.relay_mode != RelayMode::Disabled {
         capabilities.push(TransportCapability::RelayTunnel);
@@ -7602,29 +7832,22 @@ fn build_rendezvous_presence_registration(
     }
 }
 
-fn push_rendezvous_direct_candidate(
+fn push_rendezvous_candidate(
     candidates: &mut Vec<ConnectionCandidate>,
-    seen_endpoints: &mut BTreeSet<String>,
-    endpoint: Option<&str>,
+    seen_candidates: &mut BTreeSet<String>,
+    candidate: ConnectionCandidate,
 ) {
-    let Some(endpoint) = endpoint
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-    else {
+    let Ok(candidate) = normalize_connection_candidate(&candidate) else {
         return;
     };
-
-    if !seen_endpoints.insert(endpoint.clone()) {
+    let Ok(dedupe_key) = connection_candidate_dedupe_key(&candidate) else {
+        return;
+    };
+    if !seen_candidates.insert(dedupe_key) {
         return;
     }
 
-    candidates.push(ConnectionCandidate {
-        kind: CandidateKind::DirectHttps,
-        endpoint,
-        rtt_ms: None,
-        transport_hints: None,
-    });
+    candidates.push(candidate);
 }
 
 fn normalize_optional_url(value: Option<&str>) -> Option<String> {
@@ -7731,15 +7954,44 @@ fn node_descriptor_from_presence_entry(
                 .filter(|value| !value.is_empty())
                 .collect()
         });
-    let peer_direct_urls = entry
-        .registration
-        .direct_candidates
+    let mut peer_direct_candidates = Vec::new();
+    let mut seen_candidates = BTreeSet::new();
+    for candidate in &entry.registration.direct_candidates {
+        let candidate = match normalize_connection_candidate(candidate) {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    node_id = %node_id,
+                    candidate_kind = ?candidate.kind,
+                    candidate_endpoint = %candidate.endpoint,
+                    "skipping invalid rendezvous direct candidate"
+                );
+                continue;
+            }
+        };
+        let dedupe_key = match connection_candidate_dedupe_key(&candidate) {
+            Ok(dedupe_key) => dedupe_key,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    node_id = %node_id,
+                    candidate_kind = ?candidate.kind,
+                    candidate_endpoint = %candidate.endpoint,
+                    "skipping rendezvous direct candidate with invalid dedupe key"
+                );
+                continue;
+            }
+        };
+        if seen_candidates.insert(dedupe_key) {
+            peer_direct_candidates.push(candidate);
+        }
+    }
+    let mut peer_direct_urls = peer_direct_candidates
         .iter()
         .filter_map(|candidate| {
-            (candidate.kind == CandidateKind::DirectHttps)
-                .then_some(candidate.endpoint.trim().trim_end_matches('/').to_string())
+            (candidate.kind == CandidateKind::DirectHttps).then_some(candidate.endpoint.clone())
         })
-        .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     let peer_api_url = entry
         .registration
@@ -7747,12 +7999,25 @@ fn node_descriptor_from_presence_entry(
         .as_deref()
         .and_then(|value| normalize_optional_url(Some(value)))
         .or_else(|| peer_direct_urls.first().cloned());
+    if let Some(peer_api_url) = peer_api_url.as_ref()
+        && !peer_direct_urls.contains(peer_api_url)
+    {
+        peer_direct_urls.insert(0, peer_api_url.clone());
+    }
+    if let Some(peer_api_url) = peer_api_url.as_ref() {
+        let direct_https = direct_https_candidate(peer_api_url.clone(), None);
+        if let Ok(dedupe_key) = connection_candidate_dedupe_key(&direct_https)
+            && seen_candidates.insert(dedupe_key)
+        {
+            peer_direct_candidates.insert(0, direct_https);
+        }
+    }
     let has_relay_capability = entry
         .registration
         .capabilities
         .contains(&TransportCapability::RelayTunnel)
         || entry.registration.relay_mode != RelayMode::Disabled;
-    if peer_api_url.is_none() && !has_relay_capability {
+    if peer_api_url.is_none() && peer_direct_candidates.is_empty() && !has_relay_capability {
         return None;
     }
     let public_api_url = entry
@@ -7769,11 +8034,12 @@ fn node_descriptor_from_presence_entry(
             public_direct_urls,
             peer_api_url: peer_api_url.clone(),
             peer_direct_urls,
+            peer_direct_candidates: peer_direct_candidates.clone(),
             relay_required: entry.registration.relay_mode == RelayMode::Required,
         },
         capabilities: NodeCapabilities {
             public_api: public_api_url.is_some(),
-            peer_api: peer_api_url.is_some(),
+            peer_api: peer_api_url.is_some() || !peer_direct_candidates.is_empty(),
             relay_tunnel: has_relay_capability,
         },
         labels: entry.registration.labels.clone(),
@@ -7801,13 +8067,26 @@ fn peer_connection_candidates(
     node: &NodeDescriptor,
 ) -> Vec<ConnectionCandidate> {
     let mut candidates = Vec::new();
-    let mut seen_endpoints = BTreeSet::new();
+    let mut seen_candidates = BTreeSet::new();
 
     if state.network.relay_mode != RelayMode::Required && !node.relay_required() {
+        for candidate in &node.reachability.peer_direct_candidates {
+            if candidate.kind == CandidateKind::DirectQuic && state.network.direct_quic.is_none() {
+                continue;
+            }
+            if matches!(
+                candidate.kind,
+                CandidateKind::DirectHttps
+                    | CandidateKind::DirectQuic
+                    | CandidateKind::ServerReflexive
+            ) {
+                push_peer_candidate(&mut candidates, &mut seen_candidates, candidate.clone());
+            }
+        }
         for (index, peer_api_url) in node.peer_api_urls().into_iter().enumerate() {
             push_ranked_peer_candidate(
                 &mut candidates,
-                &mut seen_endpoints,
+                &mut seen_candidates,
                 normalize_optional_url(Some(peer_api_url)),
                 Some(index.saturating_add(1) as u32),
             );
@@ -7815,43 +8094,54 @@ fn peer_connection_candidates(
     }
     if state.network.relay_mode != RelayMode::Disabled && node.relay_capable() {
         for relay_url in current_rendezvous_urls(state) {
-            let Some(endpoint) = normalize_optional_url(Some(relay_url.as_str())) else {
-                continue;
-            };
-            if !seen_endpoints.insert(endpoint.clone()) {
-                continue;
-            }
-            candidates.push(ConnectionCandidate {
-                kind: CandidateKind::Relay,
-                endpoint,
-                rtt_ms: None,
-                transport_hints: None,
-            });
+            push_peer_candidate(
+                &mut candidates,
+                &mut seen_candidates,
+                ConnectionCandidate {
+                    kind: CandidateKind::Relay,
+                    endpoint: relay_url,
+                    rtt_ms: None,
+                    transport_hints: None,
+                },
+            );
         }
     }
 
     candidates
 }
 
+fn push_peer_candidate(
+    candidates: &mut Vec<ConnectionCandidate>,
+    seen_candidates: &mut BTreeSet<String>,
+    candidate: ConnectionCandidate,
+) {
+    let Ok(candidate) = normalize_connection_candidate(&candidate) else {
+        return;
+    };
+    let Ok(dedupe_key) = connection_candidate_dedupe_key(&candidate) else {
+        return;
+    };
+    if !seen_candidates.insert(dedupe_key) {
+        return;
+    }
+
+    candidates.push(candidate);
+}
+
 fn push_ranked_peer_candidate(
     candidates: &mut Vec<ConnectionCandidate>,
-    seen_endpoints: &mut BTreeSet<String>,
+    seen_candidates: &mut BTreeSet<String>,
     endpoint: Option<String>,
     rtt_ms: Option<u32>,
 ) {
     let Some(endpoint) = endpoint else {
         return;
     };
-    if !seen_endpoints.insert(endpoint.clone()) {
-        return;
-    }
-
-    candidates.push(ConnectionCandidate {
-        kind: CandidateKind::DirectHttps,
-        endpoint,
-        rtt_ms,
-        transport_hints: None,
-    });
+    push_peer_candidate(
+        candidates,
+        seen_candidates,
+        direct_https_candidate(endpoint, rtt_ms),
+    );
 }
 
 fn plan_peer_transport(
@@ -7879,9 +8169,11 @@ pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) 
         .context("peer transport plan did not include a selected candidate")?;
 
     match plan.path_kind {
-        TransportPathKind::DirectHttps | TransportPathKind::DirectQuic => {
-            Ok(candidate.endpoint.trim_end_matches('/').to_string())
-        }
+        TransportPathKind::DirectHttps => Ok(candidate.endpoint.trim_end_matches('/').to_string()),
+        TransportPathKind::DirectQuic => bail!(
+            "node {} requires direct QUIC peer transport instead of an HTTP base URL",
+            node.node_id
+        ),
         TransportPathKind::RelayTunnel => bail!(
             "node {} requires relay peer transport instead of a direct base URL",
             node.node_id
@@ -7999,7 +8291,7 @@ async fn execute_peer_request(
     let started = availability_sync.then(Instant::now);
 
     match plan.path_kind {
-        TransportPathKind::DirectHttps | TransportPathKind::DirectQuic => {
+        TransportPathKind::DirectHttps => {
             let base_url = plan
                 .candidate
                 .as_ref()
@@ -8009,6 +8301,31 @@ async fn execute_peer_request(
             let response = execute_direct_peer_request(
                 &internal_http,
                 &base_url,
+                method,
+                path_and_query,
+                headers,
+                body,
+            )
+            .await?;
+            if let Some(started) = started {
+                info!(
+                    peer_node_id = %node.node_id,
+                    transport = ?plan.path_kind,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "availability peer request transport finished"
+                );
+            }
+            Ok(response)
+        }
+        TransportPathKind::DirectQuic => {
+            let candidate = plan
+                .candidate
+                .as_ref()
+                .context("peer transport plan did not include a selected candidate")?;
+            let response = execute_direct_quic_peer_request(
+                state,
+                node,
+                candidate,
                 method,
                 path_and_query,
                 headers,
@@ -8110,6 +8427,89 @@ async fn execute_direct_peer_request(
     })
 }
 
+async fn open_direct_quic_peer_session(
+    state: &ServerState,
+    node: &NodeDescriptor,
+    candidate: &ConnectionCandidate,
+) -> Result<EstablishedPeerDirectQuicSession> {
+    let direct_quic = current_direct_quic_runtime(state)
+        .context("direct QUIC peer transport requires a local direct QUIC runtime")?;
+    let session = direct_quic
+        .endpoint
+        .connect_session(candidate, MultiplexConfig::default())
+        .await
+        .with_context(|| {
+            format!(
+                "failed opening direct QUIC peer session for node {}",
+                node.node_id
+            )
+        })?;
+    perform_transport_client_handshake(
+        &session.session,
+        TransportSessionControlMessage::Hello {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            cluster_id: state.cluster_id,
+            role: TransportSessionRole::Node,
+            peer: PeerIdentity::Node(state.node_id),
+            connection_name: None,
+            target: Some(PeerIdentity::Node(node.node_id)),
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed completing direct QUIC handshake to node {} via endpoint {}",
+            node.node_id, session.remote_endpoint_id
+        )
+    })?;
+
+    Ok(EstablishedPeerDirectQuicSession { session })
+}
+
+async fn ensure_direct_quic_peer_session(
+    state: &ServerState,
+    node: &NodeDescriptor,
+    candidate: &ConnectionCandidate,
+) -> Result<CachedPeerDirectQuicSession> {
+    let expected_endpoint_id = endpoint_id_from_candidate(candidate)
+        .with_context(|| format!("node {} direct QUIC candidate is invalid", node.node_id))?;
+    if let Some(existing) = cached_peer_direct_quic_session(state, node.node_id).await
+        && existing.session.remote_endpoint_id == expected_endpoint_id
+    {
+        return Ok(existing);
+    }
+
+    invalidate_peer_direct_quic_session(state, node.node_id).await;
+
+    let established = open_direct_quic_peer_session(state, node, candidate).await?;
+    let cached = CachedPeerDirectQuicSession {
+        session: Arc::new(established.session),
+    };
+
+    let direct_quic = current_direct_quic_runtime(state)
+        .context("direct QUIC peer transport requires a local direct QUIC runtime")?;
+    let mut sessions = direct_quic.peer_sessions.sessions.lock().await;
+    if let Some(existing) = sessions.get(&node.node_id).cloned()
+        && existing.session.remote_endpoint_id == expected_endpoint_id
+    {
+        drop(sessions);
+        if let Ok(unused_session) = Arc::try_unwrap(cached.session)
+            && let Err(err) = unused_session.session.close().await
+        {
+            tracing::debug!(
+                error = %err,
+                peer_node_id = %node.node_id,
+                remote_endpoint_id = %expected_endpoint_id,
+                "failed closing redundant direct QUIC peer session"
+            );
+        }
+        return Ok(existing);
+    }
+
+    sessions.insert(node.node_id, cached.clone());
+    Ok(cached)
+}
+
 async fn open_relay_peer_session(
     state: &ServerState,
     rendezvous: &RendezvousControlClient,
@@ -8196,6 +8596,94 @@ async fn ensure_relay_peer_session(
     Ok(cached)
 }
 
+async fn execute_multiplex_peer_request(
+    session: &MultiplexedSession,
+    node_id: NodeId,
+    transport_label: &str,
+    request: &BufferedTransportRequest,
+) -> Result<PeerHttpResponse> {
+    let mut stream = session.open_stream().await.with_context(|| {
+        format!("failed opening {transport_label} peer stream for node {node_id}")
+    })?;
+    write_buffered_transport_request(&mut stream, request)
+        .await
+        .with_context(|| {
+            format!("failed writing {transport_label} peer request for node {node_id}")
+        })?;
+    let response = match request.kind {
+        TransportStreamKind::ObjectRead => read_streamed_relay_peer_response(&mut stream)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reading {transport_label} peer streamed response for node {node_id}"
+                )
+            })?,
+        _ => {
+            let response = read_buffered_transport_response(&mut stream)
+                .await
+                .with_context(|| {
+                    format!("failed reading {transport_label} peer response for node {node_id}")
+                })?;
+            peer_http_response_from_multiplex(response)
+        }
+    };
+    Ok(response)
+}
+
+async fn execute_direct_quic_peer_request(
+    state: &ServerState,
+    node: &NodeDescriptor,
+    candidate: &ConnectionCandidate,
+    method: reqwest::Method,
+    path_and_query: &str,
+    headers: Vec<RelayHttpHeader>,
+    body: Vec<u8>,
+) -> Result<PeerHttpResponse> {
+    let normalized_path = normalize_peer_path_and_query(path_and_query)?;
+    let request_headers = transport_headers_from_relay_headers(&headers);
+    let request_kind = relay_peer_request_kind(&method, &normalized_path, &body);
+
+    for attempt in 0..2 {
+        let cached = ensure_direct_quic_peer_session(state, node, candidate).await?;
+        let request = BufferedTransportRequest::new(
+            request_kind,
+            method.as_str(),
+            normalized_path.clone(),
+            request_headers.clone(),
+            body.clone(),
+        );
+
+        match execute_multiplex_peer_request(
+            &cached.session.session,
+            node.node_id,
+            "direct QUIC",
+            &request,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                invalidate_peer_direct_quic_session(state, node.node_id).await;
+                tracing::debug!(
+                    error = %err,
+                    peer_node_id = %node.node_id,
+                    remote_endpoint_id = %cached.session.remote_endpoint_id,
+                    "retrying direct QUIC peer request after resetting cached session"
+                );
+            }
+            Err(err) => {
+                invalidate_peer_direct_quic_session(state, node.node_id).await;
+                return Err(err);
+            }
+        }
+    }
+
+    bail!(
+        "direct QUIC peer request retried without producing a response for node {}",
+        node.node_id
+    )
+}
+
 async fn execute_relay_peer_request(
     state: &ServerState,
     node: &NodeDescriptor,
@@ -8217,48 +8705,14 @@ async fn execute_relay_peer_request(
             request_headers.clone(),
             body.clone(),
         );
-
-        let result = async {
-            let mut stream = cached.session.open_stream().await.with_context(|| {
-                format!(
-                    "failed opening multiplex relay peer stream for node {}",
-                    node.node_id
-                )
-            })?;
-            write_buffered_transport_request(&mut stream, &request)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed writing multiplex relay peer request for node {}",
-                        node.node_id
-                    )
-                })?;
-            let response = match request_kind {
-                TransportStreamKind::ObjectRead => read_streamed_relay_peer_response(&mut stream)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed reading multiplex relay peer streamed response for node {}",
-                            node.node_id
-                        )
-                    })?,
-                _ => {
-                    let response = read_buffered_transport_response(&mut stream)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed reading multiplex relay peer response for node {}",
-                                node.node_id
-                            )
-                        })?;
-                    peer_http_response_from_multiplex(response)
-                }
-            };
-            Ok::<PeerHttpResponse, anyhow::Error>(response)
-        }
-        .await;
-
-        match result {
+        match execute_multiplex_peer_request(
+            &cached.session,
+            node.node_id,
+            "multiplex relay",
+            &request,
+        )
+        .await
+        {
             Ok(response) => return Ok(response),
             Err(err) if attempt == 0 => {
                 invalidate_peer_relay_session(state, node.node_id).await;
@@ -8939,26 +9393,28 @@ where
         .context("failed closing streamed transport response")
 }
 
-async fn complete_relay_multiplex_handshake(
+struct IncomingMultiplexHello {
+    peer: PeerIdentity,
+    connection_name: Option<String>,
+}
+
+async fn complete_incoming_multiplex_handshake(
     state: &ServerState,
-    endpoint_url: &str,
-    relay_session: &RelayTunnelSession,
     session: &mut MultiplexedSession,
-) -> Result<CompletedRelaySession> {
+    session_id: &str,
+    transport_label: &str,
+) -> Result<IncomingMultiplexHello> {
     let hello = perform_transport_server_handshake(
         session,
         TransportSessionControlMessage::Ready {
             protocol_version: TRANSPORT_PROTOCOL_VERSION,
-            session_id: relay_session.session_id.clone(),
+            session_id: session_id.to_string(),
             max_concurrent_streams: MultiplexConfig::default().max_num_streams,
         },
     )
     .await
     .with_context(|| {
-        format!(
-            "failed completing multiplex relay handshake for session {} from {}",
-            relay_session.session_id, endpoint_url
-        )
+        format!("failed completing {transport_label} handshake for session {session_id}")
     })?;
     let TransportSessionControlMessage::Hello {
         cluster_id,
@@ -8968,28 +9424,57 @@ async fn complete_relay_multiplex_handshake(
         ..
     } = hello
     else {
-        bail!("multiplex relay handshake did not return a hello control message");
+        bail!("{transport_label} handshake did not return a hello control message");
     };
 
     if cluster_id != state.cluster_id {
         bail!(
-            "multiplex relay handshake cluster_id {} did not match local cluster {}",
+            "{transport_label} handshake cluster_id {} did not match local cluster {}",
             cluster_id,
             state.cluster_id
         );
     }
+    if target.as_ref() != Some(&PeerIdentity::Node(state.node_id)) {
+        bail!(
+            "{transport_label} handshake target {:?} did not match local node {}",
+            target,
+            state.node_id
+        );
+    }
+
+    Ok(IncomingMultiplexHello {
+        peer,
+        connection_name,
+    })
+}
+
+async fn complete_relay_multiplex_handshake(
+    state: &ServerState,
+    endpoint_url: &str,
+    relay_session: &RelayTunnelSession,
+    session: &mut MultiplexedSession,
+) -> Result<CompletedRelaySession> {
+    let hello = complete_incoming_multiplex_handshake(
+        state,
+        session,
+        &relay_session.session_id,
+        "multiplex relay",
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed completing multiplex relay handshake for session {} from {}",
+            relay_session.session_id, endpoint_url
+        )
+    })?;
+    let peer = hello.peer;
+    let connection_name = hello.connection_name;
+
     if peer != relay_session.source {
         bail!(
             "multiplex relay handshake peer {} did not match relay source {}",
             peer,
             relay_session.source
-        );
-    }
-    if target.as_ref() != Some(&PeerIdentity::Node(state.node_id)) {
-        bail!(
-            "multiplex relay handshake target {:?} did not match local node {}",
-            target,
-            state.node_id
         );
     }
 
@@ -9027,6 +9512,205 @@ async fn complete_relay_multiplex_handshake(
         },
         tracked_connection,
     })
+}
+
+async fn direct_quic_peer_matches_node(
+    state: &ServerState,
+    node_id: NodeId,
+    remote_endpoint_id: &str,
+) -> bool {
+    let cluster = state.cluster.lock().await;
+    cluster
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .is_some_and(|node| {
+            node.reachability
+                .peer_direct_candidates
+                .iter()
+                .any(|candidate| {
+                    candidate.kind == CandidateKind::DirectQuic
+                        && endpoint_id_from_candidate(candidate)
+                            .map(|candidate_id| candidate_id == remote_endpoint_id)
+                            .unwrap_or(false)
+                })
+        })
+}
+
+async fn complete_direct_quic_multiplex_handshake(
+    state: &ServerState,
+    remote_endpoint_id: &str,
+    session: &mut MultiplexedSession,
+) -> Result<CompletedRelaySession> {
+    let session_id = format!("direct-quic-{}", Uuid::now_v7());
+    let hello = complete_incoming_multiplex_handshake(state, session, &session_id, "direct QUIC")
+        .await
+        .with_context(|| {
+            format!(
+                "failed completing direct QUIC handshake from endpoint {}",
+                remote_endpoint_id
+            )
+        })?;
+    let peer = hello.peer;
+    let connection_name = hello.connection_name;
+
+    let tracked_connection = match &peer {
+        PeerIdentity::Device(device_id) => {
+            let identity = client_identity_for_device_id(state, &device_id.to_string()).await;
+            Some(track_direct_transport_connection(
+                state,
+                &identity,
+                connection_name.clone(),
+                &session_id,
+            ))
+        }
+        PeerIdentity::Node(_) => None,
+    };
+
+    let execution_scope = match &peer {
+        PeerIdentity::Device(_) => transport_service::TransportExecutionScope::Public,
+        PeerIdentity::Node(node_id) => {
+            if !direct_quic_peer_matches_node(state, *node_id, remote_endpoint_id).await {
+                bail!(
+                    "direct QUIC endpoint {} is not currently registered for node {}",
+                    remote_endpoint_id,
+                    node_id
+                );
+            }
+            transport_service::TransportExecutionScope::Internal(InternalCaller {
+                node_id: *node_id,
+                cluster_id: state.cluster_id,
+            })
+        }
+    };
+
+    tracing::info!(
+        peer = %peer,
+        remote_endpoint_id = %remote_endpoint_id,
+        session_id = %session_id,
+        connection_name = %connection_name.as_deref().unwrap_or("-"),
+        "accepted direct QUIC transport session"
+    );
+
+    Ok(CompletedRelaySession {
+        execution_scope,
+        tracked_connection,
+    })
+}
+
+async fn serve_direct_quic_multiplex_session(
+    state: ServerState,
+    accepted: DirectQuicSession,
+) -> Result<()> {
+    let DirectQuicSession {
+        connection,
+        session,
+        remote_endpoint_id,
+    } = accepted;
+    let _connection = connection;
+    let mut session = session;
+    let completed =
+        complete_direct_quic_multiplex_handshake(&state, &remote_endpoint_id, &mut session).await?;
+
+    loop {
+        let next = session.accept_stream().await.with_context(|| {
+            format!(
+                "failed accepting direct QUIC peer stream from endpoint {}",
+                remote_endpoint_id
+            )
+        })?;
+        let Some(stream) = next else {
+            return Ok(());
+        };
+
+        if let Some(tracked_connection) = completed.tracked_connection.as_ref() {
+            tracked_connection.touch();
+        }
+
+        let state = state.clone();
+        let remote_endpoint_id = remote_endpoint_id.clone();
+        let execution_scope = completed.execution_scope.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_multiplexed_relay_stream(state, execution_scope, stream).await
+            {
+                warn!(
+                    error = %err,
+                    remote_endpoint_id = %remote_endpoint_id,
+                    "direct QUIC request stream failed"
+                );
+            }
+        });
+    }
+}
+
+fn spawn_direct_quic_multiplex_agent(state: ServerState) {
+    let Some(direct_quic) = state.network.direct_quic.clone() else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        loop {
+            match direct_quic.endpoint.accept_connection().await {
+                Ok(Some(accepted)) => {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        let remote_endpoint_id = accepted.remote_endpoint_id.clone();
+                        let timeout_connection = accepted.connection.clone();
+                        let session = match tokio::time::timeout(
+                            Duration::from_secs(DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS),
+                            accepted.into_session(MultiplexConfig::default()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(session)) => session,
+                            Ok(Err(err)) => {
+                                warn!(
+                                    error = %err,
+                                    remote_endpoint_id = %remote_endpoint_id,
+                                    "failed accepting first direct QUIC bi-stream"
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                timeout_connection.close(
+                                    0u32.into(),
+                                    b"timed out waiting for first direct QUIC stream",
+                                );
+                                warn!(
+                                    remote_endpoint_id = %remote_endpoint_id,
+                                    timeout_secs = DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS,
+                                    "timed out waiting for first direct QUIC bi-stream"
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(err) = serve_direct_quic_multiplex_session(state, session).await
+                        {
+                            warn!(
+                                error = %err,
+                                remote_endpoint_id = %remote_endpoint_id,
+                                "direct QUIC session failed"
+                            );
+                        }
+                    });
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        node_id = %state.node_id,
+                        "direct QUIC endpoint closed"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        node_id = %state.node_id,
+                        "failed accepting direct QUIC session"
+                    );
+                }
+            }
+        }
+    });
 }
 
 async fn serve_relay_multiplex_streams(
@@ -20891,6 +21575,7 @@ async fn refresh_local_node_reachability(state: &ServerState) -> Result<()> {
     let reachability = node_reachability_from_direct_endpoints(
         &direct_endpoints,
         state.network.relay_mode == RelayMode::Required,
+        state.network.direct_quic.as_ref(),
     );
 
     let changed = {
@@ -20924,7 +21609,7 @@ async fn refresh_local_node_reachability(state: &ServerState) -> Result<()> {
             reachability: reachability.clone(),
             capabilities: NodeCapabilities {
                 public_api: !reachability.public_api_urls().is_empty(),
-                peer_api: !reachability.peer_api_urls().is_empty(),
+                peer_api: reachability.has_peer_transport(),
                 relay_tunnel: state.network.rendezvous_registration_enabled
                     && state.network.relay_mode != RelayMode::Disabled,
             },
@@ -23533,18 +24218,36 @@ async fn register_node(
     {
         peer_direct_urls.insert(0, peer_api_url.clone());
     }
+    let mut peer_direct_candidates =
+        match normalize_connection_candidates(&request.reachability.peer_direct_candidates) {
+            Ok(candidates) => candidates,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+    if let Some(peer_api_url) = peer_api_url.as_ref() {
+        let direct_https = direct_https_candidate(peer_api_url.clone(), None);
+        if let Ok(dedupe_key) = connection_candidate_dedupe_key(&direct_https)
+            && !peer_direct_candidates.iter().any(|candidate| {
+                connection_candidate_dedupe_key(candidate)
+                    .map(|candidate_key| candidate_key == dedupe_key)
+                    .unwrap_or(false)
+            })
+        {
+            peer_direct_candidates.insert(0, direct_https);
+        }
+    }
 
     let reachability = NodeReachability {
         public_api_url: public_api_url.or_else(|| public_direct_urls.first().cloned()),
         public_direct_urls,
         peer_api_url: peer_api_url.or_else(|| peer_direct_urls.first().cloned()),
         peer_direct_urls,
+        peer_direct_candidates,
         relay_required: request.reachability.relay_required,
     };
     let requested_capabilities = request.capabilities.unwrap_or_default();
     let capabilities = NodeCapabilities {
         public_api: requested_capabilities.public_api || !reachability.public_api_urls().is_empty(),
-        peer_api: requested_capabilities.peer_api || !reachability.peer_api_urls().is_empty(),
+        peer_api: requested_capabilities.peer_api || reachability.has_peer_transport(),
         relay_tunnel: requested_capabilities.relay_tunnel || reachability.relay_required,
     };
 

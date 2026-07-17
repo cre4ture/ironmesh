@@ -10,7 +10,7 @@ mod tests {
         wait_for_rendezvous_registered_endpoints, wait_for_url_status,
     };
     use anyhow::{Context, Result};
-    use client_sdk::{BootstrapEndpointUse, build_http_client_with_identity_from_pem};
+    use client_sdk::{BootstrapEndpointUse, RelayMode, build_http_client_with_identity_from_pem};
     use reqwest::StatusCode;
     use std::fs;
     use std::process::Stdio;
@@ -1702,6 +1702,7 @@ mod tests {
                     endpoint.url = "http://127.0.0.1:9".to_string();
                 }
             }
+            bootstrap.relay_mode = RelayMode::Required;
             bootstrap.write_to_path(&bootstrap_path)?;
 
             let mut web = start_web_backend_with_args(
@@ -2080,6 +2081,7 @@ mod tests {
                     endpoint.url = "http://127.0.0.1:9".to_string();
                 }
             }
+            bootstrap.relay_mode = RelayMode::Required;
             bootstrap.write_to_path(&bootstrap_path)?;
 
             let mut web = start_web_backend_with_args_and_env(

@@ -94,6 +94,8 @@ targets:
       - package: AppleFileProviderPackage
         product: AppleFileProviderShared
       - sdk: FileProvider.framework
+      - sdk: Network.framework
+      - sdk: SystemConfiguration.framework
       - sdk: UniformTypeIdentifiers.framework
     preBuildScripts:
       - name: Build Rust Apple FFI
@@ -106,7 +108,7 @@ targets:
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
-        OTHER_LDFLAGS: $(inherited) -lios_app
+        OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
         CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAppGroup.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
@@ -127,6 +129,8 @@ targets:
       - package: AppleFileProviderPackage
         product: AppleFileProviderShared
       - sdk: FileProvider.framework
+      - sdk: Network.framework
+      - sdk: SystemConfiguration.framework
       - sdk: UniformTypeIdentifiers.framework
     preBuildScripts:
       - name: Build Rust Apple FFI
@@ -139,7 +143,7 @@ targets:
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
-        OTHER_LDFLAGS: $(inherited) -lios_app
+        OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
         CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAppGroup.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosfileprovider
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
