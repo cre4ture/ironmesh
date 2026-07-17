@@ -12,6 +12,8 @@ base64 = "0.22"
 common = { path = "../common" }
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 futures-util = "0.3"
+iroh = "1.0.2"
+iroh-relay = "1.0.2"
 pkcs8 = { version = "0.10", features = ["pem"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest.workspace = true
@@ -24,13 +26,13 @@ time = { version = "0.3", features = ["formatting"] }
 tokio.workspace = true
 tokio-rustls = "0.26"
 tokio-tungstenite = "0.24"
+tokio-util = { version = "0.7", features = ["compat"] }
 x509-parser = "0.16"
 yamux = "0.13.8"
 uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-tokio-util = { version = "0.7", features = ["compat"] }
 
 [lints]
 workspace = true

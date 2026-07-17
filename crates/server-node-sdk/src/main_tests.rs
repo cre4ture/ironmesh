@@ -446,6 +446,16 @@ fn test_node_reachability(
         peer_direct_urls: peer_api_url
             .map(|value| vec![value.to_string()])
             .unwrap_or_default(),
+        peer_direct_candidates: peer_api_url
+            .map(|value| {
+                vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: value.to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }]
+            })
+            .unwrap_or_default(),
         relay_required,
     }
 }
@@ -472,6 +482,64 @@ async fn register_cluster_node(
         last_heartbeat_unix: super::unix_ts(),
         status: super::cluster::NodeStatus::Online,
     });
+}
+
+async fn install_direct_quic_runtime(
+    state: &mut ServerState,
+) -> transport_sdk::ConnectionCandidate {
+    let secret_key_path = state
+        .data_dir
+        .join("state")
+        .join(format!("test-direct-quic-{}.txt", state.node_id));
+    let secret_key = transport_sdk::load_or_create_secret_key(&secret_key_path)
+        .expect("test direct QUIC secret key should persist");
+    let endpoint = transport_sdk::DirectQuicEndpoint::bind(
+        transport_sdk::DirectQuicEndpointConfig::new(secret_key),
+    )
+    .await
+    .expect("test direct QUIC endpoint should bind");
+    let candidate = endpoint.candidate();
+    state.network.direct_quic = Some(super::ServerDirectQuicRuntime {
+        endpoint: Arc::new(endpoint),
+        peer_sessions: super::PeerDirectQuicSessionPool::default(),
+    });
+    super::refresh_local_node_reachability(state)
+        .await
+        .expect("test direct QUIC reachability should refresh");
+    candidate
+}
+
+async fn register_direct_quic_cluster_node(
+    state: &ServerState,
+    node_id: NodeId,
+    candidate: transport_sdk::ConnectionCandidate,
+) -> cluster::NodeDescriptor {
+    let descriptor = cluster::NodeDescriptor {
+        node_id,
+        reachability: cluster::NodeReachability {
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            peer_direct_urls: Vec::new(),
+            peer_direct_candidates: vec![candidate],
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: false,
+            peer_api: true,
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 1_000_000,
+        free_bytes: 900_000,
+        storage_stats: None,
+        last_heartbeat_unix: super::unix_ts(),
+        status: super::cluster::NodeStatus::Online,
+    };
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.register_node(descriptor.clone());
+    descriptor
 }
 
 async fn register_node_with_server(
@@ -1261,7 +1329,26 @@ fn s3_signed_request(
     extra_headers: &[(&str, &str)],
     body: Bytes,
 ) -> Request<Body> {
-    let host = "s3.local";
+    s3_signed_request_with_host(
+        method,
+        uri,
+        "s3.local",
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+    )
+}
+
+fn s3_signed_request_with_host(
+    method: Method,
+    uri: &str,
+    host: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> Request<Body> {
     let amz_date = "20260705T120000Z";
     let date_scope = "20260705";
     let region = "us-east-1";
@@ -1344,9 +1431,10 @@ fn s3_presigned_request(
     extra_headers: &[(&str, &str)],
     body: Bytes,
 ) -> Request<Body> {
-    s3_presigned_request_at(
+    s3_presigned_request_with_host_at(
         method,
         uri,
+        "s3.local",
         access_key_id,
         secret_material,
         extra_headers,
@@ -1367,7 +1455,31 @@ fn s3_presigned_request_at(
     signed_at_unix: i64,
     expires_secs: u64,
 ) -> Request<Body> {
-    let host = "s3.local";
+    s3_presigned_request_with_host_at(
+        method,
+        uri,
+        "s3.local",
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+        signed_at_unix,
+        expires_secs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn s3_presigned_request_with_host_at(
+    method: Method,
+    uri: &str,
+    host: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+    signed_at_unix: i64,
+    expires_secs: u64,
+) -> Request<Body> {
     let (amz_date, date_scope) = sigv4_timestamp_components(signed_at_unix);
     let region = "us-east-1";
     let service = "s3";
@@ -1472,9 +1584,33 @@ fn s3_transport_request(
     extra_headers: &[(&str, &str)],
     body: Bytes,
 ) -> transport_sdk::BufferedTransportRequest {
-    let request = s3_signed_request(
+    s3_transport_request_with_host(
         method.clone(),
         external_uri,
+        transport_uri,
+        "s3.local",
+        access_key_id,
+        secret_material,
+        extra_headers,
+        body,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn s3_transport_request_with_host(
+    method: Method,
+    external_uri: &str,
+    transport_uri: &str,
+    host: &str,
+    access_key_id: &str,
+    secret_material: &str,
+    extra_headers: &[(&str, &str)],
+    body: Bytes,
+) -> transport_sdk::BufferedTransportRequest {
+    let request = s3_signed_request_with_host(
+        method.clone(),
+        external_uri,
+        host,
         access_key_id,
         secret_material,
         extra_headers,
@@ -3003,6 +3139,163 @@ run_on_main_metadata_backends!(
     s3_listener_supports_bucket_listing_and_object_crud_impl,
     s3_listener_supports_bucket_listing_and_object_crud,
     s3_listener_supports_bucket_listing_and_object_crud_turso
+);
+
+async fn s3_listener_supports_virtual_hosted_bucket_routing_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    state.s3.public_url = Some("http://s3.local".to_string());
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        test_admin_headers(),
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-virtual-hosted-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let app = super::s3_frontend::build_listener_app().with_state(state.clone());
+    let host = "photos.example.s3.local";
+
+    let head_bucket = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::HEAD,
+            "/",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+
+    let empty_listing = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::GET,
+            "/?list-type=2",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty_listing.status(), StatusCode::OK);
+    let empty_listing_body = to_bytes(empty_listing.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let empty_listing_xml = String::from_utf8(empty_listing_body.to_vec()).unwrap();
+    assert!(empty_listing_xml.contains("<Name>photos.example</Name>"));
+    assert!(!empty_listing_xml.contains("<Key>"));
+
+    let payload = Bytes::from_static(b"virtual-hosted payload");
+    let put_object = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::PUT,
+            "/hello.txt",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[("content-type", "text/plain")],
+            payload.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_object.status(), StatusCode::OK);
+
+    let get_object = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::GET,
+            "/hello.txt",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_object.status(), StatusCode::OK);
+    let get_object_body = to_bytes(get_object.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(get_object_body.as_ref(), payload.as_ref());
+
+    let list_objects = app
+        .clone()
+        .oneshot(s3_signed_request_with_host(
+            Method::GET,
+            "/?list-type=2&prefix=hello",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_objects.status(), StatusCode::OK);
+    let list_objects_body = to_bytes(list_objects.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_objects_xml = String::from_utf8(list_objects_body.to_vec()).unwrap();
+    assert!(list_objects_xml.contains("<Key>hello.txt</Key>"));
+
+    let delete_object = app
+        .oneshot(s3_signed_request_with_host(
+            Method::DELETE,
+            "/hello.txt",
+            host,
+            &created_access_key.access_key_id,
+            &created_access_key.secret_access_key,
+            &[],
+            Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_object.status(), StatusCode::NO_CONTENT);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_listener_supports_virtual_hosted_bucket_routing_impl,
+    s3_listener_supports_virtual_hosted_bucket_routing,
+    s3_listener_supports_virtual_hosted_bucket_routing_turso
 );
 
 async fn s3_listener_supports_bucket_create_and_delete_impl(backend: MainTestBackend) {
@@ -5113,6 +5406,128 @@ run_on_main_metadata_backends!(
     s3_version_listing_supports_delimiter_turso
 );
 
+async fn s3_transport_executes_virtual_hosted_listener_requests_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    state.s3.public_url = Some("http://s3.local".to_string());
+    let admin_headers = test_admin_headers();
+
+    let create_bucket = super::create_s3_bucket(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(super::CreateS3BucketRequest {
+            bucket_name: "photos.example".to_string(),
+            root_prefix: Some("tenant/photos".to_string()),
+            versioning_status: Some(super::S3BucketVersioningStatus::Enabled),
+            read_only: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_bucket.status(), StatusCode::CREATED);
+
+    let create_access_key = super::create_s3_access_key(
+        State(state.clone()),
+        admin_headers,
+        Json(super::CreateS3AccessKeyRequest {
+            description: Some("s3-transport-virtual-hosted-test".to_string()),
+            bucket_scope: vec!["photos.example".to_string()],
+            prefix_scope: vec!["tenant/photos/".to_string()],
+            allow_list: true,
+            allow_read: true,
+            allow_write: true,
+            allow_delete: true,
+            allow_manage: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_access_key.status(), StatusCode::CREATED);
+    let create_access_key_body = to_bytes(create_access_key.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_access_key: super::CreateS3AccessKeyResponse =
+        serde_json::from_slice(&create_access_key_body).unwrap();
+
+    let scope =
+        super::transport_service::TransportExecutionScope::Internal(super::InternalCaller {
+            node_id: NodeId::new_v4(),
+            cluster_id: state.cluster_id,
+        });
+    let host = "photos.example.s3.local";
+
+    let put_object_request = s3_transport_request_with_host(
+        Method::PUT,
+        "/transport.txt",
+        "/s3/transport.txt",
+        host,
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[("content-type", "text/plain")],
+        Bytes::from_static(b"transported through virtual host"),
+    );
+    let put_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &put_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(put_object.status, StatusCode::OK.as_u16());
+
+    let list_objects_request = s3_transport_request_with_host(
+        Method::GET,
+        "/?list-type=2&prefix=transport",
+        "/s3/?list-type=2&prefix=transport",
+        host,
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let list_objects = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &list_objects_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(list_objects.status, StatusCode::OK.as_u16());
+    let list_objects_xml = String::from_utf8(list_objects.body).unwrap();
+    assert!(list_objects_xml.contains("<Key>transport.txt</Key>"));
+
+    let get_object_request = s3_transport_request_with_host(
+        Method::GET,
+        "/transport.txt",
+        "/s3/transport.txt",
+        host,
+        &created_access_key.access_key_id,
+        &created_access_key.secret_access_key,
+        &[],
+        Bytes::new(),
+    );
+    let get_object = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &scope,
+        &get_object_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(get_object.status, StatusCode::OK.as_u16());
+    assert_eq!(
+        get_object.body.as_slice(),
+        b"transported through virtual host"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    s3_transport_executes_virtual_hosted_listener_requests_impl,
+    s3_transport_executes_virtual_hosted_listener_requests,
+    s3_transport_executes_virtual_hosted_listener_requests_turso
+);
+
 async fn s3_transport_executes_listener_requests_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
@@ -5512,6 +5927,12 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
                 public_direct_urls: vec!["https://127.0.0.1:9".to_string()],
                 peer_api_url: Some("https://127.0.0.1:49080".to_string()),
                 peer_direct_urls: vec!["https://127.0.0.1:49080".to_string()],
+                peer_direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://127.0.0.1:49080".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -5533,6 +5954,12 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
                 public_direct_urls: vec![public_url.clone()],
                 peer_api_url: Some("https://127.0.0.1:10009".to_string()),
                 peer_direct_urls: vec!["https://127.0.0.1:10009".to_string()],
+                peer_direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://127.0.0.1:10009".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -13154,6 +13581,7 @@ async fn build_test_state(
                 rendezvous_controls: Vec::new(),
             })),
             peer_relay_sessions: super::PeerRelaySessionPool::default(),
+            direct_quic: None,
         },
         maintenance: super::ServerMaintenanceRuntime {
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -14373,6 +14801,27 @@ async fn rendezvous_presence_registration_keeps_public_api_but_excludes_public_d
 }
 
 #[tokio::test]
+async fn rendezvous_presence_registration_includes_direct_quic_candidate_when_runtime_active() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let direct_quic_candidate = install_direct_quic_runtime(&mut state).await;
+
+    let registration = build_rendezvous_presence_registration(&state, None);
+
+    assert!(
+        registration
+            .capabilities
+            .contains(&transport_sdk::TransportCapability::DirectQuic)
+    );
+    assert!(registration.direct_candidates.iter().any(|candidate| {
+        candidate.kind == transport_sdk::CandidateKind::DirectQuic
+            && candidate.endpoint == direct_quic_candidate.endpoint
+            && candidate.transport_hints == direct_quic_candidate.transport_hints
+    }));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     let entry = transport_sdk::PresenceEntry {
         registration: transport_sdk::PresenceRegistration {
@@ -14421,6 +14870,44 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     );
     assert_eq!(descriptor.capacity_bytes, 100);
     assert_eq!(descriptor.free_bytes, 40);
+}
+
+#[tokio::test]
+async fn rendezvous_presence_entry_projects_direct_quic_only_node_descriptor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let direct_quic_candidate = install_direct_quic_runtime(&mut state).await;
+    let node_id = NodeId::new_v4();
+    let entry = transport_sdk::PresenceEntry {
+        registration: transport_sdk::PresenceRegistration {
+            cluster_id: uuid::Uuid::now_v7(),
+            identity: transport_sdk::PeerIdentity::Node(node_id),
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            direct_candidates: vec![direct_quic_candidate.clone()],
+            labels: HashMap::new(),
+            capacity_bytes: Some(10),
+            free_bytes: Some(4),
+            capabilities: vec![transport_sdk::TransportCapability::DirectQuic],
+            relay_mode: transport_sdk::RelayMode::Disabled,
+            connected_at_unix: 123,
+        },
+        updated_at_unix: 456,
+        observed_source_addr: None,
+    };
+
+    let descriptor = node_descriptor_from_presence_entry(&entry)
+        .expect("direct QUIC presence entry should project into a node descriptor");
+
+    assert_eq!(descriptor.node_id, node_id);
+    assert_eq!(descriptor.peer_api_url(), None);
+    assert_eq!(
+        descriptor.reachability.peer_direct_candidates,
+        vec![direct_quic_candidate]
+    );
+    assert!(descriptor.capabilities.peer_api);
+
+    cleanup_test_state(&state).await;
 }
 
 #[tokio::test]
@@ -15292,6 +15779,53 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
 }
 
 #[tokio::test]
+async fn plan_peer_transport_prefers_direct_quic_when_runtime_is_active() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let remote_candidate = install_direct_quic_runtime(&mut state).await;
+    let node = cluster::NodeDescriptor {
+        node_id: NodeId::new_v4(),
+        reachability: cluster::NodeReachability {
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: Some("https://fallback.example".to_string()),
+            peer_direct_urls: vec!["https://fallback.example".to_string()],
+            peer_direct_candidates: vec![
+                remote_candidate,
+                transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://fallback.example".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                },
+            ],
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: false,
+            peer_api: true,
+            relay_tunnel: true,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    };
+
+    let plan = plan_peer_transport(&state, &node)
+        .expect("peer transport should prefer direct QUIC when available");
+
+    assert_eq!(plan.path_kind, transport_sdk::TransportPathKind::DirectQuic);
+    assert_eq!(
+        plan.candidate.as_ref().map(|candidate| candidate.kind),
+        Some(transport_sdk::CandidateKind::DirectQuic)
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
@@ -15443,6 +15977,100 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
 
     relay_handle.abort();
     let _ = relay_handle.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn execute_peer_request_routes_direct_quic_over_iroh() {
+    let mut source = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let source_candidate = install_direct_quic_runtime(&mut source).await;
+
+    let mut target = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    target.cluster_id = source.cluster_id;
+    let target_candidate = install_direct_quic_runtime(&mut target).await;
+
+    let remote_node =
+        register_direct_quic_cluster_node(&source, target.node_id, target_candidate.clone()).await;
+    register_direct_quic_cluster_node(&target, source.node_id, source_candidate).await;
+
+    let plan = plan_peer_transport(&source, &remote_node)
+        .expect("peer transport should plan direct QUIC for a direct QUIC peer");
+    assert_eq!(plan.path_kind, transport_sdk::TransportPathKind::DirectQuic);
+
+    let target_accept_state = target.clone();
+    let _accept_handle = tokio::spawn(async move {
+        let direct_quic = target_accept_state
+            .network
+            .direct_quic
+            .clone()
+            .expect("target direct QUIC runtime should exist");
+        let session = direct_quic
+            .endpoint
+            .accept_session(transport_sdk::MultiplexConfig::default())
+            .await
+            .expect("target direct QUIC accept should succeed")
+            .expect("target direct QUIC accept should yield a session");
+        let _ = super::serve_direct_quic_multiplex_session(target_accept_state, session).await;
+    });
+    tokio::task::yield_now().await;
+
+    let response = super::execute_peer_request(
+        &source,
+        &remote_node,
+        reqwest::Method::GET,
+        "/cluster/availability/subjects/local",
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .expect("direct QUIC peer request should succeed");
+
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    let payload = response
+        .json::<super::LocalAvailableSubjectsResponse>()
+        .expect("direct QUIC response should decode");
+    assert_eq!(payload.node_id, target.node_id);
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+#[tokio::test]
+async fn direct_quic_transport_accepts_device_clients() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let candidate = install_direct_quic_runtime(&mut state).await;
+    super::spawn_direct_quic_multiplex_agent(state.clone());
+    tokio::task::yield_now().await;
+
+    let mut identity = transport_sdk::ClientIdentityMaterial::generate(
+        state.cluster_id,
+        None,
+        Some("direct-quic-device".to_string()),
+    )
+    .expect("client identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+
+    let client = client_sdk::IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+        candidate,
+        Some(state.node_id),
+    )
+    .with_client_identity(identity);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get_json_path("/cluster/status"),
+    )
+    .await
+    .expect("direct QUIC request should not stall")
+    .expect("direct QUIC request should succeed");
+
+    assert_eq!(
+        response
+            .get("local_node_id")
+            .and_then(|value| value.as_str()),
+        Some(state.node_id.to_string().as_str())
+    );
+
     cleanup_test_state(&state).await;
 }
 
@@ -16047,6 +16675,12 @@ async fn execute_peer_request_streams_object_reads_over_relay() {
                 public_direct_urls: Vec::new(),
                 peer_api_url: Some("https://relay-object-read-remote-internal.example".to_string()),
                 peer_direct_urls: Vec::new(),
+                peer_direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://relay-object-read-remote-internal.example".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -16464,6 +17098,7 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
 }
 
 async fn cleanup_test_state(state: &ServerState) {
+    super::shutdown_direct_quic_runtime(state).await;
     let root = {
         let store = lock_store(state, "tests.state.store").await;
         store.root_dir().to_path_buf()

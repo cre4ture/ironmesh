@@ -81,6 +81,25 @@ type MediaThumbnailPreviewProps = {
 
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
 const videoExtensions = [".m4v", ".mkv", ".mov", ".mp4", ".ogv", ".webm"];
+const browserInlineImageMimeTypes = new Set([
+  "image/avif",
+  "image/bmp",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/svg+xml",
+  "image/webp"
+]);
+const browserInlineImageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"];
+const browserUnsupportedInlineImageMimeTypes = new Set([
+  "image/heic",
+  "image/heic-sequence",
+  "image/heif",
+  "image/heif-sequence",
+  "image/tiff",
+  "image/x-tiff"
+]);
+const browserUnsupportedInlineImageExtensions = [".heic", ".heif", ".tif", ".tiff"];
 const LIGHTBOX_STRIP_RADIUS = 3;
 const MEDIA_IMAGE_ZOOM_MIN_SCALE = 1;
 const MEDIA_IMAGE_ZOOM_MAX_SCALE = 6;
@@ -451,6 +470,31 @@ export function resolveMediaKind(
   return null;
 }
 
+function isBrowserInlineImagePreviewUnsupported(
+  path: string,
+  mimeType?: string | null
+): boolean {
+  const normalizedMimeType = mimeType?.trim().toLowerCase() ?? "";
+  if (normalizedMimeType) {
+    if (browserInlineImageMimeTypes.has(normalizedMimeType)) {
+      return false;
+    }
+    if (browserUnsupportedInlineImageMimeTypes.has(normalizedMimeType)) {
+      return true;
+    }
+  }
+
+  const lowerPath = path.toLowerCase();
+  if (browserInlineImageExtensions.some((extension) => lowerPath.endsWith(extension))) {
+    return false;
+  }
+  if (browserUnsupportedInlineImageExtensions.some((extension) => lowerPath.endsWith(extension))) {
+    return true;
+  }
+
+  return false;
+}
+
 export function defaultMediaMissingThumbnailInfo(kind: MediaKind): MediaMissingThumbnailInfo {
   return kind === "video"
     ? {
@@ -501,6 +545,10 @@ function MediaLightboxImage({
   const thumbnailRequest = item.requests.thumbnail ?? null;
   const thumbnail = useResolvedMediaPreviewRequest(thumbnailRequest);
   const originalRequest = item.requests.original;
+  const originalPreviewUnsupported = isBrowserInlineImagePreviewUnsupported(
+    item.description || item.alt,
+    item.mimeType
+  );
   const original = useResolvedMediaPreviewRequest(originalRequest);
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [originalFailed, setOriginalFailed] = useState(false);
@@ -537,9 +585,13 @@ function MediaLightboxImage({
   }, [originalSignature]);
 
   const thumbnailVisible = Boolean(thumbnail.resolvedSrc) && !thumbnail.failed && !thumbnailFailed;
-  const originalVisible = Boolean(original.resolvedSrc) && !original.failed && !originalFailed;
-  const fullImageUnavailable = original.failed || originalFailed;
-  const originalPending = !fullImageUnavailable && !originalLoaded;
+  const originalVisible =
+    !originalPreviewUnsupported &&
+    Boolean(original.resolvedSrc) &&
+    !original.failed &&
+    !originalFailed;
+  const fullImageUnavailable = !originalPreviewUnsupported && (original.failed || originalFailed);
+  const originalPending = !originalPreviewUnsupported && !fullImageUnavailable && !originalLoaded;
   const thumbnailLoadFailed = Boolean(thumbnailRequest) && (thumbnail.failed || thumbnailFailed);
   const thumbnailNotice = thumbnailLoadFailed
     ? {
@@ -548,6 +600,11 @@ function MediaLightboxImage({
         color: "yellow"
       }
     : item.missingThumbnailInfo;
+  const inlineFallbackNotice = originalPreviewUnsupported
+    ? thumbnailVisible
+      ? "Browser cannot preview the original format, showing thumbnail"
+      : "Browser cannot preview the original image format"
+    : null;
   const imageTransform = `translate(${zoomState.offsetX}px, ${zoomState.offsetY}px) scale(${zoomState.scale})`;
 
   function measureZoomMetrics() {
@@ -830,7 +887,7 @@ function MediaLightboxImage({
         </div>
       ) : null}
 
-      {fullImageUnavailable ? (
+      {fullImageUnavailable || inlineFallbackNotice ? (
         <div
           style={{
             position: "absolute",
@@ -838,8 +895,10 @@ function MediaLightboxImage({
             bottom: 16
           }}
         >
-          <Badge color="yellow" variant="filled">
-            Full image unavailable, showing thumbnail
+          <Badge color={fullImageUnavailable ? "yellow" : "gray"} variant="filled">
+            {fullImageUnavailable
+              ? "Full image unavailable, showing thumbnail"
+              : inlineFallbackNotice}
           </Badge>
         </div>
       ) : null}

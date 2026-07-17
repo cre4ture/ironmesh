@@ -3,7 +3,7 @@ use crate::storage::{ObjectVersionInspection, ObjectVersionMetadataRecord, S3Obj
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
 use axum::http::{HeaderName, Method, Request, StatusCode, Uri};
-use axum::routing::get;
+use axum::routing::{any, get};
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use sha2::{Digest, Sha256};
@@ -170,6 +170,13 @@ enum S3DeleteExecutionError {
 
 pub(crate) fn build_listener_app() -> Router<ServerState> {
     Router::new()
+        .route("/", any(dispatch_listener_request))
+        .route("/{*path}", any(dispatch_listener_request))
+        .layer(DefaultBodyLimit::disable())
+}
+
+fn build_path_style_listener_app() -> Router<ServerState> {
+    Router::new()
         .route("/", get(list_buckets))
         .route(
             "/{bucket}",
@@ -196,6 +203,82 @@ pub(crate) fn build_listener_app() -> Router<ServerState> {
                 .post(post_object),
         )
         .layer(DefaultBodyLimit::disable())
+}
+
+async fn dispatch_listener_request(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let rewritten_uri = virtual_hosted_listener_uri(&state, &headers, &uri).unwrap_or(uri.clone());
+    let mut request = Request::builder()
+        .method(method)
+        .uri(rewritten_uri)
+        .body(Body::from(body))
+        .expect("S3 listener dispatch uses valid methods and URIs");
+    *request.headers_mut() = headers;
+    request.extensions_mut().insert(OriginalUri(uri.clone()));
+
+    match build_path_style_listener_app()
+        .with_state(state)
+        .oneshot(request)
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => s3_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("failed dispatching S3 listener request: {err}"),
+            uri.path(),
+            &new_s3_request_id(),
+        ),
+    }
+}
+
+fn virtual_hosted_listener_uri(state: &ServerState, headers: &HeaderMap, uri: &Uri) -> Option<Uri> {
+    let bucket_name = virtual_hosted_bucket_name(state, headers)?;
+    let rewritten_path = match uri.path() {
+        "" | "/" => format!("/{bucket_name}"),
+        path => format!("/{bucket_name}{path}"),
+    };
+    let rewritten_uri = match uri.query() {
+        Some(query) => format!("{rewritten_path}?{query}"),
+        None => rewritten_path,
+    };
+    rewritten_uri.parse().ok()
+}
+
+fn virtual_hosted_bucket_name(state: &ServerState, headers: &HeaderMap) -> Option<String> {
+    let public_url = state.s3.public_url.as_deref()?;
+    let public_uri = public_url.parse::<Uri>().ok()?;
+    let public_authority = public_uri.authority()?;
+    let endpoint_host = public_authority
+        .host()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if endpoint_host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+
+    let request_host = header_value(headers, header::HOST)?;
+    let request_authority = request_host.parse::<axum::http::uri::Authority>().ok()?;
+    if let Some(endpoint_port) = public_authority.port_u16()
+        && request_authority.port_u16() != Some(endpoint_port)
+    {
+        return None;
+    }
+
+    let request_host = request_authority
+        .host()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let bucket_name = request_host
+        .strip_suffix(&format!(".{endpoint_host}"))?
+        .to_string();
+    normalize_s3_bucket_name(&bucket_name).ok()?;
+    Some(bucket_name)
 }
 
 pub(crate) fn is_transport_path(path: &str) -> bool {

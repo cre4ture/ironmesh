@@ -60,9 +60,9 @@ private struct IronmeshMainShellView: View {
                     Label("Library", systemImage: "books.vertical")
                 }
 
-            IronmeshSyncView()
+            IronmeshFilesView()
                 .tabItem {
-                    Label("Sync", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
+                    Label("Files", systemImage: "folder.badge.gearshape")
                 }
 
             IronmeshSettingsView()
@@ -408,7 +408,7 @@ private struct IronmeshLibraryView: View {
     }
 }
 
-private struct IronmeshSyncView: View {
+private struct IronmeshFilesView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
     @State private var showsFilesPicker = false
 
@@ -422,12 +422,14 @@ private struct IronmeshSyncView: View {
                         tone: model.domainState.isRegistered ? .good : .warning
                     ) {
                         HStack {
-                            Button("Register domain") {
-                                model.registerDomain()
+                            if !model.domainState.isRegistered {
+                                Button("Register domain") {
+                                    model.registerDomain()
+                                }
+                                .buttonStyle(.borderedProminent)
                             }
-                            .buttonStyle(.borderedProminent)
 
-                            Button("Check domain") {
+                            Button(model.domainState.isRegistered ? "Refresh status" : "Check domain") {
                                 model.refreshDomainState()
                             }
                             .buttonStyle(.bordered)
@@ -439,7 +441,7 @@ private struct IronmeshSyncView: View {
                         }
                     }
 
-                    IronmeshCard(title: "Files & domain integration", subtitle: "Pragmatic iOS handoff without inventing a local mirror.") {
+                    IronmeshCard(title: "Files & domain integration", subtitle: "This slice registers the File Provider domain and shares connection state with the extension.") {
                         IronmeshKeyValueRow(label: "Display name", value: model.draft.domainDisplayName)
                         IronmeshKeyValueRow(label: "Identifier", value: model.draft.domainIdentifier)
                         Text(model.filesIntegrationNote)

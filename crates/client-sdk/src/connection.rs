@@ -13,7 +13,9 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
-use transport_sdk::{ClientIdentityMaterial, RendezvousClientConfig, TransportPathKind};
+use transport_sdk::{
+    ClientIdentityMaterial, ConnectionCandidate, RendezvousClientConfig, TransportPathKind,
+};
 
 use crate::latency_probe::LatencyProbeConfig;
 use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
@@ -151,16 +153,33 @@ pub fn build_http_client_with_identity_from_planned_target(
     target: &PlannedConnectionBootstrapTarget,
     identity: &ClientIdentityMaterial,
 ) -> Result<IronMeshClient> {
-    if let Some(server_base_url) = planned_target_direct_http_base_url(target)? {
-        return build_http_client_with_identity_from_pem_with_target_node_id(
-            target
-                .server_ca_pem
-                .as_deref()
-                .or(target.cluster_ca_pem.as_deref()),
-            server_base_url,
-            identity,
-            target.target_node_id,
-        );
+    match target.path_kind {
+        TransportPathKind::DirectHttps => {
+            let server_base_url =
+                planned_target_direct_http_base_url(target)?.ok_or_else(|| {
+                    anyhow!("direct HTTPS client transport target is missing server_base_url")
+                })?;
+            return build_http_client_with_identity_from_pem_with_target_node_id(
+                target
+                    .server_ca_pem
+                    .as_deref()
+                    .or(target.cluster_ca_pem.as_deref()),
+                server_base_url,
+                identity,
+                target.target_node_id,
+            );
+        }
+        TransportPathKind::DirectQuic => {
+            let candidate = planned_target_direct_quic_candidate(target)?;
+            return Ok(
+                IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+                    candidate.clone(),
+                    target.target_node_id,
+                )
+                .with_client_identity(identity.clone()),
+            );
+        }
+        TransportPathKind::RelayTunnel => {}
     }
 
     let target_node_id = target
@@ -275,6 +294,12 @@ pub fn build_client_with_optional_identity_from_planned_target(
     match identity {
         Some(identity) => build_http_client_with_identity_from_planned_target(target, identity),
         None => {
+            if target.path_kind == TransportPathKind::DirectQuic {
+                bail!(
+                    "direct QUIC client transport target {} requires enrolled client identity material",
+                    planned_target_label(target)
+                );
+            }
             if let Some(server_base_url) = planned_target_direct_http_base_url(target)? {
                 return build_http_client_from_pem_with_target_node_id(
                     target
@@ -518,7 +543,7 @@ fn planned_target_direct_http_base_url(
             })
         }
         TransportPathKind::DirectQuic => bail!(
-            "direct QUIC client transport target {} is not supported until a native QUIC transport is implemented",
+            "direct QUIC client transport target {} requires enrolled client identity material",
             planned_target_label(target)
         ),
         TransportPathKind::RelayTunnel => {
@@ -533,10 +558,33 @@ fn planned_target_direct_http_base_url(
     }
 }
 
+fn planned_target_direct_quic_candidate(
+    target: &PlannedConnectionBootstrapTarget,
+) -> Result<&ConnectionCandidate> {
+    if target.path_kind != TransportPathKind::DirectQuic {
+        bail!(
+            "direct QUIC candidate requested for non-QUIC target {}",
+            planned_target_label(target)
+        );
+    }
+    target.direct_candidate.as_ref().ok_or_else(|| {
+        anyhow!(
+            "direct QUIC client transport target {} is missing direct_candidate",
+            planned_target_label(target)
+        )
+    })
+}
+
 fn planned_target_label(target: &PlannedConnectionBootstrapTarget) -> String {
     target
         .server_base_url
         .clone()
+        .or_else(|| {
+            target
+                .direct_candidate
+                .as_ref()
+                .map(|candidate| candidate.endpoint.clone())
+        })
         .or_else(|| {
             target
                 .target_node_id
@@ -585,8 +633,8 @@ mod tests {
     use super::*;
     use common::NodeId;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use transport_sdk::RelayMode;
-    use transport_sdk::TransportPathKind;
+    use transport_sdk::candidates::ConnectionCandidateTransportHints;
+    use transport_sdk::{CandidateKind, DEFAULT_DIRECT_QUIC_ALPN, RelayMode, TransportPathKind};
     use uuid::Uuid;
 
     fn sample_identity() -> ClientIdentityMaterial {
@@ -641,6 +689,7 @@ mod tests {
                 rendezvous_mtls_required: false,
                 relay_mode: RelayMode::Fallback,
                 path_kind: TransportPathKind::DirectHttps,
+                direct_candidate: None,
                 server_base_url: Some("https://node-a.example".to_string()),
                 target_node_id: Some(NodeId::new_v4()),
                 server_ca_pem: None,
@@ -668,6 +717,7 @@ mod tests {
                 rendezvous_mtls_required: false,
                 relay_mode: RelayMode::Required,
                 path_kind: TransportPathKind::RelayTunnel,
+                direct_candidate: None,
                 server_base_url: None,
                 target_node_id: None,
                 server_ca_pem: None,
@@ -700,6 +750,7 @@ mod tests {
                 rendezvous_mtls_required: true,
                 relay_mode: RelayMode::Required,
                 path_kind: TransportPathKind::RelayTunnel,
+                direct_candidate: None,
                 server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
                 server_ca_pem: None,
@@ -723,16 +774,28 @@ mod tests {
     }
 
     #[test]
-    fn build_http_client_with_identity_from_planned_target_rejects_direct_quic() {
+    fn build_http_client_with_identity_from_planned_target_builds_direct_quic_transport() {
         let identity = sample_identity();
-        let error = match build_http_client_with_identity_from_planned_target(
+        let client = build_http_client_with_identity_from_planned_target(
             &PlannedConnectionBootstrapTarget {
                 cluster_id: identity.cluster_id,
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 relay_mode: RelayMode::Fallback,
                 path_kind: TransportPathKind::DirectQuic,
-                server_base_url: Some("https://node-a.example:4433".to_string()),
+                direct_candidate: Some(ConnectionCandidate {
+                    kind: CandidateKind::DirectQuic,
+                    endpoint: "iroh://peer-key-1".to_string(),
+                    rtt_ms: Some(8),
+                    transport_hints: Some(ConnectionCandidateTransportHints {
+                        transport_id: Some("peer-key-1".to_string()),
+                        relay_url: Some("https://relay.example".to_string()),
+                        alpn: Some(DEFAULT_DIRECT_QUIC_ALPN.to_string()),
+                        direct_socket_addrs: vec!["127.0.0.1:7000".to_string()],
+                        observed_socket_addrs: Vec::new(),
+                    }),
+                }),
+                server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
                 server_ca_pem: None,
                 cluster_ca_pem: None,
@@ -742,14 +805,15 @@ mod tests {
                 device_id: None,
             },
             &identity,
-        ) {
-            Ok(_) => panic!("direct QUIC target should fail closed until transport exists"),
-            Err(error) => error,
-        };
+        )
+        .expect("direct QUIC target should build with client identity");
 
-        assert!(error.to_string().contains(
-            "direct QUIC client transport target https://node-a.example:4433 is not supported"
-        ));
+        assert!(!client.uses_relay_transport());
+        assert!(client.direct_server_base_url().is_none());
+        assert_eq!(
+            client.connection_diagnostics().endpoints[0].locator,
+            "iroh://peer-key-1"
+        );
     }
 
     #[test]
@@ -762,7 +826,13 @@ mod tests {
                 rendezvous_mtls_required: false,
                 relay_mode: RelayMode::Fallback,
                 path_kind: TransportPathKind::DirectQuic,
-                server_base_url: Some("https://node-a.example:4433".to_string()),
+                direct_candidate: Some(ConnectionCandidate {
+                    kind: CandidateKind::DirectQuic,
+                    endpoint: "iroh://peer-key-1".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }),
+                server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
                 server_ca_pem: None,
                 cluster_ca_pem: None,
@@ -778,7 +848,7 @@ mod tests {
         };
 
         assert!(error.to_string().contains(
-            "direct QUIC client transport target https://node-a.example:4433 is not supported"
+            "direct QUIC client transport target iroh://peer-key-1 requires enrolled client identity material"
         ));
     }
 
@@ -791,7 +861,13 @@ mod tests {
                 rendezvous_mtls_required: false,
                 relay_mode: RelayMode::Fallback,
                 path_kind: TransportPathKind::DirectQuic,
-                server_base_url: Some("https://node-a.example:4433".to_string()),
+                direct_candidate: Some(ConnectionCandidate {
+                    kind: CandidateKind::DirectQuic,
+                    endpoint: "iroh://peer-key-1".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }),
+                server_base_url: None,
                 target_node_id: Some(NodeId::new_v4()),
                 server_ca_pem: None,
                 cluster_ca_pem: None,
@@ -805,7 +881,7 @@ mod tests {
             };
 
         assert!(error.to_string().contains(
-            "direct QUIC client transport target https://node-a.example:4433 is not supported"
+            "direct QUIC client transport target iroh://peer-key-1 requires enrolled client identity material"
         ));
     }
 }

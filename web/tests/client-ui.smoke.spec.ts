@@ -315,7 +315,19 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Fullscreen map" }).click();
   await expect(page.getByRole("button", { name: "Exit fullscreen map" })).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+  expect(
+    await page
+      .locator('[aria-label="Geotagged gallery map"]')
+      .evaluate((element) => element.parentElement?.tagName)
+  ).toBe("BODY");
+  const mapMarkerButton = page.getByRole("button", { name: "Open map marker for gallery/cat.png" });
+  await expect(mapMarkerButton).toBeVisible();
+  expect(
+    await mapMarkerButton.evaluate(
+      (element) => element.closest(".maplibregl-canvas-container") !== null
+    )
+  ).toBe(true);
+  await mapMarkerButton.click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
@@ -453,6 +465,28 @@ test("client-ui gallery cards stay compact on narrow viewports", async ({ page }
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByLabel("Show metadata")).not.toBeChecked();
   await expect(page.locator('[data-gallery-card-metadata="true"]')).toHaveCount(0);
+});
+
+test("client-ui gallery lightbox skips unsupported iOS originals and keeps the thumbnail fallback", async ({
+  page
+}) => {
+  const mockState = await installClientUiMocks(page, {
+    storeEntries: createHeicGalleryMockStoreEntries()
+  });
+
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  await page.getByText("gallery/ios-photo.heic", { exact: true }).click();
+
+  const galleryDialog = page.getByRole("dialog");
+  await expect(galleryDialog).toBeVisible();
+  await expect(page.getByText("Loading original image")).toHaveCount(0);
+  await expect(page.getByText("Full image unavailable, showing thumbnail")).toHaveCount(0);
+  await expect(
+    page.getByText("Browser cannot preview the original format, showing thumbnail")
+  ).toBeVisible();
+  expect(mockState.requestedPaths()).not.toContain(apiV1("/store/stream-binary"));
 });
 
 test("client-ui gallery virtual pages do not keep oversized spacer heights after sidebar resizing", async ({
@@ -943,7 +977,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       return json(route, buildMockStoreListResponse(storeEntries, searchParams));
     }
 
-    if (pathname === apiV1("/media/thumbnail") && method === "GET") {
+    if ((pathname === apiV1("/media/thumbnail") || pathname === "/media/thumbnail") && method === "GET") {
       await route.fulfill({
         status: 200,
         contentType: "image/png",
@@ -1069,6 +1103,14 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
           status: 200,
           contentType: "image/png",
           body: imageBody
+        });
+        return;
+      }
+      if (searchParams.get("key") === "gallery/ios-photo.heic") {
+        await route.fulfill({
+          status: 200,
+          contentType: "image/heic",
+          body: Buffer.from("mock-heic-payload")
         });
         return;
       }
@@ -1255,6 +1297,41 @@ function createGalleryPaginationMockStoreEntries(mediaCount: number): MockStoreE
       };
     })
   ];
+}
+
+function createHeicGalleryMockStoreEntries(): MockStoreEntry[] {
+  return createMockStoreEntries().map((entry) => {
+    if (entry.path !== "gallery/cat.png" || !entry.media) {
+      return entry;
+    }
+
+    return {
+      ...entry,
+      path: "gallery/ios-photo.heic",
+      size_bytes: 2_621_440,
+      modified_at_unix: 1_712_360_000,
+      media: {
+        ...entry.media,
+        content_fingerprint: "fingerprint-ios-photo",
+        mime_type: "image/heic",
+        width: 4032,
+        height: 3024,
+        taken_at_unix: 1_712_359_900,
+        gps: {
+          latitude: 37.7858,
+          longitude: -122.4064
+        },
+        thumbnail: {
+          url: "/media/thumbnail?key=gallery%2Fios-photo.heic",
+          profile: "grid",
+          width: 256,
+          height: 192,
+          format: "jpeg",
+          size_bytes: 1234
+        }
+      }
+    };
+  });
 }
 
 function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URLSearchParams) {

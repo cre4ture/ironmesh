@@ -11,6 +11,7 @@ use axum::{
     routing::{get, post, put},
 };
 use futures_util::{Sink, Stream, StreamExt};
+use iroh::SecretKey;
 use std::pin::Pin;
 use std::sync::{
     Arc, Barrier,
@@ -19,13 +20,13 @@ use std::sync::{
 use std::task::{Context, Poll};
 use tokio::sync::Mutex;
 use transport_sdk::{
-    BufferedTransportResponse as MultiplexBufferedTransportResponse, DecodedWebSocketMessage,
-    MultiplexConfig, MultiplexMode, MultiplexedSession, RelayHttpHeader, RelayTicket,
-    RelayTicketRequest, RelayTunnelControlMessage, RelayTunnelSession, RelayTunnelSessionKind,
-    RendezvousClientConfig, RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
-    TransportResponseHead, TransportSessionControlMessage, TransportSessionRole,
-    TransportStreamKind, WebSocketByteStream, WebSocketMessageCodec,
-    perform_transport_server_handshake, read_buffered_transport_request,
+    BufferedTransportResponse as MultiplexBufferedTransportResponse, ConnectionCandidate,
+    DecodedWebSocketMessage, DirectQuicEndpoint, DirectQuicEndpointConfig, MultiplexConfig,
+    MultiplexMode, MultiplexedSession, RelayHttpHeader, RelayTicket, RelayTicketRequest,
+    RelayTunnelControlMessage, RelayTunnelSession, RelayTunnelSessionKind, RendezvousClientConfig,
+    RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportResponseHead,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind, WebSocketByteStream,
+    WebSocketMessageCodec, perform_transport_server_handshake, read_buffered_transport_request,
     write_buffered_transport_response, write_transport_response_head,
 };
 
@@ -1710,6 +1711,114 @@ fn direct_transport_test_client(
     IronMeshClient::from_direct_base_url(state.public_url.clone()).with_client_identity(identity)
 }
 
+#[derive(Clone)]
+struct DirectQuicTestState {
+    candidate: ConnectionCandidate,
+    captured_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
+    health_hits: Arc<AtomicUsize>,
+    paired_session_count: Arc<AtomicUsize>,
+    response_status: u16,
+    response_headers: Vec<RelayHttpHeader>,
+    response_body: Vec<u8>,
+}
+
+async fn spawn_direct_quic_transport_test_server(
+    response_status: u16,
+    response_headers: Vec<RelayHttpHeader>,
+    response_body: Vec<u8>,
+    expected_target_node_id: NodeId,
+) -> (DirectQuicTestState, tokio::task::JoinHandle<()>) {
+    let endpoint = DirectQuicEndpoint::bind(DirectQuicEndpointConfig::new(SecretKey::generate()))
+        .await
+        .expect("direct QUIC test endpoint should bind");
+    let state = DirectQuicTestState {
+        candidate: endpoint.candidate(),
+        captured_request: Arc::new(Mutex::new(None)),
+        health_hits: Arc::new(AtomicUsize::new(0)),
+        paired_session_count: Arc::new(AtomicUsize::new(0)),
+        response_status,
+        response_headers,
+        response_body,
+    };
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        let Some(mut accepted) = endpoint
+            .accept_session(MultiplexConfig::default())
+            .await
+            .expect("direct QUIC test accept should succeed")
+        else {
+            return;
+        };
+        server_state
+            .paired_session_count
+            .fetch_add(1, Ordering::SeqCst);
+        let hello = perform_transport_server_handshake(
+            &mut accepted.session,
+            TransportSessionControlMessage::Ready {
+                protocol_version: TRANSPORT_PROTOCOL_VERSION,
+                session_id: format!("direct-quic-session-{}", uuid::Uuid::now_v7()),
+                max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+            },
+        )
+        .await
+        .expect("direct QUIC handshake should succeed");
+        assert!(matches!(
+            hello,
+            TransportSessionControlMessage::Hello {
+                role: TransportSessionRole::Client,
+                target: Some(PeerIdentity::Node(node_id)),
+                ..
+            } if node_id == expected_target_node_id
+        ));
+
+        while let Some(mut stream) = accepted
+            .session
+            .accept_stream()
+            .await
+            .expect("direct QUIC request stream should accept")
+        {
+            let request = read_buffered_transport_request(&mut stream)
+                .await
+                .expect("direct QUIC request should decode");
+            if request.path == "/api/v1/health" {
+                server_state.health_hits.fetch_add(1, Ordering::SeqCst);
+            }
+            *server_state.captured_request.lock().await = Some(capture_transport_request(&request));
+            write_buffered_transport_response(
+                &mut stream,
+                &MultiplexBufferedTransportResponse {
+                    request_id: request.request_id,
+                    status: server_state.response_status,
+                    headers: server_state
+                        .response_headers
+                        .iter()
+                        .map(|header| TransportHeader {
+                            name: header.name.clone(),
+                            value: header.value.clone(),
+                        })
+                        .collect(),
+                    body: server_state.response_body.clone(),
+                },
+            )
+            .await
+            .expect("direct QUIC response should write");
+        }
+    });
+    (state, server)
+}
+
+fn direct_quic_transport_test_client(
+    state: &DirectQuicTestState,
+    identity: ClientIdentityMaterial,
+    target_node_id: NodeId,
+) -> IronMeshClient {
+    IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+        state.candidate.clone(),
+        Some(target_node_id),
+    )
+    .with_client_identity(identity)
+}
+
 fn relay_test_client(
     state: &RelayTestState,
     identity: ClientIdentityMaterial,
@@ -2339,6 +2448,80 @@ async fn direct_transport_executes_and_reuses_multiplexed_session() {
                 && header.value == identity.device_id.to_string())
     );
 
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
+    let target_node_id = NodeId::new_v4();
+    let (direct_state, server) = spawn_direct_quic_transport_test_server(
+        200,
+        vec![
+            RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            },
+            RelayHttpHeader {
+                name: "content-length".to_string(),
+                value: br#"{"status":"ok","route":"direct-quic"}"#.len().to_string(),
+            },
+        ],
+        br#"{"status":"ok","route":"direct-quic"}"#.to_vec(),
+        target_node_id,
+    )
+    .await;
+
+    let test_result = async {
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-quic-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+
+        let client = direct_quic_transport_test_client(&direct_state, identity, target_node_id);
+        let response = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("direct QUIC request should succeed");
+        assert_eq!(response["route"], "direct-quic");
+
+        let diagnostics = client.connection_diagnostics();
+        assert_eq!(diagnostics.endpoints.len(), 1);
+        assert_eq!(diagnostics.endpoints[0].path_kind, "direct");
+        assert_eq!(
+            diagnostics.endpoints[0].transport_path_kind.as_deref(),
+            Some("direct_quic")
+        );
+        assert_eq!(
+            diagnostics.endpoints[0].locator,
+            direct_state.candidate.endpoint
+        );
+        assert_eq!(
+            diagnostics.endpoints[0].request_base_url,
+            direct_state.candidate.endpoint
+        );
+        assert_eq!(client.transport_session_pool_snapshot().connect_count, 1);
+        assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        let captured = direct_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct QUIC request should be captured");
+        assert_eq!(captured.path_and_query, "/api/v1/cluster/status");
+        assert!(
+            captured
+                .headers
+                .iter()
+                .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID)
+        );
+    };
+
+    test_result.await;
     server.abort();
     let _ = server.await;
 }
