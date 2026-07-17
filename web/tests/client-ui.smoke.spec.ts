@@ -315,7 +315,14 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Fullscreen map" }).click();
   await expect(page.getByRole("button", { name: "Exit fullscreen map" })).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+  const mapMarkerButton = page.getByRole("button", { name: "Open map marker for gallery/cat.png" });
+  await expect(mapMarkerButton).toBeVisible();
+  expect(
+    await mapMarkerButton.evaluate(
+      (element) => element.closest(".maplibregl-canvas-container") !== null
+    )
+  ).toBe(true);
+  await mapMarkerButton.click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);

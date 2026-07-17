@@ -4,6 +4,7 @@ import maplibregl, { type LngLatLike, type StyleSpecification } from "maplibre-g
 import "maplibre-gl/dist/maplibre-gl.css";
 import { createDbWorker, type WorkerHttpvfs } from "sql.js-httpvfs";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   clusterScreenPoints,
   type ClusterableScreenPoint,
@@ -164,7 +165,6 @@ export function GalleryBasemapMap({
   fallback
 }: GalleryBasemapMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const markerOverlayRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const cameraStateRef = useRef<MapCameraState | null>(null);
   const viewportFrameRef = useRef<number | null>(null);
@@ -387,41 +387,6 @@ export function GalleryBasemapMap({
   }, [entries, entrySignature, fitSignature, mapReady]);
 
   useEffect(() => {
-    const markerOverlay = markerOverlayRef.current;
-    const map = mapRef.current;
-    if (!markerOverlay || !map) {
-      return;
-    }
-    const mapCanvasContainer = map.getCanvasContainer();
-
-    function handleMarkerWheel(event: WheelEvent) {
-      event.preventDefault();
-      event.stopPropagation();
-      mapCanvasContainer.dispatchEvent(
-        new WheelEvent("wheel", {
-          bubbles: true,
-          cancelable: true,
-          deltaMode: event.deltaMode,
-          deltaX: event.deltaX,
-          deltaY: event.deltaY,
-          deltaZ: event.deltaZ,
-          clientX: event.clientX,
-          clientY: event.clientY,
-          screenX: event.screenX,
-          screenY: event.screenY,
-          ctrlKey: event.ctrlKey,
-          shiftKey: event.shiftKey,
-          altKey: event.altKey,
-          metaKey: event.metaKey
-        })
-      );
-    }
-
-    markerOverlay.addEventListener("wheel", handleMarkerWheel, { passive: false });
-    return () => markerOverlay.removeEventListener("wheel", handleMarkerWheel);
-  }, [mapReady]);
-
-  useEffect(() => {
     const map = mapRef.current;
     if (!map || typeof window === "undefined") {
       return;
@@ -489,6 +454,7 @@ export function GalleryBasemapMap({
   const markerClusterRadius = map
     ? resolveBasemapMarkerClusterRadius(map.getZoom())
     : BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX;
+  const markerOverlayTarget = mapReady && map ? map.getCanvasContainer() : null;
   const visibleMarkerClusters = useMemo(
     () => clusterScreenPoints(visibleMarkerPoints, markerClusterRadius),
     [markerClusterRadius, visibleMarkerPoints]
@@ -577,49 +543,53 @@ export function GalleryBasemapMap({
         </Center>
       ) : null}
 
-      {mapReady && map ? (
-        <div
-          ref={markerOverlayRef}
-          style={{
-            position: "absolute",
-            inset: 0,
-            pointerEvents: "none"
-          }}
-        >
-          {visibleMarkerClusters.map((cluster) => {
-            const selected = cluster.points.some((point) => point.item.path === selectedPath);
-            if (cluster.points.length === 1) {
-              const point = cluster.points[0];
-              if (!point) {
-                return null;
-              }
+      {markerOverlayTarget
+        ? createPortal(
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                pointerEvents: "none"
+              }}
+            >
+              {visibleMarkerClusters.map((cluster) => {
+                const selected = cluster.points.some((point) => point.item.path === selectedPath);
+                if (cluster.points.length === 1) {
+                  const point = cluster.points[0];
+                  if (!point) {
+                    return null;
+                  }
 
-              return (
-                <GalleryBasemapMarker
-                  key={point.item.path}
-                  entry={point.item}
-                  request={!suppressMarkerThumbnails || selected ? getMarkerRequest(point.item) : null}
-                  left={cluster.x}
-                  top={cluster.y}
-                  selected={selected}
-                  onClick={() => onSelectPath(point.item.path, visibleSelectionPaths)}
-                />
-              );
-            }
+                  return (
+                    <GalleryBasemapMarker
+                      key={point.item.path}
+                      entry={point.item}
+                      request={
+                        !suppressMarkerThumbnails || selected ? getMarkerRequest(point.item) : null
+                      }
+                      left={cluster.x}
+                      top={cluster.y}
+                      selected={selected}
+                      onClick={() => onSelectPath(point.item.path, visibleSelectionPaths)}
+                    />
+                  );
+                }
 
-            return (
-              <GalleryBasemapClusterMarker
-                key={cluster.id}
-                count={cluster.points.length}
-                left={cluster.x}
-                top={cluster.y}
-                selected={selected}
-                onClick={(ctrlKey) => handleClusterClick(cluster, ctrlKey)}
-              />
-            );
-          })}
-        </div>
-      ) : null}
+                return (
+                  <GalleryBasemapClusterMarker
+                    key={cluster.id}
+                    count={cluster.points.length}
+                    left={cluster.x}
+                    top={cluster.y}
+                    selected={selected}
+                    onClick={(ctrlKey) => handleClusterClick(cluster, ctrlKey)}
+                  />
+                );
+              })}
+            </div>,
+            markerOverlayTarget
+          )
+        : null}
 
       {!isFullscreen ? (
         <div
@@ -628,7 +598,8 @@ export function GalleryBasemapMap({
             left: 12,
             top: 12,
             display: "flex",
-            gap: 8
+            gap: 8,
+            pointerEvents: "none"
           }}
         >
           <Badge color="grape" variant="filled">
@@ -646,7 +617,8 @@ export function GalleryBasemapMap({
           style={{
             position: "absolute",
             right: 12,
-            top: 12
+            top: 12,
+            pointerEvents: "none"
           }}
         >
           <Badge color="dark" variant="filled">
@@ -662,7 +634,8 @@ export function GalleryBasemapMap({
           style={{
             position: "absolute",
             right: 12,
-            top: 12
+            top: 12,
+            pointerEvents: "none"
           }}
         >
           <Badge color="dark" variant="filled">
@@ -800,7 +773,8 @@ function GalleryBasemapMarker({
         background: failed || imageFailed ? "rgba(18, 48, 64, 0.92)" : "rgba(255, 255, 255, 0.16)",
         boxShadow: selected ? "0 0 0 6px rgba(164, 80, 255, 0.24)" : "none",
         cursor: "pointer",
-        pointerEvents: "auto"
+        pointerEvents: "auto",
+        touchAction: "none"
       }}
     >
       {failed || imageFailed || !resolvedSrc ? (
@@ -867,6 +841,7 @@ function GalleryBasemapClusterMarker({
         boxShadow: selected ? "0 0 0 6px rgba(164, 80, 255, 0.24)" : "0 8px 22px rgba(0, 0, 0, 0.24)",
         cursor: "pointer",
         pointerEvents: "auto",
+        touchAction: "none",
         color: "white",
         fontSize: count >= 100 ? "0.95rem" : "0.9rem",
         fontWeight: 700
