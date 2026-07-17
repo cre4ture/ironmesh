@@ -922,7 +922,7 @@ async fn probe_download_source(
 fn dataset_filename_from_url(url: &Url) -> std::result::Result<String, ImportAdvanceError> {
     let Some(filename) = url
         .path_segments()
-        .and_then(|segments| segments.last())
+        .and_then(|mut segments| segments.next_back())
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
     else {
@@ -954,7 +954,7 @@ fn source_display_url(raw: &str) -> String {
     let host = url.host_str().unwrap_or("unknown-host");
     let file_name = url
         .path_segments()
-        .and_then(|segments| segments.last())
+        .and_then(|mut segments| segments.next_back())
         .filter(|segment| !segment.is_empty())
         .unwrap_or("download");
     format!("{}://{host}/.../{file_name}", url.scheme())
@@ -1020,7 +1020,7 @@ fn import_error_status(error: ImportAdvanceError) -> StatusCode {
 fn transient_retry_delay_secs(job: &MapDatasetImportJob) -> u64 {
     let exponent = job.retry_count.min(6);
     let base = 2u64.saturating_pow(exponent);
-    base.min(MAP_IMPORT_RETRY_MAX_DELAY_SECS).max(2)
+    base.clamp(2, MAP_IMPORT_RETRY_MAX_DELAY_SECS)
 }
 
 fn current_part_spec(
