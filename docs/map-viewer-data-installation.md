@@ -86,9 +86,10 @@ wget -c https://data.maptiler.com/download/<account-token>/maptiler-satellite-20
 
 Set the desired part size in GiB and start the import. The UI accepts 1-64 GiB;
 the server also accepts values down to 256 MiB for API clients. The selected
-part size determines the final `sys/maps/<dataset>.mbtiles-part-<suffix>`
-objects and the automatically generated manifest. It is not restricted to the
-legacy 10 GiB layout.
+part size determines the final job-specific part objects under `sys/maps/` and
+the automatically generated manifest. It is not restricted to the legacy 10
+GiB layout. Job-specific keys keep an already published manifest serving its
+previous complete part set until the replacement import has finished.
 
 The server requires an HTTP range-capable source. It streams one configured
 part at a time into 8 MiB IronMesh chunks, so the full MBTiles file is never

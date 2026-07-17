@@ -1031,6 +1031,7 @@ fn current_part_spec(
     }
     part_spec(
         &job.dataset_filename,
+        &job.job_id,
         job.total_size_bytes,
         job.part_size_bytes,
         job.total_parts,
@@ -1042,6 +1043,7 @@ fn current_part_spec(
 
 fn part_spec(
     dataset_filename: &str,
+    job_id: &str,
     total_size_bytes: u64,
     part_size_bytes: u64,
     total_parts: usize,
@@ -1059,7 +1061,7 @@ fn part_spec(
         index,
         part_id: split_suffix(index, width),
         key: format!(
-            "{MAP_IMPORT_STORAGE_ROOT}/{dataset_filename}-part-{}",
+            "{MAP_IMPORT_STORAGE_ROOT}/{dataset_filename}.import-{job_id}-part-{}",
             split_suffix(index, width)
         ),
         offset_bytes,
@@ -1072,6 +1074,7 @@ fn build_split_manifest_bytes(job: &MapDatasetImportJob) -> Result<Vec<u8>> {
     for index in 0..job.total_parts {
         let part = part_spec(
             &job.dataset_filename,
+            &job.job_id,
             job.total_size_bytes,
             job.part_size_bytes,
             job.total_parts,
@@ -1201,6 +1204,9 @@ mod tests {
             serde_json::from_slice(&payload).expect("manifest should decode");
         assert_eq!(json["parts_count"], 3);
         assert_eq!(json["last_part_size_bytes"], 452);
-        assert_eq!(json["parts"][1]["key"], "sys/maps/file.mbtiles-part-ab");
+        assert_eq!(
+            json["parts"][1]["key"],
+            "sys/maps/file.mbtiles.import-job-part-ab"
+        );
     }
 }
