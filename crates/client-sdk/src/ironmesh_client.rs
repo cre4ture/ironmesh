@@ -32,10 +32,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
-    ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RendezvousControlClient,
-    TransportHeader, TransportRequestHead, TransportStreamKind, build_signed_request_headers,
-    read_buffered_transport_response, read_transport_response_head,
-    write_buffered_transport_request, write_transport_request_head,
+    ClientIdentityMaterial, ConnectionCandidate, PeerIdentity, RelayHttpHeader,
+    RendezvousControlClient, TransportHeader, TransportPathKind, TransportRequestHead,
+    TransportStreamKind, build_signed_request_headers, read_buffered_transport_response,
+    read_transport_response_head, write_buffered_transport_request, write_transport_request_head,
 };
 use uuid::Uuid;
 
@@ -96,6 +96,8 @@ pub struct ClientConnectionAttempt {
 #[serde(rename_all = "camelCase")]
 pub struct ClientEndpointDiagnostics {
     pub path_kind: String,
+    #[serde(default)]
+    pub transport_path_kind: Option<String>,
     pub locator: String,
     pub request_base_url: String,
     pub active: bool,
@@ -137,9 +139,14 @@ enum ClientRequestAuth {
 
 #[derive(Clone)]
 enum ClientTransport {
-    Direct {
+    DirectHttp {
         http: HttpClient,
         server_base_url: String,
+        target_node_id: Option<NodeId>,
+        session_pool: TransportSessionPool,
+    },
+    DirectQuic {
+        request_base_url: String,
         target_node_id: Option<NodeId>,
         session_pool: TransportSessionPool,
     },
@@ -184,6 +191,7 @@ struct ClientEndpoint {
 #[derive(Debug, Clone)]
 struct ClientEndpointDescriptor {
     path_kind: ClientEndpointPathKind,
+    transport_path_kind: TransportPathKind,
     locator: String,
     bootstrap_rank: usize,
 }
@@ -236,25 +244,39 @@ struct RoutedBufferedTransportResponse {
 impl ClientTransport {
     fn path_kind(&self) -> ClientEndpointPathKind {
         match self {
-            Self::Direct { .. } => ClientEndpointPathKind::Direct,
+            Self::DirectHttp { .. } | Self::DirectQuic { .. } => ClientEndpointPathKind::Direct,
             Self::Relay(_) => ClientEndpointPathKind::Relay,
+        }
+    }
+
+    fn transport_path_kind(&self) -> TransportPathKind {
+        match self {
+            Self::DirectHttp { .. } => TransportPathKind::DirectHttps,
+            Self::DirectQuic { .. } => TransportPathKind::DirectQuic,
+            Self::Relay(_) => TransportPathKind::RelayTunnel,
         }
     }
 
     fn request_base_url(&self) -> &str {
         match self {
-            Self::Direct {
+            Self::DirectHttp {
                 server_base_url, ..
             } => server_base_url.as_str(),
+            Self::DirectQuic {
+                request_base_url, ..
+            } => request_base_url.as_str(),
             Self::Relay(relay) => relay.request_base_url.as_str(),
         }
     }
 
     fn endpoint_locator(&self) -> String {
         match self {
-            Self::Direct {
+            Self::DirectHttp {
                 server_base_url, ..
             } => server_base_url.clone(),
+            Self::DirectQuic {
+                request_base_url, ..
+            } => request_base_url.clone(),
             Self::Relay(relay) => {
                 let rendezvous_hint = relay
                     .rendezvous
@@ -274,37 +296,42 @@ impl ClientTransport {
 
     fn direct_server_base_url(&self) -> Option<&str> {
         match self {
-            Self::Direct {
+            Self::DirectHttp {
                 server_base_url, ..
             } => Some(server_base_url.as_str()),
+            Self::DirectQuic { .. } => None,
             Self::Relay(_) => None,
         }
     }
 
     fn target_node_id(&self) -> Option<NodeId> {
         match self {
-            Self::Direct { target_node_id, .. } => *target_node_id,
+            Self::DirectHttp { target_node_id, .. } | Self::DirectQuic { target_node_id, .. } => {
+                *target_node_id
+            }
             Self::Relay(relay) => Some(relay.target_node_id),
         }
     }
 
     fn relay_target_node_id(&self) -> Option<NodeId> {
         match self {
-            Self::Direct { .. } => None,
+            Self::DirectHttp { .. } | Self::DirectQuic { .. } => None,
             Self::Relay(relay) => Some(relay.target_node_id),
         }
     }
 
     fn rendezvous_client(&self) -> Option<RendezvousControlClient> {
         match self {
-            Self::Direct { .. } => None,
+            Self::DirectHttp { .. } | Self::DirectQuic { .. } => None,
             Self::Relay(relay) => Some(relay.rendezvous.clone()),
         }
     }
 
     fn session_pool_snapshot(&self) -> TransportSessionPoolSnapshot {
         match self {
-            Self::Direct { session_pool, .. } => session_pool.snapshot(),
+            Self::DirectHttp { session_pool, .. } | Self::DirectQuic { session_pool, .. } => {
+                session_pool.snapshot()
+            }
             Self::Relay(relay) => relay.session_pool.snapshot(),
         }
     }
@@ -328,6 +355,7 @@ impl ClientEndpoint {
         Self {
             descriptor: ClientEndpointDescriptor {
                 path_kind: transport.path_kind(),
+                transport_path_kind: transport.transport_path_kind(),
                 locator: transport.endpoint_locator(),
                 bootstrap_rank,
             },
@@ -570,6 +598,10 @@ impl ClientEndpointRouter {
                 let state = lock_endpoint_state(&endpoint.state);
                 ClientEndpointDiagnostics {
                     path_kind: endpoint.descriptor.path_kind.as_str().to_string(),
+                    transport_path_kind: Some(
+                        transport_path_kind_label(endpoint.descriptor.transport_path_kind)
+                            .to_string(),
+                    ),
                     locator: endpoint.descriptor.locator.clone(),
                     request_base_url: endpoint.transport.request_base_url().to_string(),
                     active: active_index == Some(index),
@@ -637,6 +669,14 @@ fn compare_scores(
         .partial_cmp(&right_score)
         .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| left_index.cmp(&right_index))
+}
+
+fn transport_path_kind_label(path_kind: TransportPathKind) -> &'static str {
+    match path_kind {
+        TransportPathKind::DirectHttps => "direct_https",
+        TransportPathKind::DirectQuic => "direct_quic",
+        TransportPathKind::RelayTunnel => "relay_tunnel",
+    }
 }
 
 fn update_ewma(current: Option<f64>, sample: f64) -> f64 {
@@ -991,7 +1031,7 @@ async fn execute_buffered_request_for_transport(
     body: &[u8],
 ) -> Result<BufferedTransportResponse> {
     match transport {
-        ClientTransport::Direct {
+        ClientTransport::DirectHttp {
             http,
             server_base_url,
             session_pool,
@@ -999,7 +1039,7 @@ async fn execute_buffered_request_for_transport(
         } => {
             if let ClientRequestAuth::SignedIdentity(identity) = auth {
                 let direct = DirectMultiplexSessionContext {
-                    server_base_url,
+                    transport_locator: server_base_url,
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
@@ -1037,6 +1077,31 @@ async fn execute_buffered_request_for_transport(
                 body,
             })
         }
+        ClientTransport::DirectQuic {
+            request_base_url,
+            session_pool,
+            ..
+        } => {
+            let ClientRequestAuth::SignedIdentity(identity) = auth else {
+                bail!("direct QUIC client transport requires signed client identity material");
+            };
+            let direct = DirectMultiplexSessionContext {
+                transport_locator: request_base_url,
+                session_pool,
+                identity,
+                connection_name: options.connection_name,
+            };
+            execute_direct_multiplex_buffered_request(
+                direct,
+                method,
+                url,
+                headers,
+                body,
+                options.direct_failover_timeout,
+            )
+            .await
+            .with_context(|| format!("failed to execute multiplexed {} {}", method, url))
+        }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
             execute_relay_multiplex_buffered_request(
@@ -1063,7 +1128,7 @@ async fn execute_streaming_read_request_for_transport(
     headers: &[RelayHttpHeader],
 ) -> Result<StreamedRelativePathResponse> {
     match transport {
-        ClientTransport::Direct {
+        ClientTransport::DirectHttp {
             http,
             server_base_url,
             session_pool,
@@ -1084,6 +1149,26 @@ async fn execute_streaming_read_request_for_transport(
             }
 
             execute_direct_http_streaming_read_request(http, method, url, headers).await
+        }
+        ClientTransport::DirectQuic {
+            request_base_url,
+            session_pool,
+            ..
+        } => {
+            let ClientRequestAuth::SignedIdentity(identity) = auth else {
+                bail!("direct QUIC client transport requires signed client identity material");
+            };
+            execute_direct_multiplex_streaming_read_request(
+                request_base_url,
+                session_pool,
+                identity,
+                connection_name,
+                method,
+                url,
+                headers,
+            )
+            .await
+            .with_context(|| format!("failed to execute streamed {} {}", method, url))
         }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
@@ -1149,14 +1234,14 @@ async fn execute_streaming_object_write_request_for_transport(
     body: &[u8],
 ) -> Result<BufferedTransportResponse> {
     match transport {
-        ClientTransport::Direct {
+        ClientTransport::DirectHttp {
             server_base_url,
             session_pool,
             ..
         } => {
             if let ClientRequestAuth::SignedIdentity(identity) = auth {
                 let direct = DirectMultiplexSessionContext {
-                    server_base_url,
+                    transport_locator: server_base_url,
                     session_pool,
                     identity,
                     connection_name: options.connection_name,
@@ -1183,6 +1268,31 @@ async fn execute_streaming_object_write_request_for_transport(
                 body,
             )
             .await
+        }
+        ClientTransport::DirectQuic {
+            request_base_url,
+            session_pool,
+            ..
+        } => {
+            let ClientRequestAuth::SignedIdentity(identity) = auth else {
+                bail!("direct QUIC client transport requires signed client identity material");
+            };
+            let direct = DirectMultiplexSessionContext {
+                transport_locator: request_base_url,
+                session_pool,
+                identity,
+                connection_name: options.connection_name,
+            };
+            execute_direct_multiplex_streaming_object_write_request(
+                direct,
+                method,
+                url,
+                headers,
+                body,
+                options.direct_failover_timeout,
+            )
+            .await
+            .with_context(|| format!("failed to execute streamed {} {}", method, url))
         }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
@@ -1211,7 +1321,7 @@ async fn execute_streaming_write_request_for_transport(
     body_stream: RequestBodyStream,
 ) -> Result<BufferedTransportResponse> {
     match transport {
-        ClientTransport::Direct {
+        ClientTransport::DirectHttp {
             http,
             server_base_url,
             session_pool,
@@ -1219,7 +1329,7 @@ async fn execute_streaming_write_request_for_transport(
         } => {
             if let ClientRequestAuth::SignedIdentity(identity) = auth {
                 let direct = DirectMultiplexSessionContext {
-                    server_base_url,
+                    transport_locator: server_base_url,
                     session_pool,
                     identity,
                     connection_name,
@@ -1261,6 +1371,30 @@ async fn execute_streaming_write_request_for_transport(
                 headers,
                 body,
             })
+        }
+        ClientTransport::DirectQuic {
+            request_base_url,
+            session_pool,
+            ..
+        } => {
+            let ClientRequestAuth::SignedIdentity(identity) = auth else {
+                bail!("direct QUIC client transport requires signed client identity material");
+            };
+            let direct = DirectMultiplexSessionContext {
+                transport_locator: request_base_url,
+                session_pool,
+                identity,
+                connection_name,
+            };
+            execute_direct_multiplex_streaming_write_request(
+                direct,
+                method,
+                url,
+                headers,
+                body_stream,
+            )
+            .await
+            .with_context(|| format!("failed to execute streamed {} {}", method, url))
         }
         ClientTransport::Relay(relay) => {
             let source = relay_source_identity_for_auth(auth)?;
@@ -1794,7 +1928,7 @@ impl IronMeshClient {
         let server_base_url = server_base_url.into().trim_end_matches('/').to_string();
         Self {
             transport_router: ClientEndpointRouter::new(vec![ClientEndpoint::new(
-                ClientTransport::Direct {
+                ClientTransport::DirectHttp {
                     http,
                     target_node_id,
                     session_pool: TransportSessionPool::new_direct(
@@ -1802,6 +1936,26 @@ impl IronMeshClient {
                         server_ca_pem,
                     ),
                     server_base_url,
+                },
+                0,
+            )]),
+            auth: ClientRequestAuth::None,
+            connection_name: None,
+            upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(crate) fn from_direct_quic_candidate_with_target_node_id(
+        candidate: ConnectionCandidate,
+        target_node_id: Option<NodeId>,
+    ) -> Self {
+        let request_base_url = candidate.endpoint.trim().trim_end_matches('/').to_string();
+        Self {
+            transport_router: ClientEndpointRouter::new(vec![ClientEndpoint::new(
+                ClientTransport::DirectQuic {
+                    request_base_url,
+                    target_node_id,
+                    session_pool: TransportSessionPool::new_direct_quic(candidate),
                 },
                 0,
             )]),
@@ -4774,7 +4928,7 @@ async fn execute_direct_http_streaming_read_request(
 
 #[derive(Clone, Copy)]
 struct DirectMultiplexSessionContext<'a> {
-    server_base_url: &'a str,
+    transport_locator: &'a str,
     session_pool: &'a TransportSessionPool,
     identity: &'a ClientIdentityMaterial,
     connection_name: Option<&'a str>,
@@ -4842,7 +4996,7 @@ where
 }
 
 async fn execute_direct_multiplex_streaming_read_request(
-    server_base_url: &str,
+    transport_locator: &str,
     session_pool: &TransportSessionPool,
     identity: &ClientIdentityMaterial,
     connection_name: Option<&str>,
@@ -4863,7 +5017,7 @@ async fn execute_direct_multiplex_streaming_read_request(
                 session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
-                    server_base_url,
+                    transport_locator,
                     "retrying streamed direct object read after resetting cached session"
                 );
             }
@@ -4876,7 +5030,7 @@ async fn execute_direct_multiplex_streaming_read_request(
 
     bail!(
         "streamed direct object read retried without producing a response for {}",
-        server_base_url
+        transport_locator
     )
 }
 
@@ -4953,7 +5107,7 @@ async fn execute_direct_multiplex_streaming_object_write_request(
                 direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
-                    server_base_url = direct.server_base_url,
+                    transport_locator = direct.transport_locator,
                     "retrying streamed direct object write after resetting cached session"
                 );
             }
@@ -4966,7 +5120,7 @@ async fn execute_direct_multiplex_streaming_object_write_request(
 
     bail!(
         "streamed direct object write retried without producing a response for {}",
-        direct.server_base_url
+        direct.transport_locator
     )
 }
 
@@ -5105,7 +5259,7 @@ async fn execute_direct_multiplex_buffered_request(
                 direct.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
-                    server_base_url = direct.server_base_url,
+                    transport_locator = direct.transport_locator,
                     "retrying direct multiplex request after resetting cached session"
                 );
             }
@@ -5118,7 +5272,7 @@ async fn execute_direct_multiplex_buffered_request(
 
     bail!(
         "direct multiplex request retried without producing a response for {}",
-        direct.server_base_url
+        direct.transport_locator
     )
 }
 

@@ -12,6 +12,7 @@ base64 = "0.22"
 bytes.workspace = true
 common = { path = "../common" }
 futures-util = "0.3"
+iroh = "1.0.2"
 reqwest.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }

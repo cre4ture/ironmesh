@@ -4494,6 +4494,12 @@ async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBacke
             public_direct_urls: vec!["https://remote.example".to_string()],
             peer_api_url: Some("https://remote-internal.example".to_string()),
             peer_direct_urls: vec!["https://remote-internal.example".to_string()],
+            peer_direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectHttps,
+                endpoint: "https://remote-internal.example".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            }],
             relay_required: true,
         },
         capabilities: crate::cluster::NodeCapabilities {

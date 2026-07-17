@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, bail};
 use common::NodeId;
+use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use transport_sdk::{
-    ClientIdentityMaterial, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
+    ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
+    DirectQuicEndpointConfig, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
     RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind, RendezvousControlClient,
     TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
     WebSocketByteStream, build_signed_request_headers, connect_websocket,
@@ -21,9 +23,13 @@ pub(crate) struct TransportSessionPool {
 
 #[derive(Clone)]
 enum SessionPoolTarget {
-    Direct {
+    DirectHttps {
         server_base_url: String,
         server_ca_pem: Option<String>,
+    },
+    DirectQuic {
+        candidate: ConnectionCandidate,
+        endpoint: Arc<Mutex<Option<DirectQuicEndpoint>>>,
     },
     Relay {
         rendezvous: RendezvousControlClient,
@@ -56,9 +62,20 @@ impl TransportSessionPool {
         server_ca_pem: Option<String>,
     ) -> Self {
         Self {
-            target: SessionPoolTarget::Direct {
+            target: SessionPoolTarget::DirectHttps {
                 server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
                 server_ca_pem,
+            },
+            cached_session: Arc::new(Mutex::new(None)),
+            stats: Arc::new(TransportSessionPoolStats::default()),
+        }
+    }
+
+    pub(crate) fn new_direct_quic(candidate: ConnectionCandidate) -> Self {
+        Self {
+            target: SessionPoolTarget::DirectQuic {
+                candidate,
+                endpoint: Arc::new(Mutex::new(None)),
             },
             cached_session: Arc::new(Mutex::new(None)),
             stats: Arc::new(TransportSessionPoolStats::default()),
@@ -96,31 +113,60 @@ impl TransportSessionPool {
         identity: &ClientIdentityMaterial,
         connection_name: Option<&str>,
     ) -> Result<Arc<MultiplexedSession>> {
-        let SessionPoolTarget::Direct {
-            server_base_url,
-            server_ca_pem,
-        } = &self.target
-        else {
-            bail!("attempted to open a direct session from a relay transport session pool");
-        };
-
         let mut guard = self.cached_session.lock().await;
         if let Some(existing) = guard.as_ref() {
             self.stats.reuse_count.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(&existing.session));
         }
 
-        let ws_url = websocket_url(server_base_url, "transport/ws").with_context(|| {
-            format!("failed building direct transport websocket URL from {server_base_url}")
-        })?;
-        let ws_headers = websocket_auth_headers(identity, connection_name)?;
-        let websocket = connect_websocket(&ws_url, server_ca_pem.as_deref(), None, &ws_headers)
-            .await
-            .with_context(|| format!("failed opening direct transport websocket {}", ws_url))?;
-        let transport = WebSocketByteStream::new(websocket);
-        let multiplexed =
-            MultiplexedSession::spawn(transport, MultiplexMode::Client, MultiplexConfig::default())
-                .context("failed creating direct multiplexed transport session")?;
+        let (multiplexed, handshake_context) = match &self.target {
+            SessionPoolTarget::DirectHttps {
+                server_base_url,
+                server_ca_pem,
+            } => {
+                let ws_url = websocket_url(server_base_url, "transport/ws").with_context(|| {
+                    format!("failed building direct transport websocket URL from {server_base_url}")
+                })?;
+                let ws_headers = websocket_auth_headers(identity, connection_name)?;
+                let websocket =
+                    connect_websocket(&ws_url, server_ca_pem.as_deref(), None, &ws_headers)
+                        .await
+                        .with_context(|| {
+                            format!("failed opening direct transport websocket {}", ws_url)
+                        })?;
+                let transport = WebSocketByteStream::new(websocket);
+                (
+                    MultiplexedSession::spawn(
+                        transport,
+                        MultiplexMode::Client,
+                        MultiplexConfig::default(),
+                    )
+                    .context("failed creating direct multiplexed transport session")?,
+                    format!("failed performing direct transport handshake for {server_base_url}"),
+                )
+            }
+            SessionPoolTarget::DirectQuic {
+                candidate,
+                endpoint,
+            } => {
+                let target_label = candidate.endpoint.clone();
+                let endpoint = ensure_direct_quic_endpoint(endpoint, candidate).await?;
+                let direct_quic = endpoint
+                    .connect_session(candidate, MultiplexConfig::default())
+                    .await
+                    .with_context(|| {
+                        format!("failed opening direct QUIC transport session to {target_label}")
+                    })?;
+                (
+                    direct_quic.session,
+                    format!("failed performing direct QUIC transport handshake for {target_label}"),
+                )
+            }
+            SessionPoolTarget::Relay { .. } => {
+                bail!("attempted to open a direct session from a relay transport session pool");
+            }
+        };
+
         perform_transport_client_handshake(
             &multiplexed,
             TransportSessionControlMessage::Hello {
@@ -133,7 +179,7 @@ impl TransportSessionPool {
             },
         )
         .await
-        .context("failed performing direct transport handshake")?;
+        .with_context(|| handshake_context)?;
 
         let session = Arc::new(multiplexed);
         *guard = Some(CachedTransportSession {
@@ -224,6 +270,39 @@ fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole 
     }
 }
 
+async fn ensure_direct_quic_endpoint(
+    endpoint: &Arc<Mutex<Option<DirectQuicEndpoint>>>,
+    candidate: &ConnectionCandidate,
+) -> Result<DirectQuicEndpoint> {
+    let mut guard = endpoint.lock().await;
+    if let Some(endpoint) = guard.as_ref() {
+        return Ok(endpoint.clone());
+    }
+
+    let mut config = DirectQuicEndpointConfig::new(SecretKey::generate());
+    config.alpn = candidate
+        .transport_hints
+        .as_ref()
+        .and_then(|hints| hints.alpn.clone())
+        .unwrap_or_else(|| DEFAULT_DIRECT_QUIC_ALPN.to_string());
+    if let Some(relay_url) = candidate
+        .transport_hints
+        .as_ref()
+        .and_then(|hints| hints.relay_url.clone())
+    {
+        config.relay_urls.push(relay_url);
+    }
+
+    let endpoint = DirectQuicEndpoint::bind(config).await.with_context(|| {
+        format!(
+            "failed binding local direct QUIC endpoint for remote candidate {}",
+            candidate.endpoint
+        )
+    })?;
+    *guard = Some(endpoint.clone());
+    Ok(endpoint)
+}
+
 fn websocket_auth_headers(
     identity: &ClientIdentityMaterial,
     connection_name: Option<&str>,
@@ -270,4 +349,20 @@ fn unix_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn direct_quic_pool_snapshot_starts_empty() {
+        let pool = TransportSessionPool::new_direct_quic(ConnectionCandidate {
+            kind: transport_sdk::CandidateKind::DirectQuic,
+            endpoint: "iroh://peer-key-1".to_string(),
+            rtt_ms: None,
+            transport_hints: None,
+        });
+
+        assert_eq!(pool.snapshot(), TransportSessionPoolSnapshot::default());
+    }
 }

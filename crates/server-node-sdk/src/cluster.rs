@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::NodeId;
 use serde::{Deserialize, Serialize};
+use transport_sdk::{CandidateKind, ConnectionCandidate};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +23,8 @@ pub struct NodeReachability {
     #[serde(default)]
     pub peer_direct_urls: Vec<String>,
     #[serde(default)]
+    pub peer_direct_candidates: Vec<ConnectionCandidate>,
+    #[serde(default)]
     pub relay_required: bool,
 }
 
@@ -32,6 +35,17 @@ impl NodeReachability {
 
     pub fn peer_api_urls(&self) -> Vec<&str> {
         collect_reachability_urls(self.peer_api_url.as_deref(), &self.peer_direct_urls)
+    }
+
+    pub fn has_peer_transport(&self) -> bool {
+        self.peer_direct_candidates.iter().any(|candidate| {
+            matches!(
+                candidate.kind,
+                CandidateKind::DirectHttps
+                    | CandidateKind::DirectQuic
+                    | CandidateKind::ServerReflexive
+            )
+        }) || !self.peer_api_urls().is_empty()
     }
 }
 
@@ -954,6 +968,12 @@ mod tests {
                 public_direct_urls: vec![format!("http://{id}")],
                 peer_api_url: Some(format!("https://{id}")),
                 peer_direct_urls: vec![format!("https://{id}")],
+                peer_direct_candidates: vec![ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: format!("https://{id}"),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: NodeCapabilities {
@@ -1343,6 +1363,12 @@ mod tests {
                 public_direct_urls: vec!["https://remote.example".to_string()],
                 peer_api_url: Some("https://remote-internal.example".to_string()),
                 peer_direct_urls: vec!["https://remote-internal.example".to_string()],
+                peer_direct_candidates: vec![ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://remote-internal.example".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: NodeCapabilities {

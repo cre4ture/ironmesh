@@ -446,6 +446,16 @@ fn test_node_reachability(
         peer_direct_urls: peer_api_url
             .map(|value| vec![value.to_string()])
             .unwrap_or_default(),
+        peer_direct_candidates: peer_api_url
+            .map(|value| {
+                vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: value.to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }]
+            })
+            .unwrap_or_default(),
         relay_required,
     }
 }
@@ -472,6 +482,64 @@ async fn register_cluster_node(
         last_heartbeat_unix: super::unix_ts(),
         status: super::cluster::NodeStatus::Online,
     });
+}
+
+async fn install_direct_quic_runtime(
+    state: &mut ServerState,
+) -> transport_sdk::ConnectionCandidate {
+    let secret_key_path = state
+        .data_dir
+        .join("state")
+        .join(format!("test-direct-quic-{}.txt", state.node_id));
+    let secret_key = transport_sdk::load_or_create_secret_key(&secret_key_path)
+        .expect("test direct QUIC secret key should persist");
+    let endpoint = transport_sdk::DirectQuicEndpoint::bind(
+        transport_sdk::DirectQuicEndpointConfig::new(secret_key),
+    )
+    .await
+    .expect("test direct QUIC endpoint should bind");
+    let candidate = endpoint.candidate();
+    state.network.direct_quic = Some(super::ServerDirectQuicRuntime {
+        endpoint: Arc::new(endpoint),
+        peer_sessions: super::PeerDirectQuicSessionPool::default(),
+    });
+    super::refresh_local_node_reachability(state)
+        .await
+        .expect("test direct QUIC reachability should refresh");
+    candidate
+}
+
+async fn register_direct_quic_cluster_node(
+    state: &ServerState,
+    node_id: NodeId,
+    candidate: transport_sdk::ConnectionCandidate,
+) -> cluster::NodeDescriptor {
+    let descriptor = cluster::NodeDescriptor {
+        node_id,
+        reachability: cluster::NodeReachability {
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            peer_direct_urls: Vec::new(),
+            peer_direct_candidates: vec![candidate],
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: false,
+            peer_api: true,
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 1_000_000,
+        free_bytes: 900_000,
+        storage_stats: None,
+        last_heartbeat_unix: super::unix_ts(),
+        status: super::cluster::NodeStatus::Online,
+    };
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.register_node(descriptor.clone());
+    descriptor
 }
 
 async fn register_node_with_server(
@@ -5512,6 +5580,12 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
                 public_direct_urls: vec!["https://127.0.0.1:9".to_string()],
                 peer_api_url: Some("https://127.0.0.1:49080".to_string()),
                 peer_direct_urls: vec!["https://127.0.0.1:49080".to_string()],
+                peer_direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://127.0.0.1:49080".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -5533,6 +5607,12 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
                 public_direct_urls: vec![public_url.clone()],
                 peer_api_url: Some("https://127.0.0.1:10009".to_string()),
                 peer_direct_urls: vec!["https://127.0.0.1:10009".to_string()],
+                peer_direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://127.0.0.1:10009".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -13149,6 +13229,7 @@ async fn build_test_state(
                 rendezvous_controls: Vec::new(),
             })),
             peer_relay_sessions: super::PeerRelaySessionPool::default(),
+            direct_quic: None,
         },
         maintenance: super::ServerMaintenanceRuntime {
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -14365,6 +14446,27 @@ async fn rendezvous_presence_registration_keeps_public_api_but_excludes_public_d
 }
 
 #[tokio::test]
+async fn rendezvous_presence_registration_includes_direct_quic_candidate_when_runtime_active() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let direct_quic_candidate = install_direct_quic_runtime(&mut state).await;
+
+    let registration = build_rendezvous_presence_registration(&state, None);
+
+    assert!(
+        registration
+            .capabilities
+            .contains(&transport_sdk::TransportCapability::DirectQuic)
+    );
+    assert!(registration.direct_candidates.iter().any(|candidate| {
+        candidate.kind == transport_sdk::CandidateKind::DirectQuic
+            && candidate.endpoint == direct_quic_candidate.endpoint
+            && candidate.transport_hints == direct_quic_candidate.transport_hints
+    }));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     let entry = transport_sdk::PresenceEntry {
         registration: transport_sdk::PresenceRegistration {
@@ -14413,6 +14515,44 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     );
     assert_eq!(descriptor.capacity_bytes, 100);
     assert_eq!(descriptor.free_bytes, 40);
+}
+
+#[tokio::test]
+async fn rendezvous_presence_entry_projects_direct_quic_only_node_descriptor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let direct_quic_candidate = install_direct_quic_runtime(&mut state).await;
+    let node_id = NodeId::new_v4();
+    let entry = transport_sdk::PresenceEntry {
+        registration: transport_sdk::PresenceRegistration {
+            cluster_id: uuid::Uuid::now_v7(),
+            identity: transport_sdk::PeerIdentity::Node(node_id),
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            direct_candidates: vec![direct_quic_candidate.clone()],
+            labels: HashMap::new(),
+            capacity_bytes: Some(10),
+            free_bytes: Some(4),
+            capabilities: vec![transport_sdk::TransportCapability::DirectQuic],
+            relay_mode: transport_sdk::RelayMode::Disabled,
+            connected_at_unix: 123,
+        },
+        updated_at_unix: 456,
+        observed_source_addr: None,
+    };
+
+    let descriptor = node_descriptor_from_presence_entry(&entry)
+        .expect("direct QUIC presence entry should project into a node descriptor");
+
+    assert_eq!(descriptor.node_id, node_id);
+    assert_eq!(descriptor.peer_api_url(), None);
+    assert_eq!(
+        descriptor.reachability.peer_direct_candidates,
+        vec![direct_quic_candidate]
+    );
+    assert!(descriptor.capabilities.peer_api);
+
+    cleanup_test_state(&state).await;
 }
 
 #[tokio::test]
@@ -15284,6 +15424,53 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
 }
 
 #[tokio::test]
+async fn plan_peer_transport_prefers_direct_quic_when_runtime_is_active() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let remote_candidate = install_direct_quic_runtime(&mut state).await;
+    let node = cluster::NodeDescriptor {
+        node_id: NodeId::new_v4(),
+        reachability: cluster::NodeReachability {
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: Some("https://fallback.example".to_string()),
+            peer_direct_urls: vec!["https://fallback.example".to_string()],
+            peer_direct_candidates: vec![
+                remote_candidate,
+                transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://fallback.example".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                },
+            ],
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: false,
+            peer_api: true,
+            relay_tunnel: true,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    };
+
+    let plan = plan_peer_transport(&state, &node)
+        .expect("peer transport should prefer direct QUIC when available");
+
+    assert_eq!(plan.path_kind, transport_sdk::TransportPathKind::DirectQuic);
+    assert_eq!(
+        plan.candidate.as_ref().map(|candidate| candidate.kind),
+        Some(transport_sdk::CandidateKind::DirectQuic)
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
@@ -15436,6 +15623,61 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     relay_handle.abort();
     let _ = relay_handle.await;
     cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn execute_peer_request_routes_direct_quic_over_iroh() {
+    let mut source = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let source_candidate = install_direct_quic_runtime(&mut source).await;
+
+    let mut target = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    target.cluster_id = source.cluster_id;
+    let target_candidate = install_direct_quic_runtime(&mut target).await;
+
+    let remote_node =
+        register_direct_quic_cluster_node(&source, target.node_id, target_candidate.clone()).await;
+    register_direct_quic_cluster_node(&target, source.node_id, source_candidate).await;
+
+    let plan = plan_peer_transport(&source, &remote_node)
+        .expect("peer transport should plan direct QUIC for a direct QUIC peer");
+    assert_eq!(plan.path_kind, transport_sdk::TransportPathKind::DirectQuic);
+
+    let target_accept_state = target.clone();
+    let _accept_handle = tokio::spawn(async move {
+        let direct_quic = target_accept_state
+            .network
+            .direct_quic
+            .clone()
+            .expect("target direct QUIC runtime should exist");
+        let session = direct_quic
+            .endpoint
+            .accept_session(transport_sdk::MultiplexConfig::default())
+            .await
+            .expect("target direct QUIC accept should succeed")
+            .expect("target direct QUIC accept should yield a session");
+        let _ = super::serve_direct_quic_multiplex_session(target_accept_state, session).await;
+    });
+    tokio::task::yield_now().await;
+
+    let response = super::execute_peer_request(
+        &source,
+        &remote_node,
+        reqwest::Method::GET,
+        "/cluster/availability/subjects/local",
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .expect("direct QUIC peer request should succeed");
+
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    let payload = response
+        .json::<super::LocalAvailableSubjectsResponse>()
+        .expect("direct QUIC response should decode");
+    assert_eq!(payload.node_id, target.node_id);
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
 }
 
 #[tokio::test]
@@ -16039,6 +16281,12 @@ async fn execute_peer_request_streams_object_reads_over_relay() {
                 public_direct_urls: Vec::new(),
                 peer_api_url: Some("https://relay-object-read-remote-internal.example".to_string()),
                 peer_direct_urls: Vec::new(),
+                peer_direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                    kind: transport_sdk::CandidateKind::DirectHttps,
+                    endpoint: "https://relay-object-read-remote-internal.example".to_string(),
+                    rtt_ms: None,
+                    transport_hints: None,
+                }],
                 relay_required: false,
             },
             capabilities: cluster::NodeCapabilities {
@@ -16456,6 +16704,7 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
 }
 
 async fn cleanup_test_state(state: &ServerState) {
+    super::shutdown_direct_quic_runtime(state).await;
     let root = {
         let store = lock_store(state, "tests.state.store").await;
         store.root_dir().to_path_buf()

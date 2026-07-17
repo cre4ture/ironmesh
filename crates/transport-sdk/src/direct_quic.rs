@@ -159,15 +159,17 @@ impl DirectQuicEndpoint {
             .with_context(|| {
                 format!("failed opening direct QUIC connection to {remote_endpoint_id}")
             })?;
-        let (send, recv) = connection
-            .open_bi()
-            .await
-            .with_context(|| format!("failed opening direct QUIC bi-stream to {remote_endpoint_id}"))?;
-        let session =
-            MultiplexedSession::spawn(IrohBiStream::new(recv, send).compat(), MultiplexMode::Client, config)
-                .with_context(|| {
-                    format!("failed creating direct QUIC multiplex session to {remote_endpoint_id}")
-                })?;
+        let (send, recv) = connection.open_bi().await.with_context(|| {
+            format!("failed opening direct QUIC bi-stream to {remote_endpoint_id}")
+        })?;
+        let session = MultiplexedSession::spawn(
+            IrohBiStream::new(recv, send).compat(),
+            MultiplexMode::Client,
+            config,
+        )
+        .with_context(|| {
+            format!("failed creating direct QUIC multiplex session to {remote_endpoint_id}")
+        })?;
 
         Ok(DirectQuicSession {
             connection,
@@ -176,7 +178,10 @@ impl DirectQuicEndpoint {
         })
     }
 
-    pub async fn accept_session(&self, config: MultiplexConfig) -> Result<Option<DirectQuicSession>> {
+    pub async fn accept_session(
+        &self,
+        config: MultiplexConfig,
+    ) -> Result<Option<DirectQuicSession>> {
         let Some(incoming) = self.endpoint.accept().await else {
             return Ok(None);
         };
@@ -186,21 +191,17 @@ impl DirectQuicEndpoint {
             .await
             .context("direct QUIC connection handshake failed")?;
         let remote_endpoint_id = connection.remote_id().to_string();
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed accepting direct QUIC bi-stream from {remote_endpoint_id}"
-                )
-            })?;
-        let session =
-            MultiplexedSession::spawn(IrohBiStream::new(recv, send).compat(), MultiplexMode::Server, config)
-                .with_context(|| {
-                    format!(
-                        "failed creating direct QUIC multiplex session from {remote_endpoint_id}"
-                    )
-                })?;
+        let (send, recv) = connection.accept_bi().await.with_context(|| {
+            format!("failed accepting direct QUIC bi-stream from {remote_endpoint_id}")
+        })?;
+        let session = MultiplexedSession::spawn(
+            IrohBiStream::new(recv, send).compat(),
+            MultiplexMode::Server,
+            config,
+        )
+        .with_context(|| {
+            format!("failed creating direct QUIC multiplex session from {remote_endpoint_id}")
+        })?;
 
         Ok(Some(DirectQuicSession {
             connection,
@@ -262,10 +263,7 @@ impl AsyncWrite for IrohBiStream {
         Pin::new(&mut self.send).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.send).poll_shutdown(cx)
     }
 }
@@ -288,9 +286,7 @@ pub fn endpoint_id_from_candidate(candidate: &ConnectionCandidate) -> Result<Str
     let url = reqwest::Url::parse(candidate.endpoint.trim())
         .with_context(|| format!("invalid direct QUIC endpoint {}", candidate.endpoint))?;
     if url.scheme() != DIRECT_QUIC_ENDPOINT_SCHEME {
-        bail!(
-            "direct QUIC candidate endpoint must use {DIRECT_QUIC_ENDPOINT_SCHEME}:// scheme"
-        );
+        bail!("direct QUIC candidate endpoint must use {DIRECT_QUIC_ENDPOINT_SCHEME}:// scheme");
     }
 
     url.host_str()
@@ -322,7 +318,9 @@ pub fn endpoint_addr_from_candidate(candidate: &ConnectionCandidate) -> Result<E
             ));
         }
         addrs.extend(socket_addrs_to_transport_addrs(&hints.direct_socket_addrs)?);
-        addrs.extend(socket_addrs_to_transport_addrs(&hints.observed_socket_addrs)?);
+        addrs.extend(socket_addrs_to_transport_addrs(
+            &hints.observed_socket_addrs,
+        )?);
     }
 
     Ok(EndpointAddr::from_parts(endpoint_id, addrs))
@@ -412,7 +410,8 @@ mod tests {
 
     #[test]
     fn secret_key_roundtrip_persists_exact_key() {
-        let path = std::env::temp_dir().join(format!("ironmesh-iroh-key-{}.txt", uuid::Uuid::now_v7()));
+        let path =
+            std::env::temp_dir().join(format!("ironmesh-iroh-key-{}.txt", uuid::Uuid::now_v7()));
         let secret_key = SecretKey::generate();
 
         write_secret_key_to_path(&path, &secret_key).expect("secret key should persist");
