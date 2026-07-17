@@ -32,10 +32,10 @@ pub use bootstrap_claim::{
 };
 pub use candidates::{CandidateKind, ConnectionCandidate, rank_candidates};
 pub use direct_quic::{
-    DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint, DirectQuicEndpointConfig,
-    DirectQuicEndpointSnapshot, DirectQuicSession, direct_quic_endpoint_url,
-    endpoint_addr_from_candidate, endpoint_id_from_candidate, load_or_create_secret_key,
-    read_secret_key_from_path, write_secret_key_to_path,
+    DEFAULT_DIRECT_QUIC_ALPN, DirectQuicAcceptedConnection, DirectQuicEndpoint,
+    DirectQuicEndpointConfig, DirectQuicEndpointSnapshot, DirectQuicSession,
+    direct_quic_endpoint_url, endpoint_addr_from_candidate, endpoint_id_from_candidate,
+    load_or_create_secret_key, read_secret_key_from_path, write_secret_key_to_path,
 };
 pub use http_connector::{HttpRouteKind, TransportHttpClientConfig, TransportHttpRequestTarget};
 pub use identity::{

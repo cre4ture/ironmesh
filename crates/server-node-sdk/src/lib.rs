@@ -107,6 +107,7 @@ const PROCESS_STATS_SAMPLE_INTERVAL_SECS: u64 = 2;
 const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
+const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -9550,32 +9551,50 @@ async fn complete_direct_quic_multiplex_handshake(
                 remote_endpoint_id
             )
         })?;
-    let PeerIdentity::Node(node_id) = hello.peer else {
-        bail!("direct QUIC transport only supports node peers");
+    let peer = hello.peer;
+    let connection_name = hello.connection_name;
+
+    let tracked_connection = match &peer {
+        PeerIdentity::Device(device_id) => {
+            let identity = client_identity_for_device_id(state, &device_id.to_string()).await;
+            Some(track_direct_transport_connection(
+                state,
+                &identity,
+                connection_name.clone(),
+                &session_id,
+            ))
+        }
+        PeerIdentity::Node(_) => None,
     };
 
-    if !direct_quic_peer_matches_node(state, node_id, remote_endpoint_id).await {
-        bail!(
-            "direct QUIC endpoint {} is not currently registered for node {}",
-            remote_endpoint_id,
-            node_id
-        );
-    }
+    let execution_scope = match &peer {
+        PeerIdentity::Device(_) => transport_service::TransportExecutionScope::Public,
+        PeerIdentity::Node(node_id) => {
+            if !direct_quic_peer_matches_node(state, *node_id, remote_endpoint_id).await {
+                bail!(
+                    "direct QUIC endpoint {} is not currently registered for node {}",
+                    remote_endpoint_id,
+                    node_id
+                );
+            }
+            transport_service::TransportExecutionScope::Internal(InternalCaller {
+                node_id: *node_id,
+                cluster_id: state.cluster_id,
+            })
+        }
+    };
 
     tracing::info!(
-        peer = %hello.peer,
+        peer = %peer,
         remote_endpoint_id = %remote_endpoint_id,
         session_id = %session_id,
-        connection_name = %hello.connection_name.as_deref().unwrap_or("-"),
+        connection_name = %connection_name.as_deref().unwrap_or("-"),
         "accepted direct QUIC transport session"
     );
 
     Ok(CompletedRelaySession {
-        execution_scope: transport_service::TransportExecutionScope::Internal(InternalCaller {
-            node_id,
-            cluster_id: state.cluster_id,
-        }),
-        tracked_connection: None,
+        execution_scope,
+        tracked_connection,
     })
 }
 
@@ -9604,6 +9623,10 @@ async fn serve_direct_quic_multiplex_session(
             return Ok(());
         };
 
+        if let Some(tracked_connection) = completed.tracked_connection.as_ref() {
+            tracked_connection.touch();
+        }
+
         let state = state.clone();
         let remote_endpoint_id = remote_endpoint_id.clone();
         let execution_scope = completed.execution_scope.clone();
@@ -9627,15 +9650,40 @@ fn spawn_direct_quic_multiplex_agent(state: ServerState) {
 
     tokio::spawn(async move {
         loop {
-            match direct_quic
-                .endpoint
-                .accept_session(MultiplexConfig::default())
-                .await
-            {
-                Ok(Some(session)) => {
+            match direct_quic.endpoint.accept_connection().await {
+                Ok(Some(accepted)) => {
                     let state = state.clone();
                     tokio::spawn(async move {
-                        let remote_endpoint_id = session.remote_endpoint_id.clone();
+                        let remote_endpoint_id = accepted.remote_endpoint_id.clone();
+                        let timeout_connection = accepted.connection.clone();
+                        let session = match tokio::time::timeout(
+                            Duration::from_secs(DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS),
+                            accepted.into_session(MultiplexConfig::default()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(session)) => session,
+                            Ok(Err(err)) => {
+                                warn!(
+                                    error = %err,
+                                    remote_endpoint_id = %remote_endpoint_id,
+                                    "failed accepting first direct QUIC bi-stream"
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                timeout_connection.close(
+                                    0u32.into(),
+                                    b"timed out waiting for first direct QUIC stream",
+                                );
+                                warn!(
+                                    remote_endpoint_id = %remote_endpoint_id,
+                                    timeout_secs = DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS,
+                                    "timed out waiting for first direct QUIC bi-stream"
+                                );
+                                return;
+                            }
+                        };
                         if let Err(err) = serve_direct_quic_multiplex_session(state, session).await
                         {
                             warn!(

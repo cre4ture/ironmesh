@@ -1726,6 +1726,7 @@ async fn spawn_direct_quic_transport_test_server(
     response_status: u16,
     response_headers: Vec<RelayHttpHeader>,
     response_body: Vec<u8>,
+    expected_target_node_id: NodeId,
 ) -> (DirectQuicTestState, tokio::task::JoinHandle<()>) {
     let endpoint = DirectQuicEndpoint::bind(DirectQuicEndpointConfig::new(SecretKey::generate()))
         .await
@@ -1765,8 +1766,9 @@ async fn spawn_direct_quic_transport_test_server(
             hello,
             TransportSessionControlMessage::Hello {
                 role: TransportSessionRole::Client,
+                target: Some(PeerIdentity::Node(node_id)),
                 ..
-            }
+            } if node_id == expected_target_node_id
         ));
 
         while let Some(mut stream) = accepted
@@ -1808,10 +1810,11 @@ async fn spawn_direct_quic_transport_test_server(
 fn direct_quic_transport_test_client(
     state: &DirectQuicTestState,
     identity: ClientIdentityMaterial,
+    target_node_id: NodeId,
 ) -> IronMeshClient {
     IronMeshClient::from_direct_quic_candidate_with_target_node_id(
         state.candidate.clone(),
-        Some(NodeId::new_v4()),
+        Some(target_node_id),
     )
     .with_client_identity(identity)
 }
@@ -2451,6 +2454,7 @@ async fn direct_transport_executes_and_reuses_multiplexed_session() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
+    let target_node_id = NodeId::new_v4();
     let (direct_state, server) = spawn_direct_quic_transport_test_server(
         200,
         vec![
@@ -2464,6 +2468,7 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
             },
         ],
         br#"{"status":"ok","route":"direct-quic"}"#.to_vec(),
+        target_node_id,
     )
     .await;
 
@@ -2476,7 +2481,7 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
         .expect("identity should generate");
         identity.credential_pem = Some("issued-credential".to_string());
 
-        let client = direct_quic_transport_test_client(&direct_state, identity);
+        let client = direct_quic_transport_test_client(&direct_state, identity, target_node_id);
         let response = client
             .get_json_path("/cluster/status")
             .await

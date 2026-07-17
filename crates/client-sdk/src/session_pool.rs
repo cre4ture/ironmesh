@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use common::NodeId;
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,7 @@ enum SessionPoolTarget {
     },
     DirectQuic {
         candidate: ConnectionCandidate,
+        target_node_id: Option<NodeId>,
         endpoint: Arc<Mutex<Option<DirectQuicEndpoint>>>,
     },
     Relay {
@@ -71,10 +72,14 @@ impl TransportSessionPool {
         }
     }
 
-    pub(crate) fn new_direct_quic(candidate: ConnectionCandidate) -> Self {
+    pub(crate) fn new_direct_quic(
+        candidate: ConnectionCandidate,
+        target_node_id: Option<NodeId>,
+    ) -> Self {
         Self {
             target: SessionPoolTarget::DirectQuic {
                 candidate,
+                target_node_id,
                 endpoint: Arc::new(Mutex::new(None)),
             },
             cached_session: Arc::new(Mutex::new(None)),
@@ -119,7 +124,7 @@ impl TransportSessionPool {
             return Ok(Arc::clone(&existing.session));
         }
 
-        let (multiplexed, handshake_context) = match &self.target {
+        let (multiplexed, handshake_context, target) = match &self.target {
             SessionPoolTarget::DirectHttps {
                 server_base_url,
                 server_ca_pem,
@@ -143,12 +148,17 @@ impl TransportSessionPool {
                     )
                     .context("failed creating direct multiplexed transport session")?,
                     format!("failed performing direct transport handshake for {server_base_url}"),
+                    None,
                 )
             }
             SessionPoolTarget::DirectQuic {
                 candidate,
+                target_node_id,
                 endpoint,
             } => {
+                let target_node_id = target_node_id.ok_or_else(|| {
+                    anyhow!("direct QUIC transport target is missing target node id")
+                })?;
                 let target_label = candidate.endpoint.clone();
                 let endpoint = ensure_direct_quic_endpoint(endpoint, candidate).await?;
                 let direct_quic = endpoint
@@ -160,6 +170,7 @@ impl TransportSessionPool {
                 (
                     direct_quic.session,
                     format!("failed performing direct QUIC transport handshake for {target_label}"),
+                    Some(PeerIdentity::Node(target_node_id)),
                 )
             }
             SessionPoolTarget::Relay { .. } => {
@@ -175,7 +186,7 @@ impl TransportSessionPool {
                 role: TransportSessionRole::Client,
                 peer: PeerIdentity::Device(identity.device_id),
                 connection_name: connection_name.map(ToString::to_string),
-                target: None,
+                target,
             },
         )
         .await
@@ -356,12 +367,15 @@ mod tests {
     use super::*;
     #[test]
     fn direct_quic_pool_snapshot_starts_empty() {
-        let pool = TransportSessionPool::new_direct_quic(ConnectionCandidate {
-            kind: transport_sdk::CandidateKind::DirectQuic,
-            endpoint: "iroh://peer-key-1".to_string(),
-            rtt_ms: None,
-            transport_hints: None,
-        });
+        let pool = TransportSessionPool::new_direct_quic(
+            ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectQuic,
+                endpoint: "iroh://peer-key-1".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            },
+            Some(NodeId::new_v4()),
+        );
 
         assert_eq!(pool.snapshot(), TransportSessionPoolSnapshot::default());
     }

@@ -15684,6 +15684,45 @@ async fn execute_peer_request_routes_direct_quic_over_iroh() {
 }
 
 #[tokio::test]
+async fn direct_quic_transport_accepts_device_clients() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let candidate = install_direct_quic_runtime(&mut state).await;
+    super::spawn_direct_quic_multiplex_agent(state.clone());
+    tokio::task::yield_now().await;
+
+    let mut identity = transport_sdk::ClientIdentityMaterial::generate(
+        state.cluster_id,
+        None,
+        Some("direct-quic-device".to_string()),
+    )
+    .expect("client identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+
+    let client = client_sdk::IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+        candidate,
+        Some(state.node_id),
+    )
+    .with_client_identity(identity);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get_json_path("/cluster/status"),
+    )
+    .await
+    .expect("direct QUIC request should not stall")
+    .expect("direct QUIC request should succeed");
+
+    assert_eq!(
+        response
+            .get("local_node_id")
+            .and_then(|value| value.as_str()),
+        Some(state.node_id.to_string().as_str())
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn execute_peer_request_reuses_warm_relay_session() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.network.relay_mode = super::RelayMode::Required;

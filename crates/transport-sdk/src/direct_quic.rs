@@ -40,6 +40,11 @@ pub struct DirectQuicEndpoint {
     alpn: String,
 }
 
+pub struct DirectQuicAcceptedConnection {
+    pub connection: iroh::endpoint::Connection,
+    pub remote_endpoint_id: String,
+}
+
 pub struct DirectQuicSession {
     pub connection: iroh::endpoint::Connection,
     pub session: MultiplexedSession,
@@ -178,10 +183,7 @@ impl DirectQuicEndpoint {
         })
     }
 
-    pub async fn accept_session(
-        &self,
-        config: MultiplexConfig,
-    ) -> Result<Option<DirectQuicSession>> {
+    pub async fn accept_connection(&self) -> Result<Option<DirectQuicAcceptedConnection>> {
         let Some(incoming) = self.endpoint.accept().await else {
             return Ok(None);
         };
@@ -191,23 +193,21 @@ impl DirectQuicEndpoint {
             .await
             .context("direct QUIC connection handshake failed")?;
         let remote_endpoint_id = connection.remote_id().to_string();
-        let (send, recv) = connection.accept_bi().await.with_context(|| {
-            format!("failed accepting direct QUIC bi-stream from {remote_endpoint_id}")
-        })?;
-        let session = MultiplexedSession::spawn(
-            IrohBiStream::new(recv, send).compat(),
-            MultiplexMode::Server,
-            config,
-        )
-        .with_context(|| {
-            format!("failed creating direct QUIC multiplex session from {remote_endpoint_id}")
-        })?;
 
-        Ok(Some(DirectQuicSession {
+        Ok(Some(DirectQuicAcceptedConnection {
             connection,
-            session,
             remote_endpoint_id,
         }))
+    }
+
+    pub async fn accept_session(
+        &self,
+        config: MultiplexConfig,
+    ) -> Result<Option<DirectQuicSession>> {
+        let Some(accepted) = self.accept_connection().await? else {
+            return Ok(None);
+        };
+        accepted.into_session(config).await.map(Some)
     }
 
     pub async fn close(&self) {
@@ -235,6 +235,32 @@ impl DirectQuicEndpointSnapshot {
 impl IrohBiStream {
     fn new(recv: RecvStream, send: SendStream) -> Self {
         Self { recv, send }
+    }
+}
+
+impl DirectQuicAcceptedConnection {
+    pub async fn into_session(self, config: MultiplexConfig) -> Result<DirectQuicSession> {
+        let Self {
+            connection,
+            remote_endpoint_id,
+        } = self;
+        let (send, recv) = connection.accept_bi().await.with_context(|| {
+            format!("failed accepting direct QUIC bi-stream from {remote_endpoint_id}")
+        })?;
+        let session = MultiplexedSession::spawn(
+            IrohBiStream::new(recv, send).compat(),
+            MultiplexMode::Server,
+            config,
+        )
+        .with_context(|| {
+            format!("failed creating direct QUIC multiplex session from {remote_endpoint_id}")
+        })?;
+
+        Ok(DirectQuicSession {
+            connection,
+            session,
+            remote_endpoint_id,
+        })
     }
 }
 

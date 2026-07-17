@@ -2045,7 +2045,7 @@ impl IronMeshClient {
         }
     }
 
-    pub(crate) fn from_direct_quic_candidate_with_target_node_id(
+    pub fn from_direct_quic_candidate_with_target_node_id(
         candidate: ConnectionCandidate,
         target_node_id: Option<NodeId>,
     ) -> Self {
@@ -2055,7 +2055,7 @@ impl IronMeshClient {
                 ClientTransport::DirectQuic {
                     request_base_url,
                     target_node_id,
-                    session_pool: TransportSessionPool::new_direct_quic(candidate),
+                    session_pool: TransportSessionPool::new_direct_quic(candidate, target_node_id),
                 },
                 0,
             )]),

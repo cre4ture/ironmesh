@@ -1,4 +1,16 @@
 [graph]
+# Limit checks to the targets IronMesh actually builds in CI and distribution flows.
+# This keeps wasm-only browser relay dependencies from polluting the native/mobile graph.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-linux-android",
+  "aarch64-apple-ios",
+  "aarch64-apple-ios-sim",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
 all-features = true
 
 [advisories]
