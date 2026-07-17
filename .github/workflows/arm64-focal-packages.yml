@@ -46,6 +46,7 @@ jobs:
             ubuntu:20.04 \
             bash -lc '
               set -euo pipefail
+              git config --global --add safe.directory /build/ironmesh
               export DEBIAN_FRONTEND=noninteractive
               echo "deb http://ports.ubuntu.com/ubuntu-ports focal-backports main universe" \
                 > /etc/apt/sources.list.d/focal-backports.list
