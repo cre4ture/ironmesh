@@ -336,7 +336,8 @@ impl MediaCacheWorker {
         })
         .await
         {
-            Ok(Ok(payload)) => payload,
+            Ok(Ok(Some(payload))) => payload,
+            Ok(Ok(None)) => return Ok(None),
             Ok(Err(err)) => return Err(err),
             Err(err) => bail!("image thumbnail profile task failed: {err}"),
         };
@@ -1639,17 +1640,24 @@ fn render_image_thumbnail_payload(
     chunks_dir: &Path,
     profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     let payload = read_object_by_manifest_blocking(manifest, chunks_dir)?;
     let format = image::guess_format(&payload).context("unsupported media format")?;
     let (width, height) = image_dimensions(&payload, format)?;
     if let Some(error) = validate_image_decode_limits(width, height, image_limits) {
-        bail!(error);
+        tracing::debug!(
+            profile = profile.name,
+            width,
+            height,
+            error = %error,
+            "skipping thumbnail profile generation because image exceeds decode limits"
+        );
+        return Ok(None);
     }
 
     let image = decode_image_with_limits(&payload, format, image_limits)?;
     let (orientation, _, _) = extract_exif_fields(&payload);
-    Ok(render_thumbnail(image, orientation, profile)?.payload)
+    Ok(Some(render_thumbnail(image, orientation, profile)?.payload))
 }
 
 fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {

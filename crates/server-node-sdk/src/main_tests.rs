@@ -12884,6 +12884,75 @@ run_on_main_metadata_backends!(
     get_media_thumbnail_mobile_viewer_profile_serves_image_turso
 );
 
+async fn get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let (manifest_hash, content_fingerprint) = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked.set_media_cache_image_limits_for_test(3, 1_000, 1024 * 1024);
+        let put = locked
+            .put_object_versioned(
+                "gallery/oversized-thumb.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let metadata = locked
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.status, super::storage::MediaCacheStatus::Ready);
+        assert!(metadata.thumbnail.is_none());
+        (put.manifest_hash, metadata.content_fingerprint)
+    };
+
+    let response = super::get_media_thumbnail_response(
+        &state,
+        super::MediaThumbnailQuery {
+            key: "gallery/oversized-thumb.png".to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: Some("mobile_viewer".to_string()),
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(body.is_empty());
+
+    let thumbnail_path = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked.media_thumbnail_path(&content_fingerprint, "mobile_viewer")
+    };
+    assert!(!fs::try_exists(&thumbnail_path).await.unwrap());
+
+    let lookup = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let metadata = lookup.metadata.expect("expected cached metadata");
+    assert_eq!(metadata.status, super::storage::MediaCacheStatus::Ready);
+    assert!(metadata.thumbnail.is_none());
+    assert!(metadata.error.is_none());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image_impl,
+    get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image,
+    get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image_turso
+);
+
 #[cfg(unix)]
 async fn retry_media_cache_rebuilds_video_poster_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
