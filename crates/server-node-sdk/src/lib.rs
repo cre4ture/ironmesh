@@ -115,6 +115,7 @@ mod cluster;
 mod embedded_rendezvous;
 mod hardware_health;
 mod listing;
+mod map_config;
 mod map_dataset_import;
 mod replication;
 mod s3_frontend;
@@ -6766,6 +6767,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             post(complete_upload_session_route),
         )
         .route("/media/thumbnail", get(get_media_thumbnail))
+        .route("/maps/config", get(map_config::public_config))
         .route("/media/cache/retry", post(retry_media_cache))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
@@ -6829,6 +6831,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/data-changes", get(list_data_change_events))
+        .route(
+            "/auth/maps/config",
+            get(map_config::admin_get_config).put(map_config::admin_put_config),
+        )
         .route(
             "/auth/maps/import",
             get(map_dataset_import::admin_status).post(map_dataset_import::start_admin_import),

@@ -307,7 +307,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByLabel("Thumbnails per row")).toHaveValue("8");
   await page.getByRole("button", { name: "Map" }).click();
   await expect(
-    page.getByText("Using MapTiler Satellite 2017-11-02 Planet from your self-hosted basemap dataset.")
+    page.getByText("Using Natural Earth Globe from your self-hosted basemap dataset.")
   ).toBeVisible();
   await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
@@ -984,9 +984,32 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       }
     }
 
+    if (pathname === apiV1("/maps/config") && method === "GET") {
+      return json(route, {
+        stored: true,
+        configuration: {
+          version: 1,
+          active_variant_id: "natural-earth-globe",
+          variants: [
+            {
+              id: "natural-earth-globe",
+              label: "Natural Earth Globe",
+              mode_label: "Globe",
+              description: "Small global overview map.",
+              attribution: "Made with Natural Earth.",
+              kind: "raster",
+              style: "raster",
+              enabled: true,
+              raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
+            }
+          ]
+        }
+      });
+    }
+
     if (pathname === apiV1("/maps/mbtiles-metadata") && method === "GET") {
       return json(route, {
-        attribution: "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors.",
+        attribution: "Made with Natural Earth.",
         center: [0, 20, 1],
         format: "png",
         minzoom: 0,
