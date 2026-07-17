@@ -15904,7 +15904,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
                 &query.key,
                 query.snapshot.as_deref(),
                 query.version.as_deref(),
-                read_mode.clone(),
+                read_mode,
             )
             .await
         {
