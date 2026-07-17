@@ -34,7 +34,11 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
       try {
         const next = await getClientGalleryMapConfiguration();
         if (!cancelled) {
-          setMapConfiguration(next);
+          // Polling must not replace an equivalent response: `basemaps` then
+          // keeps its identity and the map does not get recreated every 15s.
+          setMapConfiguration((current) =>
+            sameMapConfiguration(current, next) ? current : next
+          );
         }
       } catch {
         // The gallery remains usable while a transient node or replication hop
@@ -115,6 +119,20 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         retryMediaEntry={retryMediaEntry}
       />
     </>
+  );
+}
+
+function sameMapConfiguration(
+  current: Awaited<ReturnType<typeof getClientGalleryMapConfiguration>> | null,
+  next: Awaited<ReturnType<typeof getClientGalleryMapConfiguration>>
+): boolean {
+  // `stored` communicates server-side initialization state only; it has no
+  // effect on gallery rendering. The API serializes configuration fields in a
+  // stable order, so this also compares nested variants without an additional
+  // dependency for deep equality.
+  return (
+    current !== null &&
+    JSON.stringify(current.configuration) === JSON.stringify(next.configuration)
   );
 }
 

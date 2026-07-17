@@ -350,10 +350,6 @@ async fn start_import_job(
         }
     }
 
-    let http = build_map_import_http_client().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let probe = probe_download_source(&http, &source_url)
-        .await
-        .map_err(import_error_status)?;
     let configured_target = match (request.variant_id.as_deref(), request.asset) {
         (Some(variant_id), Some(asset)) => {
             let configuration = map_config::load_current_configuration(state)
@@ -372,6 +368,16 @@ async fn start_import_job(
         (None, None) => None,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
+    let http = build_map_import_http_client().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let probe = probe_download_source(
+        &http,
+        &source_url,
+        configured_target
+            .as_ref()
+            .map(|target| target.dataset_filename.as_str()),
+    )
+    .await
+    .map_err(import_error_status)?;
     let now = unix_ts();
     let dataset_filename = configured_target
         .as_ref()
@@ -922,6 +928,7 @@ fn build_map_import_http_client() -> Result<reqwest::Client> {
 async fn probe_download_source(
     http: &reqwest::Client,
     source_url: &str,
+    configured_dataset_filename: Option<&str>,
 ) -> std::result::Result<MapDatasetProbe, ImportAdvanceError> {
     let parsed = Url::parse(source_url)
         .map_err(|err| ImportAdvanceError::Fatal(format!("invalid source URL: {err}")))?;
@@ -958,8 +965,7 @@ async fn probe_download_source(
         )));
     }
 
-    let final_url = response.url().clone();
-    let dataset_filename = dataset_filename_from_url(&final_url)?;
+    let dataset_filename = probe_dataset_filename(response.url(), configured_dataset_filename)?;
     Ok(MapDatasetProbe {
         // Keep the stable user-provided URL. Redirect targets may be short-lived
         // signed CDN URLs and must be re-resolved after a restart.
@@ -967,6 +973,19 @@ async fn probe_download_source(
         dataset_filename,
         total_size_bytes,
     })
+}
+
+fn probe_dataset_filename(
+    final_url: &Url,
+    configured_dataset_filename: Option<&str>,
+) -> std::result::Result<String, ImportAdvanceError> {
+    // A selected variant provides its canonical destination. Signed download
+    // URLs commonly end in a token or an API route rather than `.mbtiles`, so
+    // only the legacy, unconfigured import path derives a name from the URL.
+    match configured_dataset_filename {
+        Some(filename) => Ok(filename.to_string()),
+        None => dataset_filename_from_url(final_url),
+    }
 }
 
 fn dataset_filename_from_url(url: &Url) -> std::result::Result<String, ImportAdvanceError> {
@@ -1221,6 +1240,19 @@ mod tests {
             Some((1024, 2047, 4096))
         );
         assert_eq!(parse_content_range("bytes */4096"), None);
+    }
+
+    #[test]
+    fn configured_import_does_not_require_mbtiles_in_download_url() {
+        let signed_download =
+            Url::parse("https://downloads.example.test/api/v1/artifacts/123?signature=abc")
+                .expect("test URL should parse");
+
+        let filename =
+            probe_dataset_filename(&signed_download, Some("natural-earth-globe.mbtiles"))
+                .expect("configured imports use their configured destination filename");
+
+        assert_eq!(filename, "natural-earth-globe.mbtiles");
     }
 
     #[test]
