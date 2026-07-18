@@ -35,15 +35,37 @@ jobs:
       - name: Prepare vendored crates and web assets
         run: ./scripts/prepare-ppa-source.sh
 
+      - name: Cache sccache (ARM64 Focal build)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sccache-arm64
+          key: sccache-arm64-focal-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-arm64-focal-
+
       - name: Build Focal ARM64 Debian packages
         shell: bash
+        env:
+          # sccache caches the rustc invocations of the in-container release
+          # build across runs. The GHA cache backend can't be reached from
+          # inside `docker run`, so we mount an on-disk cache dir that
+          # actions/cache round-trips between runs.
+          SCCACHE_VERSION: v0.16.0
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          sccache_dir="${RUNNER_TEMP}/sccache-arm64"
+          mkdir -p "$sccache_dir"
           workspace_parent="$(dirname "$GITHUB_WORKSPACE")"
           docker run --rm \
             --volume "${workspace_parent}:/build" \
+            --volume "${sccache_dir}:/sccache" \
             --workdir /build/ironmesh \
+            --env RUSTC_WRAPPER=sccache \
+            --env SCCACHE_DIR=/sccache \
+            --env SCCACHE_CACHE_SIZE=2G \
+            --env CARGO_INCREMENTAL=0 \
+            --env SCCACHE_VERSION="${SCCACHE_VERSION}" \
             ubuntu:20.04 \
             bash -lc '
               set -euo pipefail
@@ -59,14 +81,23 @@ jobs:
               curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain nightly-2026-02-17
               export PATH=/root/.cargo/bin:$PATH
+              sccache_pkg="sccache-${SCCACHE_VERSION}-aarch64-unknown-linux-musl"
+              curl --proto "=https" --tlsv1.2 -fsSL \
+                "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${sccache_pkg}.tar.gz" \
+                | tar -xz -C /tmp
+              install -m 0755 "/tmp/${sccache_pkg}/sccache" /usr/local/bin/sccache
               CARGO_BUILD_JOBS=2 ./scripts/build-local-debs.sh \
                 --no-prepare --no-check-build-deps -- -j2
+              sccache --show-stats || true
               find /build -maxdepth 1 -type f \
                 \( -name "ironmesh-*_*_arm64.deb" \
                   -o -name "ironmesh_*_arm64.changes" \
                   -o -name "ironmesh_*_arm64.buildinfo" \) \
                 -exec cp -v {} /build/ironmesh/artifacts/ \;
             '
+          # actions/cache runs its post-job save as the runner user, but the
+          # container wrote the cache as root; hand ownership back so it saves.
+          sudo chown -R "$(id -u):$(id -g)" "$sccache_dir" || true
 
       - name: Upload Focal ARM64 Debian packages
         uses: actions/upload-artifact@v4
