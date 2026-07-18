@@ -1945,15 +1945,25 @@ fn text_fingerprint(value: &str) -> String {
     blake3::hash(value.trim().as_bytes()).to_hex().to_string()
 }
 
-fn validate_rendezvous_client_identity_issuance(state: &ServerState) -> Result<()> {
-    if !state.network.rendezvous_mtls_required {
-        return Ok(());
+fn client_transport_identity_issuance_context(state: &ServerState) -> Option<&'static str> {
+    if state.network.rendezvous_mtls_required {
+        Some("rendezvous mTLS")
+    } else if state.network.relay_mode != RelayMode::Disabled {
+        Some("relay inner mTLS")
+    } else {
+        None
     }
+}
+
+fn validate_rendezvous_client_identity_issuance(state: &ServerState) -> Result<()> {
+    let Some(context) = client_transport_identity_issuance_context(state) else {
+        return Ok(());
+    };
     if state.network.cluster_ca_pem.as_deref().is_none() {
-        bail!("rendezvous mTLS client identity issuance requires cluster_ca_pem");
+        bail!("{context} client identity issuance requires cluster_ca_pem");
     }
     if state.network.internal_ca_key_pem.as_deref().is_none() {
-        bail!("rendezvous mTLS client identity issuance requires internal_ca_key_pem");
+        bail!("{context} client identity issuance requires internal_ca_key_pem");
     }
     Ok(())
 }
@@ -1974,21 +1984,23 @@ fn issue_client_rendezvous_identity_pem(
     device_id: &str,
     expires_at_unix: Option<u64>,
 ) -> Result<Option<String>> {
-    if !state.network.rendezvous_mtls_required {
+    let Some(context) = client_transport_identity_issuance_context(state) else {
         return Ok(None);
-    }
+    };
 
     validate_rendezvous_client_identity_issuance(state)?;
 
-    let ca_cert_pem = state.network.cluster_ca_pem.as_deref().ok_or_else(|| {
-        anyhow!("rendezvous mTLS client identity issuance requires cluster_ca_pem")
-    })?;
+    let ca_cert_pem = state
+        .network
+        .cluster_ca_pem
+        .as_deref()
+        .ok_or_else(|| anyhow!("{context} client identity issuance requires cluster_ca_pem"))?;
     let ca_key_pem = state
         .network
         .internal_ca_key_pem
         .as_deref()
         .ok_or_else(|| {
-            anyhow!("rendezvous mTLS client identity issuance requires internal_ca_key_pem")
+            anyhow!("{context} client identity issuance requires internal_ca_key_pem")
         })?;
 
     let issuer_key =
@@ -21127,7 +21139,7 @@ async fn renew_device_rendezvous_identity_response(
             .into_response(),
         Ok(None) => (
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({ "error": "rendezvous mTLS is not enabled on this cluster" })),
+            Json(json!({ "error": "rendezvous mTLS and relay inner mTLS are disabled on this cluster" })),
         )
             .into_response(),
         Err(err) => (

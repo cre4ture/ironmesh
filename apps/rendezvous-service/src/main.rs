@@ -632,6 +632,7 @@ mod tests {
         let captured_request_for_acceptor = captured_request.clone();
         let rendezvous_public_url_for_acceptor = rendezvous_public_url.clone();
         let ca_pem_for_acceptor = ca.ca_pem.clone();
+        let target_tls_for_acceptor = target_tls.clone();
         let acceptor_handle = tokio::spawn(async move {
             let client = transport_sdk::RendezvousControlClient::new(
                 transport_sdk::RendezvousClientConfig {
@@ -668,18 +669,30 @@ mod tests {
             .expect("store index should serialize");
 
             loop {
-                let (relay_session, mut session) = client
-                    .accept_relay_legacy_plaintext_multiplex_target(
-                        &transport_sdk::RelayTunnelAcceptRequest {
-                            cluster_id,
-                            target: transport_sdk::PeerIdentity::Node(target_node_id),
-                            session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
-                            wait_timeout_ms: Some(15_000),
+                let tunnel = client
+                    .accept_relay_tunnel(&transport_sdk::RelayTunnelAcceptRequest {
+                        cluster_id,
+                        target: transport_sdk::PeerIdentity::Node(target_node_id),
+                        session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+                        wait_timeout_ms: Some(15_000),
+                    })
+                    .await
+                    .expect("relay tunnel accept should succeed");
+                let relay_session = tunnel.session().clone();
+                let (_, mut session) = tunnel
+                    .into_secure_multiplexed_target_session(
+                        transport_sdk::RelayTunnelTargetSecurityConfig {
+                            expected_source: relay_session.source.clone(),
+                            cluster_ca_pem: ca_pem_for_acceptor.as_bytes().to_vec(),
+                            identity: transport_sdk::RelayTunnelTlsIdentity::new(
+                                target_tls_for_acceptor.0.clone(),
+                                target_tls_for_acceptor.1.clone(),
+                            ),
                         },
                         transport_sdk::MultiplexConfig::default(),
                     )
                     .await
-                    .expect("relay tunnel accept should succeed");
+                    .expect("inner mTLS relay target should establish");
                 transport_sdk::perform_transport_server_handshake(
                     &mut session,
                     transport_sdk::TransportSessionControlMessage::Ready {

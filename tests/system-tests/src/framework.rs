@@ -711,11 +711,13 @@ async fn start_server_with_env_options_inner(
 ) -> Result<ChildGuard> {
     let server_bin = binary_path("server-node")?;
 
-    let node_id = if node_id.is_empty() {
-        Uuid::new_v4().to_string()
-    } else {
-        node_id.to_string()
-    };
+    // The server falls back to a generated UUID when IRONMESH_NODE_ID is not a
+    // UUID. Resolve the same value here so the test node certificate SAN and
+    // the runtime node identity cannot diverge.
+    let node_id = node_id
+        .parse::<Uuid>()
+        .unwrap_or_else(|_| Uuid::new_v4())
+        .to_string();
 
     let public_scheme = if public_https { "https" } else { "http" };
     let public_url = format!("{public_scheme}://{bind}");

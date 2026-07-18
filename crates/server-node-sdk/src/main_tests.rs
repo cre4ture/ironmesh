@@ -5821,13 +5821,14 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
-async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
+async fn enroll_client_device_issues_relay_identity_when_control_mtls_is_disabled() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let device_id = Uuid::now_v7().to_string();
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     state.network.cluster_ca_pem = Some(cluster_ca_pem);
     state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
-    state.network.rendezvous_mtls_required = true;
+    state.network.rendezvous_mtls_required = false;
+    state.network.relay_mode = super::RelayMode::Required;
 
     let now = super::unix_ts();
     {
@@ -5881,10 +5882,11 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
 }
 
 #[tokio::test]
-async fn enroll_client_device_returns_json_error_when_rendezvous_mtls_signing_is_unavailable() {
+async fn enroll_client_device_fails_closed_when_relay_identity_signer_is_unavailable() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.network.cluster_ca_pem = Some("cluster-ca".to_string());
-    state.network.rendezvous_mtls_required = true;
+    state.network.rendezvous_mtls_required = false;
+    state.network.relay_mode = super::RelayMode::Required;
 
     let response = super::enroll_client_device(
         State(state.clone()),
@@ -5906,8 +5908,45 @@ async fn enroll_client_device_returns_json_error_when_rendezvous_mtls_signing_is
     assert_eq!(
         payload.get("error").and_then(|value| value.as_str()),
         Some(
-            "client enrollment issuance is unavailable on this node: rendezvous mTLS client identity issuance requires internal_ca_key_pem"
+            "client enrollment issuance is unavailable on this node: relay inner mTLS client identity issuance requires internal_ca_key_pem"
         )
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn client_identity_issuance_skips_certificate_when_relay_and_control_mtls_are_disabled() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.rendezvous_mtls_required = false;
+    state.network.relay_mode = super::RelayMode::Disabled;
+
+    let identity = super::issue_client_rendezvous_identity_pem(
+        &state,
+        Uuid::now_v7().to_string().as_str(),
+        None,
+    )
+    .expect("disabled relay identity issuance should not fail");
+    assert!(identity.is_none());
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn client_identity_issuance_fails_closed_when_relay_cluster_ca_is_unavailable() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.rendezvous_mtls_required = false;
+    state.network.relay_mode = super::RelayMode::Required;
+
+    let error = super::issue_client_rendezvous_identity_pem(
+        &state,
+        Uuid::now_v7().to_string().as_str(),
+        None,
+    )
+    .expect_err("relay identity issuance without cluster CA must fail");
+    assert_eq!(
+        error.to_string(),
+        "relay inner mTLS client identity issuance requires cluster_ca_pem"
     );
 
     cleanup_test_state(&state).await;
@@ -13910,7 +13949,7 @@ async fn build_test_state(
                 "http://127.0.0.1:39080".to_string(),
                 super::RendezvousEndpointRegistrationRuntime::default(),
             )]))),
-            relay_mode: super::RelayMode::Fallback,
+            relay_mode: super::RelayMode::Disabled,
             enrollment_issuer_url: None,
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
@@ -15053,7 +15092,8 @@ run_on_main_metadata_backends!(
 
 #[tokio::test]
 async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.relay_mode = super::RelayMode::Fallback;
     super::replace_advertised_direct_endpoints(
         &state,
         super::build_bootstrap_direct_endpoints(
@@ -15099,7 +15139,8 @@ async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
 
 #[tokio::test]
 async fn rendezvous_presence_registration_keeps_public_api_but_excludes_public_direct_candidate() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.relay_mode = super::RelayMode::Fallback;
     super::replace_advertised_direct_endpoints(
         &state,
         super::build_bootstrap_direct_endpoints(
@@ -16052,7 +16093,8 @@ run_on_main_metadata_backends!(
 
 #[tokio::test]
 async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.relay_mode = super::RelayMode::Fallback;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         reachability: cluster::NodeReachability::default(),
