@@ -388,7 +388,7 @@ private struct IronmeshLibraryView: View {
                     }
                     .task {
                         if model.currentItems.isEmpty {
-                            model.refresh()
+                            model.refreshCurrentDirectory()
                         }
                     }
                 } else {
