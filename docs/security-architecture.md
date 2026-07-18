@@ -93,7 +93,7 @@ Follow-up design note:
 - Pre-enrollment bootstrap-claim relay is the deliberate legacy exception because the client does not have its certificate yet. Issue #120 tracks replacing that bootstrap path with a secure claim-specific design.
 - The rendezvous operator can observe control-plane metadata needed to broker a session, including authenticated endpoint identities, cluster scope, timing, and frame sizes. It cannot decrypt or alter protected application bytes without the inner TLS session failing.
 - The relay tunnel therefore brokers opaque byte streams and does not need feature-specific knowledge of gallery, maps, replication, or other HTTP routes. Ironmesh carries serialized HTTP/1.1 request/response bytes through the encrypted tunnel; node-side and client-side authorization still happens at the actual Ironmesh endpoint.
-- `tests/system-tests/src/relay_security_e2e_test.rs` verifies a relay-only enrolled client against a real node and rendezvous service. It confirms that known HTTP, authorization, credential, and object payload bytes are absent from observed relay binary frames and that a modified inner TLS application-data record fails closed.
+- `tests/system-tests/src/relay_security_e2e_test.rs` verifies a relay-only enrolled client against a real node and rendezvous service. It confirms that known HTTP, authorization, credential, and object payload bytes are absent from observed relay binary frames, then modifies exactly one post-handshake inner TLS application-data record and verifies that the request fails without committing its object write.
 
 ### 4.3 Human/Admin Authentication
 - Replace shared token with identity-backed auth:

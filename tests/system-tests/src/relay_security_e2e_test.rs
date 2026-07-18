@@ -32,8 +32,8 @@ mod tests {
 
     struct RelayFrameObserver {
         traffic: Arc<Mutex<ObservedRelayTraffic>>,
-        tamper_ciphertext: Arc<AtomicBool>,
-        ciphertext_tamper_count: Arc<AtomicUsize>,
+        tamper_next_tls_application_data_record: Arc<AtomicBool>,
+        tls_application_data_tamper_count: Arc<AtomicUsize>,
         shutdown: watch::Sender<bool>,
         task: JoinHandle<()>,
         public_url: String,
@@ -49,14 +49,16 @@ mod tests {
                 .context("failed reading relay frame observer address")?;
             let upstream_addr = upstream_addr.to_string();
             let traffic = Arc::new(Mutex::new(ObservedRelayTraffic::default()));
-            let tamper_ciphertext = Arc::new(AtomicBool::new(false));
-            let ciphertext_tamper_count = Arc::new(AtomicUsize::new(0));
+            let tamper_next_tls_application_data_record = Arc::new(AtomicBool::new(false));
+            let tls_application_data_tamper_count = Arc::new(AtomicUsize::new(0));
             let (shutdown, mut shutdown_rx) = watch::channel(false);
 
             let task = tokio::spawn({
                 let traffic = Arc::clone(&traffic);
-                let tamper_ciphertext = Arc::clone(&tamper_ciphertext);
-                let ciphertext_tamper_count = Arc::clone(&ciphertext_tamper_count);
+                let tamper_next_tls_application_data_record =
+                    Arc::clone(&tamper_next_tls_application_data_record);
+                let tls_application_data_tamper_count =
+                    Arc::clone(&tls_application_data_tamper_count);
                 async move {
                     loop {
                         tokio::select! {
@@ -71,16 +73,18 @@ mod tests {
                                 };
                                 let connection_shutdown = shutdown_rx.clone();
                                 let traffic = Arc::clone(&traffic);
-                                let tamper_ciphertext = Arc::clone(&tamper_ciphertext);
-                                let ciphertext_tamper_count = Arc::clone(&ciphertext_tamper_count);
+                                let tamper_next_tls_application_data_record =
+                                    Arc::clone(&tamper_next_tls_application_data_record);
+                                let tls_application_data_tamper_count =
+                                    Arc::clone(&tls_application_data_tamper_count);
                                 let upstream_addr = upstream_addr.clone();
                                 tokio::spawn(async move {
                                     relay_connection(
                                         client,
                                         &upstream_addr,
                                         traffic,
-                                        tamper_ciphertext,
-                                        ciphertext_tamper_count,
+                                        tamper_next_tls_application_data_record,
+                                        tls_application_data_tamper_count,
                                         connection_shutdown,
                                     )
                                     .await;
@@ -93,8 +97,8 @@ mod tests {
 
             Ok(Self {
                 traffic,
-                tamper_ciphertext,
-                ciphertext_tamper_count,
+                tamper_next_tls_application_data_record,
+                tls_application_data_tamper_count,
                 shutdown,
                 task,
                 public_url: format!("http://{local_addr}"),
@@ -117,15 +121,20 @@ mod tests {
                 .traffic
                 .lock()
                 .expect("relay traffic observer lock poisoned") = ObservedRelayTraffic::default();
-            self.ciphertext_tamper_count.store(0, Ordering::SeqCst);
+            self.tamper_next_tls_application_data_record
+                .store(false, Ordering::SeqCst);
+            self.tls_application_data_tamper_count
+                .store(0, Ordering::SeqCst);
         }
 
-        fn arm_ciphertext_tampering(&self) {
-            self.tamper_ciphertext.store(true, Ordering::SeqCst);
+        fn arm_next_tls_application_data_record_tampering(&self) {
+            self.tamper_next_tls_application_data_record
+                .store(true, Ordering::SeqCst);
         }
 
-        fn ciphertext_tamper_count(&self) -> usize {
-            self.ciphertext_tamper_count.load(Ordering::SeqCst)
+        fn tls_application_data_tamper_count(&self) -> usize {
+            self.tls_application_data_tamper_count
+                .load(Ordering::SeqCst)
         }
 
         async fn stop(self) {
@@ -138,8 +147,8 @@ mod tests {
         client: TcpStream,
         upstream_addr: &str,
         traffic: Arc<Mutex<ObservedRelayTraffic>>,
-        tamper_ciphertext: Arc<AtomicBool>,
-        ciphertext_tamper_count: Arc<AtomicUsize>,
+        tamper_next_tls_application_data_record: Arc<AtomicBool>,
+        tls_application_data_tamper_count: Arc<AtomicUsize>,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let Ok(upstream) = TcpStream::connect(upstream_addr).await else {
@@ -156,16 +165,16 @@ mod tests {
                         client_read,
                         upstream_write,
                         Arc::clone(&traffic),
-                        Arc::clone(&tamper_ciphertext),
-                        Arc::clone(&ciphertext_tamper_count),
+                        Arc::clone(&tamper_next_tls_application_data_record),
+                        Arc::clone(&tls_application_data_tamper_count),
                         true,
                     ),
                     forward_websocket_frames(
                         upstream_read,
                         client_write,
                         traffic,
-                        tamper_ciphertext,
-                        ciphertext_tamper_count,
+                        tamper_next_tls_application_data_record,
+                        tls_application_data_tamper_count,
                         false,
                     ),
                 );
@@ -177,8 +186,8 @@ mod tests {
         mut reader: OwnedReadHalf,
         mut writer: OwnedWriteHalf,
         traffic: Arc<Mutex<ObservedRelayTraffic>>,
-        tamper_ciphertext: Arc<AtomicBool>,
-        ciphertext_tamper_count: Arc<AtomicUsize>,
+        tamper_next_tls_application_data_record: Arc<AtomicBool>,
+        tls_application_data_tamper_count: Arc<AtomicUsize>,
         source_to_target: bool,
     ) {
         let mut observer = WebSocketFrameForwarder::default();
@@ -195,10 +204,10 @@ mod tests {
                 observe_websocket_frame(
                     &mut frame,
                     &traffic,
-                    &tamper_ciphertext,
-                    &ciphertext_tamper_count,
+                    &tamper_next_tls_application_data_record,
+                    &tls_application_data_tamper_count,
                     source_to_target,
-                    &mut observer.tampered_ciphertext,
+                    &mut observer.tampered_tls_application_data_record,
                 );
                 if writer.write_all(&frame).await.is_err() {
                     return;
@@ -211,7 +220,7 @@ mod tests {
     struct WebSocketFrameForwarder {
         upgraded: bool,
         pending: Vec<u8>,
-        tampered_ciphertext: bool,
+        tampered_tls_application_data_record: bool,
     }
 
     impl WebSocketFrameForwarder {
@@ -240,10 +249,10 @@ mod tests {
     fn observe_websocket_frame(
         frame: &mut [u8],
         traffic: &Arc<Mutex<ObservedRelayTraffic>>,
-        tamper_ciphertext: &Arc<AtomicBool>,
-        ciphertext_tamper_count: &Arc<AtomicUsize>,
+        tamper_next_tls_application_data_record: &Arc<AtomicBool>,
+        tls_application_data_tamper_count: &Arc<AtomicUsize>,
         source_to_target: bool,
-        tampered_ciphertext: &mut bool,
+        tampered_tls_application_data_record: &mut bool,
     ) {
         let Some(metadata) = websocket_frame_metadata(frame) else {
             return;
@@ -268,12 +277,16 @@ mod tests {
                     .push(payload.clone());
 
                 if source_to_target
-                    && tamper_ciphertext.load(Ordering::SeqCst)
-                    && !*tampered_ciphertext
-                    && tamper_tls_application_data(frame, &metadata, &payload)
+                    && !*tampered_tls_application_data_record
+                    && tamper_next_tls_application_data_record.load(Ordering::SeqCst)
+                    && let Some(payload_offset) = tls_application_data_payload_offset(&payload)
+                    && tamper_next_tls_application_data_record
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
                 {
-                    *tampered_ciphertext = true;
-                    ciphertext_tamper_count.fetch_add(1, Ordering::SeqCst);
+                    frame[metadata.payload_start + payload_offset] ^= 0x01;
+                    *tampered_tls_application_data_record = true;
+                    tls_application_data_tamper_count.fetch_add(1, Ordering::SeqCst);
                 }
             }
             _ => {}
@@ -361,11 +374,7 @@ mod tests {
         payload
     }
 
-    fn tamper_tls_application_data(
-        frame: &mut [u8],
-        metadata: &WebSocketFrameMetadata,
-        payload: &[u8],
-    ) -> bool {
+    fn tls_application_data_payload_offset(payload: &[u8]) -> Option<usize> {
         let mut offset = 0;
         while offset + 5 <= payload.len() {
             let record_len = usize::from(u16::from_be_bytes([
@@ -374,18 +383,17 @@ mod tests {
             ]));
             let record_end = offset + 5 + record_len;
             if record_end > payload.len() {
-                return false;
+                return None;
             }
             if payload[offset] == 0x17
                 && payload[offset + 1..offset + 3] == [0x03, 0x03]
                 && record_len > 0
             {
-                frame[metadata.payload_start + offset + 5] ^= 0x01;
-                return true;
+                return Some(offset + 5);
             }
             offset = record_end;
         }
-        false
+        None
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -396,7 +404,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_only_enrolled_client_keeps_frames_opaque_and_rejects_tampering() -> Result<()> {
+    async fn relay_only_enrolled_client_keeps_frames_opaque_and_rejects_post_handshake_tampering_without_committing_write()
+    -> Result<()> {
         let rendezvous_bind = "127.0.0.1:19266";
         let server_bind = "127.0.0.1:19267";
         let cluster_id = "11111111-1111-7111-8111-111111111166";
@@ -528,8 +537,6 @@ mod tests {
                 );
             }
 
-            observer.clear();
-            observer.arm_ciphertext_tampering();
             let tampered_client = {
                 let bootstrap = relay_only_bootstrap;
                 let identity = enrolled.identity.clone();
@@ -537,6 +544,14 @@ mod tests {
                     .await
                     .context("tampered relay-only client construction task panicked")??
             };
+            assert_eq!(
+                tampered_client.get("relay-security-e2e.bin").await?,
+                Bytes::from_static(KNOWN_RELAY_PAYLOAD),
+                "the second client must complete inner mTLS before tampering is armed"
+            );
+
+            observer.clear();
+            observer.arm_next_tls_application_data_record_tampering();
             let tampered_result = timeout(
                 Duration::from_secs(30),
                 tampered_client.put(
@@ -551,8 +566,12 @@ mod tests {
                 "a relay session with modified inner-TLS ciphertext must fail closed"
             );
             assert!(
-                observer.ciphertext_tamper_count() > 0,
-                "the observer did not modify a TLS application-data relay frame"
+                observer.tls_application_data_tamper_count() == 1,
+                "the observer must modify exactly one post-handshake TLS application-data record"
+            );
+            assert!(
+                client.get("relay-security-e2e-tampered.bin").await.is_err(),
+                "the node must not commit an object write carried by modified inner-TLS ciphertext"
             );
 
             Ok::<(), anyhow::Error>(())
