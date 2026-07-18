@@ -580,6 +580,22 @@ impl RelayTestSecurity {
         let cluster_ca_key_pem = ca_key.serialize_pem();
         let issuer = Issuer::new(ca_params, ca_key);
 
+        let target_identity = Self::issue_target_identity(cluster_id, target_node_id, &issuer);
+
+        Self {
+            cluster_id,
+            target_node_id,
+            cluster_ca_pem,
+            cluster_ca_key_pem,
+            target_identity,
+        }
+    }
+
+    fn issue_target_identity(
+        cluster_id: uuid::Uuid,
+        target_node_id: NodeId,
+        issuer: &Issuer<'_, KeyPair>,
+    ) -> RelayTunnelTlsIdentity {
         let target_key = KeyPair::generate().expect("relay test target key should generate");
         let mut target_params = CertificateParams::default();
         target_params.distinguished_name.push(
@@ -603,19 +619,17 @@ impl RelayTestSecurity {
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
         let target_cert = target_params
-            .signed_by(&target_key, &issuer)
+            .signed_by(&target_key, issuer)
             .expect("relay test target certificate should issue");
+        RelayTunnelTlsIdentity::new(target_cert.pem(), target_key.serialize_pem())
+    }
 
-        Self {
-            cluster_id,
-            target_node_id,
-            cluster_ca_pem,
-            cluster_ca_key_pem,
-            target_identity: RelayTunnelTlsIdentity::new(
-                target_cert.pem(),
-                target_key.serialize_pem(),
-            ),
-        }
+    fn target_identity_for_node(&self, node_id: NodeId) -> RelayTunnelTlsIdentity {
+        let issuer_key =
+            KeyPair::from_pem(&self.cluster_ca_key_pem).expect("relay test CA key should parse");
+        let issuer = Issuer::from_ca_cert_pem(&self.cluster_ca_pem, issuer_key)
+            .expect("relay test CA issuer should build");
+        Self::issue_target_identity(self.cluster_id, node_id, &issuer)
     }
 
     fn source_security(&self, device_id: uuid::Uuid) -> RelayTunnelSourceSecurityConfig {
@@ -2257,6 +2271,47 @@ async fn relay_transport_fails_closed_when_source_certificate_identity_mismatche
     .await
     .expect("target should observe the rejected source identity");
     assert!(relay_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
+    assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 0);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn relay_transport_rejects_target_with_wrong_node_identity() {
+    let mut security = RelayTestSecurity::new();
+    let wrong_target_node_id = NodeId::new_v4();
+    security.target_identity = security.target_identity_for_node(wrong_target_node_id);
+    let (relay_state, server) = spawn_relay_test_server_at_with_security(
+        "127.0.0.1:0".parse().expect("bind addr should parse"),
+        200,
+        vec![RelayHttpHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        br#"{"status":"ok"}"#.to_vec(),
+        0,
+        0,
+        security,
+    )
+    .await;
+    let client = relay_test_client(
+        &relay_state,
+        relay_test_identity(&relay_state.security, "relay-wrong-target-identity-device"),
+    );
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get_json_path("/cluster/status"),
+    )
+    .await
+    .expect("wrong target identity request should fail promptly")
+    .expect_err("relay source must reject a target certificate with the wrong node SAN");
+    assert!(
+        format!("{error:#}").contains("inner mTLS relay session"),
+        "unexpected relay target identity error: {error:#}"
+    );
+    assert!(relay_state.captured_request.lock().await.is_none());
     assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 0);
 
     server.abort();
