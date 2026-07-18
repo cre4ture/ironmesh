@@ -6808,6 +6808,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
 
     let redeem_request = transport_sdk::ClientBootstrapClaimRedeemRequest {
         claim_token: claim_token.to_string(),
+        cluster_id: Some(state.cluster_id),
         target_node_id: state.node_id,
         device_id: Some(Uuid::now_v7().to_string()),
         label: Some("Tablet".to_string()),
