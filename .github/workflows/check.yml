@@ -249,51 +249,10 @@ jobs:
           echo "BUILD_COMMIT_SHORT=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
           echo "BUILD_NAME_SUFFIX=${BUILD_SUFFIX}" >> "$GITHUB_ENV"
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+      - name: Setup Android + Rust toolchain
+        uses: ./.github/actions/setup-android-rust
         with:
-          version: 10.6.0
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-
-      - name: Install web workspace dependencies
-        working-directory: web
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Rust toolchain with Android targets
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,x86_64-linux-android
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: gradle
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK (side by side)
-        run: sdkmanager --install "ndk;27.1.12297006"
-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+          rust-cache-shared-key: android-rust
 
       - name: Verify Android native toolchain
         run: |
@@ -592,51 +551,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+      - name: Setup Android + Rust toolchain
+        uses: ./.github/actions/setup-android-rust
         with:
-          version: 10.6.0
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-
-      - name: Install web workspace dependencies
-        working-directory: web
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Rust toolchain with Android targets
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,x86_64-linux-android
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: gradle
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK (side by side)
-        run: sdkmanager --install "ndk;27.1.12297006"
-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+          rust-cache-shared-key: android-rust
 
       - name: Restore Android keystore
         run: |

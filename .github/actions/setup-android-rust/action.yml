@@ -1,0 +1,67 @@
+name: Setup Android + Rust toolchain
+description: >-
+  Shared setup for Android/Rust CI jobs: pnpm + Node.js, web workspace
+  dependencies, a Rust toolchain with Android targets, the Swatinem cargo
+  cache, Java, the Android SDK/NDK, and a prebuilt cargo-ndk.
+
+inputs:
+  rust-cache-shared-key:
+    description: >-
+      Shared key passed to Swatinem/rust-cache so jobs with the same key reuse
+      the same cargo registry cache.
+    required: false
+    default: android-rust
+
+runs:
+  using: composite
+  steps:
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 10.6.0
+        run_install: false
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: pnpm
+        cache-dependency-path: web/pnpm-lock.yaml
+
+    - name: Install web workspace dependencies
+      working-directory: web
+      shell: bash
+      run: pnpm install --frozen-lockfile
+
+    - name: Install Rust toolchain with Android targets
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android,x86_64-linux-android
+
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Cache cargo registry and build artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: false
+        shared-key: ${{ inputs.rust-cache-shared-key }}
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+        cache: gradle
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install Android NDK (side by side)
+      shell: bash
+      run: sdkmanager --install "ndk;27.1.12297006"
+
+    - name: Install cargo-ndk (prebuilt)
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk
