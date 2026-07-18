@@ -851,21 +851,10 @@ async fn serve_test_multiplex_session(
             .expect("multiplexed relay test request should decode");
         if request.path == "/api/v1/health" {
             state.health_hits.fetch_add(1, Ordering::SeqCst);
+        } else {
+            // Background transport probes must not overwrite the request under test.
+            *state.captured_request.lock().await = Some(capture_transport_request(&request));
         }
-        *state.captured_request.lock().await = Some(RelayTestCapturedRequest {
-            kind: Some(request.kind),
-            method: request.method.clone(),
-            path_and_query: request.path.clone(),
-            headers: request
-                .headers
-                .iter()
-                .map(|header| RelayHttpHeader {
-                    name: header.name.clone(),
-                    value: header.value.clone(),
-                })
-                .collect(),
-            body: request.body.clone(),
-        });
 
         let fail_object_write = request.kind == TransportStreamKind::ObjectWrite
             && state
@@ -1328,11 +1317,22 @@ async fn serve_direct_transport_stalls_object_write_socket(
         }
     ));
 
-    while let Some(mut stream) = session
-        .accept_stream()
-        .await
-        .expect("stalling direct object-write stream accept should succeed")
-    {
+    loop {
+        let next_stream = match session.accept_stream().await {
+            Ok(next_stream) => next_stream,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("Connection reset")
+                    || message.contains("without closing handshake")
+                {
+                    return;
+                }
+                panic!("stalling direct object-write stream accept should succeed: {error:#}");
+            }
+        };
+        let Some(mut stream) = next_stream else {
+            return;
+        };
         let request = read_buffered_transport_request(&mut stream)
             .await
             .expect("stalling direct object-write request should decode");
