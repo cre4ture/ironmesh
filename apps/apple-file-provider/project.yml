@@ -42,6 +42,7 @@ targets:
           "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAppGroup.entitlements
         INFOPLIST_FILE: Resources/Info/IronmeshMacApp-Info.plist
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
@@ -72,6 +73,7 @@ targets:
           "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAppGroup.entitlements
         INFOPLIST_FILE: Resources/Info/IronmeshMacFileProviderExtension-Info.plist
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)

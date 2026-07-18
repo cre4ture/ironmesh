@@ -624,6 +624,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
@@ -816,6 +817,7 @@
 		438673375255170381B484EA /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";
@@ -947,6 +949,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
@@ -966,6 +969,7 @@
 		C8D904EEB4580E12BF4D2C45 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";

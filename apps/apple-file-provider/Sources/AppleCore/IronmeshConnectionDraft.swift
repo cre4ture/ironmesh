@@ -30,6 +30,67 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         self.domainDisplayName = domainDisplayName
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case deviceLabel
+        case directConnectionInput
+        case bootstrapInput
+        case serverCAPem
+        case clientIdentityJSON
+        case enrolledDeviceID
+        case domainIdentifier
+        case domainDisplayName
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            deviceLabel: try container.decodeIfPresent(
+                String.self,
+                forKey: .deviceLabel
+            ) ?? "",
+            directConnectionInput: try container.decodeIfPresent(
+                String.self,
+                forKey: .directConnectionInput
+            ) ?? "",
+            bootstrapInput: try container.decodeIfPresent(
+                String.self,
+                forKey: .bootstrapInput
+            ) ?? "",
+            serverCAPem: try container.decodeIfPresent(
+                String.self,
+                forKey: .serverCAPem
+            ) ?? "",
+            clientIdentityJSON: try container.decodeIfPresent(
+                String.self,
+                forKey: .clientIdentityJSON
+            ) ?? "",
+            enrolledDeviceID: try container.decodeIfPresent(
+                String.self,
+                forKey: .enrolledDeviceID
+            ) ?? "",
+            domainIdentifier: try container.decodeIfPresent(
+                String.self,
+                forKey: .domainIdentifier
+            ) ?? "dev.ironmesh.default",
+            domainDisplayName: try container.decodeIfPresent(
+                String.self,
+                forKey: .domainDisplayName
+            ) ?? "IronMesh"
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        // Decode the legacy identity for migration, but never encode it again.
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(deviceLabel, forKey: .deviceLabel)
+        try container.encode(directConnectionInput, forKey: .directConnectionInput)
+        try container.encode(bootstrapInput, forKey: .bootstrapInput)
+        try container.encode(serverCAPem, forKey: .serverCAPem)
+        try container.encode(enrolledDeviceID, forKey: .enrolledDeviceID)
+        try container.encode(domainIdentifier, forKey: .domainIdentifier)
+        try container.encode(domainDisplayName, forKey: .domainDisplayName)
+    }
+
     public var effectiveConnectionInput: String {
         bootstrapInput.nilIfBlank ?? directConnectionInput.nilIfBlank ?? ""
     }

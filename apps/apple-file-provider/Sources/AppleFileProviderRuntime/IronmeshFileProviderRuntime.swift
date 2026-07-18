@@ -364,14 +364,14 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         }
     }
 
-    func currentConnectionConfiguration() -> AppleConnectionConfiguration {
-        let stored = settingsStore.load()
+    func currentConnectionConfiguration() throws -> AppleConnectionConfiguration {
+        let stored = try settingsStore.load()
         return stored?.effectiveConfiguration(fallback: configuration.defaultConnectionConfiguration)
             ?? configuration.defaultConnectionConfiguration
     }
 
-    func storedConnectionState() -> AppleStoredConnectionState {
-        settingsStore.load() ?? AppleStoredConnectionState(
+    func storedConnectionState() throws -> AppleStoredConnectionState {
+        try settingsStore.load() ?? AppleStoredConnectionState(
             connectionInput: configuration.defaultConnectionConfiguration.connectionInput
         )
     }
@@ -383,13 +383,13 @@ final class IronmeshFileProviderService: @unchecked Sendable {
         }
     }
 
-    func clearStoredConnectionState() {
-        settingsStore.clear()
+    func clearStoredConnectionState() throws {
+        try settingsStore.clear()
         resetConnection()
     }
 
     func startWebUi() throws -> URL {
-        let connectionConfiguration = currentConnectionConfiguration()
+        let connectionConfiguration = try currentConnectionConfiguration()
         let urlString = try ffi.startWebUi(
             connectionInput: connectionConfiguration.normalizedConnectionInput,
             serverCAPem: connectionConfiguration.serverCAPem,
@@ -402,7 +402,7 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     }
 
     private func connectIfNeeded() throws {
-        let configuration = currentConnectionConfiguration()
+        let configuration = try currentConnectionConfiguration()
         lock.lock()
         let alreadyConnected = connected
         let currentConfiguration = connectedConfiguration

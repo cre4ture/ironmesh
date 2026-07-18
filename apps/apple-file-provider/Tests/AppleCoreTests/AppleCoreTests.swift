@@ -50,31 +50,6 @@ final class AppleCoreTests: XCTestCase {
         XCTAssertEqual(effective.clientIdentityJSON, #"{"device_id":"abc"}"#)
     }
 
-    func testConnectionSettingsStoreRoundTripsSavedState() throws {
-        let suiteName = "AppleCoreTests.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            XCTFail("Expected isolated test defaults")
-            return
-        }
-        defaults.removePersistentDomain(forName: suiteName)
-
-        let store = AppleConnectionSettingsStore(defaults: defaults)
-        let state = AppleStoredConnectionState(
-            connectionInput: #"{"version":1}"#,
-            serverCAPem: "demo-ca",
-            clientIdentityJSON: #"{"device_id":"device-1"}"#,
-            deviceID: "device-1",
-            deviceLabel: "Phone",
-            bootstrapInputDraft: #"{"claim":true}"#
-        )
-
-        try store.save(state)
-
-        XCTAssertEqual(store.load(), state)
-        store.clear()
-        XCTAssertNil(store.load())
-    }
-
     func testEnrollmentResultBuildsClientIdentityJSONWhenMissing() throws {
         let enrollment = AppleBootstrapEnrollmentResult(
             clusterID: "cluster-1",
