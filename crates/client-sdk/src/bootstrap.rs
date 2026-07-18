@@ -1271,6 +1271,7 @@ pub fn enroll_bootstrap_claim_blocking(
     let rendezvous_ca_pem = claim_rendezvous_ca_pem(&claim.trust)?;
     let redeem_request = ClientBootstrapClaimRedeemRequest {
         claim_token: claim.claim_token.clone(),
+        cluster_id: Some(claim.cluster_id),
         target_node_id: claim.target_node_id,
         device_id: Some(identity.device_id.to_string()),
         label,

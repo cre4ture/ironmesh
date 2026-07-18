@@ -538,24 +538,11 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
     authenticated_peer: &MaybeAuthenticatedPeer,
     request: &ClientBootstrapClaimRedeemRequest,
 ) -> std::result::Result<ClientBootstrapClaimRedeemResponse, (StatusCode, String)> {
+    let target_presence = bootstrap_claim_target_presence(state, request)?;
     let target = PeerIdentity::Node(request.target_node_id);
-    let target_presence = state
-        .presence
-        .only_cluster_id()
-        .and_then(|cluster_id| state.presence.entry_for_identity(cluster_id, &target))
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "bootstrap claim target node {} is not currently connected to rendezvous",
-                    request.target_node_id
-                ),
-            )
-        })?;
 
     // Bootstrap-claim redemption is intentionally usable before a client certificate
-    // exists. Its target is nevertheless resolved only from an unambiguous presence
-    // cluster; when a certificate is presented, it must be bound to that cluster.
+    // exists. When a certificate is presented, it must be bound to the target cluster.
     if authenticated_peer.identity().is_some() {
         ensure_authenticated_peer_cluster(
             state.config.mtls.is_some(),
@@ -645,6 +632,31 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
         .validate()
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
     Ok(redeemed)
+}
+
+fn bootstrap_claim_target_presence(
+    state: &RendezvousAppState,
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> std::result::Result<transport_sdk::PresenceEntry, (StatusCode, String)> {
+    // Older clients did not send cluster_id. Keep them working only while the
+    // rendezvous registry is unambiguously single-cluster.
+    let cluster_id = request
+        .cluster_id
+        .or_else(|| state.presence.only_cluster_id())
+        .ok_or_else(|| bootstrap_claim_target_unavailable(request.target_node_id))?;
+    state
+        .presence
+        .entry_for_identity(cluster_id, &PeerIdentity::Node(request.target_node_id))
+        .ok_or_else(|| bootstrap_claim_target_unavailable(request.target_node_id))
+}
+
+fn bootstrap_claim_target_unavailable(target_node_id: NodeId) -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "bootstrap claim target node {target_node_id} is not currently connected to rendezvous"
+        ),
+    )
 }
 
 async fn relay_tunnel_ws(
@@ -1461,6 +1473,59 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn bootstrap_claim_target_resolution_is_cluster_scoped() {
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let target_node_id = NodeId::now_v7();
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("rendezvous app state should build");
+        state.presence.register(
+            presence_registration(
+                cluster_b,
+                PeerIdentity::Node(target_node_id),
+                "https://node-b.example:7443",
+            ),
+            None,
+        );
+
+        let mut request = ClientBootstrapClaimRedeemRequest {
+            claim_token: "claim-token".to_string(),
+            cluster_id: None,
+            target_node_id,
+            device_id: Some(DeviceId::now_v7().to_string()),
+            label: Some("Phone".to_string()),
+            public_key_pem: "public-key".to_string(),
+        };
+        let legacy_target = bootstrap_claim_target_presence(&state, &request)
+            .expect("legacy request should resolve in a single-cluster registry");
+        assert_eq!(legacy_target.registration.cluster_id, cluster_b);
+
+        state.presence.register(
+            presence_registration(
+                cluster_a,
+                PeerIdentity::Node(NodeId::now_v7()),
+                "https://node-a.example:7443",
+            ),
+            None,
+        );
+        request.cluster_id = Some(cluster_b);
+        let scoped_target = bootstrap_claim_target_presence(&state, &request)
+            .expect("cluster-scoped request should resolve its target");
+        assert_eq!(scoped_target.registration.cluster_id, cluster_b);
+
+        request.cluster_id = None;
+        let ambiguous_target = bootstrap_claim_target_presence(&state, &request)
+            .expect_err("legacy request must not cross a multi-cluster registry");
+        assert_eq!(ambiguous_target.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

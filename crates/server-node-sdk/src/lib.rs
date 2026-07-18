@@ -21183,6 +21183,18 @@ async fn redeem_client_bootstrap_claim(
         )
             .into_response();
     }
+    if let Some(cluster_id) = request.cluster_id
+        && cluster_id != state.cluster_id
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "bootstrap claim cluster_id {} does not match node cluster {}",
+                cluster_id, state.cluster_id
+            ),
+        )
+            .into_response();
+    }
 
     let device_id = match request
         .device_id

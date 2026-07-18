@@ -51,6 +51,8 @@ pub struct ClientBootstrapClaimPublishResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientBootstrapClaimRedeemRequest {
     pub claim_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<ClusterId>,
     pub target_node_id: NodeId,
     #[serde(default)]
     pub device_id: Option<String>,
@@ -344,6 +346,12 @@ impl ClientBootstrapClaimRedeemRequest {
         if self.claim_token.trim().is_empty() {
             bail!("bootstrap claim redeem request must include a claim_token");
         }
+        if self
+            .cluster_id
+            .is_some_and(|cluster_id| cluster_id.is_nil())
+        {
+            bail!("bootstrap claim redeem request cluster_id must not be nil when provided");
+        }
         if self.target_node_id.is_nil() {
             bail!("bootstrap claim redeem request must include a non-nil target_node_id");
         }
@@ -520,6 +528,7 @@ mod tests {
     fn bootstrap_claim_redeem_request_serializes_device_label_and_accepts_legacy_label() {
         let request = ClientBootstrapClaimRedeemRequest {
             claim_token: "im-claim-test-token".to_string(),
+            cluster_id: Some("019d02eb-ab39-7220-911a-c0eafcb38249".parse().unwrap()),
             target_node_id: "9f068697-bd16-431a-8311-8ae985025bcf".parse().unwrap(),
             device_id: Some("019d04a8-3099-75bc-8ff5-f5bd9a78bb83".to_string()),
             label: Some("Tablet".to_string()),
@@ -530,6 +539,10 @@ mod tests {
         let object = json
             .as_object()
             .expect("redeem request should serialize as an object");
+        assert_eq!(
+            object.get("cluster_id").and_then(serde_json::Value::as_str),
+            Some("019d02eb-ab39-7220-911a-c0eafcb38249")
+        );
         assert_eq!(
             object
                 .get("device_label")
@@ -548,6 +561,7 @@ mod tests {
         let parsed: ClientBootstrapClaimRedeemRequest =
             serde_json::from_value(legacy).expect("legacy redeem request should deserialize");
 
+        assert_eq!(parsed.cluster_id, None);
         assert_eq!(parsed.label.as_deref(), Some("Phone"));
     }
 
