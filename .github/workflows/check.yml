@@ -343,6 +343,10 @@ jobs:
         working-directory: apps/android-server-node-app
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
+      - name: Build Android server-node debug APK
+        working-directory: apps/android-server-node-app
+        run: ./gradlew --no-daemon :app:assembleDebug
+
       - name: Reclaim disk before Android server-node release build
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         run: |
