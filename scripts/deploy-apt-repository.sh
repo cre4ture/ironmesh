@@ -17,7 +17,7 @@ log() {
 
 usage() {
   cat <<'EOF'
-Deploy the generated Ironmesh apt repository to a static web directory.
+Deploy generated Ironmesh apt repository updates to a static web directory.
 
 Usage:
   ./scripts/deploy-apt-repository.sh [options]
@@ -121,19 +121,46 @@ if [[ ! -f "${REPO_DIR}/dists/${SUITE}/InRelease" ]]; then
   exit 1
 fi
 
-RSYNC_ARGS=(-av --delete)
-if [[ "${DRY_RUN}" == true ]]; then
-  RSYNC_ARGS+=(--dry-run)
+if [[ ! -d "${REPO_DIR}/pool" ]]; then
+  printf 'package pool not found: %s\n' "${REPO_DIR}/pool" >&2
+  exit 1
 fi
 
-log "ensuring ${REMOTE}:${REMOTE_DIR} exists"
-ssh "${REMOTE}" "mkdir -p $(shell_quote "${REMOTE_DIR}")"
+if [[ ! -f "${REPO_DIR}/ironmesh-archive-keyring.asc" ]]; then
+  printf 'archive signing key not found: %s\n' \
+    "${REPO_DIR}/ironmesh-archive-keyring.asc" >&2
+  exit 1
+fi
 
-log "syncing ${REPO_DIR}/ to ${REMOTE}:${REMOTE_DIR}/"
+RSYNC_ARGS=(-av --delete)
+RSYNC_ADDITION_ARGS=(-av)
+if [[ "${DRY_RUN}" == true ]]; then
+  RSYNC_ARGS+=(--dry-run)
+  RSYNC_ADDITION_ARGS+=(--dry-run)
+fi
+
+if [[ "${DRY_RUN}" == false ]]; then
+  log "ensuring ${REMOTE}:${REMOTE_DIR} exists"
+  ssh "${REMOTE}" "mkdir -p $(shell_quote "${REMOTE_DIR}")"
+fi
+
+log "syncing ${SUITE} metadata"
 rsync "${RSYNC_ARGS[@]}" \
   --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-  "${REPO_DIR%/}/" \
-  "${REMOTE}:${REMOTE_DIR%/}/"
+  "${REPO_DIR%/}/dists/${SUITE}/" \
+  "${REMOTE}:${REMOTE_DIR%/}/dists/${SUITE}/"
+
+log "syncing package pool additions"
+rsync "${RSYNC_ADDITION_ARGS[@]}" \
+  --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+  "${REPO_DIR%/}/pool/" \
+  "${REMOTE}:${REMOTE_DIR%/}/pool/"
+
+log "syncing archive signing key"
+rsync "${RSYNC_ADDITION_ARGS[@]}" \
+  --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+  "${REPO_DIR%/}/ironmesh-archive-keyring.asc" \
+  "${REMOTE}:${REMOTE_DIR%/}/ironmesh-archive-keyring.asc"
 
 if [[ "${DRY_RUN}" == true ]]; then
   log "dry run complete"

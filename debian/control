@@ -4,6 +4,8 @@ Priority: optional
 Maintainer: Ulrich Hornung <hornunguli@gmx.de>
 Build-Depends:
  debhelper-compat (= 13),
+ dh-sysuser,
+ clang,
  cargo-1.91 | cargo-1.89 | cargo-1.85,
  rustc-1.91 | rustc-1.89 | rustc-1.85,
  libfuse3-dev,

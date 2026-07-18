@@ -70,6 +70,11 @@ int ironmesh_ios_facade_fetch_bytes(void *handle,
                                     struct IronmeshIosBytes *out_bytes,
                                     char **out_error);
 
+int ironmesh_ios_facade_fetch_relative_bytes(void *handle,
+                                             const char *path,
+                                             struct IronmeshIosBytes *out_bytes,
+                                             char **out_error);
+
 int ironmesh_ios_facade_put_bytes(void *handle,
                                   const char *key,
                                   const uint8_t *data,

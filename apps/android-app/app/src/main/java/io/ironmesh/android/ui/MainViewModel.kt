@@ -10,6 +10,7 @@ import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.DeviceAuthState
+import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.AppConnectionStatus
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
@@ -173,7 +174,10 @@ class MainViewModel(
 
     init {
         val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
-        val persistedDeviceAuth = IronmeshPreferences.getDeviceAuthState(getApplication())
+        val persistedDeviceAuthResult = runCatching {
+            IronmeshPreferences.getDeviceAuthState(getApplication())
+        }
+        val persistedDeviceAuth = persistedDeviceAuthResult.getOrDefault(DeviceAuthState())
         val persistedGalleryViewMode = IronmeshPreferences.getGalleryViewMode(getApplication())
         val persistedConnectionStatus = IronmeshPreferences.getAppConnectionStatus(getApplication())
         val persistedThemeAccentColor = IronmeshPreferences.getThemeAccentColor(getApplication())
@@ -184,6 +188,9 @@ class MainViewModel(
             galleryMode = persistedGalleryViewMode,
             appConnectionStatus = persistedConnectionStatus,
             themeAccentColorHex = persistedThemeAccentColor,
+            status = persistedDeviceAuthResult.exceptionOrNull()?.let { error ->
+                "Device identity unavailable: ${error.message}"
+            } ?: uiState.value.status,
         )
         FolderSyncScheduler.reschedule(getApplication())
         observeFolderSyncStatus()
@@ -808,8 +815,17 @@ class MainViewModel(
     }
 
     fun startWebUi() {
-        val connectionInput = currentConnectionInput()
-        val clientIdentityJson = currentClientIdentityJson()
+        val deviceAuth = try {
+            currentDeviceAuthState()
+        } catch (error: DeviceIdentityStorageException) {
+            uiState.value = uiState.value.copy(
+                webUiUrl = "",
+                status = "Device identity unavailable: ${error.message}",
+            )
+            return
+        }
+        val connectionInput = deviceAuth.preferredConnectionInput()
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             uiState.value = uiState.value.copy(
                 webUiUrl = "",
@@ -827,12 +843,19 @@ class MainViewModel(
                 withContext(Dispatchers.IO) {
                     repository.startWebUi(
                         connectionInput,
-                        currentServerCaPem(),
+                        deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
                         clientIdentityJson,
                     )
                 }
             }
-            refreshPersistedDeviceAuthState()
+            runCatching { refreshPersistedDeviceAuthState() }
+                .onFailure { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    return@launch
+                }
             result
                 .onSuccess { url ->
                     uiState.value = uiState.value.copy(
@@ -872,11 +895,11 @@ class MainViewModel(
                 uiState.value = uiState.value.copy(status = "Verifying enrollment...")
                 withContext(Dispatchers.IO) {
                     repository.verifyEnrollmentAccess(authState)
+                    IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
                 }
                 authState
             }
                 .onSuccess { authState ->
-                    IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
                     stopConnectionRoutesMonitor()
                     uiState.value = uiState.value.copy(
                         loading = false,
@@ -902,30 +925,53 @@ class MainViewModel(
     }
 
     fun clearDeviceEnrollment() {
-        IronmeshPreferences.clearDeviceAuthState(getApplication())
-        IronmeshPreferences.clearAppConnectionStatus(getApplication())
-        stopConnectionRoutesMonitor()
-        uiState.value = uiState.value.copy(
-            deviceAuthState = DeviceAuthState(),
-            appConnectionStatus = AppConnectionStatus(),
-            bootstrapInput = "",
-            deviceLabelInput = "",
-            connectionRoutes = null,
-            connectionRoutesLoading = false,
-            connectionRoutesError = null,
-            connectionRoutesLastLoadedUnixMs = 0L,
-            selectedSection = MainSection.HOME,
-            webUiUrl = "",
-            status = "Cleared local device credential",
-        )
-        FolderSyncScheduler.reschedule(getApplication())
+        uiState.value = uiState.value.copy(loading = true, status = "Clearing device credential...")
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    IronmeshPreferences.clearDeviceAuthState(getApplication())
+                }
+            }
+                .onSuccess {
+                    IronmeshPreferences.clearAppConnectionStatus(getApplication())
+                    stopConnectionRoutesMonitor()
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        deviceAuthState = DeviceAuthState(),
+                        appConnectionStatus = AppConnectionStatus(),
+                        bootstrapInput = "",
+                        deviceLabelInput = "",
+                        connectionRoutes = null,
+                        connectionRoutesLoading = false,
+                        connectionRoutesError = null,
+                        connectionRoutesLastLoadedUnixMs = 0L,
+                        selectedSection = MainSection.HOME,
+                        webUiUrl = "",
+                        status = "Cleared local device credential",
+                    )
+                    FolderSyncScheduler.reschedule(getApplication())
+                }
+                .onFailure { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Could not clear device credential: ${error.message}",
+                    )
+                }
+        }
     }
 
     private fun execute(loadingMessage: String, action: suspend () -> String) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {
             val result = runCatching { action() }
-            refreshPersistedDeviceAuthState()
+            runCatching { refreshPersistedDeviceAuthState() }
+                .onFailure { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Device identity unavailable: ${error.message}",
+                    )
+                    return@launch
+                }
             result
                 .onSuccess { message ->
                     uiState.value = uiState.value.copy(loading = false, status = message)
@@ -993,7 +1039,20 @@ class MainViewModel(
         } else {
             existing.records.size.coerceAtLeast(FOLDER_SYNC_HISTORY_PAGE_SIZE)
         }
-        val connectionInput = currentConnectionInput()
+        val connectionInput = runCatching { currentConnectionInput() }
+            .getOrElse { error ->
+                updateFolderSyncHistoryState(profileId) { historyState ->
+                    historyState.copy(
+                        expanded = true,
+                        loading = false,
+                        error = error.message ?: "Device identity is unavailable",
+                    )
+                }
+                uiState.value = uiState.value.copy(
+                    status = "Device identity unavailable: ${error.message}",
+                )
+                return
+            }
         updateFolderSyncHistoryState(profileId) { historyState ->
             historyState.copy(
                 expanded = true,
@@ -1244,8 +1303,22 @@ class MainViewModel(
         showLoading: Boolean,
         statusOnFailure: Boolean,
     ) {
-        val connectionInput = currentConnectionInput()
-        val clientIdentityJson = currentClientIdentityJson()
+        val deviceAuth = try {
+            currentDeviceAuthState()
+        } catch (error: DeviceIdentityStorageException) {
+            uiState.value = uiState.value.copy(
+                connectionRoutesLoading = false,
+                connectionRoutesError = error.message,
+                status = if (statusOnFailure) {
+                    "Device identity unavailable: ${error.message}"
+                } else {
+                    uiState.value.status
+                },
+            )
+            return
+        }
+        val connectionInput = deviceAuth.preferredConnectionInput()
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             uiState.value = uiState.value.copy(
                 connectionRoutesLoading = false,
@@ -1265,7 +1338,7 @@ class MainViewModel(
             withContext(Dispatchers.IO) {
                 repository.getConnectionRouteSnapshot(
                     connectionInput = connectionInput,
-                    serverCaPem = currentServerCaPem(),
+                    serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
                     clientIdentityJson = clientIdentityJson,
                     refresh = refresh,
                 )

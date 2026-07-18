@@ -289,99 +289,114 @@ private struct IronmeshLibraryView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
     @State private var selectedFilePath: String?
     @State private var showsFilesPicker = false
+    @State private var section: IronmeshLibrarySection = .browse
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 18) {
-                    IronmeshCard(title: "Remote browser", subtitle: "Browse the remote library directly from the app.") {
-                        IronmeshKeyValueRow(label: "Current path", value: displayPath(model.currentPath))
-                        HStack {
-                            Button("Root") {
-                                model.browse(path: "")
-                            }
-                            .buttonStyle(.bordered)
+            VStack(spacing: 0) {
+                Picker("Library section", selection: $section) {
+                    Label("Browse", systemImage: "folder").tag(IronmeshLibrarySection.browse)
+                    Label("Photos", systemImage: "photo.on.rectangle").tag(IronmeshLibrarySection.photos)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
 
-                            Button("Up") {
-                                model.navigateUp()
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(model.currentPath.isEmpty)
-
-                            Button("Refresh") {
-                                model.refreshCurrentDirectory()
-                            }
-                            .buttonStyle(.borderedProminent)
-
-                            Button("Open Files") {
-                                showsFilesPicker = true
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-
-                    if !model.breadcrumbs.isEmpty {
-                        IronmeshCard(title: "Breadcrumbs") {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 8) {
-                                    Button("/") {
+                if section == .browse {
+                    ScrollView {
+                        VStack(spacing: 18) {
+                            IronmeshCard(title: "Remote browser", subtitle: "Browse the remote library directly from the app.") {
+                                IronmeshKeyValueRow(label: "Current path", value: displayPath(model.currentPath))
+                                HStack {
+                                    Button("Root") {
                                         model.browse(path: "")
                                     }
                                     .buttonStyle(.bordered)
 
-                                    ForEach(model.breadcrumbs) { breadcrumb in
-                                        Button(breadcrumb.label) {
-                                            model.browse(path: breadcrumb.path)
+                                    Button("Up") {
+                                        model.navigateUp()
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(model.currentPath.isEmpty)
+
+                                    Button("Refresh") {
+                                        model.refreshCurrentDirectory()
+                                    }
+                                    .buttonStyle(.borderedProminent)
+
+                                    Button("Open Files") {
+                                        showsFilesPicker = true
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+
+                            if !model.breadcrumbs.isEmpty {
+                                IronmeshCard(title: "Breadcrumbs") {
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 8) {
+                                            Button("/") {
+                                                model.browse(path: "")
+                                            }
+                                            .buttonStyle(.bordered)
+
+                                            ForEach(model.breadcrumbs) { breadcrumb in
+                                                Button(breadcrumb.label) {
+                                                    model.browse(path: breadcrumb.path)
+                                                }
+                                                .buttonStyle(.bordered)
+                                            }
                                         }
-                                        .buttonStyle(.bordered)
                                     }
                                 }
                             }
+
+                            if model.currentItems.isEmpty {
+                                IronmeshCard(title: "No items", subtitle: "Refresh the current path or adjust the connection in Settings.") {
+                                    Text("This directory is empty or has not been loaded yet.")
+                                        .foregroundStyle(.secondary)
+                                }
+                            } else {
+                                if !model.libraryDirectories.isEmpty {
+                                    IronmeshCard(title: "Folders") {
+                                        ForEach(model.libraryDirectories, id: \.identifier.serialized) { item in
+                                            Button {
+                                                model.browse(path: item.path)
+                                            } label: {
+                                                IronmeshBrowserRow(item: item)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+
+                                if !model.libraryFiles.isEmpty {
+                                    IronmeshCard(title: "Files") {
+                                        ForEach(model.libraryFiles, id: \.identifier.serialized) { item in
+                                            Button {
+                                                selectedFilePath = item.path
+                                            } label: {
+                                                IronmeshBrowserRow(item: item)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .padding(16)
+                    }
+                    .task {
+                        if model.currentItems.isEmpty {
+                            model.refreshCurrentDirectory()
                         }
                     }
-
-                    if model.currentItems.isEmpty {
-                        IronmeshCard(title: "No items", subtitle: "Refresh the current path or adjust the connection in Settings.") {
-                            Text("This directory is empty or has not been loaded yet.")
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        if !model.libraryDirectories.isEmpty {
-                            IronmeshCard(title: "Folders") {
-                                ForEach(model.libraryDirectories, id: \.identifier.serialized) { item in
-                                    Button {
-                                        model.browse(path: item.path)
-                                    } label: {
-                                        IronmeshBrowserRow(item: item)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-
-                        if !model.libraryFiles.isEmpty {
-                            IronmeshCard(title: "Files") {
-                                ForEach(model.libraryFiles, id: \.identifier.serialized) { item in
-                                    Button {
-                                        selectedFilePath = item.path
-                                    } label: {
-                                        IronmeshBrowserRow(item: item)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                    }
+                } else {
+                    IronmeshGalleryView()
                 }
-                .padding(16)
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Library")
-            .task {
-                if model.currentItems.isEmpty {
-                    model.refresh()
-                }
-            }
         }
         .sheet(
             isPresented: Binding(
@@ -406,6 +421,11 @@ private struct IronmeshLibraryView: View {
             }
         }
     }
+}
+
+private enum IronmeshLibrarySection {
+    case browse
+    case photos
 }
 
 private struct IronmeshFilesView: View {

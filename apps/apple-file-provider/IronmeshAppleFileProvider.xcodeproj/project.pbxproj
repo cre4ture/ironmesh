@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		082E983DBE4DD0A288B7E0B2 /* IronmeshMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */; };
 		09176176A1A35D7D95E20B12 /* IronmeshIosProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A36A32CA7808E8CC71993FEC /* IronmeshIosProjectTests.swift */; };
+		0A7DB1E9C4F248B49A625B31 /* IronmeshGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D91A6F7B3C84E58A10479D2 /* IronmeshGalleryModel.swift */; };
 		0BC42E8828E7FB463CEA0761 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 		0DBC3C31113B92CB3CFE0EFD /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
 		1596A1C38F950315CB507483 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 220FA7A03D50518BD537F1CB /* AVFoundation.framework */; };
@@ -19,6 +20,7 @@
 		5AA87421C5EE2962F1348EEC /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
 		5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */; };
 		6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */; };
+		65C3E8A14B724D9FA8062E57 /* IronmeshGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F52C9D08E634AB1B49730C6 /* IronmeshGalleryView.swift */; };
 		63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 		6F3E03595FD2D97919630E3B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */; };
 		71AE453247F18B2C6C8A3FD4 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 4CADBC90D590EDBD274936BB /* AppleFileProviderShared */; };
@@ -59,11 +61,13 @@
 
 /* Begin PBXFileReference section */
 		220FA7A03D50518BD537F1CB /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
+		2D91A6F7B3C84E58A10479D2 /* IronmeshGalleryModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryModel.swift; sourceTree = "<group>"; };
 		244B38CABFC537484ED1F06D /* apple-file-provider */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "apple-file-provider"; path = .; sourceTree = SOURCE_ROOT; };
 		3AF23604A81569FFBE88C99C /* IronmeshMacFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshMacFileProviderExtension.swift; sourceTree = "<group>"; };
 		69448FBEB222C861B5CA9C1C /* IronmeshAppleProjectTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = IronmeshAppleProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosApp.swift; sourceTree = "<group>"; };
 		7DA129FD959C0FD0D040070D /* IronmeshIosProjectTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = IronmeshIosProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		7F52C9D08E634AB1B49730C6 /* IronmeshGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryView.swift; sourceTree = "<group>"; };
 		7DD73EE64ADF4D79132C4282 /* IronmeshAppleFFI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IronmeshAppleFFI-Bridging-Header.h"; sourceTree = "<group>"; };
 		8F5701975DDED656D7A9B6A6 /* IronmeshMacFileProviderExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = IronmeshMacFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		987EDC104DA47B5CF20BED0D /* IronmeshMacApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IronmeshMacApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -202,6 +206,7 @@
 		6A4777D0C0506B8D27B6198F /* AppleAppSupport */ = {
 			isa = PBXGroup;
 			children = (
+				2D91A6F7B3C84E58A10479D2 /* IronmeshGalleryModel.swift */,
 				A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */,
 			);
 			name = AppleAppSupport;
@@ -266,6 +271,7 @@
 			isa = PBXGroup;
 			children = (
 				E936F23DD46DDF6D86D2F447 /* IronmeshBootstrapScannerSheet.swift */,
+				7F52C9D08E634AB1B49730C6 /* IronmeshGalleryView.swift */,
 				6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */,
 			);
 			name = IronmeshIosApp;
@@ -592,6 +598,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				EA5CEAEDBC7AE459CDEF1C8B /* IronmeshBootstrapScannerSheet.swift in Sources */,
+				0A7DB1E9C4F248B49A625B31 /* IronmeshGalleryModel.swift in Sources */,
+				65C3E8A14B724D9FA8062E57 /* IronmeshGalleryView.swift in Sources */,
 				5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */,
 				1F30F9EE22B86F396DAEA0DF /* IronmeshFileProviderRuntime.swift in Sources */,
 				6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */,

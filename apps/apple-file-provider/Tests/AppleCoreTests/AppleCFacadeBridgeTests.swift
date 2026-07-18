@@ -132,6 +132,68 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertFalse(result.accepted)
         XCTAssertEqual(result.resultingIdentifier, "dir:path:docs/new-folder")
     }
+
+    func testBridgeMapsStoreIndexOptionsAndRelativeBytesThroughFFI() throws {
+        let ffi = MockFFI()
+        ffi.storeIndexResponseJSON = """
+        {
+          "prefix": "photos",
+          "depth": 1,
+          "entry_count": 1,
+          "total_entry_count": 33,
+          "offset": 32,
+          "limit": 32,
+          "has_more": false,
+          "next_cursor": null,
+          "media_summary": {
+            "ready_count": 1,
+            "pending_count": 0,
+            "incomplete_count": 0,
+            "image_count": 1,
+            "video_count": 0,
+            "geotagged_count": 0
+          },
+          "entries": [
+            {
+              "path": "photos/cat.jpg",
+              "entry_type": "key",
+              "media": {
+                "status": "ready",
+                "content_fingerprint": "fingerprint",
+                "media_type": "image"
+              }
+            }
+          ]
+        }
+        """
+        ffi.relativeResponseData = Data("thumbnail".utf8)
+
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+        let response = try bridge.storeIndex(
+            AppleStoreIndexRequest(
+                prefix: "photos",
+                depth: 1,
+                options: AppleStoreIndexRequestOptions(
+                    offset: 32,
+                    limit: 32,
+                    sort: .capturedDescending,
+                    mediaFilter: .image
+                )
+            )
+        )
+        let thumbnail = try bridge.fetchRelativeBytes(path: "/media/thumbnail?key=photos%2Fcat.jpg")
+
+        XCTAssertEqual(response.totalEntryCount, 33)
+        XCTAssertEqual(response.entries.first?.entryType, .key)
+        XCTAssertEqual(ffi.lastStoreIndexPrefix, "photos")
+        XCTAssertEqual(ffi.lastStoreIndexOffset, 32)
+        XCTAssertEqual(ffi.lastStoreIndexLimit, 32)
+        XCTAssertEqual(ffi.lastStoreIndexSort, "captured_desc")
+        XCTAssertEqual(ffi.lastStoreIndexMediaFilter, "image")
+        XCTAssertEqual(ffi.lastRelativePath, "/media/thumbnail?key=photos%2Fcat.jpg")
+        XCTAssertEqual(String(decoding: thumbnail, as: UTF8.self), "thumbnail")
+    }
 }
 
 private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
@@ -141,11 +203,19 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var lastDeletePath: String?
     var lastMoveFromPath: String?
     var lastMoveToPath: String?
+    var lastStoreIndexPrefix: String?
+    var lastStoreIndexOffset: Int?
+    var lastStoreIndexLimit: Int?
+    var lastStoreIndexSort: String?
+    var lastStoreIndexMediaFilter: String?
+    var lastRelativePath: String?
 
     var listResponseJSON = #"{"entries":[]}"#
+    var storeIndexResponseJSON = #"{"prefix":"","depth":1,"entry_count":0,"total_entry_count":0,"offset":0,"has_more":false,"media_summary":{"ready_count":0,"pending_count":0,"incomplete_count":0,"image_count":0,"video_count":0,"geotagged_count":0},"entries":[]}"#
     var metadataResponseJSON = #"{"key":"","item_id":"dir:root","kind":"directory"}"#
     var putResponseJSON = #"{"item_id":"file:path:test.txt"}"#
     var fetchResponseData = Data()
+    var relativeResponseData = Data()
     var diagnosticsResponseJSON = #"{"endpoints":[]}"#
     var webUIURL = "http://127.0.0.1:4100/"
 
@@ -189,10 +259,39 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         return metadataResponseJSON
     }
 
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?
+    ) throws -> String {
+        _ = handle
+        _ = depth
+        _ = snapshot
+        _ = view
+        lastStoreIndexPrefix = prefix
+        lastStoreIndexOffset = offset
+        lastStoreIndexLimit = limit
+        lastStoreIndexSort = sort
+        lastStoreIndexMediaFilter = mediaFilter
+        return storeIndexResponseJSON
+    }
+
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data {
         _ = handle
         _ = key
         return fetchResponseData
+    }
+
+    func fetchRelativeBytes(handle: AppleRustHandle, path: String) throws -> Data {
+        _ = handle
+        lastRelativePath = path
+        return relativeResponseData
     }
 
     func putBytes(handle: AppleRustHandle, key: String, data: Data) throws -> String {

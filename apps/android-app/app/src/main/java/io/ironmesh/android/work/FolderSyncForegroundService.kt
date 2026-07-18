@@ -20,6 +20,7 @@ import io.ironmesh.android.data.APP_CONNECTION_STATE_RECONNECTING
 import io.ironmesh.android.data.APP_CONNECTION_STATE_RETRY_SCHEDULED
 import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
 import io.ironmesh.android.data.AppConnectionStatus
+import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncStorageDiagnosticsHelper
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
@@ -537,10 +538,24 @@ class FolderSyncForegroundService : Service() {
             nextRetryUnixMs = null
         }
         scope.launch {
-            val started = runCatching {
+            val started = try {
                 Log.i(TAG, "reconciling continuous sync: $reason")
                 reconcileProfiles()
-            }.getOrElse { error ->
+            } catch (error: DeviceIdentityStorageException) {
+                val message = error.message
+                    ?: "Protected device identity is unavailable; enroll again."
+                clearRetryState(resetAttempts = true)
+                repository.stopAllContinuousFolderSync()
+                waitingSummary = message
+                publishConnectionStatus(
+                    state = APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT,
+                    message = message,
+                    retryCount = 0L,
+                    nextRetryAt = null,
+                )
+                updateNotification("Ironmesh sync paused", message)
+                false
+            } catch (error: Exception) {
                 val retryReason = error.message ?: "Failed to start sync"
                 scheduleRetry(retryReason)
                 updateNotification("Ironmesh sync issue", retryReason)

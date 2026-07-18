@@ -12,6 +12,8 @@ import android.util.Log
 import android.webkit.MimeTypeMap
 import io.ironmesh.android.R
 import io.ironmesh.android.api.StoreIndexEntry
+import io.ironmesh.android.data.DeviceAuthState
+import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.RustPreferencesBridge
@@ -356,21 +358,28 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     }
 
     private fun resolveConnectionInput(): String {
-        val context = context ?: return ""
-        val auth = IronmeshPreferences.getDeviceAuthState(context)
-        return auth.preferredConnectionInput()
+        return resolveDeviceAuthState().preferredConnectionInput()
     }
 
     private fun resolveClientIdentityJson(): String? {
-        val context = context ?: return null
-        return IronmeshPreferences.getDeviceAuthState(context).toClientIdentityJson()
+        return resolveDeviceAuthState().toClientIdentityJson()
     }
 
     private fun resolveServerCaPem(): String? {
-        val context = context ?: return null
-        return IronmeshPreferences.getDeviceAuthState(context)
+        return resolveDeviceAuthState()
             .serverCaPem
             ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun resolveDeviceAuthState(): DeviceAuthState {
+        val context = context
+            ?: throw FileNotFoundException("Ironmesh application context is unavailable")
+        return try {
+            IronmeshPreferences.getDeviceAuthState(context)
+        } catch (error: DeviceIdentityStorageException) {
+            throw FileNotFoundException(error.message ?: "Protected device identity is unavailable")
+                .apply { initCause(error) }
+        }
     }
 
     private fun resolveRootProjection(projection: Array<out String>?): Array<String> {
