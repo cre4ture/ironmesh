@@ -15092,7 +15092,8 @@ run_on_main_metadata_backends!(
 
 #[tokio::test]
 async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.relay_mode = super::RelayMode::Fallback;
     super::replace_advertised_direct_endpoints(
         &state,
         super::build_bootstrap_direct_endpoints(
@@ -15138,7 +15139,8 @@ async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
 
 #[tokio::test]
 async fn rendezvous_presence_registration_keeps_public_api_but_excludes_public_direct_candidate() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.relay_mode = super::RelayMode::Fallback;
     super::replace_advertised_direct_endpoints(
         &state,
         super::build_bootstrap_direct_endpoints(
@@ -16091,7 +16093,8 @@ run_on_main_metadata_backends!(
 
 #[tokio::test]
 async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.relay_mode = super::RelayMode::Fallback;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         reachability: cluster::NodeReachability::default(),
