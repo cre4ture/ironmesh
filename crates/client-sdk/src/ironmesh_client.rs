@@ -2337,12 +2337,14 @@ impl IronMeshClient {
             let Some(endpoint) = self.transport_router.endpoint(index).cloned() else {
                 continue;
             };
+            let endpoint_context = self.endpoint_context_for_route(index);
             let endpoint_url = endpoint
                 .rewrite_url(&url)
                 .with_context(|| format!("failed to rewrite {} {}", method, url));
             let endpoint_url = match endpoint_url {
                 Ok(endpoint_url) => endpoint_url,
                 Err(error) => {
+                    let error = error.context(endpoint_context);
                     self.transport_router
                         .record_failure(index, &error.to_string());
                     last_error = Some(error);
@@ -2374,16 +2376,12 @@ impl IronMeshClient {
                             timeout: direct_failover_timeout,
                             started_unix_ms,
                         },
-                        &format!(
-                            "retryable HTTP {} from {}",
-                            response.status, endpoint.descriptor.locator
-                        ),
+                        &format!("retryable HTTP {} ({endpoint_context})", response.status,),
                     );
                     self.publish_connection_diagnostics();
                     last_error = Some(anyhow!(
-                        "retryable transport response {} from {}",
+                        "retryable transport response {} ({endpoint_context})",
                         response.status,
-                        endpoint.descriptor.locator
                     ));
                 }
                 Ok(response) => {
@@ -2405,6 +2403,7 @@ impl IronMeshClient {
                     });
                 }
                 Err(error) => {
+                    let error = error.context(endpoint_context);
                     self.transport_router.record_request_failure(
                         index,
                         ClientRequestAttemptContext {
@@ -2643,7 +2642,7 @@ impl IronMeshClient {
         let routed = self
             .execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
             .await
-            .with_context(|| format!("failed to GET object key={key}"))?;
+            .map_err(|error| anyhow!("failed to GET object key={key}: {error:#}"))?;
         let endpoint_context = self.endpoint_context_for_route(routed.route_index);
         let response = routed.response;
         if !response.status.is_success() {
@@ -3546,7 +3545,7 @@ impl IronMeshClient {
         let routed = self
             .execute_buffered_request_with_route(Method::HEAD, url, Vec::new(), None)
             .await
-            .with_context(|| format!("failed to HEAD object key={key}"))?;
+            .map_err(|error| anyhow!("failed to HEAD object key={key}: {error:#}"))?;
         let endpoint_context = self.endpoint_context_for_route(routed.route_index);
         let response = routed.response;
         if !response.status.is_success() {

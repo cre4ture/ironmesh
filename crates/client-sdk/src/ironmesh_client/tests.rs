@@ -3349,6 +3349,61 @@ async fn direct_transport_head_error_includes_endpoint_and_target_node_id() {
 }
 
 #[tokio::test]
+async fn direct_transport_retryable_head_error_includes_endpoint_and_target_node_id() {
+    let (direct_state, server) =
+        spawn_direct_transport_test_server(503, Vec::new(), Vec::new()).await;
+
+    let mut identity = ClientIdentityMaterial::generate(
+        uuid::Uuid::now_v7(),
+        None,
+        Some("direct-retryable-head-error-device".to_string()),
+    )
+    .expect("identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    let target_node_id = NodeId::new_v4();
+    let client = IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+        direct_state.public_url.clone(),
+        HttpClient::new(),
+        Some(target_node_id),
+        None,
+    )
+    .with_client_identity(identity);
+
+    let error = client
+        .head_object("gallery/retryable.jpg", None, None)
+        .await
+        .expect_err("retryable object response should return an error");
+    let message = error.to_string();
+    assert!(
+        message.contains("503 Service Unavailable"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains(&format!("endpoint_locator={}", direct_state.public_url)),
+        "missing endpoint locator: {message}"
+    );
+    assert!(
+        message.contains(&format!("target_node_id={target_node_id}")),
+        "missing target node ID: {message}"
+    );
+
+    let captured = direct_state
+        .captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("direct request should be captured");
+    assert_eq!(captured.method, "HEAD");
+    assert_eq!(
+        captured.path_and_query,
+        "/api/v1/store/gallery%2Fretryable.jpg"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn direct_transport_streams_upload_session_chunks_over_object_write() {
     let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
         stored: true,
