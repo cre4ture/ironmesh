@@ -6773,7 +6773,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
     let relay_accept_task = tokio::spawn(async move {
         let (relay_session, multiplexed) = endpoint
             .control
-            .accept_relay_multiplex_target(
+            .accept_relay_legacy_plaintext_multiplex_target(
                 &transport_sdk::RelayTunnelAcceptRequest {
                     cluster_id: relay_state.cluster_id,
                     target: transport_sdk::PeerIdentity::Node(relay_state.node_id),
@@ -16473,12 +16473,16 @@ async fn relay_health_check_via_rendezvous(
             source: source.clone(),
             target: transport_sdk::PeerIdentity::Node(target_node_id),
             session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
             requested_expires_in_secs: Some(10),
         })
         .await
         .map_err(|err| format!("failed issuing relay ticket via {rendezvous_url}: {err}"))?;
     let (_relay_session, session) = rendezvous
-        .connect_relay_multiplex_source(&ticket, transport_sdk::MultiplexConfig::default())
+        .connect_relay_legacy_plaintext_multiplex_source(
+            &ticket,
+            transport_sdk::MultiplexConfig::default(),
+        )
         .await
         .map_err(|err| format!("failed opening relay session via {rendezvous_url}: {err}"))?;
     transport_sdk::perform_transport_client_handshake(
@@ -16588,6 +16592,7 @@ async fn spawn_cleanup_relay_stub(
                             source: request.source,
                             target: request.target,
                             session_kind: request.session_kind,
+                            security_mode: request.security_mode,
                             relay_urls: vec![relay_base_url],
                             issued_at_unix: 1,
                             expires_at_unix: 301,
@@ -16665,6 +16670,7 @@ async fn serve_cleanup_relay_tunnel_socket(
         source: ticket.source.clone(),
         target: ticket.target.clone(),
         session_kind: ticket.session_kind,
+        security_mode: ticket.security_mode,
     };
     socket
         .send(axum::extract::ws::Message::Text(

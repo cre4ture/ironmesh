@@ -8,6 +8,7 @@ pub mod multiplex_transport;
 pub mod mux;
 pub mod peer;
 pub mod relay;
+pub mod relay_security;
 pub mod relay_tunnel;
 pub mod relay_wake;
 pub mod rendezvous;
@@ -51,7 +52,13 @@ pub use multiplex_transport::{
 };
 pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
-pub use relay::{RelayHttpHeader, RelayTicket, RelayTicketRequest, RelayTunnelSessionKind};
+pub use relay::{
+    RelayHttpHeader, RelayTicket, RelayTicketRequest, RelayTunnelSecurityMode,
+    RelayTunnelSessionKind,
+};
+pub use relay_security::{
+    RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
+};
 pub use relay_tunnel::{
     RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelControlMessage, RelayTunnelEvent,
     RelayTunnelSession, relay_tunnel_ws_url,

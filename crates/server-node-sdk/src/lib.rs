@@ -8567,12 +8567,13 @@ async fn open_relay_peer_session(
             source: PeerIdentity::Node(state.node_id),
             target: PeerIdentity::Node(node.node_id),
             session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
             requested_expires_in_secs: Some(300),
         })
         .await
         .with_context(|| format!("failed issuing relay ticket for node {}", node.node_id))?;
     let (relay_session, session) = rendezvous
-        .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
+        .connect_relay_legacy_plaintext_multiplex_source(&ticket, MultiplexConfig::default())
         .await
         .with_context(|| {
             format!(
@@ -9873,7 +9874,7 @@ async fn drain_pending_relay_multiplex_targets(
     for _ in 0..RENDEZVOUS_RELAY_WAKE_DRAIN_MAX_ITERATIONS {
         let result = endpoint
             .control
-            .accept_relay_multiplex_target(
+            .accept_relay_legacy_plaintext_multiplex_target(
                 &RelayTunnelAcceptRequest {
                     cluster_id,
                     target: PeerIdentity::Node(node_id),

@@ -669,7 +669,7 @@ mod tests {
 
             loop {
                 let (relay_session, mut session) = client
-                    .accept_relay_multiplex_target(
+                    .accept_relay_legacy_plaintext_multiplex_target(
                         &transport_sdk::RelayTunnelAcceptRequest {
                             cluster_id,
                             target: transport_sdk::PeerIdentity::Node(target_node_id),
@@ -947,7 +947,7 @@ mod tests {
                         })
                         .await
                         .expect("relay tunnel should pair with target node")
-                        .into_multiplexed_session(
+                        .into_legacy_plaintext_multiplexed_session(
                             transport_sdk::MultiplexMode::Server,
                             transport_sdk::MultiplexConfig::default(),
                         )

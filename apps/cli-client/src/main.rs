@@ -1595,6 +1595,7 @@ mod tests {
             source: request.source,
             target: request.target,
             session_kind: request.session_kind,
+            security_mode: request.security_mode,
             relay_urls: vec![state.public_url],
             issued_at_unix: 1,
             expires_at_unix: 61,
@@ -1622,6 +1623,7 @@ mod tests {
                 source: ticket.source.clone(),
                 target: ticket.target.clone(),
                 session_kind: ticket.session_kind,
+                security_mode: ticket.security_mode,
             };
             socket
                 .send(Message::Text(

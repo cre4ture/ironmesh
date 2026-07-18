@@ -226,6 +226,7 @@ impl TransportSessionPool {
                 source: source.clone(),
                 target: PeerIdentity::Node(*target_node_id),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(300),
             })
             .await
@@ -236,7 +237,7 @@ impl TransportSessionPool {
                 )
             })?;
         let (relay_session, multiplexed) = rendezvous
-            .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
+            .connect_relay_legacy_plaintext_multiplex_source(&ticket, MultiplexConfig::default())
             .await
             .with_context(|| {
                 format!(
