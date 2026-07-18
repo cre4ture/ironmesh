@@ -221,9 +221,38 @@ jobs:
             web/playwright-report
           if-no-files-found: ignore
 
-  android-build:
+  android-build-matrix:
     runs-on: ubuntu-latest
-    needs: workspace-check
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Compute Android build matrix
+        id: set-matrix
+        env:
+          IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 }}
+        run: |
+          # Debug legs run the cheap JVM unit tests (+ server-node package
+          # validation build). They always run, including on pull requests.
+          DEBUG_TARGETS='{"module":"android-app","directory":"apps/android-app","variant":"debug","artifact":""},{"module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"debug","artifact":""}'
+          # Release legs build the signed "performance testing" APKs. They are
+          # expensive, so build them only on push to main / workflow_dispatch
+          # (never on pull_request) and only when the signing keystore secret
+          # is available.
+          RELEASE_TARGETS='{"module":"android-app","directory":"apps/android-app","variant":"release","artifact":"android-release-performance"},{"module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"release","artifact":"android-server-node-release-performance"}'
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] && [ -n "${IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
+            TARGETS="[${DEBUG_TARGETS},${RELEASE_TARGETS}]"
+          else
+            TARGETS="[${DEBUG_TARGETS}]"
+          fi
+          echo "matrix={\"target\":${TARGETS}}" >> "$GITHUB_OUTPUT"
+
+  android-build:
+    name: android-build (${{ matrix.target.module }} ${{ matrix.target.variant }})
+    runs-on: ubuntu-latest
+    needs: [workspace-check, android-build-matrix]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.android-build-matrix.outputs.matrix) }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -309,6 +338,10 @@ jobs:
           chmod 600 $HOME/.android/debug.keystore
 
       - name: Restore Android internal release keystore
+        # Restore whenever the signing secret is present (not only for the
+        # release legs): build.gradle.kts validates the release signing config
+        # at configuration time for every task, including :app:testDebugUnitTest,
+        # so the debug legs also need STORE_FILE set to avoid a partial config.
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         run: |
           mkdir -p $HOME/.android
@@ -317,54 +350,26 @@ jobs:
           echo "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE=$HOME/.android/ironmesh-internal-release.keystore" >> $GITHUB_ENV
 
       - name: Run Android JVM unit tests
-        working-directory: apps/android-app
+        if: ${{ matrix.target.variant == 'debug' }}
+        working-directory: ${{ matrix.target.directory }}
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
+      - name: Build Android server-node debug APK (package validation)
+        if: ${{ matrix.target.variant == 'debug' && matrix.target.module == 'android-server-node-app' }}
+        working-directory: ${{ matrix.target.directory }}
+        run: ./gradlew --no-daemon :app:assembleDebug
+
       - name: Build Android signed internal release APK for performance testing
-        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
-        working-directory: apps/android-app
+        if: ${{ matrix.target.variant == 'release' }}
+        working-directory: ${{ matrix.target.directory }}
         run: ./gradlew --no-daemon :app:assembleRelease
 
       - name: Upload Android release APK for performance testing
-        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
+        if: ${{ matrix.target.variant == 'release' }}
         uses: actions/upload-artifact@v4
         with:
-          name: android-release-performance-${{ env.BUILD_NAME_SUFFIX }}
-          path: apps/android-app/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
-
-      - name: Reclaim disk after Android app builds
-        run: |
-          rm -rf apps/android-app/app/build
-          rm -rf apps/android-app/build
-          rm -rf apps/android-app/.gradle
-
-      - name: Run Android server-node JVM unit tests
-        working-directory: apps/android-server-node-app
-        run: ./gradlew --no-daemon :app:testDebugUnitTest
-
-      - name: Build Android server-node debug APK
-        working-directory: apps/android-server-node-app
-        run: ./gradlew --no-daemon :app:assembleDebug
-
-      - name: Reclaim disk before Android server-node release build
-        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
-        run: |
-          rm -rf apps/android-server-node-app/app/build
-          rm -rf apps/android-server-node-app/build
-          rm -rf apps/android-server-node-app/.gradle
-
-      - name: Build Android server-node signed internal release APK for performance testing
-        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
-        working-directory: apps/android-server-node-app
-        run: ./gradlew --no-daemon :app:assembleRelease
-
-      - name: Upload Android server-node release APK for performance testing
-        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-server-node-release-performance-${{ env.BUILD_NAME_SUFFIX }}
-          path: apps/android-server-node-app/app/build/outputs/apk/release/*.apk
+          name: ${{ matrix.target.artifact }}-${{ env.BUILD_NAME_SUFFIX }}
+          path: ${{ matrix.target.directory }}/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
   ios-build:
