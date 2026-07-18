@@ -22,6 +22,8 @@ mod tests {
     };
 
     const KNOWN_RELAY_PAYLOAD: &[u8] = b"phase1-relay-e2e-known-payload-do-not-leak";
+    const RECOVERY_RELAY_PAYLOAD: &[u8] =
+        b"phase1-relay-e2e-recovery-payload-must-remain-exact";
     const UNREACHABLE_DIRECT_ENDPOINT: &str = "http://127.0.0.1:9";
 
     #[derive(Debug, Default, Clone)]
@@ -404,7 +406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_only_enrolled_client_keeps_frames_opaque_and_rejects_post_handshake_tampering_without_committing_write()
+    async fn relay_only_enrolled_client_keeps_frames_opaque_and_recovers_from_post_handshake_tampering()
     -> Result<()> {
         let rendezvous_bind = "127.0.0.1:19266";
         let server_bind = "127.0.0.1:19267";
@@ -556,36 +558,55 @@ mod tests {
             );
 
             observer.clear();
+            let tamper_count_before = observer.tls_application_data_tamper_count();
+            assert_eq!(
+                tamper_count_before, 0,
+                "clearing the observer must reset its TLS tamper count"
+            );
             observer.arm_next_tls_application_data_record_tampering();
-            let tampered_result = timeout(
+            let recovered_result = timeout(
                 Duration::from_secs(30),
                 tampered_client.put(
                     "relay-security-e2e-tampered.bin",
-                    Bytes::from_static(KNOWN_RELAY_PAYLOAD),
+                    Bytes::from_static(RECOVERY_RELAY_PAYLOAD),
                 ),
             )
             .await
             .context("tampered relay request timed out")?;
-            assert!(
-                tampered_result.is_err(),
-                "a relay session with modified inner-TLS ciphertext must fail closed"
-            );
-            let failed_write_session = tampered_client.transport_session_pool_snapshot();
+            let recovered_session = tampered_client.transport_session_pool_snapshot();
             assert_eq!(
-                failed_write_session.connect_count, established_session.connect_count,
-                "the tampered write must use the already established inner-mTLS session"
-            );
-            assert!(
-                failed_write_session.reuse_count > established_session.reuse_count,
-                "the tampered write must reuse the warm relay session"
-            );
-            assert!(
-                observer.tls_application_data_tamper_count() == 1,
+                observer.tls_application_data_tamper_count(),
+                tamper_count_before + 1,
                 "the observer must modify exactly one post-handshake TLS application-data record"
             );
+            assert_eq!(
+                recovered_session.reuse_count,
+                established_session.reuse_count + 1,
+                "the first write attempt must reuse the warm inner-mTLS session"
+            );
+            assert_eq!(
+                recovered_session.reset_count,
+                established_session.reset_count + 1,
+                "the client must discard the session whose TLS record authentication failed"
+            );
+            assert_eq!(
+                recovered_session.connect_count,
+                established_session.connect_count + 1,
+                "the retry must establish exactly one fresh inner-mTLS session"
+            );
+            recovered_result.context(
+                "the unchanged request must recover over a fresh authenticated relay session",
+            )?;
+            assert_eq!(
+                client.get("relay-security-e2e-tampered.bin").await?,
+                Bytes::from_static(RECOVERY_RELAY_PAYLOAD),
+                "recovery must commit exactly the original payload, never modified application data"
+            );
+
+            let recovered_ciphertext = observer.snapshot().binary_frames.concat();
             assert!(
-                client.get("relay-security-e2e-tampered.bin").await.is_err(),
-                "the node must not commit an object write carried by modified inner-TLS ciphertext"
+                !contains_bytes(&recovered_ciphertext, RECOVERY_RELAY_PAYLOAD),
+                "the tampered attempt and authenticated retry must both remain opaque to rendezvous"
             );
 
             Ok::<(), anyhow::Error>(())
