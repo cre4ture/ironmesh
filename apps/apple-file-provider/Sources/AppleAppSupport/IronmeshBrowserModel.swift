@@ -150,7 +150,7 @@ final class IronmeshBrowserModel: ObservableObject {
     private let enroller: AppleBootstrapEnroller
     private let fileProviderDomains: AppleFileProviderDomainCoordinator
     private let userDefaults: UserDefaults
-    private let draftStorageKey = "IronmeshIosApp.connectionDraft"
+    private let draftStorageKey = AppleConnectionSettingsStore.defaultLegacyDraftStateKey
     private let onboardingStorageKey = "IronmeshIosApp.hasCompletedOnboarding"
     private let recentActionLimit = 6
 
@@ -175,11 +175,30 @@ final class IronmeshBrowserModel: ObservableObject {
         bundleDefaults = defaults
         self.settingsStore = settingsStore ?? bundleConfiguration.makeSettingsStore()
 
+        let storedDraft: IronmeshConnectionDraft? = if let storedData = userDefaults.data(
+            forKey: draftStorageKey
+        ) {
+            try? JSONDecoder().decode(IronmeshConnectionDraft.self, from: storedData)
+        } else {
+            nil
+        }
+        let storedState: AppleStoredConnectionState?
+        let settingsLoadError: Error?
+        do {
+            storedState = try self.settingsStore.load(legacyDraftDefaults: userDefaults)
+            settingsLoadError = nil
+        } catch {
+            storedState = nil
+            settingsLoadError = error
+        }
+
         let initialDraft: IronmeshConnectionDraft
-        if let storedData = userDefaults.data(forKey: draftStorageKey),
-           let storedDraft = try? JSONDecoder().decode(IronmeshConnectionDraft.self, from: storedData) {
+        if var storedDraft {
+            if let clientIdentity = storedState?.clientIdentityJSON?.nilIfBlank {
+                storedDraft.clientIdentityJSON = clientIdentity
+            }
             initialDraft = storedDraft
-        } else if let storedState = self.settingsStore.load() {
+        } else if let storedState {
             initialDraft = IronmeshConnectionDraft(
                 bundleConfiguration: bundleConfiguration,
                 storedState: storedState
@@ -190,7 +209,8 @@ final class IronmeshBrowserModel: ObservableObject {
         draft = initialDraft
 
         hasCompletedOnboarding = userDefaults.object(forKey: onboardingStorageKey) as? Bool ?? false
-        statusText = initialDraft.setupSummary
+        lastErrorMessage = settingsLoadError?.localizedDescription
+        statusText = settingsLoadError?.localizedDescription ?? initialDraft.setupSummary
     }
 
     var shouldShowOnboarding: Bool {
@@ -451,8 +471,19 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func resetToBundleDefaults() {
+        do {
+            try settingsStore.save(
+                bundleDefaults.appliedConnectionState(
+                    defaultConnectionInput: bundleDefaults.directConnectionInput
+                )
+            )
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            statusText = error.localizedDescription
+            addAction("Restore defaults failed", detail: error.localizedDescription)
+            return
+        }
         draft = bundleDefaults
-        try? syncSharedSettingsFromDraft()
         invalidateConnectionRouteState()
         lastErrorMessage = nil
         statusText = "Restored bundled defaults."
@@ -466,6 +497,14 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func clearAppSetup() {
+        do {
+            try settingsStore.clear()
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            statusText = error.localizedDescription
+            addAction("Clear setup failed", detail: error.localizedDescription)
+            return
+        }
         draft = IronmeshConnectionDraft(
             deviceLabel: draft.deviceLabel,
             domainIdentifier: bundleDefaults.domainIdentifier,
@@ -478,19 +517,31 @@ final class IronmeshBrowserModel: ObservableObject {
         connectionDiagnostics = nil
         invalidateConnectionRouteState()
         webUIPresentation = nil
-        settingsStore.clear()
         statusText = "Setup cleared. Finish onboarding to reconnect."
         addAction("Cleared setup", detail: "App connection and identity fields were reset.")
     }
 
     func clearIdentity() {
-        draft.clientIdentityJSON = ""
-        draft.serverCAPem = ""
-        draft.enrolledDeviceID = ""
-        if draft.requiresEnrollment {
+        var clearedDraft = draft
+        clearedDraft.clientIdentityJSON = ""
+        clearedDraft.serverCAPem = ""
+        clearedDraft.enrolledDeviceID = ""
+        do {
+            try settingsStore.save(
+                clearedDraft.appliedConnectionState(
+                    defaultConnectionInput: bundleDefaults.directConnectionInput
+                )
+            )
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            statusText = error.localizedDescription
+            addAction("Clear identity failed", detail: error.localizedDescription)
+            return
+        }
+        draft = clearedDraft
+        if clearedDraft.requiresEnrollment {
             hasCompletedOnboarding = false
         }
-        try? syncSharedSettingsFromDraft()
         invalidateConnectionRouteState()
         clearDirectoryAfterConnectionContextChange()
         addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
