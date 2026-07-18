@@ -323,7 +323,7 @@ class FolderSyncForegroundService : Service() {
                         retryCount = 0L,
                         nextRetryAt = null,
                     )
-                    updateNotification("Ironmesh sync paused", requireNotNull(waitingSummary))
+                    updateNotification("BerryKeep sync paused", requireNotNull(waitingSummary))
                     return@withContext true
                 }
 
@@ -434,10 +434,10 @@ class FolderSyncForegroundService : Service() {
                 } else {
                     val contentText = status?.serviceMessage ?: "Continuous sync is starting"
                     val notificationTitle = when (status?.serviceState) {
-                        "error" -> "Ironmesh sync issue"
-                        "syncing" -> "Ironmesh syncing ${status.syncingProfileCount}/${status.activeProfileCount}"
-                        "running" -> "Ironmesh sync active"
-                        else -> "Ironmesh sync idle"
+                        "error" -> "BerryKeep sync issue"
+                        "syncing" -> "BerryKeep syncing ${status.syncingProfileCount}/${status.activeProfileCount}"
+                        "running" -> "BerryKeep sync active"
+                        else -> "BerryKeep sync idle"
                     }
                     val notificationDetail = status?.currentActivity
                         ?.takeIf { it.isNotBlank() }
@@ -558,7 +558,7 @@ class FolderSyncForegroundService : Service() {
             } catch (error: Exception) {
                 val retryReason = error.message ?: "Failed to start sync"
                 scheduleRetry(retryReason)
-                updateNotification("Ironmesh sync issue", retryReason)
+                updateNotification("BerryKeep sync issue", retryReason)
                 false
             }
             if (started) {
@@ -648,7 +648,7 @@ class FolderSyncForegroundService : Service() {
         val notificationManager = getSystemService(NotificationManager::class.java)
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Ironmesh Sync",
+            "BerryKeep Sync",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
             description = "Continuous folder synchronization"

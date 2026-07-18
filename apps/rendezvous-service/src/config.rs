@@ -26,7 +26,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Parser)]
 #[command(name = "ironmesh-rendezvous-service")]
-#[command(about = "Standalone Ironmesh rendezvous plus relay service")]
+#[command(about = "Standalone BerryKeep rendezvous plus relay service")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]

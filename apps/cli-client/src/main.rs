@@ -76,7 +76,7 @@ struct S3GatewayState {
 }
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
-#[command(about = "CLI client for ironmesh distributed storage")]
+#[command(about = "CLI client for BerryKeep distributed storage")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]
@@ -386,7 +386,7 @@ async fn s3_gateway_proxy(
             Err(err) => {
                 return (
                     StatusCode::BAD_GATEWAY,
-                    format!("failed forwarding S3 request through Ironmesh transport: {err:#}"),
+                    format!("failed forwarding S3 request through BerryKeep transport: {err:#}"),
                 )
                     .into_response();
             }
@@ -439,7 +439,7 @@ async fn s3_gateway_proxy(
         Err(err) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("failed forwarding S3 request through Ironmesh transport: {err:#}"),
+                format!("failed forwarding S3 request through BerryKeep transport: {err:#}"),
             )
                 .into_response();
         }

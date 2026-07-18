@@ -16,9 +16,9 @@
     Publisher="CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21"
     Version="0.1.0.1" />
   <Properties>
-    <DisplayName>IronMesh</DisplayName>
+    <DisplayName>BerryKeep</DisplayName>
     <PublisherDisplayName>Ulrich Hornung</PublisherDisplayName>
-    <Description>Configure IronMesh shared folders and Windows filesystem integration.</Description>
+    <Description>Configure BerryKeep shared folders and Windows filesystem integration.</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   <Resources>
@@ -37,8 +37,8 @@
       Executable="ironmesh-config-app.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="IronMesh"
-        Description="Configure IronMesh shared folders and background services"
+        DisplayName="BerryKeep"
+        Description="Configure BerryKeep shared folders and background services"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png" />
@@ -58,7 +58,7 @@
           <desktop:StartupTask
             TaskId="IronmeshBackgroundLauncher"
             Enabled="true"
-            DisplayName="IronMesh background services" />
+            DisplayName="BerryKeep background services" />
         </desktop:Extension>
       </Extensions>
     </Application>
@@ -67,8 +67,8 @@
       Executable="ironmesh-background-launcher.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="IronMesh Background Launcher"
-        Description="Packaged background startup helper for IronMesh"
+        DisplayName="BerryKeep Background Launcher"
+        Description="Packaged background startup helper for BerryKeep"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png"
@@ -89,8 +89,8 @@
       Executable="ironmesh-os-integration.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="IronMesh OS Integration"
-        Description="Packaged Windows filesystem integration host for IronMesh"
+        DisplayName="BerryKeep OS Integration"
+        Description="Packaged Windows filesystem integration host for BerryKeep"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png"
@@ -106,7 +106,7 @@
         </uap3:Extension>
         <com:Extension Category="windows.comServer">
           <com:ComServer>
-            <com:SurrogateServer DisplayName="Ironmesh Thumbnail Provider">
+            <com:SurrogateServer DisplayName="BerryKeep Thumbnail Provider">
               <com:Class
                 Id="D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB"
                 Path="windows_thumbnail_provider.dll"
@@ -158,8 +158,8 @@
       Executable="ironmesh-folder-agent.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="IronMesh Folder Agent"
-        Description="Packaged background folder synchronization agent for IronMesh"
+        DisplayName="BerryKeep Folder Agent"
+        Description="Packaged background folder synchronization agent for BerryKeep"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png"
@@ -180,8 +180,8 @@
       Executable="ironmesh.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="IronMesh CLI Client"
-        Description="Packaged local client service host for IronMesh"
+        DisplayName="BerryKeep CLI Client"
+        Description="Packaged local client service host for BerryKeep"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png"

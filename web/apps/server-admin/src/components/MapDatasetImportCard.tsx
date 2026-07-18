@@ -127,7 +127,7 @@ export function MapDatasetImportCard() {
               <Text c="dimmed" size="sm" maw={860}>
                 Choose the configured map artifact, then paste its HTTP URL or a copied{" "}
                 <Code>wget -c ...</Code> command. The server node downloads that MBTiles file with
-                resumable range requests, ingests it directly into IronMesh chunks, finalizes the
+                resumable range requests, ingests it directly into BerryKeep chunks, finalizes the
                 selected cluster artifact, and resumes automatically after server restarts.
               </Text>
             </div>
@@ -174,7 +174,7 @@ export function MapDatasetImportCard() {
           <Group align="flex-end">
             <NumberInput
               label="Part size"
-              description="Each finalized part object keeps its own IronMesh object key under sys/maps/."
+              description="Each finalized part object keeps its own BerryKeep object key under sys/maps/."
               value={partSizeGiB}
               min={1}
               max={64}

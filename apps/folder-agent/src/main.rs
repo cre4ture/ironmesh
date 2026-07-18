@@ -24,7 +24,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-folder-agent")]
-#[command(about = "OS-independent folder synchronization agent for Ironmesh")]
+#[command(about = "OS-independent folder synchronization agent for BerryKeep")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]

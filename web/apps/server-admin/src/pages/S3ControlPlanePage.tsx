@@ -332,7 +332,7 @@ export function S3ControlPlanePage() {
 
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
-          Buckets here are prefix mappings into Ironmesh storage, and the access keys are replicated
+          Buckets here are prefix mappings into BerryKeep storage, and the access keys are replicated
           cluster-wide so any node can eventually expose the same S3 surface. Use this page to
           stage the operator-managed state before or while the listener layer is enabled node by
           node.
@@ -383,7 +383,7 @@ export function S3ControlPlanePage() {
               <Stack gap="xs">
                 <Text c="dimmed">
                   Use the gateway mode below when you need a standard S3 endpoint over authenticated
-                  Ironmesh direct or relay transport instead of exposing this node&apos;s listener
+                  BerryKeep direct or relay transport instead of exposing this node&apos;s listener
                   directly.
                 </Text>
                 <Textarea
@@ -418,7 +418,7 @@ export function S3ControlPlanePage() {
                   </Group>
                   <Text c="dimmed">
                     Leave the root prefix blank to use the default <Code>s3/&lt;bucket&gt;/</Code>{" "}
-                    layout inside Ironmesh storage.
+                    layout inside BerryKeep storage.
                   </Text>
                   <TextInput
                     label="Bucket name"

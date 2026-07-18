@@ -20,7 +20,7 @@ struct IronmeshMacApp: App {
                 .navigationSplitViewColumnWidth(min: 280, ideal: 320)
             } detail: {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("IronMesh macOS")
+                    Text("BerryKeep macOS")
                         .font(.largeTitle)
                         .bold()
                     Text(model.statusText)
