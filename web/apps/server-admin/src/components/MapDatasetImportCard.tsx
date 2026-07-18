@@ -1,4 +1,5 @@
 import {
+  getAdminGalleryMapConfiguration,
   getAdminMapDatasetImportStatus,
   startAdminMapDatasetImport,
   type AdminMapDatasetImportJobView
@@ -14,16 +15,25 @@ import {
   Group,
   NumberInput,
   Progress,
+  Select,
   Stack,
   Text,
   Textarea
 } from "@mantine/core";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatBytes, formatRelativeUnixTs, formatUnixTs } from "../lib/format";
 
 const DEFAULT_MAP_IMPORT_PART_SIZE_GIB = 10;
 const GIB_BYTES = 1024 ** 3;
+
+type MapImportTarget = {
+  key: string;
+  variantId: string;
+  asset: "raster" | "vector";
+  label: string;
+  manifestKey: string;
+};
 
 export function MapDatasetImportCard() {
   const queryClient = useQueryClient();
@@ -36,6 +46,25 @@ export function MapDatasetImportCard() {
     !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
   const [mapImportSource, setMapImportSource] = useState("");
   const [partSizeGiB, setPartSizeGiB] = useState<number>(DEFAULT_MAP_IMPORT_PART_SIZE_GIB);
+  const [selectedTargetKey, setSelectedTargetKey] = useState<string | null>(null);
+
+  const mapConfigurationQuery = useQuery({
+    queryKey: ["gallery-page", "map-configuration", normalizedAdminTokenOverride],
+    queryFn: () => getAdminGalleryMapConfiguration(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectMapImport,
+    staleTime: 5_000
+  });
+  const importTargets = useMemo(
+    () => mapImportTargets(mapConfigurationQuery.data?.configuration.variants ?? []),
+    [mapConfigurationQuery.data]
+  );
+  const importTargetSignature = importTargets.map((target) => target.key).join("\u0000");
+  const selectedTarget = importTargets.find((target) => target.key === selectedTargetKey) ?? null;
+  useEffect(() => {
+    if (!selectedTargetKey || !importTargets.some((target) => target.key === selectedTargetKey)) {
+      setSelectedTargetKey(importTargets[0]?.key ?? null);
+    }
+  }, [selectedTargetKey, importTargetSignature]);
 
   const mapImportStatusQuery = useQuery({
     queryKey: ["gallery-page", "map-import", normalizedAdminTokenOverride],
@@ -49,7 +78,9 @@ export function MapDatasetImportCard() {
       startAdminMapDatasetImport(
         {
           source: mapImportSource.trim(),
-          part_size_bytes: Math.round(partSizeGiB * GIB_BYTES)
+          part_size_bytes: Math.round(partSizeGiB * GIB_BYTES),
+          variant_id: selectedTarget?.variantId,
+          asset: selectedTarget?.asset
         },
         normalizedAdminTokenOverride || undefined
       ),
@@ -69,11 +100,13 @@ export function MapDatasetImportCard() {
   const activeMapImport = mapImportStatus?.active_job ?? null;
   const mapImportError = firstErrorMessage([
     mapImportStatusQuery.error,
+    mapConfigurationQuery.error,
     startMapImportMutation.error
   ]);
   const canStartMapImport =
     canInspectMapImport &&
     mapImportStatus?.can_start_new !== false &&
+    Boolean(selectedTarget) &&
     mapImportSource.trim().length > 0 &&
     Number.isFinite(partSizeGiB) &&
     partSizeGiB > 0;
@@ -92,25 +125,45 @@ export function MapDatasetImportCard() {
             <div>
               <Text fw={600}>Map dataset import</Text>
               <Text c="dimmed" size="sm" maw={860}>
-                Paste the MapTiler URL or the full copied <Code>wget -c ...</Code> command. The
-                server node downloads the MBTiles file with resumable range requests, ingests it
-                directly into IronMesh chunks, finalizes configurable part objects under{" "}
-                <Code>sys/maps/</Code>, and resumes automatically after server restarts.
+                Choose the configured map artifact, then paste its HTTP URL or a copied{" "}
+                <Code>wget -c ...</Code> command. The server node downloads that MBTiles file with
+                resumable range requests, ingests it directly into IronMesh chunks, finalizes the
+                selected cluster artifact, and resumes automatically after server restarts.
               </Text>
             </div>
             <MapDatasetImportStateBadge job={activeMapImport} />
           </Group>
 
-          <Alert color="yellow" variant="light" title="Filename expectation">
-            The shared gallery basemap currently looks for the standard MapTiler manifest keys
-            already wired into this page. Use the default MapTiler filenames so the imported
-            dataset is picked up automatically by the existing gallery map modes.
+          <Alert color="blue" variant="light" title="Configured destination">
+            The source filename is no longer significant. This import writes the selected variant
+            asset to its manifest key from the replicated map configuration, so each map package
+            can be downloaded and enabled independently.
           </Alert>
 
+          <Select
+            label="Map variant artifact"
+            description="Disabled variants can be imported first and made visible later in the map variant configuration."
+            placeholder={mapConfigurationQuery.isLoading ? "Loading configured map artifacts…" : "No map artifact configured"}
+            value={selectedTargetKey}
+            data={importTargets.map((target) => ({
+              value: target.key,
+              label: `${target.label} — ${target.asset}`
+            }))}
+            onChange={setSelectedTargetKey}
+            disabled={mapImportStatus?.can_start_new === false || importTargets.length === 0}
+            searchable
+            nothingFoundMessage="No configured map artifact"
+          />
+          {selectedTarget ? (
+            <Text size="xs" c="dimmed">
+              Target manifest: <Code>{selectedTarget.manifestKey}</Code>
+            </Text>
+          ) : null}
+
           <Textarea
-            label="MapTiler URL or pasted CLI command"
-            description="The tokenized source URL is persisted server-side for resumable retries and restart-safe continuation, but the admin UI only shows a redacted display form afterward."
-            placeholder="wget -c https://data.maptiler.com/download/.../maptiler-satellite-2017-11-02-planet.mbtiles"
+            label="MBTiles URL or pasted CLI command"
+            description="The source URL is persisted server-side for resumable retries and restart-safe continuation, but the admin UI only shows a redacted display form afterward."
+            placeholder="wget -c https://maps.example.org/natural-earth-globe.mbtiles"
             minRows={3}
             autosize
             value={mapImportSource}
@@ -147,7 +200,7 @@ export function MapDatasetImportCard() {
             <MapDatasetImportProgress job={activeMapImport} />
           ) : (
             <Alert color="gray" variant="light" title="No imported map dataset job yet">
-              This node has not started a persisted MapTiler dataset import yet.
+              This node has not started a persisted map dataset import yet.
             </Alert>
           )}
         </Stack>
@@ -196,6 +249,12 @@ function MapDatasetImportProgress({ job }: { job: AdminMapDatasetImportJobView }
             {job.source_display}
           </Text>
         </Group>
+
+        {job.variant_id && job.asset ? (
+          <Text size="sm" c="dimmed">
+            Target: {job.variant_id} — {job.asset}
+          </Text>
+        ) : null}
 
         <div>
           <Group justify="space-between" align="center" mb={6}>
@@ -286,6 +345,38 @@ function MapDatasetImportProgress({ job }: { job: AdminMapDatasetImportJobView }
       </Stack>
     </Card>
   );
+}
+
+function mapImportTargets(
+  variants: Array<{
+    id: string;
+    label: string;
+    raster_manifest_key?: string | null;
+    vector_manifest_key?: string | null;
+  }>
+): MapImportTarget[] {
+  return variants.flatMap((variant) => {
+    const targets: MapImportTarget[] = [];
+    if (variant.raster_manifest_key) {
+      targets.push({
+        key: `${variant.id}:raster`,
+        variantId: variant.id,
+        asset: "raster",
+        label: variant.label,
+        manifestKey: variant.raster_manifest_key
+      });
+    }
+    if (variant.vector_manifest_key) {
+      targets.push({
+        key: `${variant.id}:vector`,
+        variantId: variant.id,
+        asset: "vector",
+        label: variant.label,
+        manifestKey: variant.vector_manifest_key
+      });
+    }
+    return targets;
+  });
 }
 
 function ImportDetail({ label, children }: { label: string; children: ReactNode }) {

@@ -1,4 +1,5 @@
 import {
+  getClientGalleryMapConfiguration,
   getBinaryObjectStreamUrl,
   getVersionGraph,
   listSnapshots,
@@ -8,63 +9,53 @@ import {
 } from "@ironmesh/api";
 import {
   GallerySurface,
+  galleryBasemapsFromConfiguration,
   PageHeader,
-  type GalleryBasemapConfig,
   type GalleryEntry,
   type GalleryLoadEntriesOptions,
   type GalleryMediaRequests,
   type GallerySurfaceViewMode
 } from "@ironmesh/ui";
-import { useCallback } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
-
-const CLIENT_GALLERY_BASEMAP_MANIFEST_KEY =
-  "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json";
-const CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY =
-  "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json";
-const CLIENT_GALLERY_BASEMAPS: GalleryBasemapConfig[] = [
-  {
-    id: "satellite",
-    kind: "raster",
-    modeLabel: "Satellite",
-    logicalFileUrl: logicalMapFileUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-    metadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-    tileUrlTemplate: logicalMapTileUrlTemplate(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-    label: "MapTiler Satellite 2017-11-02 Planet",
-    attribution:
-      "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors."
-  },
-  {
-    id: "hybrid",
-    kind: "hybrid",
-    modeLabel: "Hybrid",
-    rasterMetadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-    rasterTileUrlTemplate: logicalMapTileUrlTemplate(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-    vectorMetadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
-    vectorTileUrlTemplate: logicalMapVectorTileUrlTemplate(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
-    glyphsUrlTemplate: logicalMapGlyphUrlTemplate(),
-    label: "Satellite with city and border overlay",
-    attribution:
-      "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors."
-  },
-  {
-    id: "street",
-    kind: "vector",
-    modeLabel: "Street",
-    metadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
-    vectorTileUrlTemplate: logicalMapVectorTileUrlTemplate(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
-    glyphsUrlTemplate: logicalMapGlyphUrlTemplate(),
-    label: "OpenMapTiles Street 2020-02-10 v3.11 Planet",
-    attribution: "Data Copyright OpenStreetMap contributors."
-  }
-];
 
 type GalleryPageProps = {
   initialViewMode?: GallerySurfaceViewMode;
 };
 
 export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
+  const [mapConfiguration, setMapConfiguration] = useState<
+    Awaited<ReturnType<typeof getClientGalleryMapConfiguration>> | null
+  >(null);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const next = await getClientGalleryMapConfiguration();
+        if (!cancelled) {
+          // Polling must not replace an equivalent response: `basemaps` then
+          // keeps its identity and the map does not get recreated every 15s.
+          setMapConfiguration((current) =>
+            sameMapConfiguration(current, next) ? current : next
+          );
+        }
+      } catch {
+        // The gallery remains usable while a transient node or replication hop
+        // is unavailable. The next refresh picks up the shared setting.
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+  const basemaps = useMemo(
+    () => galleryBasemapsFromConfiguration(mapConfiguration?.configuration.variants ?? []),
+    [mapConfiguration]
+  );
   const loadSnapshots = useCallback(() => listSnapshots(), []);
   const loadEntries = useCallback(
     (
@@ -116,7 +107,8 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         previewHint="Only indexed thumbnail URLs are used for gallery cards and movie posters. Missing thumbnails stay visible in the UI so pending or failed media processing is obvious."
         initialViewMode={initialViewMode}
         allowedMediaKinds={["image", "video"]}
-        basemaps={CLIENT_GALLERY_BASEMAPS}
+        basemaps={basemaps}
+        preferredBasemapId={mapConfiguration?.configuration.active_variant_id}
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
         getMediaRequests={getMediaRequests}
@@ -130,36 +122,26 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
   );
 }
 
+function sameMapConfiguration(
+  current: Awaited<ReturnType<typeof getClientGalleryMapConfiguration>> | null,
+  next: Awaited<ReturnType<typeof getClientGalleryMapConfiguration>>
+): boolean {
+  // `stored` communicates server-side initialization state only; it has no
+  // effect on gallery rendering. The API serializes configuration fields in a
+  // stable order, so this also compares nested variants without an additional
+  // dependency for deep equality.
+  return (
+    current !== null &&
+    JSON.stringify(current.configuration) === JSON.stringify(next.configuration)
+  );
+}
+
 function binaryMediaUrl(
   key: string,
   snapshotId: string | null,
   versionId?: string | null
 ): string {
   return getBinaryObjectStreamUrl(key, snapshotId, versionId);
-}
-
-function logicalMapFileUrl(manifestKey: string): string {
-  const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/v1/maps/logical-file?${query.toString()}`;
-}
-
-function logicalMapMetadataUrl(manifestKey: string): string {
-  const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/v1/maps/mbtiles-metadata?${query.toString()}`;
-}
-
-function logicalMapTileUrlTemplate(manifestKey: string): string {
-  const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/v1/maps/tiles/{z}/{x}/{y}?${query.toString()}`;
-}
-
-function logicalMapVectorTileUrlTemplate(manifestKey: string): string {
-  const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/v1/maps/vector-tiles/{z}/{x}/{y}?${query.toString()}`;
-}
-
-function logicalMapGlyphUrlTemplate(): string {
-  return "/api/v1/maps/fonts/{fontstack}/{range}.pbf";
 }
 
 function withThumbnailProfile(url: string, profile: string): string {
