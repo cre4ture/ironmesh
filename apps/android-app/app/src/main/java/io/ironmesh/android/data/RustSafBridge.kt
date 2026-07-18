@@ -125,10 +125,16 @@ object RustSafBridge {
     fun openTreeFileOutput(treeUriString: String, relativePath: String): OutputStream {
         val resolver = requireResolver()
         val treeUri = Uri.parse(treeUriString)
-        val documentUri = resolveOrCreateFileDocumentUri(resolver, treeUriString, treeUri, relativePath)
         invalidateTreeCache(treeUriString)
-        return resolver.openOutputStream(documentUri, "wt")
-            ?: error("Failed to open SAF output stream for $relativePath")
+        val resolution = resolveFileForWrite(resolver, treeUriString, treeUri, relativePath)
+        return AndroidSafWriteTransactionStore.open(
+            resolver = resolver,
+            parentUri = resolution.parentUri,
+            targetName = resolution.fileName,
+            mimeType = resolution.mimeType,
+            targetUri = resolution.existingDocumentUri,
+            onFinalized = { invalidateTreeCache(treeUriString) },
+        )
     }
 
     @JvmStatic
@@ -615,12 +621,12 @@ object RustSafBridge {
         return DirectoryResolution(currentDocumentUri, createdAny)
     }
 
-    private fun resolveOrCreateFileDocumentUri(
+    private fun resolveFileForWrite(
         resolver: ContentResolver,
         treeUriString: String,
         treeUri: Uri,
         relativePath: String,
-    ): Uri {
+    ): FileWriteResolution {
         val normalized = normalizeRelativePath(relativePath)
         require(normalized.isNotBlank()) { "Relative path must not be empty" }
 
@@ -635,15 +641,23 @@ object RustSafBridge {
 
         if (existing != null) {
             check(!existing.isDirectory) { "Expected file at $normalized but found directory" }
-            return DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.documentId)
+            return FileWriteResolution(
+                parentUri = parentUri,
+                fileName = fileName,
+                mimeType = existing.mimeType ?: guessMimeType(fileName),
+                existingDocumentUri = DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri,
+                    existing.documentId,
+                ),
+            )
         }
 
-        return DocumentsContract.createDocument(
-            resolver,
-            parentUri,
-            guessMimeType(fileName),
-            fileName,
-        ) ?: error("Failed to create SAF file $normalized")
+        return FileWriteResolution(
+            parentUri = parentUri,
+            fileName = fileName,
+            mimeType = guessMimeType(fileName),
+            existingDocumentUri = null,
+        )
     }
 
     private fun queryChildren(
@@ -716,6 +730,13 @@ object RustSafBridge {
     private data class DirectoryResolution(
         val documentUri: Uri,
         val createdAny: Boolean,
+    )
+
+    private data class FileWriteResolution(
+        val parentUri: Uri,
+        val fileName: String,
+        val mimeType: String,
+        val existingDocumentUri: Uri?,
     )
 
     private data class TreeScanProgressState(

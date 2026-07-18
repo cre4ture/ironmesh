@@ -776,18 +776,57 @@ struct JavaOutputStreamWriter<'env, 'local> {
     env: &'env mut JNIEnv<'local>,
     output_stream: JObject<'local>,
     java_buffer: jni::objects::JByteArray<'local>,
+    finalized: bool,
 }
 
 impl<'env, 'local> JavaOutputStreamWriter<'env, 'local> {
     const BUFFER_SIZE: usize = 64 * 1024;
 
     fn new(env: &'env mut JNIEnv<'local>, output_stream: JObject<'local>) -> Result<Self> {
-        let java_buffer = env.new_byte_array(Self::BUFFER_SIZE as i32)?;
+        let java_buffer = match env.new_byte_array(Self::BUFFER_SIZE as i32) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                clear_pending_java_exception(env);
+                let _ = env.call_method(&output_stream, "abort", "()V", &[]);
+                clear_pending_java_exception(env);
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             env,
             output_stream,
             java_buffer,
+            finalized: false,
         })
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.flush()?;
+        // Kotlin close performs the commit and its own rollback on failure. Mark this writer as
+        // finalized first so Drop never turns a reported commit error into a second JNI call.
+        self.finalized = true;
+        let result = self
+            .env
+            .call_method(&self.output_stream, "close", "()V", &[]);
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(jni_output_error(self.env, error)),
+        }
+    }
+
+    fn abort(&mut self) -> std::io::Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        clear_pending_java_exception(self.env);
+        let result = self
+            .env
+            .call_method(&self.output_stream, "abort", "()V", &[]);
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(jni_output_error(self.env, error)),
+        }
     }
 }
 
@@ -801,21 +840,25 @@ impl Write for JavaOutputStreamWriter<'_, '_> {
             let byte_slice = unsafe {
                 std::slice::from_raw_parts(chunk.as_ptr() as *const jni::sys::jbyte, chunk.len())
             };
-            self.env
+            if let Err(error) = self
+                .env
                 .set_byte_array_region(&self.java_buffer, 0, byte_slice)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
-            self.env
-                .call_method(
-                    &self.output_stream,
-                    "write",
-                    "([BII)V",
-                    &[
-                        JValue::Object(self.java_buffer.as_ref()),
-                        JValue::Int(0),
-                        JValue::Int(chunk_len as i32),
-                    ],
-                )
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            {
+                return Err(jni_output_error(self.env, error));
+            }
+            let result = self.env.call_method(
+                &self.output_stream,
+                "write",
+                "([BII)V",
+                &[
+                    JValue::Object(self.java_buffer.as_ref()),
+                    JValue::Int(0),
+                    JValue::Int(chunk_len as i32),
+                ],
+            );
+            if let Err(error) = result {
+                return Err(jni_output_error(self.env, error));
+            }
             written += chunk_len;
         }
 
@@ -823,22 +866,31 @@ impl Write for JavaOutputStreamWriter<'_, '_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.env
-            .call_method(&self.output_stream, "flush", "()V", &[])
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
-        Ok(())
+        let result = self
+            .env
+            .call_method(&self.output_stream, "flush", "()V", &[]);
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(jni_output_error(self.env, error)),
+        }
     }
 }
 
 impl Drop for JavaOutputStreamWriter<'_, '_> {
     fn drop(&mut self) {
-        let _ = self
-            .env
-            .call_method(&self.output_stream, "flush", "()V", &[]);
-        let _ = self
-            .env
-            .call_method(&self.output_stream, "close", "()V", &[]);
+        let _ = self.abort();
     }
+}
+
+fn clear_pending_java_exception(env: &mut JNIEnv<'_>) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+}
+
+fn jni_output_error(env: &mut JNIEnv<'_>, error: jni::errors::Error) -> std::io::Error {
+    clear_pending_java_exception(env);
+    std::io::Error::other(error.to_string())
 }
 
 fn upload_saf_file(
@@ -900,8 +952,8 @@ fn download_remote_file_to_saf(
         client
             .download_to_writer_resumable_staged(remote_key, None, None, &mut writer, &staging_root)
             .with_context(|| format!("failed to download remote file {remote_key}"))?;
-        writer.flush().with_context(|| {
-            format!("failed to flush downloaded SAF file {local_relative_path}")
+        writer.finish().with_context(|| {
+            format!("failed to close and commit downloaded SAF file {local_relative_path}")
         })?;
         Ok(())
     })
