@@ -5703,6 +5703,40 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     assert!(rendezvous_identity_pem.contains("BEGIN CERTIFICATE"));
     assert!(rendezvous_identity_pem.contains("PRIVATE KEY"));
 
+    let mut reader = std::io::Cursor::new(rendezvous_identity_pem.as_bytes());
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("rendezvous client identity certificate PEM should parse");
+    let cert = certs
+        .first()
+        .expect("rendezvous client identity should include a certificate");
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+        .expect("rendezvous client identity certificate DER should parse");
+    let mut saw_device_uri = false;
+    let mut saw_cluster_uri = false;
+
+    for extension in parsed.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            extension.parsed_extension()
+        {
+            for name in &san.general_names {
+                if let x509_parser::extensions::GeneralName::URI(uri) = name {
+                    saw_device_uri |= *uri == format!("urn:ironmesh:device:{device_id}");
+                    saw_cluster_uri |= *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
+                }
+            }
+        }
+    }
+
+    assert!(
+        saw_device_uri,
+        "expected rendezvous client device identity SAN"
+    );
+    assert!(
+        saw_cluster_uri,
+        "expected rendezvous client cluster identity SAN from server state"
+    );
+
     cleanup_test_state(&state).await;
 }
 
