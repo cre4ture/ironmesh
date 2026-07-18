@@ -113,6 +113,9 @@ struct IronmeshWebUIPresentation: Identifiable, Equatable, Sendable {
 final class IronmeshBrowserModel: ObservableObject {
     @Published var draft: IronmeshConnectionDraft {
         didSet {
+            if oldValue.connectionConfiguration != draft.connectionConfiguration {
+                invalidateConnectionRouteState()
+            }
             persistDraft()
         }
     }
@@ -135,6 +138,9 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var lastLibraryRefreshAt: Date?
     @Published var filesSelectionSummary: String?
     @Published var connectionDiagnostics: IronmeshConnectionDiagnosticsSnapshot?
+    @Published var connectionRouteSnapshot: AppleConnectionRouteSnapshot?
+    @Published var connectionRoutesErrorMessage: String?
+    @Published var isRefreshingConnectionRoutes = false
     @Published var webUIPresentation: IronmeshWebUIPresentation?
 
     let bundleDefaults: IronmeshConnectionDraft
@@ -150,6 +156,8 @@ final class IronmeshBrowserModel: ObservableObject {
 
     private var didActivate = false
     private var pendingOperations = 0
+    private var connectionRouteRequests = AppleLatestRequestCoordinator()
+    private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
 
     init(
         userDefaults: UserDefaults = .standard,
@@ -317,10 +325,11 @@ final class IronmeshBrowserModel: ObservableObject {
 
         hasCompletedOnboarding = true
         lastErrorMessage = nil
+        invalidateConnectionRouteState()
         statusText = "Onboarding complete. Connecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Completed onboarding", detail: draft.enrollmentSummary)
         refreshDomainState()
-        refresh()
+        reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after onboarding")
     }
 
     func applyConnectionSettings() {
@@ -351,18 +360,30 @@ final class IronmeshBrowserModel: ObservableObject {
         }
 
         lastErrorMessage = nil
+        invalidateConnectionRouteState()
         statusText = "Applied connection settings. Reconnecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Applied settings", detail: draft.setupSummary)
         refreshDomainState()
-        refresh()
+        reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after reconnecting")
     }
 
     func refresh() {
-        loadDirectory(path: "", updatesCurrentPath: currentPath.isEmpty, actionTitle: "Refreshed root")
+        let presentsRootDirectory = currentPath.isEmpty
+        loadDirectory(
+            path: "",
+            updatesCurrentDirectory: presentsRootDirectory,
+            updatesCurrentPath: presentsRootDirectory,
+            actionTitle: "Refreshed root"
+        )
     }
 
     func browse(path: String) {
-        loadDirectory(path: path, updatesCurrentPath: true, actionTitle: "Opened \(displayPath(path))")
+        loadDirectory(
+            path: path,
+            updatesCurrentDirectory: true,
+            updatesCurrentPath: true,
+            actionTitle: "Opened \(displayPath(path))"
+        )
     }
 
     func navigateUp() {
@@ -376,7 +397,12 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func refreshCurrentDirectory() {
-        loadDirectory(path: currentPath, updatesCurrentPath: false, actionTitle: "Refreshed \(displayPath(currentPath))")
+        loadDirectory(
+            path: currentPath,
+            updatesCurrentDirectory: true,
+            updatesCurrentPath: false,
+            actionTitle: "Refreshed \(displayPath(currentPath))"
+        )
     }
 
     func registerDomain() {
@@ -427,10 +453,16 @@ final class IronmeshBrowserModel: ObservableObject {
     func resetToBundleDefaults() {
         draft = bundleDefaults
         try? syncSharedSettingsFromDraft()
+        invalidateConnectionRouteState()
         lastErrorMessage = nil
         statusText = "Restored bundled defaults."
         addAction("Restored defaults", detail: draft.setupSummary)
         refreshDomainState()
+        if hasCompletedOnboarding, !draft.requiresEnrollment, draft.connectionConfiguration != nil {
+            reloadRootAfterConnectionContextChange(actionTitle: "Loaded bundled root")
+        } else {
+            clearDirectoryAfterConnectionContextChange()
+        }
     }
 
     func clearAppSetup() {
@@ -440,12 +472,11 @@ final class IronmeshBrowserModel: ObservableObject {
             domainDisplayName: bundleDefaults.domainDisplayName
         )
         hasCompletedOnboarding = false
-        items = []
-        currentItems = []
-        currentPath = ""
+        clearDirectoryAfterConnectionContextChange()
         lastSuccessfulConnectionAt = nil
         lastErrorMessage = nil
         connectionDiagnostics = nil
+        invalidateConnectionRouteState()
         webUIPresentation = nil
         settingsStore.clear()
         statusText = "Setup cleared. Finish onboarding to reconnect."
@@ -460,6 +491,8 @@ final class IronmeshBrowserModel: ObservableObject {
             hasCompletedOnboarding = false
         }
         try? syncSharedSettingsFromDraft()
+        invalidateConnectionRouteState()
+        clearDirectoryAfterConnectionContextChange()
         addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
     }
 
@@ -525,6 +558,7 @@ final class IronmeshBrowserModel: ObservableObject {
                 draft.enrolledDeviceID = enrollment.deviceID
                 draft.deviceLabel = enrollment.label ?? draft.deviceLabel
                 try syncSharedSettingsFromDraft()
+                invalidateConnectionRouteState()
 
                 if let configuration = draft.connectionConfiguration {
                     connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
@@ -537,8 +571,8 @@ final class IronmeshBrowserModel: ObservableObject {
                 if completesOnboarding {
                     hasCompletedOnboarding = true
                     refreshDomainState()
-                    refresh()
                 }
+                reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after enrollment")
             } catch {
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
@@ -572,6 +606,52 @@ final class IronmeshBrowserModel: ObservableObject {
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Diagnostics failed", detail: error.localizedDescription)
+            }
+        }
+    }
+
+    func refreshConnectionPaths() {
+        guard let configuration = draft.connectionConfiguration else {
+            invalidateConnectionRouteState()
+            let message = "A bootstrap bundle or direct route is required."
+            connectionRoutesErrorMessage = message
+            statusText = message
+            return
+        }
+
+        let remoteSession = remoteSession
+        let requestToken = connectionRouteRequests.begin()
+        isRefreshingConnectionRoutes = true
+        beginOperation()
+        Task {
+            defer {
+                if connectionRouteRequests.complete(requestToken) {
+                    isRefreshingConnectionRoutes = false
+                }
+                endOperation()
+            }
+
+            do {
+                let snapshot = try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.connectionRouteSnapshot(
+                        configuration: configuration,
+                        refresh: true
+                    )
+                }.value
+                guard connectionRouteRequests.isCurrent(requestToken) else {
+                    return
+                }
+                connectionRouteSnapshot = snapshot
+                connectionRoutesErrorMessage = nil
+                statusText = "Re-evaluated \(snapshot.endpoints.count) connection path(s)."
+                addAction("Re-evaluated connection paths", detail: "\(snapshot.endpoints.count) path(s)")
+            } catch {
+                guard connectionRouteRequests.isCurrent(requestToken) else {
+                    return
+                }
+                connectionRoutesErrorMessage = error.localizedDescription
+                statusText = error.localizedDescription
+                addAction("Connection paths failed", detail: error.localizedDescription)
             }
         }
     }
@@ -685,51 +765,103 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
-    private func loadDirectory(path: String, updatesCurrentPath: Bool, actionTitle: String) {
+    private func loadDirectory(
+        path: String,
+        updatesCurrentDirectory: Bool,
+        updatesCurrentPath: Bool,
+        actionTitle: String
+    ) {
+        let request = directoryLoadCoordinator.begin(
+            path: path,
+            updatesCurrentDirectory: updatesCurrentDirectory,
+            updatesCurrentPath: updatesCurrentPath
+        )
+
+        loadDirectory(request: request, actionTitle: actionTitle)
+    }
+
+    private func reloadRootAfterConnectionContextChange(actionTitle: String) {
+        let request = directoryLoadCoordinator.beginConnectionContextReset()
+        clearDirectoryPresentation()
+        loadDirectory(request: request, actionTitle: actionTitle)
+    }
+
+    private func clearDirectoryAfterConnectionContextChange() {
+        directoryLoadCoordinator.invalidate()
+        clearDirectoryPresentation()
+    }
+
+    private func clearDirectoryPresentation() {
+        items = []
+        currentItems = []
+        currentPath = ""
+    }
+
+    private func loadDirectory(request: AppleDirectoryLoadRequest, actionTitle: String) {
         guard let configuration = draft.connectionConfiguration else {
             let message = "A bootstrap bundle or direct route is required."
             lastErrorMessage = message
             statusText = message
-            if updatesCurrentPath {
-                currentPath = normalizedPath(path)
+            if directoryLoadCoordinator.acceptsCurrentDirectory(request), request.updatesCurrentPath {
+                currentPath = request.path
                 currentItems = []
             }
             return
         }
 
-        let normalized = normalizedPath(path)
         let remoteSession = remoteSession
         beginOperation()
 
         Task {
+            defer { endOperation() }
+
             do {
                 let loadedItems = try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.list(path: normalized, configuration: configuration)
+                    try remoteSession.list(path: request.path, configuration: configuration)
                 }.value
 
-                let loadedAt = Date()
-                items = normalized.isEmpty ? loadedItems : items
-                if normalized.isEmpty {
+                guard directoryLoadCoordinator.acceptsAnyResult(from: request) else {
+                    return
+                }
+
+                if directoryLoadCoordinator.acceptsRootSnapshot(request) {
                     items = loadedItems
                 }
-                if updatesCurrentPath {
-                    currentPath = normalized
+                if directoryLoadCoordinator.acceptsCurrentDirectory(request) {
+                    if request.updatesCurrentPath {
+                        currentPath = request.path
+                    }
+                    currentItems = loadedItems
                 }
-                currentItems = loadedItems
+
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
+
+                let diagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
+
+                let loadedAt = Date()
                 lastLibraryRefreshAt = loadedAt
                 lastSuccessfulConnectionAt = loadedAt
-                connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                connectionDiagnostics = diagnostics
                 lastErrorMessage = nil
-                statusText = "Loaded \(loadedItems.count) item(s) from \(displayPath(normalized))."
+                statusText = "Loaded \(loadedItems.count) item(s) from \(displayPath(request.path))."
                 addAction(actionTitle, detail: "Loaded \(loadedItems.count) item(s)")
             } catch {
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
                 connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Browse failed", detail: error.localizedDescription)
             }
-
-            endOperation()
         }
     }
 
@@ -744,6 +876,13 @@ final class IronmeshBrowserModel: ObservableObject {
         try settingsStore.save(
             draft.appliedConnectionState(defaultConnectionInput: bundleDefaults.directConnectionInput)
         )
+    }
+
+    private func invalidateConnectionRouteState() {
+        connectionRouteRequests.invalidate()
+        connectionRouteSnapshot = nil
+        connectionRoutesErrorMessage = nil
+        isRefreshingConnectionRoutes = false
     }
 
     private func addAction(_ title: String, detail: String) {
@@ -796,6 +935,15 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         try connectIfNeeded(configuration)
         let json = try bridge.connectionDiagnosticsJSON()
         return try decode(IronmeshConnectionDiagnosticsSnapshot.self, from: json)
+    }
+
+    func connectionRouteSnapshot(
+        configuration: AppleConnectionConfiguration,
+        refresh: Bool
+    ) throws -> AppleConnectionRouteSnapshot {
+        try connectIfNeeded(configuration)
+        let json = try bridge.connectionRouteSnapshotJSON(refresh: refresh)
+        return try decode(AppleConnectionRouteSnapshot.self, from: json)
     }
 
     func startWebUI(configuration: AppleConnectionConfiguration) throws -> URL {

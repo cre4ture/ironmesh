@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- Device identity metadata and pre-migration cleartext must never leave this device. -->
+        <exclude domain="sharedpref" path="ironmesh_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="ironmesh_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>

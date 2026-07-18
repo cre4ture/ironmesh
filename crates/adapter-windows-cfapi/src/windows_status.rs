@@ -423,9 +423,9 @@ fn effective_document_for_tray(shared: &TraySharedState) -> Result<DesktopStatus
 
 fn build_tooltip(document: &DesktopStatusDocument) -> String {
     match document.overall.state.as_str() {
-        "syncing" => format!("IronMesh: {}", document.sync.detail),
-        "error" | "warning" => format!("IronMesh: {}", document.overall.summary),
-        _ => format!("IronMesh: {}", document.overall.summary),
+        "syncing" => format!("BerryKeep: {}", document.sync.detail),
+        "error" | "warning" => format!("BerryKeep: {}", document.overall.summary),
+        _ => format!("BerryKeep: {}", document.overall.summary),
     }
 }
 

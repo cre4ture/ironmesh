@@ -18,7 +18,7 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
         clientIdentityJSON: String = "",
         enrolledDeviceID: String = "",
         domainIdentifier: String = "dev.ironmesh.default",
-        domainDisplayName: String = "IronMesh"
+        domainDisplayName: String = "BerryKeep"
     ) {
         self.deviceLabel = deviceLabel
         self.directConnectionInput = directConnectionInput
@@ -83,7 +83,7 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
     public var setupSummary: String {
         if let normalizedConnectionInput {
             if hasBootstrapPayload {
-                return "Bootstrap bundle ready for \(domainDisplayName.nilIfBlank ?? "IronMesh")."
+                return "Bootstrap bundle ready for \(domainDisplayName.nilIfBlank ?? "BerryKeep")."
             }
             return "Direct route \(normalizedConnectionInput)"
         }

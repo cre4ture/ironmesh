@@ -359,7 +359,7 @@ impl IExplorerCommand_Impl for IronmeshCancelHydrationCommand_Impl {
 
     fn GetToolTip(&self, _psiitemarray: Ref<'_, IShellItemArray>) -> Result<PWSTR> {
         duplicate_shell_text(
-            "Abort an active Ironmesh on-demand hydration for the selected placeholder",
+            "Abort an active BerryKeep on-demand hydration for the selected placeholder",
         )
     }
 
@@ -1120,7 +1120,7 @@ fn find_registered_sync_root(path: &Path) -> AnyhowResult<(PathBuf, RegisteredSy
     }
 
     Err(anyhow!(
-        "{} is not under a registered Ironmesh sync root",
+        "{} is not under a registered BerryKeep sync root",
         path.display()
     ))
 }

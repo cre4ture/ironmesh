@@ -6,6 +6,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.json.JSONArray
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -70,6 +71,37 @@ class RustSafBridgeInstrumentationTest {
         }
     }
 
+    @Test
+    fun transactionalWrite_preservesOldBytesUntilCloseThenReplacesTarget() {
+        TestTreeDocumentsProvider.seedFile(appContext, "existing.txt", "old".toByteArray())
+
+        val output = RustSafBridge.openTreeFileOutput(treeUriString, "existing.txt")
+        output.write("new".toByteArray())
+
+        assertArrayEquals("old".toByteArray(), readTreeFile("existing.txt"))
+        assertTrue(temporaryPaths().isNotEmpty())
+
+        output.close()
+
+        assertArrayEquals("new".toByteArray(), readTreeFile("existing.txt"))
+        assertTrue(temporaryPaths().isEmpty())
+    }
+
+    @Test
+    fun transactionalWrite_renameCommitFailureRestoresTargetAndCleansTemporaryDocuments() {
+        TestTreeDocumentsProvider.seedFile(appContext, "existing.txt", "old".toByteArray())
+        val output = RustSafBridge.openTreeFileOutput(treeUriString, "existing.txt")
+        output.write("new".toByteArray())
+        TestTreeDocumentsProvider.failNextRenameTo("existing.txt")
+
+        assertThrows(java.io.IOException::class.java) {
+            output.close()
+        }
+
+        assertArrayEquals("old".toByteArray(), readTreeFile("existing.txt"))
+        assertTrue(temporaryPaths().isEmpty())
+    }
+
     private fun snapshotPaths(snapshotJson: String): Set<String> {
         val array = JSONArray(snapshotJson)
         val result = linkedSetOf<String>()
@@ -77,6 +109,17 @@ class RustSafBridgeInstrumentationTest {
             result += array.getJSONObject(index).getString("path")
         }
         return result
+    }
+
+    private fun readTreeFile(relativePath: String): ByteArray {
+        return RustSafBridge.openTreeFileInput(treeUriString, relativePath).use { input ->
+            input.readBytes()
+        }
+    }
+
+    private fun temporaryPaths(): Set<String> {
+        return TestTreeDocumentsProvider.relativePaths(appContext)
+            .filterTo(linkedSetOf()) { path -> path.substringAfterLast('/').contains(".ironmesh-part-") }
     }
 
     private fun waitForTreeVersionGreaterThan(previous: Long, timeoutMs: Long = 5_000): Boolean {

@@ -12,6 +12,8 @@
     <string>6.0</string>
     <key>CFBundleName</key>
     <string>IronmeshMacApp</string>
+    <key>CFBundleDisplayName</key>
+    <string>BerryKeep</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -23,7 +25,7 @@
     <key>IronmeshAppGroupIdentifier</key>
     <string>group.dev.ironmesh.apple.shared</string>
     <key>IronmeshDomainDisplayName</key>
-    <string>IronMesh</string>
+    <string>BerryKeep</string>
     <key>IronmeshDomainIdentifier</key>
     <string>dev.ironmesh.default</string>
     <key>LSMinimumSystemVersion</key>
