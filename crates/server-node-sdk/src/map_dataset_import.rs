@@ -1256,6 +1256,15 @@ mod tests {
     }
 
     #[test]
+    fn legacy_import_still_requires_mbtiles_in_download_url() {
+        let signed_download =
+            Url::parse("https://downloads.example.test/api/v1/artifacts/123?signature=abc")
+                .expect("test URL should parse");
+
+        assert!(probe_dataset_filename(&signed_download, None).is_err());
+    }
+
+    #[test]
     fn manifest_builder_uses_variable_part_size() {
         let job = MapDatasetImportJob {
             job_id: "job".to_string(),
