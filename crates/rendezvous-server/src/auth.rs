@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use axum::extract::{FromRequestParts, connect_info::ConnectInfo};
+use common::ClusterId;
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -21,6 +22,7 @@ use crate::{RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerTlsIdentit
 #[derive(Debug, Clone)]
 pub(crate) struct AuthenticatedPeer {
     pub(crate) identity: PeerIdentity,
+    pub(crate) cluster_id: Option<ClusterId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,6 +117,32 @@ pub(crate) fn ensure_authenticated_peer_identity(
     } else {
         bail!(
             "{field_name} {identity} does not match authenticated rendezvous client {authenticated_identity}"
+        )
+    }
+}
+
+pub(crate) fn ensure_authenticated_peer_cluster(
+    mtls_enabled: bool,
+    authenticated_peer: &MaybeAuthenticatedPeer,
+    cluster_id: ClusterId,
+    field_name: &str,
+) -> Result<()> {
+    if !mtls_enabled {
+        return Ok(());
+    }
+
+    let Some(authenticated_peer) = authenticated_peer.0.as_ref() else {
+        bail!("rendezvous mTLS requires an authenticated peer certificate");
+    };
+    let Some(authenticated_cluster_id) = authenticated_peer.cluster_id else {
+        bail!("authenticated rendezvous client certificate is missing a cluster URI SAN");
+    };
+
+    if authenticated_cluster_id == cluster_id {
+        Ok(())
+    } else {
+        bail!(
+            "{field_name} cluster_id {cluster_id} does not match authenticated rendezvous client cluster_id {authenticated_cluster_id}"
         )
     }
 }
@@ -229,8 +257,7 @@ fn authenticated_peer_from_tls_stream<T>(
         return Ok(None);
     };
 
-    let identity = extract_peer_identity_from_peer_certs(certs)?;
-    Ok(Some(AuthenticatedPeer { identity }))
+    Ok(Some(extract_authenticated_peer_from_peer_certs(certs)?))
 }
 
 pub(crate) fn build_mtls_rustls_config(
@@ -318,25 +345,50 @@ pub(crate) fn build_mtls_rustls_config(
     ))
 }
 
-fn extract_peer_identity_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result<PeerIdentity> {
+fn extract_authenticated_peer_from_peer_certs(
+    certs: &[CertificateDer<'_>],
+) -> Result<AuthenticatedPeer> {
     let cert = certs
         .first()
         .context("missing end-entity peer certificate")?;
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
         .context("failed parsing peer certificate")?;
+    let mut identity = None;
+    let mut cluster_id = None;
     for extension in parsed.extensions() {
         if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
             for name in &san.general_names {
-                if let x509_parser::extensions::GeneralName::URI(uri) = name
-                    && let Some(identity) = parse_peer_identity_from_san_uri(uri)
-                {
-                    return Ok(identity);
+                if let x509_parser::extensions::GeneralName::URI(uri) = name {
+                    if let Some(parsed_identity) = parse_peer_identity_from_san_uri(uri) {
+                        if let Some(existing_identity) = identity.as_ref()
+                            && existing_identity != &parsed_identity
+                        {
+                            bail!(
+                                "peer certificate contains conflicting ironmesh identity URI SANs"
+                            );
+                        }
+                        identity = Some(parsed_identity);
+                    }
+                    if let Some(parsed_cluster_id) = parse_cluster_id_from_san_uri(uri)? {
+                        if let Some(existing_cluster_id) = cluster_id
+                            && existing_cluster_id != parsed_cluster_id
+                        {
+                            bail!(
+                                "peer certificate contains conflicting ironmesh cluster URI SANs"
+                            );
+                        }
+                        cluster_id = Some(parsed_cluster_id);
+                    }
                 }
             }
         }
     }
 
-    bail!("peer certificate missing URI SAN for ironmesh identity")
+    let identity = identity.context("peer certificate missing URI SAN for ironmesh identity")?;
+    Ok(AuthenticatedPeer {
+        identity,
+        cluster_id,
+    })
 }
 
 fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
@@ -349,16 +401,35 @@ fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
         .map(PeerIdentity::Device)
 }
 
+fn parse_cluster_id_from_san_uri(uri: &str) -> Result<Option<ClusterId>> {
+    let Some(value) = uri.strip_prefix("urn:ironmesh:cluster:") else {
+        return Ok(None);
+    };
+
+    let cluster_id = value
+        .parse::<ClusterId>()
+        .context("invalid urn:ironmesh:cluster:<uuid> SAN URI in peer certificate")?;
+    if cluster_id.is_nil() {
+        bail!("peer certificate cluster SAN must not use the nil UUID");
+    }
+    Ok(Some(cluster_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::DeviceId;
+    use common::{ClusterId, DeviceId};
+
+    fn authenticated_peer(cluster_id: Option<ClusterId>) -> MaybeAuthenticatedPeer {
+        MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
+            identity: PeerIdentity::Device(DeviceId::now_v7()),
+            cluster_id,
+        }))
+    }
 
     #[test]
     fn require_any_authenticated_peer_accepts_device_certificate() {
-        let peer = MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
-            identity: PeerIdentity::Device(DeviceId::now_v7()),
-        }));
+        let peer = authenticated_peer(Some(ClusterId::now_v7()));
 
         require_any_authenticated_peer(true, &peer)
             .expect("device certificates should satisfy read-only rendezvous auth");
@@ -370,5 +441,50 @@ mod tests {
             .expect_err("missing certificates should be rejected");
 
         assert!(error.to_string().contains("authenticated peer certificate"));
+    }
+
+    #[test]
+    fn authenticated_cluster_san_authorizes_only_its_cluster() {
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let peer = authenticated_peer(Some(cluster_a));
+
+        ensure_authenticated_peer_cluster(true, &peer, cluster_a, "presence registration")
+            .expect("matching cluster SAN should authorize the request");
+        let error =
+            ensure_authenticated_peer_cluster(true, &peer, cluster_b, "presence registration")
+                .expect_err("cluster A certificate must not authorize cluster B");
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn authenticated_cluster_check_rejects_legacy_certificate_without_cluster_san() {
+        let error = ensure_authenticated_peer_cluster(
+            true,
+            &authenticated_peer(None),
+            ClusterId::now_v7(),
+            "relay ticket",
+        )
+        .expect_err("cluster-bound requests require a cluster SAN");
+
+        assert!(error.to_string().contains("missing a cluster URI SAN"));
+    }
+
+    #[test]
+    fn cluster_san_parser_requires_a_non_nil_uuid() {
+        let cluster_id = ClusterId::now_v7();
+        assert_eq!(
+            parse_cluster_id_from_san_uri(&format!("urn:ironmesh:cluster:{cluster_id}"))
+                .expect("cluster SAN should parse"),
+            Some(cluster_id)
+        );
+        assert!(parse_cluster_id_from_san_uri("urn:ironmesh:cluster:not-a-uuid").is_err());
+        assert!(
+            parse_cluster_id_from_san_uri(
+                "urn:ironmesh:cluster:00000000-0000-0000-0000-000000000000"
+            )
+            .is_err()
+        );
     }
 }
