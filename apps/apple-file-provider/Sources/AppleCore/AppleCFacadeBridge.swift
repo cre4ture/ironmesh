@@ -16,8 +16,20 @@ public protocol AppleManualCBridgeFFI: Sendable {
         clientIdentityJSON: String?
     ) throws -> String
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?
+    ) throws -> String
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data
+    func fetchRelativeBytes(handle: AppleRustHandle, path: String) throws -> Data
     func putBytes(handle: AppleRustHandle, key: String, data: Data) throws -> String
     func deletePath(handle: AppleRustHandle, key: String) throws
     func movePath(handle: AppleRustHandle, fromPath: String, toPath: String, overwrite: Bool) throws
@@ -104,10 +116,33 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
         }
     }
 
+    public func storeIndex(_ request: AppleStoreIndexRequest) throws -> AppleStoreIndexResponse {
+        try withHandle { handle in
+            let responseJSON = try ffi.storeIndexJSON(
+                handle: handle,
+                prefix: request.prefix,
+                depth: request.depth,
+                snapshot: request.snapshot,
+                view: request.options.view?.rawValue,
+                offset: request.options.offset,
+                limit: request.options.limit,
+                sort: request.options.sort?.rawValue,
+                mediaFilter: request.options.mediaFilter?.rawValue
+            )
+            return try decode(AppleStoreIndexResponse.self, from: responseJSON)
+        }
+    }
+
     public func download(path: String, revisionHint: String?) throws -> Data {
         _ = revisionHint
         return try withHandle { handle in
             try ffi.fetchBytes(handle: handle, key: normalizedPath(path))
+        }
+    }
+
+    public func fetchRelativeBytes(path: String) throws -> Data {
+        try withHandle { handle in
+            try ffi.fetchRelativeBytes(handle: handle, path: path)
         }
     }
 

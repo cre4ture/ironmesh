@@ -323,6 +323,17 @@ impl IosStorageApp {
         self.runtime.block_on(self.fetch_async(key))
     }
 
+    pub fn fetch_relative_path(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {
+        let path = path.as_ref().to_string();
+        self.runtime.block_on(async {
+            let response = self.sdk.get_relative_path(&path).await?;
+            if !response.status.is_success() {
+                bail!("{path} returned non-success status: {}", response.status);
+            }
+            Ok(response.body.to_vec())
+        })
+    }
+
     pub fn list(
         &self,
         prefix: Option<&str>,
@@ -645,6 +656,12 @@ fn fetch_bytes(handle: *mut c_void, key: impl AsRef<str>) -> Result<Vec<u8>> {
 }
 
 #[allow(unsafe_code)]
+fn fetch_relative_bytes(handle: *mut c_void, path: impl AsRef<str>) -> Result<Vec<u8>> {
+    let app = unsafe { handle_to_app(handle)? };
+    app.fetch_relative_path(path)
+}
+
+#[allow(unsafe_code)]
 fn put_json(handle: *mut c_void, key: impl Into<String>, data: Vec<u8>) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
     serde_json::to_string(&app.put(key, data)?).context("failed to serialize Apple put response")
@@ -886,6 +903,21 @@ pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
     run_ffi_bytes_result(out_bytes, out_error, || {
         let bytes = fetch_bytes(handle, required_c_string(key, "key")?)?;
         Ok(bytes)
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_fetch_relative_bytes(
+    handle: *mut c_void,
+    path: *const c_char,
+    out_bytes: *mut IronmeshIosBytes,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_bytes_out(out_bytes);
+    clear_error(out_error);
+    run_ffi_bytes_result(out_bytes, out_error, || {
+        fetch_relative_bytes(handle, required_c_string(path, "path")?)
     })
 }
 
@@ -1276,7 +1308,7 @@ where
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
-    use axum::extract::{Path, State};
+    use axum::extract::{OriginalUri, Path, State};
     use axum::http::{HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::{get, post, put};
@@ -1293,6 +1325,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestServerState {
         objects: Arc<Mutex<BTreeMap<String, TestObject>>>,
+        last_store_index_query: Arc<Mutex<Option<String>>>,
+        last_relative_path: Arc<Mutex<Option<String>>>,
     }
 
     #[derive(Clone)]
@@ -1315,6 +1349,7 @@ mod tests {
             .route("/auth/device/enroll", post(enroll_device))
             .route("/api/v1/auth/device/enroll", post(enroll_device))
             .route("/api/v1/store/index", get(list_store_index))
+            .route("/api/v1/media/thumbnail", get(get_media_thumbnail))
             .route("/api/v1/store/delete", post(delete_by_query))
             .route("/api/v1/store/rename", post(rename_path))
             .route(
@@ -1508,7 +1543,12 @@ mod tests {
         (StatusCode::OK, Json(response)).into_response()
     }
 
-    async fn list_store_index(State(state): State<TestServerState>) -> impl IntoResponse {
+    async fn list_store_index(
+        State(state): State<TestServerState>,
+        OriginalUri(uri): OriginalUri,
+    ) -> impl IntoResponse {
+        *state.last_store_index_query.lock().expect("lock poisoned") =
+            uri.query().map(ToOwned::to_owned);
         let objects = state.objects.lock().expect("lock poisoned");
         let mut prefixes = std::collections::BTreeSet::new();
         let mut entries = Vec::new();
@@ -1561,9 +1601,21 @@ mod tests {
         (StatusCode::OK, Json(response)).into_response()
     }
 
+    async fn get_media_thumbnail(
+        State(state): State<TestServerState>,
+        OriginalUri(uri): OriginalUri,
+    ) -> impl IntoResponse {
+        *state.last_relative_path.lock().expect("lock poisoned") = Some(uri.to_string());
+        (StatusCode::OK, b"authenticated thumbnail".to_vec())
+    }
+
     fn spawn_test_server() -> SocketAddr {
         let state = TestServerState::default();
-        let app = test_router(state);
+        spawn_test_server_with_state(state).0
+    }
+
+    fn spawn_test_server_with_state(state: TestServerState) -> (SocketAddr, TestServerState) {
+        let app = test_router(state.clone());
         let std_listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
         std_listener
@@ -1582,7 +1634,7 @@ mod tests {
             });
         });
 
-        addr
+        (addr, state)
     }
 
     fn create_handle_for_server(addr: SocketAddr) -> *mut c_void {
@@ -1701,6 +1753,95 @@ mod tests {
             response.enrollment.label.as_deref()
         );
         assert!(persisted_bootstrap.pairing_token.is_none());
+    }
+
+    #[test]
+    fn blocking_facade_maps_store_index_options_and_fetches_relative_bytes() {
+        let state = TestServerState::default();
+        let (addr, state) = spawn_test_server_with_state(state);
+        let handle = create_handle_for_server(addr);
+
+        let prefix = CString::new("photos").expect("prefix should be valid");
+        let view = CString::new("raw").expect("view should be valid");
+        let sort = CString::new("captured_desc").expect("sort should be valid");
+        let media_filter = CString::new("image").expect("filter should be valid");
+        let mut json_out = ptr::null_mut();
+        let mut index_error = ptr::null_mut();
+        let status = ironmesh_ios_facade_store_index_with_options_json(
+            handle,
+            prefix.as_ptr(),
+            64,
+            ptr::null(),
+            view.as_ptr(),
+            32,
+            32,
+            sort.as_ptr(),
+            media_filter.as_ptr(),
+            &mut json_out,
+            &mut index_error,
+        );
+
+        assert_eq!(status, FFI_OK);
+        assert!(index_error.is_null());
+        let response: StoreIndexResponse =
+            serde_json::from_str(&read_string(json_out)).expect("store index should parse");
+        assert_eq!(response.entry_count, 0);
+        assert_eq!(
+            state
+                .last_store_index_query
+                .lock()
+                .expect("lock poisoned")
+                .as_deref(),
+            Some(
+                "depth=64&prefix=photos&view=raw&offset=32&limit=32&sort=captured_desc&media_filter=image"
+            )
+        );
+
+        let relative_path = CString::new("/media/thumbnail?key=photos%2Fcat%20one.jpg")
+            .expect("relative path should be valid");
+        let mut bytes_out = IronmeshIosBytes {
+            data: ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let mut relative_error = ptr::null_mut();
+        let status = ironmesh_ios_facade_fetch_relative_bytes(
+            handle,
+            relative_path.as_ptr(),
+            &mut bytes_out,
+            &mut relative_error,
+        );
+
+        assert_eq!(status, FFI_OK);
+        assert!(relative_error.is_null());
+        assert_eq!(read_bytes(bytes_out), b"authenticated thumbnail");
+        assert_eq!(
+            state
+                .last_relative_path
+                .lock()
+                .expect("lock poisoned")
+                .as_deref(),
+            Some("/api/v1/media/thumbnail?key=photos%2Fcat%20one.jpg")
+        );
+
+        let missing_path = CString::new("/media/missing").expect("path should be valid");
+        let mut missing_bytes = IronmeshIosBytes {
+            data: ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let mut missing_error = ptr::null_mut();
+        let status = ironmesh_ios_facade_fetch_relative_bytes(
+            handle,
+            missing_path.as_ptr(),
+            &mut missing_bytes,
+            &mut missing_error,
+        );
+        assert_eq!(status, FFI_ERR);
+        assert!(!missing_error.is_null());
+        unsafe { ironmesh_ios_string_free(missing_error) };
+
+        ironmesh_ios_facade_free(handle);
     }
 
     #[test]

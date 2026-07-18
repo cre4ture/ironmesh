@@ -30,6 +30,10 @@ pub(crate) struct AdminMapDatasetImportJobView {
     pub(crate) state: AdminMapDatasetImportState,
     pub(crate) dataset_filename: String,
     pub(crate) source_display: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) variant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) asset: Option<map_config::MapVariantAssetKind>,
     pub(crate) logical_key: String,
     pub(crate) manifest_key: String,
     pub(crate) part_size_bytes: u64,
@@ -56,6 +60,12 @@ pub(crate) struct AdminMapDatasetImportJobView {
 pub(crate) struct StartAdminMapDatasetImportRequest {
     source: String,
     part_size_bytes: u64,
+    /// The cluster-configured map variant whose artifact is replaced.  Omitted
+    /// only for compatibility with pre-variant import clients.
+    #[serde(default)]
+    variant_id: Option<String>,
+    #[serde(default)]
+    asset: Option<map_config::MapVariantAssetKind>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +92,10 @@ struct MapDatasetImportJob {
     job_id: String,
     state: AdminMapDatasetImportState,
     source_url: String,
+    #[serde(default)]
+    variant_id: Option<String>,
+    #[serde(default)]
+    asset: Option<map_config::MapVariantAssetKind>,
     dataset_filename: String,
     logical_key: String,
     manifest_key: String,
@@ -187,6 +201,8 @@ impl MapDatasetImportJob {
             state: self.state,
             dataset_filename: self.dataset_filename.clone(),
             source_display: source_display_url(&self.source_url),
+            variant_id: self.variant_id.clone(),
+            asset: self.asset,
             logical_key: self.logical_key.clone(),
             manifest_key: self.manifest_key.clone(),
             part_size_bytes: self.part_size_bytes,
@@ -265,6 +281,8 @@ pub(crate) async fn start_admin_import(
         true,
         json!({
             "part_size_bytes": request.part_size_bytes,
+            "variant_id": request.variant_id,
+            "asset": request.asset,
         }),
     )
     .await
@@ -294,6 +312,8 @@ pub(crate) async fn start_admin_import(
             "started": start_result.started,
             "active_job": start_result.status.active_job.as_ref().map(|job| json!({
                 "job_id": job.job_id,
+                "variant_id": job.variant_id,
+                "asset": job.asset,
                 "logical_key": job.logical_key,
                 "manifest_key": job.manifest_key,
                 "part_size_bytes": job.part_size_bytes,
@@ -330,22 +350,58 @@ async fn start_import_job(
         }
     }
 
+    let configured_target = match (request.variant_id.as_deref(), request.asset) {
+        (Some(variant_id), Some(asset)) => {
+            let configuration = map_config::load_current_configuration(state)
+                .await
+                .map_err(|err| {
+                    warn!(error = %err, variant_id, "failed loading map configuration for import");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            map_config::resolve_import_target(&configuration.configuration, variant_id, asset)
+                .map(Some)
+                .map_err(|err| {
+                    warn!(error = %err, variant_id, ?asset, "invalid configured map import target");
+                    StatusCode::BAD_REQUEST
+                })?
+        }
+        (None, None) => None,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
     let http = build_map_import_http_client().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let probe = probe_download_source(&http, &source_url)
-        .await
-        .map_err(import_error_status)?;
+    let probe = probe_download_source(
+        &http,
+        &source_url,
+        configured_target
+            .as_ref()
+            .map(|target| target.dataset_filename.as_str()),
+    )
+    .await
+    .map_err(import_error_status)?;
     let now = unix_ts();
-    let dataset_filename = probe.dataset_filename.clone();
+    let dataset_filename = configured_target
+        .as_ref()
+        .map(|target| target.dataset_filename.clone())
+        .unwrap_or(probe.dataset_filename.clone());
+    let logical_key = configured_target
+        .as_ref()
+        .map(|target| target.logical_key.clone())
+        .unwrap_or_else(|| format!("{MAP_IMPORT_STORAGE_ROOT}/{dataset_filename}"));
+    let manifest_key = configured_target
+        .as_ref()
+        .map(|target| target.manifest_key.clone())
+        .unwrap_or_else(|| format!("{MAP_IMPORT_STORAGE_ROOT}/{dataset_filename}.manifest.json"));
     let job = MapDatasetImportJob {
         job_id: Uuid::now_v7().to_string(),
         state: AdminMapDatasetImportState::Running,
         source_url: probe.source_url,
+        variant_id: configured_target
+            .as_ref()
+            .map(|target| target.variant_id.clone()),
+        asset: configured_target.as_ref().map(|target| target.asset),
         dataset_filename: dataset_filename.clone(),
-        logical_key: format!("{MAP_IMPORT_STORAGE_ROOT}/{dataset_filename}"),
-        manifest_key: format!(
-            "{MAP_IMPORT_STORAGE_ROOT}/{}.manifest.json",
-            dataset_filename
-        ),
+        logical_key,
+        manifest_key,
         part_size_bytes: request.part_size_bytes,
         total_size_bytes: probe.total_size_bytes,
         total_parts: part_count_for_size(probe.total_size_bytes, request.part_size_bytes)
@@ -828,7 +884,7 @@ async fn ingest_import_chunk(
     })
 }
 
-async fn register_put_outcome(state: &ServerState, key: &str, version_id: &str) {
+pub(crate) async fn register_put_outcome(state: &ServerState, key: &str, version_id: &str) {
     publish_namespace_change(state);
 
     let mut cluster = state.cluster.lock().await;
@@ -872,6 +928,7 @@ fn build_map_import_http_client() -> Result<reqwest::Client> {
 async fn probe_download_source(
     http: &reqwest::Client,
     source_url: &str,
+    configured_dataset_filename: Option<&str>,
 ) -> std::result::Result<MapDatasetProbe, ImportAdvanceError> {
     let parsed = Url::parse(source_url)
         .map_err(|err| ImportAdvanceError::Fatal(format!("invalid source URL: {err}")))?;
@@ -908,8 +965,7 @@ async fn probe_download_source(
         )));
     }
 
-    let final_url = response.url().clone();
-    let dataset_filename = dataset_filename_from_url(&final_url)?;
+    let dataset_filename = probe_dataset_filename(response.url(), configured_dataset_filename)?;
     Ok(MapDatasetProbe {
         // Keep the stable user-provided URL. Redirect targets may be short-lived
         // signed CDN URLs and must be re-resolved after a restart.
@@ -917,6 +973,19 @@ async fn probe_download_source(
         dataset_filename,
         total_size_bytes,
     })
+}
+
+fn probe_dataset_filename(
+    final_url: &Url,
+    configured_dataset_filename: Option<&str>,
+) -> std::result::Result<String, ImportAdvanceError> {
+    // A selected variant provides its canonical destination. Signed download
+    // URLs commonly end in a token or an API route rather than `.mbtiles`, so
+    // only the legacy, unconfigured import path derives a name from the URL.
+    match configured_dataset_filename {
+        Some(filename) => Ok(filename.to_string()),
+        None => dataset_filename_from_url(final_url),
+    }
 }
 
 fn dataset_filename_from_url(url: &Url) -> std::result::Result<String, ImportAdvanceError> {
@@ -1174,11 +1243,35 @@ mod tests {
     }
 
     #[test]
+    fn configured_import_does_not_require_mbtiles_in_download_url() {
+        let signed_download =
+            Url::parse("https://downloads.example.test/api/v1/artifacts/123?signature=abc")
+                .expect("test URL should parse");
+
+        let filename =
+            probe_dataset_filename(&signed_download, Some("natural-earth-globe.mbtiles"))
+                .expect("configured imports use their configured destination filename");
+
+        assert_eq!(filename, "natural-earth-globe.mbtiles");
+    }
+
+    #[test]
+    fn legacy_import_still_requires_mbtiles_in_download_url() {
+        let signed_download =
+            Url::parse("https://downloads.example.test/api/v1/artifacts/123?signature=abc")
+                .expect("test URL should parse");
+
+        assert!(probe_dataset_filename(&signed_download, None).is_err());
+    }
+
+    #[test]
     fn manifest_builder_uses_variable_part_size() {
         let job = MapDatasetImportJob {
             job_id: "job".to_string(),
             state: AdminMapDatasetImportState::Running,
             source_url: "https://example.invalid/file.mbtiles".to_string(),
+            variant_id: None,
+            asset: None,
             dataset_filename: "file.mbtiles".to_string(),
             logical_key: "sys/maps/file.mbtiles".to_string(),
             manifest_key: "sys/maps/file.mbtiles.manifest.json".to_string(),

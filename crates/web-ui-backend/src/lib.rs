@@ -304,6 +304,7 @@ pub fn router(config: WebUiConfig) -> Router {
     let api_v1 = Router::new()
         .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/media/cache/retry", post(web_media_cache_retry))
+        .route("/maps/config", get(web_map_config))
         .route("/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
         .route("/maps/logical-file", get(web_map_logical_file))
         .route("/maps/tiles/{z}/{x}/{y}", get(web_map_xyz_tile))
@@ -354,6 +355,7 @@ pub fn router(config: WebUiConfig) -> Router {
     let legacy_api = Router::new()
         .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/media/cache/retry", post(web_media_cache_retry))
+        .route("/api/maps/config", get(web_map_config))
         .route("/api/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
         .route("/api/maps/logical-file", get(web_map_logical_file))
         .route("/api/maps/tiles/{z}/{x}/{y}", get(web_map_xyz_tile))
@@ -1863,6 +1865,30 @@ async fn web_media_cache_retry(
         headers.insert(CONTENT_TYPE, value);
     }
 
+    (response.status, headers, response.body).into_response()
+}
+
+async fn web_map_config(State(state): State<WebState>) -> impl IntoResponse {
+    let response = match current_sdk(&state)
+        .await
+        .get_relative_path("/maps/config")
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return logged_error_response(
+                &state,
+                StatusCode::BAD_GATEWAY,
+                "map configuration request failed",
+                err.to_string(),
+            );
+        }
+    };
+
+    let mut headers = HeaderMap::new();
+    if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+        headers.insert(CONTENT_TYPE, value);
+    }
     (response.status, headers, response.body).into_response()
 }
 

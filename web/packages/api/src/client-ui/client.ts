@@ -1,4 +1,5 @@
 import { fetchJson } from "../shared/http";
+import type { GalleryMapConfigurationResponse } from "../shared/map-config";
 import type { StoreIndexMedia } from "../shared/store-index";
 import type {
   ClientConnectionRouteSnapshot,
@@ -46,6 +47,12 @@ function apiV1(path: string): string {
 
 export async function getClientPing(): Promise<ClientUiPingResponse> {
   return fetchJson<ClientUiPingResponse>(apiV1("/ping"));
+}
+
+export async function getClientGalleryMapConfiguration(): Promise<GalleryMapConfigurationResponse> {
+  return fetchJson<GalleryMapConfigurationResponse>(apiV1("/maps/config"), {
+    cache: "no-store"
+  });
 }
 
 export async function getClientHealth(): Promise<JsonObject> {

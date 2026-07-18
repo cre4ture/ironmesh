@@ -4,6 +4,10 @@ import android.content.Context
 import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
+import io.ironmesh.android.data.APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT
+import io.ironmesh.android.data.AppConnectionStatus
+import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
@@ -29,7 +33,21 @@ class FolderSyncWorker(
             return@withContext Result.success()
         }
 
-        val deviceAuth = IronmeshPreferences.getDeviceAuthState(applicationContext)
+        val deviceAuth = try {
+            IronmeshPreferences.getDeviceAuthState(applicationContext)
+        } catch (error: DeviceIdentityStorageException) {
+            val message = error.message ?: "Protected device identity is unavailable; enroll again."
+            Log.e(TAG, message, error)
+            IronmeshPreferences.setAppConnectionStatus(
+                applicationContext,
+                AppConnectionStatus(
+                    state = APP_CONNECTION_STATE_WAITING_FOR_ENROLLMENT,
+                    message = message,
+                    updatedUnixMs = System.currentTimeMillis(),
+                ),
+            )
+            return@withContext Result.failure(workDataOf(OUTPUT_ERROR to message))
+        }
         val connectionInput = deviceAuth.preferredConnectionInput()
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
@@ -110,5 +128,6 @@ class FolderSyncWorker(
 
     private companion object {
         private const val TAG = "FolderSyncWorker"
+        private const val OUTPUT_ERROR = "error"
     }
 }

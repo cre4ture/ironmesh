@@ -228,6 +228,8 @@ type GallerySurfaceProps = {
   previewHint: string;
   initialViewMode?: GalleryViewMode;
   basemaps?: GalleryBasemapConfig[] | null;
+  /** Cluster-configured initial choice. A config update overrides an old local choice. */
+  preferredBasemapId?: string | null;
   allowedMediaKinds?: GalleryMediaKind[];
   loadSnapshots: () => Promise<GallerySnapshot[]>;
   loadEntries: (
@@ -254,6 +256,7 @@ export function GallerySurface({
   previewHint,
   initialViewMode,
   basemaps,
+  preferredBasemapId,
   allowedMediaKinds,
   loadSnapshots,
   loadEntries,
@@ -358,10 +361,20 @@ export function GallerySurface({
     mediaFilter
   );
   const availableBasemaps = basemaps ?? [];
+  const basemapIdSignature = availableBasemaps.map((candidate) => candidate.id).join("\u0000");
   const activeBasemap =
     availableBasemaps.find((candidate) => candidate.id === activeBasemapId) ??
     availableBasemaps[0] ??
     null;
+
+  useEffect(() => {
+    if (
+      preferredBasemapId &&
+      availableBasemaps.some((candidate) => candidate.id === preferredBasemapId)
+    ) {
+      setActiveBasemapId(preferredBasemapId);
+    }
+  }, [preferredBasemapId, basemapIdSignature]);
   const currentGalleryPrefix = normalizeGalleryPrefix(
     navigationPayload?.prefix ?? loadedScope?.prefix ?? prefix
   );
