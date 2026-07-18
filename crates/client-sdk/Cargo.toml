@@ -26,7 +26,7 @@ uuid.workspace = true
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] }
 futures-util = "0.3"
-rcgen = { version = "0.14", features = ["crypto", "pem", "ring"] }
+rcgen = { version = "0.14", features = ["crypto", "pem", "ring", "x509-parser"] }
 rendezvous-server = { path = "../rendezvous-server" }
 
 [lints]

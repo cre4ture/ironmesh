@@ -822,6 +822,7 @@ async fn serve_test_multiplex_session(
                 let message = format!("{error:#}");
                 if message.contains("Connection reset")
                     || message.contains("without closing handshake")
+                    || message.contains("peer closed connection without sending TLS close_notify")
                 {
                     return;
                 }
@@ -1558,11 +1559,21 @@ async fn serve_mixed_workload_transport_session(
         }
     ));
 
-    while let Some(mut stream) = session
-        .accept_stream()
-        .await
-        .expect("mixed workload stream accept should succeed")
-    {
+    loop {
+        let mut stream = match session.accept_stream().await {
+            Ok(Some(stream)) => stream,
+            Ok(None) => return,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("Connection reset")
+                    || message.contains("without closing handshake")
+                    || message.contains("peer closed connection without sending TLS close_notify")
+                {
+                    return;
+                }
+                panic!("mixed workload stream accept should succeed: {error:#}");
+            }
+        };
         let payload = Arc::clone(&payload);
         tokio::spawn(async move {
             let request = read_buffered_transport_request(&mut stream)
