@@ -2011,11 +2011,18 @@ fn issue_client_rendezvous_identity_pem(
     params.not_after = OffsetDateTime::from_unix_timestamp(not_after_unix as i64)
         .context("invalid rendezvous client cert not_after timestamp")?;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    params.subject_alt_names = vec![SanType::URI(
-        format!("urn:ironmesh:device:{device_id}")
-            .try_into()
-            .context("invalid rendezvous client SAN URI")?,
-    )];
+    params.subject_alt_names = vec![
+        SanType::URI(
+            format!("urn:ironmesh:device:{device_id}")
+                .try_into()
+                .context("invalid rendezvous client device SAN URI")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{}", state.cluster_id)
+                .try_into()
+                .context("invalid rendezvous client cluster SAN URI")?,
+        ),
+    ];
 
     let key_pair = KeyPair::generate().context("failed generating rendezvous client key")?;
     let cert = params
