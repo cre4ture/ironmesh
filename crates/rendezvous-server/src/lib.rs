@@ -35,7 +35,7 @@ use transport_sdk::{
 
 use crate::auth::{
     MaybeAuthenticatedPeer, MaybeObservedPeerAddr, MtlsAuthenticatedPeerAcceptor,
-    build_mtls_rustls_config, ensure_authenticated_peer_cluster,
+    authenticated_peer_cluster, build_mtls_rustls_config, ensure_authenticated_peer_cluster,
     ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
 
@@ -176,9 +176,9 @@ async fn discovery(
     authenticated_peer: MaybeAuthenticatedPeer,
     Query(query): Query<DiscoveryQuery>,
 ) -> std::result::Result<Json<DiscoveryResponse>, (StatusCode, String)> {
-    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
+    let cluster_id = authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    Ok(Json(discovery_response(&state, query.node_id)))
+    Ok(Json(discovery_response(&state, cluster_id, query.node_id)))
 }
 
 async fn register_presence(
@@ -221,12 +221,15 @@ async fn list_presence(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
 ) -> std::result::Result<Json<PresenceListResponse>, (StatusCode, String)> {
-    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
+    let cluster_id = authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
     let entries = state
         .presence
         .list()
         .into_iter()
+        .filter(|entry| {
+            cluster_id.is_none_or(|cluster_id| entry.registration.cluster_id == cluster_id)
+        })
         .map(response_presence_entry)
         .collect::<Vec<_>>();
     Ok(Json(PresenceListResponse {
@@ -363,7 +366,11 @@ fn empty_rendezvous_runtime_state() -> RendezvousRuntimeState {
     }
 }
 
-fn discovery_response(state: &RendezvousAppState, node_id: Option<NodeId>) -> DiscoveryResponse {
+fn discovery_response(
+    state: &RendezvousAppState,
+    cluster_id: Option<ClusterId>,
+    node_id: Option<NodeId>,
+) -> DiscoveryResponse {
     let rendezvous_peers = state
         .mesh_peers
         .as_ref()
@@ -376,6 +383,9 @@ fn discovery_response(state: &RendezvousAppState, node_id: Option<NodeId>) -> Di
             state
                 .presence
                 .entry_for_identity(&PeerIdentity::Node(node_id))
+                .filter(|entry| {
+                    cluster_id.is_none_or(|cluster_id| entry.registration.cluster_id == cluster_id)
+                })
                 .map(response_presence_entry)
         })
         .map(|entry| {
@@ -1276,6 +1286,94 @@ mod tests {
         )
         .expect_err("cluster A certificate must not register a cluster B relay wake channel");
         assert!(wake_error.to_string().contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn mtls_presence_reads_are_filtered_by_authenticated_cluster() {
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let node_a = NodeId::now_v7();
+        let node_b = NodeId::now_v7();
+        let state = mtls_test_state();
+
+        let mut registration_a = presence_registration(cluster_a, PeerIdentity::Node(node_a));
+        registration_a.direct_candidates = vec![ConnectionCandidate {
+            kind: CandidateKind::DirectHttps,
+            endpoint: "https://node-a.example:7443".to_string(),
+            rtt_ms: None,
+            transport_hints: None,
+        }];
+        state.presence.register(registration_a, None);
+
+        let mut registration_b = presence_registration(cluster_b, PeerIdentity::Node(node_b));
+        registration_b.direct_candidates = vec![ConnectionCandidate {
+            kind: CandidateKind::DirectHttps,
+            endpoint: "https://node-b.example:7443".to_string(),
+            rtt_ms: None,
+            transport_hints: None,
+        }];
+        state.presence.register(registration_b, None);
+
+        let cluster_a_peer =
+            authenticated_peer(PeerIdentity::Device(DeviceId::now_v7()), cluster_a);
+        let presence = list_presence(State(state.clone()), cluster_a_peer.clone())
+            .await
+            .expect("cluster A presence read should succeed")
+            .0;
+        assert_eq!(presence.registered_endpoints, 1);
+        assert_eq!(presence.entries[0].registration.cluster_id, cluster_a);
+
+        let own_discovery = discovery(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            Query(DiscoveryQuery {
+                node_id: Some(node_a),
+            }),
+        )
+        .await
+        .expect("cluster A should discover its own node")
+        .0;
+        assert_eq!(
+            own_discovery.node_candidates,
+            Some(vec![ConnectionCandidate {
+                kind: CandidateKind::DirectHttps,
+                endpoint: "https://node-a.example:7443".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            }])
+        );
+
+        let foreign_discovery = discovery(
+            State(state.clone()),
+            cluster_a_peer,
+            Query(DiscoveryQuery {
+                node_id: Some(node_b),
+            }),
+        )
+        .await
+        .expect("foreign node discovery should return an empty result")
+        .0;
+        assert!(foreign_discovery.node_candidates.is_none());
+        assert!(!foreign_discovery.node_relay_capable);
+
+        let legacy_peer = MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
+            identity: PeerIdentity::Device(DeviceId::now_v7()),
+            cluster_id: None,
+        }));
+        let list_error = list_presence(State(state.clone()), legacy_peer.clone())
+            .await
+            .expect_err("presence reads require a cluster SAN under mTLS");
+        assert_eq!(list_error.0, StatusCode::UNAUTHORIZED);
+        let discovery_error = discovery(
+            State(state),
+            legacy_peer,
+            Query(DiscoveryQuery {
+                node_id: Some(node_a),
+            }),
+        )
+        .await
+        .expect_err("discovery reads require a cluster SAN under mTLS");
+        assert_eq!(discovery_error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
