@@ -150,6 +150,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     private var didActivate = false
     private var pendingOperations = 0
+    private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
 
     init(
         userDefaults: UserDefaults = .standard,
@@ -358,11 +359,22 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func refresh() {
-        loadDirectory(path: "", updatesCurrentPath: currentPath.isEmpty, actionTitle: "Refreshed root")
+        let presentsRootDirectory = currentPath.isEmpty
+        loadDirectory(
+            path: "",
+            updatesCurrentDirectory: presentsRootDirectory,
+            updatesCurrentPath: presentsRootDirectory,
+            actionTitle: "Refreshed root"
+        )
     }
 
     func browse(path: String) {
-        loadDirectory(path: path, updatesCurrentPath: true, actionTitle: "Opened \(displayPath(path))")
+        loadDirectory(
+            path: path,
+            updatesCurrentDirectory: true,
+            updatesCurrentPath: true,
+            actionTitle: "Opened \(displayPath(path))"
+        )
     }
 
     func navigateUp() {
@@ -376,7 +388,12 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func refreshCurrentDirectory() {
-        loadDirectory(path: currentPath, updatesCurrentPath: false, actionTitle: "Refreshed \(displayPath(currentPath))")
+        loadDirectory(
+            path: currentPath,
+            updatesCurrentDirectory: true,
+            updatesCurrentPath: false,
+            actionTitle: "Refreshed \(displayPath(currentPath))"
+        )
     }
 
     func registerDomain() {
@@ -434,6 +451,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func clearAppSetup() {
+        directoryLoadCoordinator.invalidate()
         draft = IronmeshConnectionDraft(
             deviceLabel: draft.deviceLabel,
             domainIdentifier: bundleDefaults.domainIdentifier,
@@ -685,51 +703,82 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
-    private func loadDirectory(path: String, updatesCurrentPath: Bool, actionTitle: String) {
+    private func loadDirectory(
+        path: String,
+        updatesCurrentDirectory: Bool,
+        updatesCurrentPath: Bool,
+        actionTitle: String
+    ) {
+        let request = directoryLoadCoordinator.begin(
+            path: path,
+            updatesCurrentDirectory: updatesCurrentDirectory,
+            updatesCurrentPath: updatesCurrentPath
+        )
+
         guard let configuration = draft.connectionConfiguration else {
             let message = "A bootstrap bundle or direct route is required."
             lastErrorMessage = message
             statusText = message
-            if updatesCurrentPath {
-                currentPath = normalizedPath(path)
+            if directoryLoadCoordinator.acceptsCurrentDirectory(request), request.updatesCurrentPath {
+                currentPath = request.path
                 currentItems = []
             }
             return
         }
 
-        let normalized = normalizedPath(path)
         let remoteSession = remoteSession
         beginOperation()
 
         Task {
+            defer { endOperation() }
+
             do {
                 let loadedItems = try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.list(path: normalized, configuration: configuration)
+                    try remoteSession.list(path: request.path, configuration: configuration)
                 }.value
 
-                let loadedAt = Date()
-                items = normalized.isEmpty ? loadedItems : items
-                if normalized.isEmpty {
+                guard directoryLoadCoordinator.acceptsAnyResult(from: request) else {
+                    return
+                }
+
+                if directoryLoadCoordinator.acceptsRootSnapshot(request) {
                     items = loadedItems
                 }
-                if updatesCurrentPath {
-                    currentPath = normalized
+                if directoryLoadCoordinator.acceptsCurrentDirectory(request) {
+                    if request.updatesCurrentPath {
+                        currentPath = request.path
+                    }
+                    currentItems = loadedItems
                 }
-                currentItems = loadedItems
+
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
+
+                let diagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
+
+                let loadedAt = Date()
                 lastLibraryRefreshAt = loadedAt
                 lastSuccessfulConnectionAt = loadedAt
-                connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                connectionDiagnostics = diagnostics
                 lastErrorMessage = nil
-                statusText = "Loaded \(loadedItems.count) item(s) from \(displayPath(normalized))."
+                statusText = "Loaded \(loadedItems.count) item(s) from \(displayPath(request.path))."
                 addAction(actionTitle, detail: "Loaded \(loadedItems.count) item(s)")
             } catch {
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
                 connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                guard directoryLoadCoordinator.acceptsSharedState(request) else {
+                    return
+                }
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Browse failed", detail: error.localizedDescription)
             }
-
-            endOperation()
         }
     }
 
