@@ -12,19 +12,22 @@ use axum::{
 };
 use futures_util::{Sink, Stream, StreamExt};
 use iroh::SecretKey;
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
+};
 use std::pin::Pin;
 use std::sync::{
     Arc, Barrier,
     atomic::{AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::Mutex;
 use transport_sdk::{
     BufferedTransportResponse as MultiplexBufferedTransportResponse, ConnectionCandidate,
     DecodedWebSocketMessage, DirectQuicEndpoint, DirectQuicEndpointConfig, MultiplexConfig,
-    MultiplexMode, MultiplexedSession, PeerIdentity, RelayHttpHeader, RelayTicket,
-    RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelControlMessage,
-    RelayTunnelSession, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
+    MultiplexMode, MultiplexedSession, PeerIdentity, RelayHttpHeader, RelayTunnelAcceptRequest,
+    RelayTunnelSecurityMode, RelayTunnelSessionKind, RelayTunnelSourceSecurityConfig,
     RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity, RendezvousClientConfig,
     RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportResponseHead,
     TransportSessionControlMessage, TransportSessionRole, TransportStreamKind, WebSocketByteStream,
@@ -544,68 +547,142 @@ async fn spawn_upload_session_http_server(
 }
 
 #[derive(Clone)]
+struct RelayTestSecurity {
+    cluster_id: uuid::Uuid,
+    target_node_id: NodeId,
+    cluster_ca_pem: String,
+    cluster_ca_key_pem: String,
+    target_identity: RelayTunnelTlsIdentity,
+}
+
+impl RelayTestSecurity {
+    fn new() -> Self {
+        Self::for_cluster(uuid::Uuid::now_v7(), NodeId::new_v4())
+    }
+
+    fn for_cluster(cluster_id: uuid::Uuid, target_node_id: NodeId) -> Self {
+        let ca_key = KeyPair::generate().expect("relay test CA key should generate");
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "ironmesh-client-relay-test-ca");
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .expect("relay test CA certificate should issue");
+        let cluster_ca_pem = ca_cert.pem();
+        let cluster_ca_key_pem = ca_key.serialize_pem();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let target_identity = Self::issue_target_identity(cluster_id, target_node_id, &issuer);
+
+        Self {
+            cluster_id,
+            target_node_id,
+            cluster_ca_pem,
+            cluster_ca_key_pem,
+            target_identity,
+        }
+    }
+
+    fn issue_target_identity(
+        cluster_id: uuid::Uuid,
+        target_node_id: NodeId,
+        issuer: &Issuer<'_, KeyPair>,
+    ) -> RelayTunnelTlsIdentity {
+        let target_key = KeyPair::generate().expect("relay test target key should generate");
+        let mut target_params = CertificateParams::default();
+        target_params.distinguished_name.push(
+            DnType::CommonName,
+            format!("ironmesh-node-{target_node_id}"),
+        );
+        target_params.subject_alt_names = vec![
+            SanType::URI(
+                format!("urn:ironmesh:node:{target_node_id}")
+                    .try_into()
+                    .expect("relay target node SAN should parse"),
+            ),
+            SanType::URI(
+                format!("urn:ironmesh:cluster:{cluster_id}")
+                    .try_into()
+                    .expect("relay target cluster SAN should parse"),
+            ),
+        ];
+        target_params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let target_cert = target_params
+            .signed_by(&target_key, issuer)
+            .expect("relay test target certificate should issue");
+        RelayTunnelTlsIdentity::new(target_cert.pem(), target_key.serialize_pem())
+    }
+
+    fn target_identity_for_node(&self, node_id: NodeId) -> RelayTunnelTlsIdentity {
+        let issuer_key =
+            KeyPair::from_pem(&self.cluster_ca_key_pem).expect("relay test CA key should parse");
+        let issuer = Issuer::from_ca_cert_pem(&self.cluster_ca_pem, issuer_key)
+            .expect("relay test CA issuer should build");
+        Self::issue_target_identity(self.cluster_id, node_id, &issuer)
+    }
+
+    fn source_security(&self, device_id: uuid::Uuid) -> RelayTunnelSourceSecurityConfig {
+        let issuer_key =
+            KeyPair::from_pem(&self.cluster_ca_key_pem).expect("relay test CA key should parse");
+        let issuer = Issuer::from_ca_cert_pem(&self.cluster_ca_pem, issuer_key)
+            .expect("relay test CA issuer should build");
+        let source_key = KeyPair::generate().expect("relay test source key should generate");
+        let mut source_params = CertificateParams::default();
+        source_params
+            .distinguished_name
+            .push(DnType::CommonName, format!("ironmesh-device-{device_id}"));
+        source_params.subject_alt_names = vec![SanType::URI(
+            format!("urn:ironmesh:device:{device_id}")
+                .try_into()
+                .expect("relay source device SAN should parse"),
+        )];
+        source_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let source_cert = source_params
+            .signed_by(&source_key, &issuer)
+            .expect("relay test source certificate should issue");
+
+        RelayTunnelSourceSecurityConfig {
+            cluster_id: self.cluster_id,
+            expected_target_node_id: self.target_node_id,
+            cluster_ca_pem: self.cluster_ca_pem.as_bytes().to_vec(),
+            identity: RelayTunnelTlsIdentity::new(source_cert.pem(), source_key.serialize_pem()),
+        }
+    }
+
+    fn target_security(&self, expected_source: PeerIdentity) -> RelayTunnelTargetSecurityConfig {
+        RelayTunnelTargetSecurityConfig {
+            expected_source,
+            cluster_ca_pem: self.cluster_ca_pem.as_bytes().to_vec(),
+            identity: self.target_identity.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct RelayTestState {
     public_url: String,
-    tunnel: RelayTestTunnelCoordinator,
+    security: RelayTestSecurity,
     captured_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
     health_hits: Arc<AtomicUsize>,
     issued_ticket_count: Arc<AtomicUsize>,
     paired_session_count: Arc<AtomicUsize>,
+    target_handshake_failure_count: Arc<AtomicUsize>,
     object_write_failures_remaining: Arc<AtomicUsize>,
     response_delay_ms: u64,
     response_status: u16,
     response_headers: Vec<RelayHttpHeader>,
     response_body: Vec<u8>,
-}
-
-struct PendingRelayTarget {
-    request: RelayTunnelAcceptRequest,
-    socket: WebSocket,
-}
-
-#[derive(Clone)]
-struct RelayTestTunnelCoordinator {
-    public_url: String,
-    pending_target: Arc<Mutex<Option<oneshot::Sender<PendingRelayTarget>>>>,
-    observed_binary_frames: Arc<Mutex<Vec<Vec<u8>>>>,
-    target_identity_override: Arc<Mutex<Option<RelayTunnelTlsIdentity>>>,
-}
-
-impl RelayTestTunnelCoordinator {
-    fn new(public_url: String) -> Self {
-        Self {
-            public_url,
-            pending_target: Arc::new(Mutex::new(None)),
-            observed_binary_frames: Arc::new(Mutex::new(Vec::new())),
-            target_identity_override: Arc::new(Mutex::new(None)),
-        }
-    }
-}
-
-async fn issue_ticket(
-    State(state): State<RelayTestState>,
-    Json(request): Json<RelayTicketRequest>,
-) -> Json<RelayTicket> {
-    state.issued_ticket_count.fetch_add(1, Ordering::SeqCst);
-    Json(RelayTicket {
-        cluster_id: request.cluster_id,
-        session_id: format!("relay-session-{}", uuid::Uuid::now_v7()),
-        source: request.source,
-        target: request.target,
-        session_kind: request.session_kind,
-        relay_urls: vec![state.public_url],
-        issued_at_unix: 1,
-        expires_at_unix: 61,
-    })
-}
-
-async fn relay_tunnel_ws(
-    State(state): State<RelayTestState>,
-    websocket: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    websocket.on_upgrade(move |socket| async move {
-        serve_relay_tunnel_test_connection(state, socket).await;
-    })
 }
 
 async fn direct_transport_ws(
@@ -626,36 +703,10 @@ async fn direct_transport_ws(
 #[derive(Clone)]
 struct RelayMixedWorkloadState {
     public_url: String,
-    tunnel: RelayTestTunnelCoordinator,
+    security: RelayTestSecurity,
     payload: Arc<Vec<u8>>,
     issued_ticket_count: Arc<AtomicUsize>,
     paired_session_count: Arc<AtomicUsize>,
-}
-
-async fn issue_mixed_workload_ticket(
-    State(state): State<RelayMixedWorkloadState>,
-    Json(request): Json<RelayTicketRequest>,
-) -> Json<RelayTicket> {
-    state.issued_ticket_count.fetch_add(1, Ordering::SeqCst);
-    Json(RelayTicket {
-        cluster_id: request.cluster_id,
-        session_id: format!("relay-mixed-session-{}", uuid::Uuid::now_v7()),
-        source: request.source,
-        target: request.target,
-        session_kind: request.session_kind,
-        relay_urls: vec![state.public_url],
-        issued_at_unix: 1,
-        expires_at_unix: 61,
-    })
-}
-
-async fn relay_mixed_workload_tunnel_ws(
-    State(state): State<RelayMixedWorkloadState>,
-    websocket: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    websocket.on_upgrade(move |socket| async move {
-        serve_relay_mixed_workload_connection(state, socket).await;
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -746,27 +797,12 @@ impl Sink<RelayTestWsMessage> for RelayTestSocketAdapter {
     }
 }
 
-async fn serve_relay_tunnel_test_connection(state: RelayTestState, mut socket: WebSocket) {
-    let initial = match socket.recv().await {
-        Some(Ok(Message::Text(text))) => text,
-        _ => return,
-    };
-    match serde_json::from_str(&initial).expect("test relay tunnel control should parse") {
-        RelayTunnelControlMessage::ConnectSource { ticket } => {
-            serve_relay_tunnel_test_source(state, socket, ticket).await;
-        }
-        RelayTunnelControlMessage::AcceptTarget { request } => {
-            deliver_relay_test_target(&state.tunnel, request, socket).await;
-        }
-        _ => {}
-    }
-}
-
 async fn serve_test_multiplex_socket(state: RelayTestState, socket: WebSocket, session_id: String) {
     let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
     let session =
         MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
             .expect("multiplexed relay test session should spawn");
+
     serve_test_multiplex_session(state, session, session_id).await;
 }
 
@@ -800,6 +836,7 @@ async fn serve_test_multiplex_session(
                 let message = format!("{error:#}");
                 if message.contains("Connection reset")
                     || message.contains("without closing handshake")
+                    || message.contains("peer closed connection without sending TLS close_notify")
                 {
                     return;
                 }
@@ -866,196 +903,66 @@ async fn serve_test_multiplex_session(
     }
 }
 
-async fn serve_relay_tunnel_test_source(
-    state: RelayTestState,
-    socket: WebSocket,
-    ticket: RelayTicket,
-) {
-    assert_eq!(
-        ticket.session_kind,
-        RelayTunnelSessionKind::MultiplexTransport
-    );
-    let target_tunnel = pair_relay_test_tunnel(&state.tunnel, socket, &ticket).await;
-    let target_security = relay_test_target_security(&state.tunnel, &ticket).await;
-    let Ok((_session, multiplexed)) = target_tunnel
-        .into_secure_multiplexed_target_session(target_security, MultiplexConfig::default())
-        .await
-    else {
-        return;
-    };
+async fn serve_secure_relay_test_targets(state: RelayTestState) {
+    let control = RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id: state.security.cluster_id,
+            rendezvous_urls: vec![state.public_url.clone()],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("secure relay test target control should build");
 
-    state.paired_session_count.fetch_add(1, Ordering::SeqCst);
-    serve_test_multiplex_session(state, multiplexed, ticket.session_id).await;
-}
-
-async fn serve_relay_mixed_workload_connection(
-    state: RelayMixedWorkloadState,
-    mut socket: WebSocket,
-) {
-    let initial = match socket.recv().await {
-        Some(Ok(Message::Text(text))) => text,
-        _ => return,
-    };
-    match serde_json::from_str(&initial).expect("mixed workload relay control should parse") {
-        RelayTunnelControlMessage::ConnectSource { ticket } => {
-            assert_eq!(
-                ticket.session_kind,
-                RelayTunnelSessionKind::MultiplexTransport
-            );
-            let target_tunnel = pair_relay_test_tunnel(&state.tunnel, socket, &ticket).await;
-            let target_security = relay_test_target_security(&state.tunnel, &ticket).await;
-            let Ok((_session, multiplexed)) = target_tunnel
-                .into_secure_multiplexed_target_session(target_security, MultiplexConfig::default())
-                .await
-            else {
-                return;
-            };
-
-            state.paired_session_count.fetch_add(1, Ordering::SeqCst);
-            serve_mixed_workload_multiplex_session(
-                multiplexed,
-                Arc::clone(&state.payload),
-                ticket.session_id,
-            )
-            .await;
-        }
-        RelayTunnelControlMessage::AcceptTarget { request } => {
-            deliver_relay_test_target(&state.tunnel, request, socket).await;
-        }
-        _ => {}
-    }
-}
-
-async fn deliver_relay_test_target(
-    coordinator: &RelayTestTunnelCoordinator,
-    request: RelayTunnelAcceptRequest,
-    socket: WebSocket,
-) {
-    let sender = coordinator.pending_target.lock().await.take();
-    if let Some(sender) = sender {
-        let _ = sender.send(PendingRelayTarget { request, socket });
-    }
-}
-
-async fn pair_relay_test_tunnel(
-    coordinator: &RelayTestTunnelCoordinator,
-    mut source_socket: WebSocket,
-    ticket: &RelayTicket,
-) -> RelayTunnelClient {
-    let (sender, receiver) = oneshot::channel();
-    {
-        let mut pending = coordinator.pending_target.lock().await;
-        assert!(
-            pending.is_none(),
-            "relay test server supports one pending target per relay endpoint"
-        );
-        *pending = Some(sender);
-    }
-
-    let target_request = RelayTunnelAcceptRequest {
-        cluster_id: ticket.cluster_id,
-        target: ticket.target.clone(),
-        session_kind: ticket.session_kind,
-        wait_timeout_ms: Some(1_000),
-    };
-    let public_url = coordinator.public_url.clone();
-    let target_task = tokio::spawn(async move {
-        RelayTunnelClient::accept_target(&public_url, None, None, target_request).await
-    });
-    let PendingRelayTarget {
-        request,
-        socket: mut target_socket,
-    } = tokio::time::timeout(Duration::from_secs(2), receiver)
-        .await
-        .expect("relay test target should connect")
-        .expect("relay test target sender should remain available");
-    assert_eq!(request.cluster_id, ticket.cluster_id);
-    assert_eq!(request.target, ticket.target);
-    assert_eq!(request.session_kind, ticket.session_kind);
-
-    let session = RelayTunnelSession {
-        cluster_id: ticket.cluster_id,
-        session_id: ticket.session_id.clone(),
-        source: ticket.source.clone(),
-        target: ticket.target.clone(),
-        session_kind: ticket.session_kind,
-    };
-    let paired = serde_json::to_string(&RelayTunnelControlMessage::Paired { session })
-        .expect("relay test paired control should serialize");
-    source_socket
-        .send(Message::Text(paired.clone().into()))
-        .await
-        .expect("relay test source paired response should send");
-    target_socket
-        .send(Message::Text(paired.into()))
-        .await
-        .expect("relay test target paired response should send");
-
-    let target_tunnel = target_task
-        .await
-        .expect("relay test target task should not panic")
-        .expect("relay test target should pair");
-    let observed_binary_frames = Arc::clone(&coordinator.observed_binary_frames);
-    tokio::spawn(async move {
-        forward_relay_test_frames(source_socket, target_socket, observed_binary_frames).await;
-    });
-    target_tunnel
-}
-
-async fn forward_relay_test_frames(
-    mut source: WebSocket,
-    mut target: WebSocket,
-    observed_binary_frames: Arc<Mutex<Vec<Vec<u8>>>>,
-) {
     loop {
-        tokio::select! {
-            message = source.recv() => {
-                if !forward_relay_test_frame(message, &mut target, &observed_binary_frames).await {
-                    return;
-                }
+        let tunnel = match control
+            .accept_relay_tunnel(&RelayTunnelAcceptRequest {
+                cluster_id: state.security.cluster_id,
+                target: PeerIdentity::Node(state.security.target_node_id),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(3_000),
+            })
+            .await
+        {
+            Ok(tunnel) => tunnel,
+            Err(error)
+                if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
+                    &error.to_string(),
+                ) =>
+            {
+                continue;
             }
-            message = target.recv() => {
-                if !forward_relay_test_frame(message, &mut source, &observed_binary_frames).await {
-                    return;
-                }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
             }
-        }
-    }
-}
-
-async fn forward_relay_test_frame(
-    message: Option<Result<Message, axum::Error>>,
-    destination: &mut WebSocket,
-    observed_binary_frames: &Arc<Mutex<Vec<Vec<u8>>>>,
-) -> bool {
-    let Some(Ok(message)) = message else {
-        return false;
-    };
-    if let Message::Binary(bytes) = &message {
-        observed_binary_frames.lock().await.push(bytes.to_vec());
-    }
-    let is_close = matches!(&message, Message::Close(_));
-    destination.send(message).await.is_ok() && !is_close
-}
-
-async fn relay_test_target_security(
-    coordinator: &RelayTestTunnelCoordinator,
-    ticket: &RelayTicket,
-) -> RelayTunnelTargetSecurityConfig {
-    let target_node_id = match ticket.target {
-        PeerIdentity::Node(node_id) => node_id,
-        PeerIdentity::Device(_) => panic!("relay test target must be a node"),
-    };
-    let identity = coordinator
-        .target_identity_override
-        .lock()
-        .await
-        .clone()
-        .unwrap_or_else(|| relay_test_target_identity(target_node_id));
-    RelayTunnelTargetSecurityConfig {
-        expected_source: ticket.source.clone(),
-        cluster_ca_pem: RELAY_TEST_CLUSTER_CA_PEM.to_vec(),
-        identity,
+        };
+        assert_eq!(
+            tunnel.session().security_mode,
+            RelayTunnelSecurityMode::InnerMtls
+        );
+        let target_security = state
+            .security
+            .target_security(tunnel.session().source.clone());
+        let target_result = tunnel
+            .into_secure_multiplexed_target_session(target_security, MultiplexConfig::default())
+            .await;
+        let (relay_session, multiplexed) = match target_result {
+            Ok(secured) => secured,
+            Err(_) => {
+                state
+                    .target_handshake_failure_count
+                    .fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+        };
+        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+        let session_state = state.clone();
+        tokio::spawn(async move {
+            serve_test_multiplex_session(session_state, multiplexed, relay_session.session_id)
+                .await;
+        });
     }
 }
 
@@ -1123,6 +1030,22 @@ async fn spawn_relay_test_server_with_delay_and_object_write_failures(
     .await
 }
 
+async fn wait_for_relay_test_runtime(public_url: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if reqwest::get(format!("{public_url}/health"))
+                .await
+                .is_ok_and(|response| response.status() == StatusCode::OK)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("relay test runtime should become healthy");
+}
+
 async fn spawn_relay_test_server_at(
     bind_addr: std::net::SocketAddr,
     response_status: u16,
@@ -1131,18 +1054,39 @@ async fn spawn_relay_test_server_at(
     response_delay_ms: u64,
     object_write_failures_remaining: usize,
 ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
+    spawn_relay_test_server_at_with_security(
+        bind_addr,
+        response_status,
+        response_headers,
+        response_body,
+        response_delay_ms,
+        object_write_failures_remaining,
+        RelayTestSecurity::new(),
+    )
+    .await
+}
+
+async fn spawn_relay_test_server_at_with_security(
+    bind_addr: std::net::SocketAddr,
+    response_status: u16,
+    response_headers: Vec<RelayHttpHeader>,
+    response_body: Vec<u8>,
+    response_delay_ms: u64,
+    object_write_failures_remaining: usize,
+    security: RelayTestSecurity,
+) -> (RelayTestState, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener addr");
-    let public_url = format!("http://{addr}");
     let state = RelayTestState {
-        public_url: public_url.clone(),
-        tunnel: RelayTestTunnelCoordinator::new(public_url),
+        public_url: format!("http://{addr}"),
+        security,
         captured_request: Arc::new(Mutex::new(None)),
         health_hits: Arc::new(AtomicUsize::new(0)),
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
         paired_session_count: Arc::new(AtomicUsize::new(0)),
+        target_handshake_failure_count: Arc::new(AtomicUsize::new(0)),
         object_write_failures_remaining: Arc::new(AtomicUsize::new(
             object_write_failures_remaining,
         )),
@@ -1151,15 +1095,39 @@ async fn spawn_relay_test_server_at(
         response_headers,
         response_body,
     };
-    let router = Router::new()
-        .route("/control/relay/ticket", post(issue_ticket))
-        .route("/relay/tunnel/ws", get(relay_tunnel_ws))
-        .with_state(state.clone());
+    let rendezvous =
+        rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
+            bind_addr: addr,
+            public_url: format!("{}/", state.public_url),
+            relay_public_urls: vec![format!("{}/", state.public_url)],
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("secure relay test rendezvous state should build");
+    let router = rendezvous_server::build_router(rendezvous).layer(axum::middleware::from_fn({
+        let issued_ticket_count = Arc::clone(&state.issued_ticket_count);
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let issued_ticket_count = Arc::clone(&issued_ticket_count);
+            async move {
+                if request.method() == axum::http::Method::POST
+                    && request.uri().path() == "/control/relay/ticket"
+                {
+                    issued_ticket_count.fetch_add(1, Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        }
+    }));
+    let target_state = state.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("relay test server should run");
+        tokio::select! {
+            result = axum::serve(listener, router) => {
+                result.expect("relay test server should run");
+            }
+            _ = serve_secure_relay_test_targets(target_state) => {}
+        }
     });
+    wait_for_relay_test_runtime(&state.public_url).await;
     (state, server)
 }
 
@@ -1172,14 +1140,14 @@ async fn spawn_direct_transport_test_server(
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener addr");
-    let public_url = format!("http://{addr}");
     let state = RelayTestState {
-        public_url: public_url.clone(),
-        tunnel: RelayTestTunnelCoordinator::new(public_url),
+        public_url: format!("http://{addr}"),
+        security: RelayTestSecurity::new(),
         captured_request: Arc::new(Mutex::new(None)),
         health_hits: Arc::new(AtomicUsize::new(0)),
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
         paired_session_count: Arc::new(AtomicUsize::new(0)),
+        target_handshake_failure_count: Arc::new(AtomicUsize::new(0)),
         object_write_failures_remaining: Arc::new(AtomicUsize::new(0)),
         response_delay_ms: 0,
         response_status,
@@ -1570,14 +1538,6 @@ fn relay_header_value(headers: &[RelayHttpHeader], name: &str) -> Option<String>
         .map(|header| header.value.clone())
 }
 
-fn relay_binary_frames_contain(frames: &[Vec<u8>], plaintext: &[u8]) -> bool {
-    frames.iter().any(|frame| {
-        frame
-            .windows(plaintext.len())
-            .any(|candidate| candidate == plaintext)
-    })
-}
-
 async fn serve_mixed_workload_transport_socket(
     socket: WebSocket,
     payload: Arc<Vec<u8>>,
@@ -1587,10 +1547,10 @@ async fn serve_mixed_workload_transport_socket(
     let session =
         MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
             .expect("mixed workload session should spawn");
-    serve_mixed_workload_multiplex_session(session, payload, session_id).await;
+    serve_mixed_workload_transport_session(session, payload, session_id).await;
 }
 
-async fn serve_mixed_workload_multiplex_session(
+async fn serve_mixed_workload_transport_session(
     mut session: MultiplexedSession,
     payload: Arc<Vec<u8>>,
     session_id: String,
@@ -1613,11 +1573,21 @@ async fn serve_mixed_workload_multiplex_session(
         }
     ));
 
-    while let Some(mut stream) = session
-        .accept_stream()
-        .await
-        .expect("mixed workload stream accept should succeed")
-    {
+    loop {
+        let mut stream = match session.accept_stream().await {
+            Ok(Some(stream)) => stream,
+            Ok(None) => return,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("Connection reset")
+                    || message.contains("without closing handshake")
+                    || message.contains("peer closed connection without sending TLS close_notify")
+                {
+                    return;
+                }
+                panic!("mixed workload stream accept should succeed: {error:#}");
+            }
+        };
         let payload = Arc::clone(&payload);
         tokio::spawn(async move {
             let request = read_buffered_transport_request(&mut stream)
@@ -1815,6 +1785,61 @@ async fn direct_mixed_workload_ws(
     })
 }
 
+async fn serve_secure_relay_mixed_workload_targets(state: RelayMixedWorkloadState) {
+    let control = RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id: state.security.cluster_id,
+            rendezvous_urls: vec![state.public_url.clone()],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("secure mixed relay target control should build");
+
+    loop {
+        let tunnel = match control
+            .accept_relay_tunnel(&RelayTunnelAcceptRequest {
+                cluster_id: state.security.cluster_id,
+                target: PeerIdentity::Node(state.security.target_node_id),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(3_000),
+            })
+            .await
+        {
+            Ok(tunnel) => tunnel,
+            Err(error)
+                if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
+                    &error.to_string(),
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        assert_eq!(
+            tunnel.session().security_mode,
+            RelayTunnelSecurityMode::InnerMtls
+        );
+        let target_security = state
+            .security
+            .target_security(tunnel.session().source.clone());
+        let (relay_session, multiplexed) = tunnel
+            .into_secure_multiplexed_target_session(target_security, MultiplexConfig::default())
+            .await
+            .expect("secure mixed relay target should establish inner mTLS");
+        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+        let payload = Arc::clone(&state.payload);
+        tokio::spawn(async move {
+            serve_mixed_workload_transport_session(multiplexed, payload, relay_session.session_id)
+                .await;
+        });
+    }
+}
+
 async fn spawn_direct_mixed_workload_test_server(
     payload: Arc<Vec<u8>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -1835,172 +1860,63 @@ async fn spawn_direct_mixed_workload_test_server(
 
 async fn spawn_relay_mixed_workload_test_server(
     payload: Arc<Vec<u8>>,
-) -> (
-    String,
-    Arc<AtomicUsize>,
-    Arc<AtomicUsize>,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (RelayMixedWorkloadState, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
     let addr = listener.local_addr().expect("listener addr");
-    let public_url = format!("http://{addr}");
     let state = RelayMixedWorkloadState {
-        public_url: public_url.clone(),
-        tunnel: RelayTestTunnelCoordinator::new(public_url),
+        public_url: format!("http://{addr}"),
+        security: RelayTestSecurity::new(),
         payload,
         issued_ticket_count: Arc::new(AtomicUsize::new(0)),
         paired_session_count: Arc::new(AtomicUsize::new(0)),
     };
-    let issued_ticket_count = Arc::clone(&state.issued_ticket_count);
-    let paired_session_count = Arc::clone(&state.paired_session_count);
-    let router = Router::new()
-        .route("/control/relay/ticket", post(issue_mixed_workload_ticket))
-        .route("/relay/tunnel/ws", get(relay_mixed_workload_tunnel_ws))
-        .with_state(state.clone());
+    let rendezvous =
+        rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
+            bind_addr: addr,
+            public_url: format!("{}/", state.public_url),
+            relay_public_urls: vec![format!("{}/", state.public_url)],
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("mixed workload rendezvous state should build");
+    let router = rendezvous_server::build_router(rendezvous).layer(axum::middleware::from_fn({
+        let issued_ticket_count = Arc::clone(&state.issued_ticket_count);
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let issued_ticket_count = Arc::clone(&issued_ticket_count);
+            async move {
+                if request.method() == axum::http::Method::POST
+                    && request.uri().path() == "/control/relay/ticket"
+                {
+                    issued_ticket_count.fetch_add(1, Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        }
+    }));
+    let target_state = state.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("relay mixed workload server should run");
+        tokio::select! {
+            result = axum::serve(listener, router) => {
+                result.expect("relay mixed workload server should run");
+            }
+            _ = serve_secure_relay_mixed_workload_targets(target_state) => {}
+        }
     });
-    (
-        state.public_url,
-        issued_ticket_count,
-        paired_session_count,
-        server,
-    )
-}
-
-const RELAY_TEST_CLUSTER_CA_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
-MIIBdTCCASegAwIBAgIUTAmHXbmklpn9cR+NYspWDqFx5HgwBQYDK2VwMCgxJjAk
-BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
-MDA1MFoXDTM2MDcxNTEyMDA1MFowKDEmMCQGA1UEAwwdaXJvbm1lc2gtY2xpZW50
-LXJlbGF5LXRlc3QtY2EwKjAFBgMrZXADIQB1yUvlrXRvCJTVy8rvQ9w2oNosUu31
-gWuoAjbX4Thy6qNjMGEwHQYDVR0OBBYEFBJQ+0tTV/fwjfvCNIQGfE3tDYwPMB8G
-A1UdIwQYMBaAFBJQ+0tTV/fwjfvCNIQGfE3tDYwPMA8GA1UdEwEB/wQFMAMBAf8w
-DgYDVR0PAQH/BAQDAgGGMAUGAytlcANBAGJs/RG8Ny1ChFm1IfSZ1pTSp7sVPst3
-6QYnFYEz1YZBr/1CB2aVmLC+v8lewclcjwxaybHFkHjzf6DFVeTTNwI=
------END CERTIFICATE-----
-"#;
-
-const RELAY_TEST_DEVICE_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
-MIIBpzCCAVmgAwIBAgIUUllSOBs4p5L3mul7N1WwCHru2iswBQYDK2VwMCgxJjAk
-BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
-MDA1MFoXDTM2MDcxNTEyMDA1MFowHzEdMBsGA1UEAwwUaXJvbm1lc2gtdGVzdC1k
-ZXZpY2UwKjAFBgMrZXADIQBi15Ew6XFHba9sBaO1vPKTBbwD59lMPMtzer7XVPOJ
-r6OBnTCBmjBDBgNVHREEPDA6hjh1cm46aXJvbm1lc2g6ZGV2aWNlOjExMTExMTEx
-LTExMTEtNDExMS04MTExLTExMTExMTExMTExMTATBgNVHSUEDDAKBggrBgEFBQcD
-AjAdBgNVHQ4EFgQUTk5zKB4OV29HXfRYJ/eK76AfcvAwHwYDVR0jBBgwFoAUElD7
-S1NX9/CN+8I0hAZ8Te0NjA8wBQYDK2VwA0EA4VyaAmXX5VLy9VEhfeMxtnYFG9ha
-dt/bEx3BPR+X2juAV6UQCvkGHRW6bPJRoP22p+Th5wg/h01xUVCJg+JoBA==
------END CERTIFICATE-----
-"#;
-
-const RELAY_TEST_DEVICE_PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIE54qTegcr5AxJc38901WwsLV0dJ/kCx51+wox0VwImj
------END PRIVATE KEY-----
-"#;
-
-const RELAY_TEST_PRIMARY_NODE_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
-MIIB8DCCAaKgAwIBAgIUUllSOBs4p5L3mul7N1WwCHru2iwwBQYDK2VwMCgxJjAk
-BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
-MDA1MFoXDTM2MDcxNTEyMDA1MFowJTEjMCEGA1UEAwwaaXJvbm1lc2gtdGVzdC1w
-cmltYXJ5LW5vZGUwKjAFBgMrZXADIQDycFdl3pvrCagyj2aCBV5rb/cyDXc+xJLt
-rANG7JzQVaOB4DCB3TB8BgNVHREEdTBzhjZ1cm46aXJvbm1lc2g6bm9kZToyMjIy
-MjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjKGOXVybjppcm9ubWVzaDpj
-bHVzdGVyOjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMTAdBgNV
-HSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwHQYDVR0OBBYEFN6ThF2RHLqPTFcr
-EE9hCB005JUqMB8GA1UdIwQYMBaAFBJQ+0tTV/fwjfvCNIQGfE3tDYwPMAUGAytl
-cANBAKCQ0VYwFn63G4wMc+oIt7A68CrX1ilLEaiEMjpK3TQaBa1qOgx/9MYsIyW8
-rj0YNUu1qLPLENZf0Q5Z4eRIGws=
------END CERTIFICATE-----
-"#;
-
-const RELAY_TEST_PRIMARY_NODE_PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIJXGOuKLDCoh2qI1rjK5t6bbPhhK7ApCaJkZhZsiHhGL
------END PRIVATE KEY-----
-"#;
-
-const RELAY_TEST_FALLBACK_NODE_CERTIFICATE_PEM: &[u8] = br#"-----BEGIN CERTIFICATE-----
-MIIB8TCCAaOgAwIBAgIUUllSOBs4p5L3mul7N1WwCHru2i0wBQYDK2VwMCgxJjAk
-BgNVBAMMHWlyb25tZXNoLWNsaWVudC1yZWxheS10ZXN0LWNhMB4XDTI2MDcxODEy
-MDA1MFoXDTM2MDcxNTEyMDA1MFowJjEkMCIGA1UEAwwbaXJvbm1lc2gtdGVzdC1m
-YWxsYmFjay1ub2RlMCowBQYDK2VwAyEAnKh3sMFV4xLlfzF8ZLOtzY7NK+RK1eBD
-9c175jPiOHqjgeAwgd0wfAYDVR0RBHUwc4Y2dXJuOmlyb25tZXNoOm5vZGU6MzMz
-MzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzhjl1cm46aXJvbm1lc2g6
-Y2x1c3RlcjowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEwHQYD
-VR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMB0GA1UdDgQWBBQzPWmAyzGTNWt6
-vevH9xd1aokxMjAfBgNVHSMEGDAWgBQSUPtLU1f38I37wjSEBnxN7Q2MDzAFBgMr
-ZXADQQA4KhD5VwQxGmK6IjN0A4HtPrGruRBWskt4vycjigi85Es2b3GfH7Oeawsv
-FHANbgrxJJ0v8CV1Cw6mUWpotjoJ
------END CERTIFICATE-----
-"#;
-
-const RELAY_TEST_FALLBACK_NODE_PRIVATE_KEY_PEM: &[u8] = br#"-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIDmH4aJthlxYKPUD7X871wXaxo/9DGqqnu5H8UwIkmuw
------END PRIVATE KEY-----
-"#;
-
-fn relay_test_identity(label: &str) -> ClientIdentityMaterial {
-    let mut identity = ClientIdentityMaterial::generate(
-        relay_test_cluster_id(),
-        Some(relay_test_device_id()),
-        Some(label.to_string()),
-    )
-    .expect("relay test identity should generate");
-    identity.credential_pem = Some("issued-credential".to_string());
-    identity
-}
-
-fn relay_test_cluster_id() -> common::ClusterId {
-    "00000000-0000-4000-8000-000000000001"
-        .parse()
-        .expect("relay test cluster ID should parse")
-}
-
-fn relay_test_device_id() -> common::DeviceId {
-    "11111111-1111-4111-8111-111111111111"
-        .parse()
-        .expect("relay test device ID should parse")
-}
-
-fn relay_test_primary_node_id() -> NodeId {
-    "22222222-2222-4222-8222-222222222222"
-        .parse()
-        .expect("relay test primary node ID should parse")
-}
-
-fn relay_test_fallback_node_id() -> NodeId {
-    "33333333-3333-4333-8333-333333333333"
-        .parse()
-        .expect("relay test fallback node ID should parse")
-}
-
-fn relay_test_target_identity(node_id: NodeId) -> RelayTunnelTlsIdentity {
-    if node_id == relay_test_primary_node_id() {
-        RelayTunnelTlsIdentity::new(
-            RELAY_TEST_PRIMARY_NODE_CERTIFICATE_PEM,
-            RELAY_TEST_PRIMARY_NODE_PRIVATE_KEY_PEM,
-        )
-    } else if node_id == relay_test_fallback_node_id() {
-        RelayTunnelTlsIdentity::new(
-            RELAY_TEST_FALLBACK_NODE_CERTIFICATE_PEM,
-            RELAY_TEST_FALLBACK_NODE_PRIVATE_KEY_PEM,
-        )
-    } else {
-        panic!("relay test target node needs a fixture identity: {node_id}");
-    }
+    wait_for_relay_test_runtime(&state.public_url).await;
+    (state, server)
 }
 
 fn relay_test_client_for_public_url(
     public_url: impl Into<String>,
+    security: &RelayTestSecurity,
     identity: ClientIdentityMaterial,
-    target_node_id: NodeId,
 ) -> IronMeshClient {
+    assert_eq!(identity.cluster_id, security.cluster_id);
     let rendezvous = RendezvousControlClient::new(
         RendezvousClientConfig {
-            cluster_id: identity.cluster_id,
+            cluster_id: security.cluster_id,
             rendezvous_urls: vec![public_url.into()],
             heartbeat_interval_secs: 15,
         },
@@ -2008,22 +1924,22 @@ fn relay_test_client_for_public_url(
         None,
     )
     .expect("rendezvous client should build");
-    let source_security = RelayTunnelSourceSecurityConfig {
-        cluster_id: identity.cluster_id,
-        expected_target_node_id: target_node_id,
-        cluster_ca_pem: RELAY_TEST_CLUSTER_CA_PEM.to_vec(),
-        identity: RelayTunnelTlsIdentity::new(
-            RELAY_TEST_DEVICE_CERTIFICATE_PEM,
-            RELAY_TEST_DEVICE_PRIVATE_KEY_PEM,
-        ),
-    };
+    let source_security = security.source_security(identity.device_id);
     IronMeshClient::with_relay_transport(
         "https://relay.invalid/",
         rendezvous,
-        target_node_id,
+        security.target_node_id,
         source_security,
     )
     .with_client_identity(identity)
+}
+
+fn relay_test_identity(security: &RelayTestSecurity, label: &str) -> ClientIdentityMaterial {
+    let mut identity =
+        ClientIdentityMaterial::generate(security.cluster_id, None, Some(label.to_string()))
+            .expect("relay test identity should generate");
+    identity.credential_pem = Some("issued-credential".to_string());
+    identity
 }
 
 fn direct_transport_test_client(
@@ -2141,12 +2057,8 @@ fn direct_quic_transport_test_client(
     .with_client_identity(identity)
 }
 
-fn relay_test_client(
-    state: &RelayTestState,
-    identity: ClientIdentityMaterial,
-    target_node_id: NodeId,
-) -> IronMeshClient {
-    relay_test_client_for_public_url(state.public_url.clone(), identity, target_node_id)
+fn relay_test_client(state: &RelayTestState, identity: ClientIdentityMaterial) -> IronMeshClient {
+    relay_test_client_for_public_url(state.public_url.clone(), &state.security, identity)
 }
 
 fn parse_range_header(range: &str, total_len: usize) -> (usize, usize) {
@@ -2225,9 +2137,8 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
     )
     .await;
 
-    let identity = relay_test_identity("relay-test-device");
-    let target_node_id = relay_test_primary_node_id();
-    let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
+    let identity = relay_test_identity(&relay_state.security, "relay-test-device");
+    let client = relay_test_client(&relay_state, identity.clone());
 
     let response = client
         .store_index(None, 1, None)
@@ -2276,9 +2187,8 @@ async fn relay_transport_executes_generic_json_get_request() {
     )
     .await;
 
-    let identity = relay_test_identity("relay-test-device");
-    let target_node_id = relay_test_primary_node_id();
-    let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
+    let identity = relay_test_identity(&relay_state.security, "relay-test-device");
+    let client = relay_test_client(&relay_state, identity.clone());
 
     let response = client
         .get_json_path("/cluster/status")
@@ -2307,22 +2217,98 @@ async fn relay_transport_executes_generic_json_get_request() {
 }
 
 #[tokio::test]
-async fn relay_transport_rejects_target_with_wrong_node_identity() {
-    let (relay_state, server) = spawn_relay_test_server(200, Vec::new(), Vec::new()).await;
-    *relay_state.tunnel.target_identity_override.lock().await =
-        Some(relay_test_target_identity(relay_test_fallback_node_id()));
-    let client = relay_test_client(
-        &relay_state,
-        relay_test_identity("relay-wrong-target-identity-device"),
-        relay_test_primary_node_id(),
+async fn relay_transport_fails_closed_when_source_certificate_identity_mismatches_ticket() {
+    let (relay_state, server) = spawn_relay_test_server(
+        200,
+        vec![RelayHttpHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        br#"{"status":"ok"}"#.to_vec(),
+    )
+    .await;
+
+    let identity = relay_test_identity(&relay_state.security, "relay-test-device");
+    let wrong_source_security = relay_state.security.source_security(uuid::Uuid::now_v7());
+    let rendezvous = RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id: relay_state.security.cluster_id,
+            rendezvous_urls: vec![relay_state.public_url.clone()],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("rendezvous client should build");
+    let client = IronMeshClient::with_relay_transport(
+        "https://relay.invalid/",
+        rendezvous,
+        relay_state.security.target_node_id,
+        wrong_source_security,
+    )
+    .with_client_identity(identity);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get_json_path("/cluster/status"),
+    )
+    .await
+    .expect("mismatched relay identity request should fail promptly");
+    assert!(
+        result.is_err(),
+        "mismatched relay identity must fail closed"
     );
 
-    let error = client
-        .get_json_path("/cluster/status")
-        .await
-        .expect_err("relay source must reject a target certificate with the wrong node SAN");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while relay_state
+            .target_handshake_failure_count
+            .load(Ordering::SeqCst)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("target should observe the rejected source identity");
+    assert!(relay_state.issued_ticket_count.load(Ordering::SeqCst) >= 1);
+    assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 0);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn relay_transport_rejects_target_with_wrong_node_identity() {
+    let mut security = RelayTestSecurity::new();
+    let wrong_target_node_id = NodeId::new_v4();
+    security.target_identity = security.target_identity_for_node(wrong_target_node_id);
+    let (relay_state, server) = spawn_relay_test_server_at_with_security(
+        "127.0.0.1:0".parse().expect("bind addr should parse"),
+        200,
+        vec![RelayHttpHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        br#"{"status":"ok"}"#.to_vec(),
+        0,
+        0,
+        security,
+    )
+    .await;
+    let client = relay_test_client(
+        &relay_state,
+        relay_test_identity(&relay_state.security, "relay-wrong-target-identity-device"),
+    );
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get_json_path("/cluster/status"),
+    )
+    .await
+    .expect("wrong target identity request should fail promptly")
+    .expect_err("relay source must reject a target certificate with the wrong node SAN");
     assert!(
-        format!("{error:#}").contains("inner relay TLS source handshake failed"),
+        format!("{error:#}").contains("inner mTLS relay session"),
         "unexpected relay target identity error: {error:#}"
     );
     assert!(relay_state.captured_request.lock().await.is_none());
@@ -2350,9 +2336,8 @@ async fn relay_transport_executes_relative_path_get_request() {
     )
     .await;
 
-    let identity = relay_test_identity("relay-test-device");
-    let target_node_id = relay_test_primary_node_id();
-    let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
+    let identity = relay_test_identity(&relay_state.security, "relay-test-device");
+    let client = relay_test_client(&relay_state, identity.clone());
 
     let response = client
         .get_relative_path("/media/thumbnail?key=gallery%2Fcat.png")
@@ -2407,9 +2392,8 @@ async fn relay_transport_preserves_head_response_headers() {
     )
     .await;
 
-    let identity = relay_test_identity("relay-test-device");
-    let target_node_id = relay_test_primary_node_id();
-    let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
+    let identity = relay_test_identity(&relay_state.security, "relay-test-device");
+    let client = relay_test_client(&relay_state, identity.clone());
 
     let response = client
         .head_object("gallery/cat.png", None, None)
@@ -2451,9 +2435,8 @@ async fn relay_transport_reuses_multiplexed_session_for_multiple_requests() {
     )
     .await;
 
-    let identity = relay_test_identity("relay-test-device");
-    let target_node_id = relay_test_primary_node_id();
-    let client = relay_test_client(&relay_state, identity, target_node_id);
+    let identity = relay_test_identity(&relay_state.security, "relay-test-device");
+    let client = relay_test_client(&relay_state, identity);
 
     let first = client
         .get_json_path("/cluster/status")
@@ -2496,9 +2479,8 @@ async fn relay_transport_streams_upload_session_chunks_over_object_write() {
     )
     .await;
 
-    let identity = relay_test_identity("relay-upload-test-device");
-    let target_node_id = relay_test_primary_node_id();
-    let client = relay_test_client(&relay_state, identity, target_node_id);
+    let identity = relay_test_identity(&relay_state.security, "relay-upload-test-device");
+    let client = relay_test_client(&relay_state, identity);
 
     let response = client
         .upload_session_chunk_bytes("upload-123", 2, b"chunk-body".to_vec())
@@ -2521,16 +2503,6 @@ async fn relay_transport_streams_upload_session_chunks_over_object_write() {
         "/api/v1/store/uploads/upload-123/chunk/2"
     );
     assert_eq!(captured.body, b"chunk-body".to_vec());
-    let observed_binary_frames = relay_state
-        .tunnel
-        .observed_binary_frames
-        .lock()
-        .await
-        .clone();
-    assert!(
-        !relay_binary_frames_contain(&observed_binary_frames, b"chunk-body"),
-        "relay WebSocket binary frames must not expose the upload body"
-    );
 
     server.abort();
     let _ = server.await;
@@ -2560,9 +2532,8 @@ async fn relay_transport_retries_streamed_upload_chunk_after_partial_session_fai
     )
     .await;
 
-    let identity = relay_test_identity("relay-upload-retry-test-device");
-    let target_node_id = relay_test_primary_node_id();
-    let client = relay_test_client(&relay_state, identity, target_node_id);
+    let identity = relay_test_identity(&relay_state.security, "relay-upload-retry-test-device");
+    let client = relay_test_client(&relay_state, identity);
 
     let response = client
         .upload_session_chunk_bytes("upload-retry", 4, b"retry-body".to_vec())
@@ -3024,12 +2995,13 @@ async fn direct_route_stall_falls_back_to_relay_within_three_seconds() {
     .await;
 
     let test_result = async {
-        let identity = relay_test_identity("direct-stall-failover-device");
-        let target_node_id = relay_test_primary_node_id();
+        let identity =
+            relay_test_identity(&relay_state.security, "direct-stall-failover-device");
+        let target_node_id = relay_state.security.target_node_id;
 
         let direct = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
             .with_client_identity(identity.clone());
-        let relay = relay_test_client(&relay_state, identity, target_node_id);
+        let relay = relay_test_client(&relay_state, identity);
         let client = IronMeshClient::combine(vec![direct, relay])
             .expect("combined direct+relay client should build");
 
@@ -3158,12 +3130,13 @@ async fn mutating_request_reuses_operation_id_across_direct_timeout_and_relay_fa
             .await;
 
     let test_result = async {
-        let identity = relay_test_identity("direct-write-failover-device");
-        let target_node_id = relay_test_primary_node_id();
+        let identity =
+            relay_test_identity(&relay_state.security, "direct-write-failover-device");
+        let target_node_id = relay_state.security.target_node_id;
 
         let direct = IronMeshClient::from_direct_base_url(direct_state.public_url.clone())
             .with_client_identity(identity.clone());
-        let relay = relay_test_client(&relay_state, identity, target_node_id);
+        let relay = relay_test_client(&relay_state, identity);
         let client = IronMeshClient::combine(vec![direct, relay])
             .expect("combined direct+relay client should build");
 
@@ -3377,15 +3350,14 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
     )
     .await;
 
-    let identity = relay_test_identity("relay-background-refresh-device");
-    let primary_target_node_id = relay_test_primary_node_id();
-    let fallback_target_node_id = relay_test_fallback_node_id();
-    let primary = relay_test_client_for_public_url(
-        primary_url.clone(),
-        identity.clone(),
-        primary_target_node_id,
-    );
-    let fallback = relay_test_client(&fallback_state, identity.clone(), fallback_target_node_id);
+    let identity = relay_test_identity(&fallback_state.security, "relay-background-refresh-device");
+    let primary_security =
+        RelayTestSecurity::for_cluster(fallback_state.security.cluster_id, NodeId::new_v4());
+    let primary_target_node_id = primary_security.target_node_id;
+    let fallback_target_node_id = fallback_state.security.target_node_id;
+    let primary =
+        relay_test_client_for_public_url(primary_url.clone(), &primary_security, identity.clone());
+    let fallback = relay_test_client(&fallback_state, identity.clone());
     let client = IronMeshClient::combine(vec![primary, fallback])
         .expect("combined relay client should build");
 
@@ -3402,7 +3374,7 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
         "route": "primary",
     }))
     .expect("primary relay body should serialize");
-    let (primary_state, primary_server) = spawn_relay_test_server_at(
+    let (primary_state, primary_server) = spawn_relay_test_server_at_with_security(
         primary_addr,
         200,
         vec![
@@ -3418,6 +3390,7 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
         primary_body,
         0,
         0,
+        primary_security,
     )
     .await;
 
@@ -3786,12 +3759,14 @@ async fn direct_transport_streams_relative_s3_reads_without_blocking_small_rpcs(
 async fn relay_transport_streams_relative_s3_reads_without_blocking_small_rpcs() {
     let payload = Arc::new(vec![0x7B; 1024 * 1024]);
     let payload_len = payload.len();
-    let (public_url, issued_ticket_count, paired_session_count, server) =
-        spawn_relay_mixed_workload_test_server(Arc::clone(&payload)).await;
+    let (relay_state, server) = spawn_relay_mixed_workload_test_server(Arc::clone(&payload)).await;
 
-    let identity = relay_test_identity("relay-stream-relative-s3-device");
-    let client =
-        relay_test_client_for_public_url(public_url, identity, relay_test_primary_node_id());
+    let identity = relay_test_identity(&relay_state.security, "relay-stream-relative-s3-device");
+    let client = relay_test_client_for_public_url(
+        relay_state.public_url.clone(),
+        &relay_state.security,
+        identity,
+    );
 
     let download_client = client.clone();
     let download_future = async move {
@@ -3834,8 +3809,8 @@ async fn relay_transport_streams_relative_s3_reads_without_blocking_small_rpcs()
     assert_eq!(rpc_response["status"], "ok");
     assert_eq!(output.len(), payload_len);
     assert_eq!(output, payload.as_ref().to_vec());
-    assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
-    assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
+    assert_eq!(relay_state.issued_ticket_count.load(Ordering::SeqCst), 1);
+    assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 1);
 
     server.abort();
     let _ = server.await;

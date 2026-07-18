@@ -11,6 +11,19 @@ pub enum RelayTunnelSessionKind {
     MultiplexTransport,
 }
 
+/// Security protocol negotiated inside a paired relay tunnel.
+///
+/// `LegacyPlaintext` remains the serde default so older tickets and peers keep their existing
+/// behavior during a staged rollout. Callers must opt into `InnerMtls`; conversion APIs reject a
+/// session whose declared mode does not match the selected transport.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayTunnelSecurityMode {
+    #[default]
+    LegacyPlaintext,
+    InnerMtls,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayTicketRequest {
     pub cluster_id: ClusterId,
@@ -18,6 +31,8 @@ pub struct RelayTicketRequest {
     pub target: PeerIdentity,
     #[serde(default)]
     pub session_kind: RelayTunnelSessionKind,
+    #[serde(default)]
+    pub security_mode: RelayTunnelSecurityMode,
     #[serde(default)]
     pub requested_expires_in_secs: Option<u64>,
 }
@@ -30,9 +45,56 @@ pub struct RelayTicket {
     pub target: PeerIdentity,
     #[serde(default)]
     pub session_kind: RelayTunnelSessionKind,
+    #[serde(default)]
+    pub security_mode: RelayTunnelSecurityMode,
     pub relay_urls: Vec<String>,
     pub issued_at_unix: u64,
     pub expires_at_unix: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_ticket_request_defaults_missing_security_mode_to_legacy_plaintext() {
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Device(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let request: RelayTicketRequest = serde_json::from_value(serde_json::json!({
+            "cluster_id": cluster_id,
+            "source": source,
+            "target": target,
+        }))
+        .expect("legacy relay ticket request should deserialize");
+
+        assert_eq!(
+            request.security_mode,
+            RelayTunnelSecurityMode::LegacyPlaintext
+        );
+    }
+
+    #[test]
+    fn relay_ticket_defaults_missing_security_mode_to_legacy_plaintext() {
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Device(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let ticket: RelayTicket = serde_json::from_value(serde_json::json!({
+            "cluster_id": cluster_id,
+            "session_id": "legacy-session",
+            "source": source,
+            "target": target,
+            "relay_urls": ["https://relay.example"],
+            "issued_at_unix": 1,
+            "expires_at_unix": 2,
+        }))
+        .expect("legacy relay ticket should deserialize");
+
+        assert_eq!(
+            ticket.security_mode,
+            RelayTunnelSecurityMode::LegacyPlaintext
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

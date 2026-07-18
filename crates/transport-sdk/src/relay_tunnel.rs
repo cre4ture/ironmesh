@@ -17,7 +17,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
-use crate::relay::{RelayTicket, RelayTunnelSessionKind};
+use crate::relay::{RelayTicket, RelayTunnelSecurityMode, RelayTunnelSessionKind};
 use crate::relay_security::{
     RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, build_source_tls_config,
     build_target_tls_config, relay_tls_server_name,
@@ -50,6 +50,8 @@ pub struct RelayTunnelSession {
     pub target: PeerIdentity,
     #[serde(default)]
     pub session_kind: RelayTunnelSessionKind,
+    #[serde(default)]
+    pub security_mode: RelayTunnelSecurityMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +95,21 @@ impl RelayTunnelSession {
         }
         Ok(())
     }
+
+    pub(crate) fn require_security_mode(
+        &self,
+        required: RelayTunnelSecurityMode,
+        conversion: &str,
+    ) -> Result<()> {
+        if self.security_mode != required {
+            bail!(
+                "relay tunnel {conversion} requires security mode {required:?}, but paired session {} declares {:?}",
+                self.session_id,
+                self.security_mode
+            );
+        }
+        Ok(())
+    }
 }
 
 impl RelayTunnelClient {
@@ -106,7 +123,15 @@ impl RelayTunnelClient {
         let control = RelayTunnelControlMessage::ConnectSource {
             ticket: ticket.clone(),
         };
-        Self::connect(base_url, server_ca_pem, client_identity_pem, control).await
+        let client = Self::connect(base_url, server_ca_pem, client_identity_pem, control).await?;
+        if client.session.security_mode != ticket.security_mode {
+            bail!(
+                "paired relay session security mode {:?} does not match source ticket security mode {:?}",
+                client.session.security_mode,
+                ticket.security_mode
+            );
+        }
+        Ok(client)
     }
 
     pub async fn accept_target(
@@ -124,16 +149,20 @@ impl RelayTunnelClient {
         &self.session
     }
 
-    /// Converts a paired tunnel directly into Yamux without inner peer-to-peer encryption.
+    /// Converts a paired legacy plaintext tunnel directly into Yamux.
     ///
-    /// This legacy compatibility method is not production-safe for relay traffic. Use
+    /// This compatibility method is not production-safe for relay traffic. Use
     /// [`Self::into_secure_multiplexed_source_session`] or
     /// [`Self::into_secure_multiplexed_target_session`] instead.
-    pub fn into_multiplexed_session(
+    pub fn into_legacy_plaintext_multiplexed_session(
         self,
         mode: MultiplexMode,
         config: MultiplexConfig,
     ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.session.require_security_mode(
+            RelayTunnelSecurityMode::LegacyPlaintext,
+            "legacy plaintext conversion",
+        )?;
         let RelayTunnelClient { session, websocket } = self;
         let transport = WebSocketByteStream::new(websocket);
         let multiplexed = MultiplexedSession::spawn(transport, mode, config)
@@ -141,17 +170,36 @@ impl RelayTunnelClient {
         Ok((session, multiplexed))
     }
 
+    /// Deprecated compatibility alias for
+    /// [`Self::into_legacy_plaintext_multiplexed_session`].
+    #[deprecated(
+        since = "1.0.34",
+        note = "use into_legacy_plaintext_multiplexed_session for explicit legacy behavior or an into_secure_* conversion for inner mTLS"
+    )]
+    pub fn into_multiplexed_session(
+        self,
+        mode: MultiplexMode,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.into_legacy_plaintext_multiplexed_session(mode, config)
+    }
+
     /// Converts a paired relay source endpoint into a TLS 1.3-protected multiplexed session.
     ///
     /// This validates the paired cluster and target before the handshake, then requires the
     /// target certificate to chain to `cluster_ca_pem` and contain the expected node and cluster
-    /// URI SANs. Unlike [`Self::into_multiplexed_session`], this is suitable for production use.
+    /// URI SANs. Unlike [`Self::into_legacy_plaintext_multiplexed_session`], this is suitable for
+    /// production use.
     pub async fn into_secure_multiplexed_source_session(
         self,
         security: RelayTunnelSourceSecurityConfig,
         config: MultiplexConfig,
     ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
         security.validate()?;
+        self.session.require_security_mode(
+            RelayTunnelSecurityMode::InnerMtls,
+            "secure source conversion",
+        )?;
         let RelayTunnelClient { session, websocket } = self;
         validate_source_security_context(&session, &security)?;
 
@@ -180,6 +228,10 @@ impl RelayTunnelClient {
         config: MultiplexConfig,
     ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
         security.validate()?;
+        self.session.require_security_mode(
+            RelayTunnelSecurityMode::InnerMtls,
+            "secure target conversion",
+        )?;
         let RelayTunnelClient { session, websocket } = self;
         validate_target_security_context(&session, &security)?;
 
@@ -596,6 +648,7 @@ mod tests {
             source,
             target,
             session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::InnerMtls,
         }
     }
 
@@ -711,6 +764,121 @@ mod tests {
             .await
             .expect("target TLS handshake should resolve")
             .expect("target TLS task should not panic")
+    }
+
+    #[test]
+    fn relay_tunnel_session_defaults_missing_security_mode_to_legacy_plaintext() {
+        let session: RelayTunnelSession = serde_json::from_value(serde_json::json!({
+            "cluster_id": Uuid::now_v7(),
+            "session_id": "legacy-session",
+            "source": PeerIdentity::Device(Uuid::now_v7()),
+            "target": PeerIdentity::Node(Uuid::now_v7()),
+        }))
+        .expect("legacy paired session should deserialize");
+
+        assert_eq!(
+            session.security_mode,
+            RelayTunnelSecurityMode::LegacyPlaintext
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_conversion_rejects_inner_mtls_session() {
+        let tunnel = test_tunnel(relay_session(
+            Uuid::now_v7(),
+            PeerIdentity::Device(Uuid::now_v7()),
+            PeerIdentity::Node(Uuid::now_v7()),
+        ))
+        .await;
+
+        let error = match tunnel.source.into_legacy_plaintext_multiplexed_session(
+            MultiplexMode::Client,
+            MultiplexConfig::default(),
+        ) {
+            Ok(_) => panic!("legacy conversion must reject an inner-mTLS session"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("legacy plaintext conversion requires security mode LegacyPlaintext")
+        );
+        tunnel.relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn secure_source_conversion_rejects_legacy_plaintext_session() {
+        let cluster_id = Uuid::now_v7();
+        let source_device_id = Uuid::now_v7();
+        let target_node_id = Uuid::now_v7();
+        let ca = issue_test_ca();
+        let mut session = relay_session(
+            cluster_id,
+            PeerIdentity::Device(source_device_id),
+            PeerIdentity::Node(target_node_id),
+        );
+        session.security_mode = RelayTunnelSecurityMode::LegacyPlaintext;
+        let tunnel = test_tunnel(session).await;
+
+        let error = match tunnel
+            .source
+            .into_secure_multiplexed_source_session(
+                source_security(
+                    cluster_id,
+                    target_node_id,
+                    &ca.pem,
+                    issue_device_identity(&ca, source_device_id),
+                ),
+                MultiplexConfig::default(),
+            )
+            .await
+        {
+            Ok(_) => panic!("secure source conversion must reject a legacy plaintext session"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("secure source conversion requires security mode InnerMtls")
+        );
+        tunnel.relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn secure_target_conversion_rejects_legacy_plaintext_session() {
+        let cluster_id = Uuid::now_v7();
+        let source_device_id = Uuid::now_v7();
+        let target_node_id = Uuid::now_v7();
+        let ca = issue_test_ca();
+        let mut session = relay_session(
+            cluster_id,
+            PeerIdentity::Device(source_device_id),
+            PeerIdentity::Node(target_node_id),
+        );
+        session.security_mode = RelayTunnelSecurityMode::LegacyPlaintext;
+        let tunnel = test_tunnel(session).await;
+
+        let error = match tunnel
+            .target
+            .into_secure_multiplexed_target_session(
+                target_security(
+                    PeerIdentity::Device(source_device_id),
+                    &ca.pem,
+                    issue_node_identity(&ca, target_node_id, cluster_id),
+                ),
+                MultiplexConfig::default(),
+            )
+            .await
+        {
+            Ok(_) => panic!("secure target conversion must reject a legacy plaintext session"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("secure target conversion requires security mode InnerMtls")
+        );
+        tunnel.relay_task.abort();
     }
 
     #[tokio::test]
@@ -993,6 +1161,7 @@ mod tests {
             source: PeerIdentity::Device(Uuid::now_v7()),
             target: PeerIdentity::Node(Uuid::now_v7()),
             session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::LegacyPlaintext,
         };
         let client = RelayTunnelClient {
             session: session.clone(),
@@ -1000,7 +1169,10 @@ mod tests {
         };
 
         let (returned_session, client_mux) = client
-            .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
+            .into_legacy_plaintext_multiplexed_session(
+                MultiplexMode::Client,
+                MultiplexConfig::default(),
+            )
             .expect("client multiplexed session should build");
         let mut server_mux = MultiplexedSession::spawn(
             WebSocketByteStream::new(server_ws),

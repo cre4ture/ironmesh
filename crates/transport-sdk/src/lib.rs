@@ -52,7 +52,10 @@ pub use multiplex_transport::{
 };
 pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
-pub use relay::{RelayHttpHeader, RelayTicket, RelayTicketRequest, RelayTunnelSessionKind};
+pub use relay::{
+    RelayHttpHeader, RelayTicket, RelayTicketRequest, RelayTunnelSecurityMode,
+    RelayTunnelSessionKind,
+};
 pub use relay_security::{
     RelayTunnelSourceSecurityConfig, RelayTunnelTargetSecurityConfig, RelayTunnelTlsIdentity,
 };

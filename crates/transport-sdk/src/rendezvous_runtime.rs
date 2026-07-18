@@ -18,7 +18,9 @@ use crate::bootstrap_claim::{
 };
 use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
-use crate::relay::{RelayTicket, RelayTicketRequest, RelayTunnelSessionKind};
+use crate::relay::{
+    RelayTicket, RelayTicketRequest, RelayTunnelSecurityMode, RelayTunnelSessionKind,
+};
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelSession};
 use crate::rendezvous::{PresenceEntry, PresenceRegistration};
 
@@ -173,6 +175,7 @@ pub fn issue_relay_ticket(
         source: request.source,
         target: request.target,
         session_kind: request.session_kind,
+        security_mode: request.security_mode,
         relay_urls: relay_public_urls.to_vec(),
         issued_at_unix: now,
         expires_at_unix,
@@ -196,11 +199,15 @@ impl RelayTunnelEndpoint {
         &self.session
     }
 
-    pub fn into_multiplexed_session(
+    pub fn into_legacy_plaintext_multiplexed_session(
         self,
         mode: MultiplexMode,
         config: MultiplexConfig,
     ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.session.require_security_mode(
+            RelayTunnelSecurityMode::LegacyPlaintext,
+            "legacy plaintext broker conversion",
+        )?;
         let RelayTunnelEndpoint {
             session,
             inbound,
@@ -213,6 +220,20 @@ impl RelayTunnelEndpoint {
         )
         .map_err(|err| anyhow!("failed creating multiplexed relay endpoint session: {err:#}"))?;
         Ok((session, multiplexed))
+    }
+
+    /// Deprecated compatibility alias for
+    /// [`Self::into_legacy_plaintext_multiplexed_session`].
+    #[deprecated(
+        since = "1.0.34",
+        note = "use into_legacy_plaintext_multiplexed_session for explicit legacy behavior"
+    )]
+    pub fn into_multiplexed_session(
+        self,
+        mode: MultiplexMode,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.into_legacy_plaintext_multiplexed_session(mode, config)
     }
 
     pub async fn send(&self, frame: RelayTunnelFrame) -> Result<()> {
@@ -513,6 +534,7 @@ impl RelayTunnelBroker {
             source: ticket.source.clone(),
             target: ticket.target.clone(),
             session_kind: ticket.session_kind,
+            security_mode: ticket.security_mode,
         };
         session.validate()?;
 
@@ -757,6 +779,23 @@ mod tests {
         TransportStreamKind,
     };
 
+    #[test]
+    fn issued_relay_ticket_preserves_inner_mtls_security_mode() {
+        let ticket = issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id: uuid::Uuid::now_v7(),
+                source: PeerIdentity::Device(uuid::Uuid::now_v7()),
+                target: PeerIdentity::Node(uuid::Uuid::now_v7()),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::InnerMtls,
+                requested_expires_in_secs: Some(60),
+            },
+            &["https://relay.example".to_string()],
+        );
+
+        assert_eq!(ticket.security_mode, RelayTunnelSecurityMode::InnerMtls);
+    }
+
     #[tokio::test]
     async fn relay_tunnel_broker_pairs_source_and_target_and_relays_frames() {
         let broker = RelayTunnelBroker::new();
@@ -769,6 +808,7 @@ mod tests {
                 source: source.clone(),
                 target: target.clone(),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -839,6 +879,7 @@ mod tests {
                 source: source.clone(),
                 target: target.clone(),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -851,7 +892,10 @@ mod tests {
                 .connect_source(ticket)
                 .await
                 .expect("source should pair")
-                .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
+                .into_legacy_plaintext_multiplexed_session(
+                    MultiplexMode::Client,
+                    MultiplexConfig::default(),
+                )
                 .expect("source multiplex session should spawn");
             assert_eq!(relay_session.source, source_for_task);
 
@@ -902,7 +946,10 @@ mod tests {
             })
             .await
             .expect("target should pair")
-            .into_multiplexed_session(MultiplexMode::Server, MultiplexConfig::default())
+            .into_legacy_plaintext_multiplexed_session(
+                MultiplexMode::Server,
+                MultiplexConfig::default(),
+            )
             .expect("target multiplex session should spawn");
         assert_eq!(relay_session.source, source);
         let hello = perform_transport_server_handshake(
@@ -969,6 +1016,7 @@ mod tests {
                 source: source.clone(),
                 target: target.clone(),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -1035,6 +1083,7 @@ mod tests {
             source,
             target: target.clone(),
             session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: RelayTunnelSecurityMode::LegacyPlaintext,
             relay_urls: vec!["https://relay.example".to_string()],
             issued_at_unix: unix_ts(),
             expires_at_unix: unix_ts() + 3,
@@ -1099,6 +1148,7 @@ mod tests {
                 source: source.clone(),
                 target: target.clone(),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],

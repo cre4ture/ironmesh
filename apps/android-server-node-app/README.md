@@ -28,7 +28,8 @@ The app uses a Rust JNI bridge:
 - `cargo-ndk` installed: `cargo install cargo-ndk`
 - Android SDK + NDK installed in Android Studio
 
-Gradle packages the JNI libraries from `app/build/generated/rustJniLibs`.
+Gradle packages the JNI libraries from the variant-specific
+`app/build/generated/rustJniLibs/debug` or `app/build/generated/rustJniLibs/release` directory.
 
 ## Internal release signing
 

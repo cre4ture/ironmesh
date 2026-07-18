@@ -476,6 +476,7 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             source: bootstrap_claim_relay_source_identity(request),
             target,
             session_kind: RelayTunnelSessionKind::MultiplexTransport,
+            security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
             requested_expires_in_secs: Some(30),
         },
         &state.config.relay_public_urls,
@@ -487,7 +488,10 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
         .connect_source(ticket)
         .await
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?
-        .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
+        .into_legacy_plaintext_multiplexed_session(
+            MultiplexMode::Client,
+            MultiplexConfig::default(),
+        )
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
     perform_transport_client_handshake(
         &session,
@@ -1113,6 +1117,7 @@ mod tests {
                 source: source_peer.clone(),
                 target: target_peer.clone(),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
                 relay_urls: vec!["https://relay.example".to_string()],
                 issued_at_unix: 1,
                 expires_at_unix: 2,
@@ -1466,6 +1471,7 @@ mod tests {
                 source: source.clone(),
                 target: target.clone(),
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(60),
             },
             &[format!("http://{bind_addr}")],
@@ -1687,6 +1693,7 @@ mod tests {
                 source,
                 target,
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(60),
             },
             &[format!("http://{bind_addr}")],
@@ -1742,6 +1749,7 @@ mod tests {
                 source,
                 target,
                 session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: transport_sdk::RelayTunnelSecurityMode::LegacyPlaintext,
                 requested_expires_in_secs: Some(60),
             },
             &[format!("http://{bind_addr}")],
