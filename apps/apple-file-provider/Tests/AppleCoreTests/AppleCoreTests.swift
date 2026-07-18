@@ -87,6 +87,26 @@ final class AppleCoreTests: XCTestCase {
         XCTAssertFalse(coordinator.acceptsAnyResult(from: request))
     }
 
+    func testConnectionContextResetInvalidatesNestedResultAndReloadsRootAsCurrentDirectory() {
+        var coordinator = AppleDirectoryLoadCoordinator()
+        let staleNestedRequest = coordinator.begin(
+            path: "documents",
+            updatesCurrentDirectory: true,
+            updatesCurrentPath: true
+        )
+
+        let rootRequest = coordinator.beginConnectionContextReset()
+
+        XCTAssertFalse(coordinator.acceptsAnyResult(from: staleNestedRequest))
+        XCTAssertEqual(rootRequest.path, "")
+        XCTAssertTrue(rootRequest.updatesRootSnapshot)
+        XCTAssertTrue(rootRequest.updatesCurrentDirectory)
+        XCTAssertTrue(rootRequest.updatesCurrentPath)
+        XCTAssertTrue(coordinator.acceptsRootSnapshot(rootRequest))
+        XCTAssertTrue(coordinator.acceptsCurrentDirectory(rootRequest))
+        XCTAssertTrue(coordinator.acceptsSharedState(rootRequest))
+    }
+
     func testConnectionInputNormalizationAddsHttpSchemeAndSlash() {
         let configuration = AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080")
         XCTAssertEqual(configuration.normalizedConnectionInput, "http://127.0.0.1:18080/")

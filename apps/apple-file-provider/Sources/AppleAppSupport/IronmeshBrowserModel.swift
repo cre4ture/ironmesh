@@ -321,7 +321,7 @@ final class IronmeshBrowserModel: ObservableObject {
         statusText = "Onboarding complete. Connecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Completed onboarding", detail: draft.enrollmentSummary)
         refreshDomainState()
-        refresh()
+        reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after onboarding")
     }
 
     func applyConnectionSettings() {
@@ -355,7 +355,7 @@ final class IronmeshBrowserModel: ObservableObject {
         statusText = "Applied connection settings. Reconnecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Applied settings", detail: draft.setupSummary)
         refreshDomainState()
-        refresh()
+        reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after reconnecting")
     }
 
     func refresh() {
@@ -448,19 +448,21 @@ final class IronmeshBrowserModel: ObservableObject {
         statusText = "Restored bundled defaults."
         addAction("Restored defaults", detail: draft.setupSummary)
         refreshDomainState()
+        if hasCompletedOnboarding, !draft.requiresEnrollment, draft.connectionConfiguration != nil {
+            reloadRootAfterConnectionContextChange(actionTitle: "Loaded bundled root")
+        } else {
+            clearDirectoryAfterConnectionContextChange()
+        }
     }
 
     func clearAppSetup() {
-        directoryLoadCoordinator.invalidate()
         draft = IronmeshConnectionDraft(
             deviceLabel: draft.deviceLabel,
             domainIdentifier: bundleDefaults.domainIdentifier,
             domainDisplayName: bundleDefaults.domainDisplayName
         )
         hasCompletedOnboarding = false
-        items = []
-        currentItems = []
-        currentPath = ""
+        clearDirectoryAfterConnectionContextChange()
         lastSuccessfulConnectionAt = nil
         lastErrorMessage = nil
         connectionDiagnostics = nil
@@ -478,6 +480,7 @@ final class IronmeshBrowserModel: ObservableObject {
             hasCompletedOnboarding = false
         }
         try? syncSharedSettingsFromDraft()
+        clearDirectoryAfterConnectionContextChange()
         addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
     }
 
@@ -555,8 +558,8 @@ final class IronmeshBrowserModel: ObservableObject {
                 if completesOnboarding {
                     hasCompletedOnboarding = true
                     refreshDomainState()
-                    refresh()
                 }
+                reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after enrollment")
             } catch {
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
@@ -715,6 +718,27 @@ final class IronmeshBrowserModel: ObservableObject {
             updatesCurrentPath: updatesCurrentPath
         )
 
+        loadDirectory(request: request, actionTitle: actionTitle)
+    }
+
+    private func reloadRootAfterConnectionContextChange(actionTitle: String) {
+        let request = directoryLoadCoordinator.beginConnectionContextReset()
+        clearDirectoryPresentation()
+        loadDirectory(request: request, actionTitle: actionTitle)
+    }
+
+    private func clearDirectoryAfterConnectionContextChange() {
+        directoryLoadCoordinator.invalidate()
+        clearDirectoryPresentation()
+    }
+
+    private func clearDirectoryPresentation() {
+        items = []
+        currentItems = []
+        currentPath = ""
+    }
+
+    private func loadDirectory(request: AppleDirectoryLoadRequest, actionTitle: String) {
         guard let configuration = draft.connectionConfiguration else {
             let message = "A bootstrap bundle or direct route is required."
             lastErrorMessage = message

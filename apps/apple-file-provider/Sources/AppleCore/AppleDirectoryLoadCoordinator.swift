@@ -58,6 +58,15 @@ public struct AppleDirectoryLoadCoordinator: Sendable {
         return request
     }
 
+    public mutating func beginConnectionContextReset() -> AppleDirectoryLoadRequest {
+        invalidate()
+        return begin(
+            path: "",
+            updatesCurrentDirectory: true,
+            updatesCurrentPath: true
+        )
+    }
+
     public func acceptsRootSnapshot(_ request: AppleDirectoryLoadRequest) -> Bool {
         request.updatesRootSnapshot
             && latestRootSnapshotGeneration == request.generation
