@@ -89,6 +89,8 @@ targets:
       - path: Sources/AppleNativeBridge
       - path: Sources/AppleFileProviderRuntime
     dependencies:
+      - target: IronmeshIosFileProviderExtension
+        embed: true
       - package: AppleFileProviderPackage
         product: AppleCore
       - package: AppleFileProviderPackage
@@ -145,7 +147,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
         CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAppGroup.entitlements
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosfileprovider
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp.fileprovider
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
