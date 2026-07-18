@@ -197,6 +197,23 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(jsonPointer)
     }
 
+    func connectionRouteSnapshotJSON(handle: AppleRustHandle, refresh: Bool) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_connection_route_snapshot_json(
+            handle,
+            refresh ? 1 : 0,
+            &jsonPointer,
+            &errorPointer
+        )
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no connection paths JSON.")
+        }
+        return consumeString(jsonPointer)
+    }
+
     func startWebUI(
         connectionInput: String,
         serverCAPem: String?,

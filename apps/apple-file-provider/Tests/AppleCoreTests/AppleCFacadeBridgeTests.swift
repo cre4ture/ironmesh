@@ -132,6 +132,18 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertFalse(result.accepted)
         XCTAssertEqual(result.resultingIdentifier, "dir:path:docs/new-folder")
     }
+
+    func testConnectionRouteSnapshotForwardsRefreshChoice() throws {
+        let ffi = MockFFI()
+        ffi.routeSnapshotResponseJSON = #"{"ranked_indices":[0],"endpoints":[]}"#
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+
+        let response = try bridge.connectionRouteSnapshotJSON(refresh: true)
+
+        XCTAssertEqual(response, ffi.routeSnapshotResponseJSON)
+        XCTAssertEqual(ffi.lastRouteSnapshotRefresh, true)
+    }
 }
 
 private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
@@ -147,7 +159,9 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var putResponseJSON = #"{"item_id":"file:path:test.txt"}"#
     var fetchResponseData = Data()
     var diagnosticsResponseJSON = #"{"endpoints":[]}"#
+    var routeSnapshotResponseJSON = #"{"ranked_indices":[],"endpoints":[]}"#
     var webUIURL = "http://127.0.0.1:4100/"
+    var lastRouteSnapshotRefresh: Bool?
 
     func createHandle(
         connectionInput: String,
@@ -217,6 +231,12 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String {
         _ = handle
         return diagnosticsResponseJSON
+    }
+
+    func connectionRouteSnapshotJSON(handle: AppleRustHandle, refresh: Bool) throws -> String {
+        _ = handle
+        lastRouteSnapshotRefresh = refresh
+        return routeSnapshotResponseJSON
     }
 
     func startWebUI(

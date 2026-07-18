@@ -22,6 +22,7 @@ public protocol AppleManualCBridgeFFI: Sendable {
     func deletePath(handle: AppleRustHandle, key: String) throws
     func movePath(handle: AppleRustHandle, fromPath: String, toPath: String, overwrite: Bool) throws
     func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String
+    func connectionRouteSnapshotJSON(handle: AppleRustHandle, refresh: Bool) throws -> String
     func startWebUI(
         connectionInput: String,
         serverCAPem: String?,
@@ -166,6 +167,12 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     public func connectionDiagnosticsJSON() throws -> String {
         try withHandle { handle in
             try ffi.connectionDiagnosticsJSON(handle: handle)
+        }
+    }
+
+    public func connectionRouteSnapshotJSON(refresh: Bool) throws -> String {
+        try withHandle { handle in
+            try ffi.connectionRouteSnapshotJSON(handle: handle, refresh: refresh)
         }
     }
 
