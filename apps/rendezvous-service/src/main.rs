@@ -97,7 +97,8 @@ mod tests {
         let source_tls = write_tls_material(
             &source_dir,
             &ca.ca_pem,
-            &issue_node_cert(&ca, source_node_id).expect("source node cert should issue"),
+            &issue_node_cert(&ca, source_node_id, cluster_id)
+                .expect("source node cert should issue"),
         )
         .expect("source TLS material should write");
         let source_bind_addr = free_bind_addr();
@@ -135,7 +136,8 @@ mod tests {
         let target_tls = write_tls_material(
             &target_dir,
             &ca.ca_pem,
-            &issue_node_cert(&ca, target_node_id).expect("target node cert should issue"),
+            &issue_node_cert(&ca, target_node_id, cluster_id)
+                .expect("target node cert should issue"),
         )
         .expect("target TLS material should write");
         let target_bind_addr = free_bind_addr();
@@ -314,12 +316,14 @@ mod tests {
             failover_package: None,
         };
 
+        let cluster_id = Uuid::now_v7();
         let source_dir = fresh_test_dir("relay-required-source-mtls");
         let source_node_id = Uuid::now_v7();
         let source_tls = write_tls_material(
             &source_dir,
             &ca.ca_pem,
-            &issue_node_cert(&ca, source_node_id).expect("source node cert should issue"),
+            &issue_node_cert(&ca, source_node_id, cluster_id)
+                .expect("source node cert should issue"),
         )
         .expect("source TLS material should write");
         let rendezvous_health_client =
@@ -340,7 +344,6 @@ mod tests {
         )
         .await;
 
-        let cluster_id = Uuid::now_v7();
         let source_bind_addr = free_bind_addr();
         let source_public_url = format!("http://{source_bind_addr}");
         let mut source_config = build_cluster_config_from_bootstrap(
@@ -376,7 +379,8 @@ mod tests {
         let target_tls = write_tls_material(
             &target_dir,
             &ca.ca_pem,
-            &issue_node_cert(&ca, target_node_id).expect("target node cert should issue"),
+            &issue_node_cert(&ca, target_node_id, cluster_id)
+                .expect("target node cert should issue"),
         )
         .expect("target TLS material should write");
         let target_bind_addr = free_bind_addr();
@@ -582,9 +586,10 @@ mod tests {
             failover_package: None,
         };
 
+        let cluster_id = Uuid::now_v7();
         let target_node_id = Uuid::now_v7();
-        let target_tls =
-            issue_node_cert(&ca, target_node_id).expect("target node cert should issue");
+        let target_tls = issue_node_cert(&ca, target_node_id, cluster_id)
+            .expect("target node cert should issue");
         let target_identity_pem = format!("{}\n{}", target_tls.0, target_tls.1);
         let health_dir = fresh_test_dir("relay-client-device-rendezvous-health");
         let target_tls_paths = write_tls_material(&health_dir, &ca.ca_pem, &target_tls)
@@ -613,7 +618,6 @@ mod tests {
         )
         .await;
 
-        let cluster_id = Uuid::now_v7();
         let device_id = Uuid::now_v7();
         let device_tls =
             issue_device_cert(&ca, device_id).expect("device client cert should issue");
@@ -845,9 +849,10 @@ mod tests {
             failover_package: None,
         };
 
+        let cluster_id = Uuid::now_v7();
         let target_node_id = Uuid::now_v7();
-        let target_tls =
-            issue_node_cert(&ca, target_node_id).expect("target node cert should issue");
+        let target_tls = issue_node_cert(&ca, target_node_id, cluster_id)
+            .expect("target node cert should issue");
         let target_identity_pem = format!("{}\n{}", target_tls.0, target_tls.1);
         let target_tls_paths = write_tls_material(&rendezvous_dir, &ca.ca_pem, &target_tls)
             .expect("target TLS material should write");
@@ -863,7 +868,7 @@ mod tests {
 
         let node_control = transport_sdk::RendezvousControlClient::new(
             transport_sdk::RendezvousClientConfig {
-                cluster_id: Uuid::now_v7(),
+                cluster_id,
                 rendezvous_urls: vec![rendezvous_public_url.clone()],
                 heartbeat_interval_secs: 15,
             },
@@ -1160,7 +1165,11 @@ mod tests {
         })
     }
 
-    fn issue_node_cert(ca: &TestCa, node_id: Uuid) -> anyhow::Result<(String, String)> {
+    fn issue_node_cert(
+        ca: &TestCa,
+        node_id: Uuid,
+        cluster_id: Uuid,
+    ) -> anyhow::Result<(String, String)> {
         let node_key = rcgen::KeyPair::generate().context("failed generating node key")?;
         let mut params = rcgen::CertificateParams::default();
         params.distinguished_name.push(
@@ -1173,6 +1182,10 @@ mod tests {
         params.subject_alt_names.push(rcgen::SanType::URI(
             rcgen::string::Ia5String::try_from(format!("urn:ironmesh:node:{node_id}"))
                 .context("invalid node SAN URI")?,
+        ));
+        params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+                .context("invalid cluster SAN URI")?,
         ));
         params.extended_key_usages = vec![
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,
