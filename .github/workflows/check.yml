@@ -320,17 +320,6 @@ jobs:
         working-directory: apps/android-app
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
-      - name: Build Android app
-        working-directory: apps/android-app
-        run: ./gradlew --no-daemon :app:assembleDebug
-
-      - name: Upload Android debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-debug-${{ env.BUILD_NAME_SUFFIX }}
-          path: apps/android-app/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-
       - name: Build Android signed internal release APK for performance testing
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         working-directory: apps/android-app
@@ -354,18 +343,7 @@ jobs:
         working-directory: apps/android-server-node-app
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
-      - name: Build Android server-node app
-        working-directory: apps/android-server-node-app
-        run: ./gradlew --no-daemon :app:assembleDebug
-
-      - name: Upload Android server-node debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-server-node-debug-${{ env.BUILD_NAME_SUFFIX }}
-          path: apps/android-server-node-app/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-
-      - name: Reclaim disk after Android server-node debug build
+      - name: Reclaim disk before Android server-node release build
         if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         run: |
           rm -rf apps/android-server-node-app/app/build
