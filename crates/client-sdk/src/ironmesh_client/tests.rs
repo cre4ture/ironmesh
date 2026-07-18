@@ -2503,6 +2503,12 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
             diagnostics.endpoints[0].request_base_url,
             direct_state.candidate.endpoint
         );
+        let route_snapshot = client.connection_route_snapshot();
+        assert_eq!(route_snapshot.endpoints.len(), 1);
+        assert_eq!(
+            route_snapshot.endpoints[0].path_kind,
+            transport_sdk::TransportPathKind::DirectQuic
+        );
         assert_eq!(client.transport_session_pool_snapshot().connect_count, 1);
         assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
 

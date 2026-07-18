@@ -1,6 +1,11 @@
 import type { VersionGraphResponse } from "../client-ui/types";
 import type { LogsResponse, ServerLogEntry } from "../shared/logs";
 import type {
+  GalleryMapConfiguration,
+  GalleryMapConfigurationResponse,
+  GalleryMapVariantAsset
+} from "../shared/map-config";
+import type {
   StoreIndexEntry,
   StoreIndexMediaSummary,
   StoreIndexResponse,
@@ -44,6 +49,50 @@ export type {
   StoreListSortOrder,
   StoreListView
 };
+
+export type AdminMapDatasetImportState = "running" | "failed" | "completed";
+
+export type AdminMapDatasetImportJobView = {
+  job_id: string;
+  state: AdminMapDatasetImportState;
+  dataset_filename: string;
+  source_display: string;
+  variant_id?: string | null;
+  asset?: GalleryMapVariantAsset | null;
+  logical_key: string;
+  manifest_key: string;
+  part_size_bytes: number;
+  total_size_bytes: number;
+  total_parts: number;
+  completed_parts: number;
+  completed_bytes: number;
+  current_part_index?: number | null;
+  current_part_id?: string | null;
+  current_part_key?: string | null;
+  current_part_size_bytes?: number | null;
+  current_part_completed_bytes: number;
+  manifest_uploaded: boolean;
+  retry_count: number;
+  next_retry_at_unix?: number | null;
+  last_error?: string | null;
+  started_at_unix: number;
+  updated_at_unix: number;
+  finished_at_unix?: number | null;
+  progress_percent: number;
+};
+
+export type AdminMapDatasetImportStatusResponse = {
+  active_job?: AdminMapDatasetImportJobView | null;
+  can_start_new: boolean;
+};
+
+export type StartAdminMapDatasetImportResponse = {
+  started: boolean;
+  status: AdminMapDatasetImportStatusResponse;
+};
+
+export type AdminGalleryMapConfiguration = GalleryMapConfiguration;
+export type AdminGalleryMapConfigurationResponse = GalleryMapConfigurationResponse;
 
 export type DataChangeAction = "upload" | "rename" | "copy" | "delete";
 

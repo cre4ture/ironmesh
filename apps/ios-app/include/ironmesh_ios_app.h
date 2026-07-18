@@ -65,10 +65,20 @@ int ironmesh_ios_facade_connection_diagnostics_json(void *handle,
                                                     char **out_json,
                                                     char **out_error);
 
+int ironmesh_ios_facade_connection_route_snapshot_json(void *handle,
+                                                       int refresh,
+                                                       char **out_json,
+                                                       char **out_error);
+
 int ironmesh_ios_facade_fetch_bytes(void *handle,
                                     const char *key,
                                     struct IronmeshIosBytes *out_bytes,
                                     char **out_error);
+
+int ironmesh_ios_facade_fetch_relative_bytes(void *handle,
+                                             const char *path,
+                                             struct IronmeshIosBytes *out_bytes,
+                                             char **out_error);
 
 int ironmesh_ios_facade_put_bytes(void *handle,
                                   const char *key,
@@ -82,12 +92,6 @@ int ironmesh_ios_facade_enroll_with_bootstrap(const char *connection_input,
                                               const char *device_label_override,
                                               char **out_json,
                                               char **out_error);
-
-int ironmesh_ios_facade_start_web_ui(const char *connection_input,
-                                     const char *server_ca_pem,
-                                     const char *client_identity_json,
-                                     char **out_url,
-                                     char **out_error);
 
 int ironmesh_ios_facade_delete_path(void *handle, const char *key, char **out_error);
 

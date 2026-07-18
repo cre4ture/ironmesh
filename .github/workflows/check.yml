@@ -6,6 +6,9 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   workspace-check:
     runs-on: ubuntu-latest
@@ -479,6 +482,9 @@ jobs:
               CODE_SIGNING_REQUIRED=NO
           fi
 
+      - name: Verify archived iOS File Provider extension
+        run: apps/apple-file-provider/scripts/verify-ios-app-archive.sh "$IOS_ARCHIVE_PATH"
+
       - name: Write iOS export options
         if: env.IOS_SIGNED_EXPORT_ENABLED == 'true'
         run: |
@@ -495,7 +501,7 @@ jobs:
             <dict>
               <key>dev.ironmesh.apple.iosapp</key>
               <string>${IRONMESH_IOS_APP_PROFILE_UUID}</string>
-              <key>dev.ironmesh.apple.iosfileprovider</key>
+              <key>dev.ironmesh.apple.iosapp.fileprovider</key>
               <string>${IRONMESH_IOS_EXTENSION_PROFILE_UUID}</string>
             </dict>
             <key>signingStyle</key>

@@ -79,7 +79,7 @@ Configure these repository secrets for signed iOS artifacts:
 - `IRONMESH_IOS_SIGNING_CERT_B64` — base64-encoded `.p12` signing certificate
 - `IRONMESH_IOS_SIGNING_CERT_PASSWORD` — password for that `.p12`
 - `IRONMESH_IOS_APP_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosapp`
-- `IRONMESH_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosfileprovider`
+- `IRONMESH_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosapp.fileprovider`
 
 Optional repository variable:
 

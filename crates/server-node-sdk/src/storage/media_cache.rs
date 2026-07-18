@@ -45,8 +45,44 @@ const DEFAULT_MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const IMAGE_DECODE_ESTIMATED_BYTES_PER_PIXEL: u64 = 4;
 pub(super) const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 pub(super) const GRID_THUMBNAIL_PROFILE: &str = "grid";
+pub(super) const MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION: u32 = 1536;
+pub(super) const MOBILE_VIEWER_THUMBNAIL_PROFILE: &str = "mobile_viewer";
 pub(super) const MEDIA_FORMAT_SNIFF_BYTES: usize = 64 * 1024;
 pub(super) const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 20000;
+const GRID_THUMBNAIL_JPEG_QUALITY: u8 = 82;
+const MOBILE_VIEWER_THUMBNAIL_JPEG_QUALITY: u8 = 84;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThumbnailProfileSpec {
+    pub(crate) name: &'static str,
+    pub(crate) max_dimension: u32,
+    jpeg_quality: u8,
+}
+
+pub(crate) fn grid_thumbnail_profile() -> ThumbnailProfileSpec {
+    ThumbnailProfileSpec {
+        name: GRID_THUMBNAIL_PROFILE,
+        max_dimension: GRID_THUMBNAIL_MAX_DIMENSION,
+        jpeg_quality: GRID_THUMBNAIL_JPEG_QUALITY,
+    }
+}
+
+pub(crate) fn mobile_viewer_thumbnail_profile() -> ThumbnailProfileSpec {
+    ThumbnailProfileSpec {
+        name: MOBILE_VIEWER_THUMBNAIL_PROFILE,
+        max_dimension: MOBILE_VIEWER_THUMBNAIL_MAX_DIMENSION,
+        jpeg_quality: MOBILE_VIEWER_THUMBNAIL_JPEG_QUALITY,
+    }
+}
+
+pub(crate) fn thumbnail_profile_from_query(profile: Option<&str>) -> Option<ThumbnailProfileSpec> {
+    let profile = profile.unwrap_or(GRID_THUMBNAIL_PROFILE).trim();
+    match profile {
+        GRID_THUMBNAIL_PROFILE => Some(grid_thumbnail_profile()),
+        MOBILE_VIEWER_THUMBNAIL_PROFILE => Some(mobile_viewer_thumbnail_profile()),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +277,73 @@ impl MediaCacheWorker {
         manifest_hash: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
         self.ensure_media_artifact(manifest_hash, true).await
+    }
+
+    pub(crate) async fn ensure_image_thumbnail_profile_payload(
+        &self,
+        manifest_hash: &str,
+        profile: ThumbnailProfileSpec,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(None);
+        };
+
+        if !manifest_chunks_are_locally_complete(&manifest, &self.chunks_dir).await? {
+            return Ok(None);
+        }
+
+        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
+        let thumbnail_path = self
+            .media_thumbnails_dir
+            .join(&content_fingerprint)
+            .join(format!("{}.jpg", profile.name));
+        if fs::try_exists(&thumbnail_path).await? {
+            return Ok(Some(fs::read(&thumbnail_path).await?));
+        }
+
+        let sniff_bytes =
+            read_object_prefix_from_manifest(&manifest, &self.chunks_dir, MEDIA_FORMAT_SNIFF_BYTES)
+                .await?;
+        let format = match image::guess_format(&sniff_bytes) {
+            Ok(format) => format,
+            Err(_) => return Ok(None),
+        };
+        if image_format_mime_type(format).is_none() {
+            return Ok(None);
+        }
+
+        let build_permits =
+            self.media_cache_build_config
+                .permits_for_estimated_bytes(estimated_image_build_bytes(
+                    manifest.total_size_bytes,
+                    image_dimensions(&sniff_bytes, format).ok(),
+                    true,
+                    self.media_cache_build_config.image_limits(),
+                ));
+        let build_permit = self
+            .media_cache_build_permits
+            .clone()
+            .acquire_many_owned(build_permits)
+            .await
+            .expect("media cache build semaphore should remain open");
+
+        let manifest_owned = manifest.clone();
+        let chunks_dir = self.chunks_dir.clone();
+        let image_limits = self.media_cache_build_config.image_limits().clone();
+        let rendered = match task::spawn_blocking(move || {
+            let _build_permit = build_permit;
+            render_image_thumbnail_payload(&manifest_owned, &chunks_dir, profile, &image_limits)
+        })
+        .await
+        {
+            Ok(Ok(Some(payload))) => payload,
+            Ok(Ok(None)) => return Ok(None),
+            Ok(Err(err)) => return Err(err),
+            Err(err) => bail!("image thumbnail profile task failed: {err}"),
+        };
+
+        write_atomic(&thumbnail_path, &rendered).await?;
+        Ok(Some(rendered))
     }
 
     async fn ensure_media_artifact(
@@ -1401,10 +1504,10 @@ fn derive_image_media_cache(
     }
 
     let image = decode_image_with_limits(payload, format, image_limits)?;
-    let rendered_thumbnail = render_thumbnail(image, orientation, GRID_THUMBNAIL_MAX_DIMENSION)?;
+    let rendered_thumbnail = render_thumbnail(image, orientation, grid_thumbnail_profile())?;
 
     metadata.thumbnail = Some(CachedThumbnailInfo {
-        profile: GRID_THUMBNAIL_PROFILE.to_string(),
+        profile: grid_thumbnail_profile().name.to_string(),
         format: "jpeg".to_string(),
         width: rendered_thumbnail.width,
         height: rendered_thumbnail.height,
@@ -1516,12 +1619,12 @@ fn validate_image_decode_limits(
 fn render_thumbnail(
     mut image: DynamicImage,
     orientation: Option<u16>,
-    max_dimension: u32,
+    profile: ThumbnailProfileSpec,
 ) -> Result<RenderedThumbnail> {
     apply_exif_orientation(&mut image, orientation);
-    let thumbnail = image.thumbnail(max_dimension, max_dimension);
+    let thumbnail = image.thumbnail(profile.max_dimension, profile.max_dimension);
     let mut encoded = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 82);
+    let mut encoder = JpegEncoder::new_with_quality(&mut encoded, profile.jpeg_quality);
     encoder
         .encode_image(&thumbnail)
         .context("failed to encode thumbnail")?;
@@ -1530,6 +1633,31 @@ fn render_thumbnail(
         width: thumbnail.width(),
         height: thumbnail.height(),
     })
+}
+
+fn render_image_thumbnail_payload(
+    manifest: &ObjectManifest,
+    chunks_dir: &Path,
+    profile: ThumbnailProfileSpec,
+    image_limits: &MediaCacheImageLimits,
+) -> Result<Option<Vec<u8>>> {
+    let payload = read_object_by_manifest_blocking(manifest, chunks_dir)?;
+    let format = image::guess_format(&payload).context("unsupported media format")?;
+    let (width, height) = image_dimensions(&payload, format)?;
+    if let Some(error) = validate_image_decode_limits(width, height, image_limits) {
+        tracing::debug!(
+            profile = profile.name,
+            width,
+            height,
+            error = %error,
+            "skipping thumbnail profile generation because image exceeds decode limits"
+        );
+        return Ok(None);
+    }
+
+    let image = decode_image_with_limits(&payload, format, image_limits)?;
+    let (orientation, _, _) = extract_exif_fields(&payload);
+    Ok(Some(render_thumbnail(image, orientation, profile)?.payload))
 }
 
 fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {

@@ -1,185 +1,132 @@
-# Map Viewer Data Installation
+# Gallery Map Packages
 
-This is the manual administrator flow for installing the self-hosted map data
-used by the gallery map view.
+IronMesh keeps gallery map selection in the cluster object
+`sys/maps/gallery-map-config.json`. The selected map and its artifact keys are
+therefore identical regardless of which server node an administrator or client
+uses. The object is confirmed, replicated, versioned, and published using the
+same path as other cluster objects.
 
-The current Ironmesh map viewer expects split MapTiler MBTiles artifacts stored
-under `sys/maps/` in the cluster object namespace, plus one manifest per logical
-MBTiles file.
+The Server Admin Gallery initializes this file with a small Natural Earth
+world-map profile. It is the initial client default. The browser can switch
+between every enabled profile immediately; changing the initial profile in the
+admin UI is picked up by the client UI on its next configuration refresh.
 
-## License Check
+## Included profiles
 
-Before downloading data, verify that the intended deployment is allowed by the
-current MapTiler terms.
+| Profile | Purpose | Default state |
+| --- | --- | --- |
+| `natural-earth-globe` | Small raster world overview based on Natural Earth | enabled and active |
+| `natural-earth-labels` | The Natural Earth base plus cities, borders, and optional roads | disabled until its overlay is imported |
+| `openmaptiles-street` | A detailed global vector street map | disabled until its larger artifact is imported |
 
-As checked on 2026-05-02, MapTiler's On-prem Free tier is listed as `0 USD` for
-non-commercial or evaluation use with a maximum of 100 monthly active users. The
-free-tier maps listed there are:
+Natural Earth data is public domain. The detailed street profile is deliberately
+not coupled to a particular provider: the administrator must use a compatible,
+properly licensed MBTiles source. OpenStreetMap-derived data normally requires
+attribution and observance of the [Open Database License](https://www.openstreetmap.org/copyright).
 
-- OpenStreetMap Vectors (2020)
-- Satellite Low-Res (2016)
+## Configure a map variant
 
-Relevant MapTiler pages:
+Open **Server Admin → Gallery → Gallery map variants**. The first authenticated
+read materializes the default configuration in cluster storage. From there an
+administrator can:
 
-- <https://www.maptiler.com/data/pricing/>
-- <https://www.maptiler.com/terms/server-data/>
-- <https://www.maptiler.com/copyright/>
+1. choose the shared initial gallery map;
+2. enable or hide profiles without deleting their already imported artifacts;
+3. use the advanced JSON editor to add future profiles or change artifact keys.
 
-Administrators are responsible for checking the current terms before download
-and before production use. In particular, do not use the free datasets for a
-commercial, public, government, military, B2B, or B2C deployment unless the
-current MapTiler license for that deployment explicitly allows it.
+The server rejects an invalid document. A configuration must have an enabled
+active variant, unique lower-case variant IDs, and valid `sys/maps/*.mbtiles.manifest.json`
+artifact keys. A raster profile has one raster artifact, a vector profile one
+vector artifact, and a hybrid profile has both.
 
-## 1. Create a MapTiler Account
+An abbreviated example for a custom small globe profile is:
 
-Create an account at:
-
-```text
-https://data.maptiler.com/
+```json
+{
+  "version": 1,
+  "active_variant_id": "natural-earth-globe",
+  "variants": [
+    {
+      "id": "natural-earth-globe",
+      "label": "Natural Earth Globe",
+      "mode_label": "Globe",
+      "description": "Small global overview map.",
+      "attribution": "Made with Natural Earth. Free vector and raster map data in the public domain.",
+      "kind": "raster",
+      "style": "raster",
+      "enabled": true,
+      "raster_manifest_key": "sys/maps/natural-earth-globe.mbtiles.manifest.json"
+    }
+  ]
+}
 ```
 
-Use the account only according to the license that applies to the target
-cluster. The free path is intended for non-commercial/evaluation usage within
-MapTiler's published limits.
+`style` is `raster`, `openmaptiles`, or `natural_earth`. The style selects the
+source-layer schema used by the shared MapLibre gallery component; it does not
+alter the source data.
 
-## 2. Select the MapTiler Data Downloads
+## Import an MBTiles artifact
 
-After signing in, make sure the interface is for **MapTiler Data**, not
-**MapTiler Cloud**. The browser may pass through MapTiler Cloud authentication,
-but the download workflow should end at `data.maptiler.com`.
+The **Map dataset import** card first asks for a configured *variant artifact*
+(for example `natural-earth-globe — raster`). Paste an HTTP(S) URL to a single
+MBTiles file or a copied `wget -c ...` command, choose a part size, and start
+the job.
 
-Navigate to:
+The importer requires HTTP range requests. It streams the source directly into
+IronMesh chunks, checkpoints after at most 64 MiB of input, and resumes an
+unfinished job after the server node restarts. It publishes the generated
+split-file manifest only after all parts are complete. The source file name is
+not used as a destination: the selected cluster configuration controls the
+logical file and manifest keys. This makes it safe to replace one profile while
+leaving other imported profiles available.
 
-```text
-Downloads -> GET NEW DATASET
-```
+The persisted source URL may contain credentials or signed-download tokens.
+Restrict the server-node state directory to administrators.
 
-Select whole-planet downloads for:
+## Natural Earth labels and roads
 
-- OpenStreetMap Vectors (2020)
-- Satellite Low-Res (2016)
+Natural Earth distributes source vector and raster data, not a universal
+ready-made MBTiles package. Package the chosen Natural Earth layers into a
+worldwide raster MBTiles base and, if desired, a separate vector MBTiles
+overlay. Point the profile's manifest keys at those two artifacts and import
+them through the admin UI.
 
-Expected local filenames for the manifests currently included in this repo are:
+For the `natural_earth` vector style, the overlay uses this compact source-layer
+contract:
 
-```text
-maptiler-osm-2020-02-10-v3.11-planet.mbtiles
-maptiler-satellite-2017-11-02-planet.mbtiles
-```
+- `ne_places` for country, city, town, and village names; use a `class` property
+  and a `name` or `name_en` property;
+- `ne_boundaries` for borders;
+- `ne_roads` for optional road lines.
 
-The combined payload is roughly 260 GiB, or about 275 GB in decimal units. Use
-MapTiler's **Copy CLI command** option instead of downloading through the
-browser. Reserve extra local disk space: while splitting, the original files and
-the split output may coexist.
+The viewer tolerates absent optional source layers. A cities-and-borders overlay
+can therefore be installed first, with roads added later by replacing the same
+configured vector artifact. Natural Earth itself has only limited global road
+coverage; it is not a replacement for a detailed OpenStreetMap street map.
 
-## 3. Split the MBTiles Files
+## Detailed street packages
 
-Split each MBTiles file into 10 GiB parts. Run the commands from the directory
-where the part files should be written:
+For a larger worldwide street map, create or obtain an MBTiles package that
+uses the OpenMapTiles source-layer schema, add its manifest key to a `vector`
+profile with `style: "openmaptiles"`, import it, then enable it. The standard
+OpenMapTiles layer names (`transportation`, `place`, `boundary`, and so on) are
+rendered by the existing street style.
 
-```bash
-split -b 10737418240 \
-  maptiler-satellite-2017-11-02-planet.mbtiles \
-  maptiler-satellite-2017-11-02-planet.mbtiles-part-
+Keep the legally required attribution in the profile's `attribution` field.
+IronMesh intentionally does not download a provider-specific global street
+dataset by default; the map variant document keeps that policy and its artifact
+URLs under administrator control.
 
-split -b 10737418240 \
-  maptiler-osm-2020-02-10-v3.11-planet.mbtiles \
-  maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-
-```
+## Verify
 
-If the OSM file is stored in the checkout-local `map/` directory, use that path
-as the source instead:
+After an import completes:
 
-```bash
-split -b 10737418240 \
-  ~/rust-dev/ironmesh/map/maptiler-osm-2020-02-10-v3.11-planet.mbtiles \
-  maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-
-```
+1. enable the profile in **Gallery map variants** if it is not already enabled;
+2. select it as the initial profile if wanted;
+3. open the gallery map in the server admin UI or client UI;
+4. confirm the base map, marker thumbnails, and (for a hybrid/vector profile)
+   labels render as expected.
 
-The repo manifests assume the default `split` suffixes:
-
-- satellite parts: `aa` through `as`
-- OSM parts: `aa` through `ag`
-
-Do not change the part size, suffix format, or filenames unless you also
-regenerate the corresponding manifest JSON.
-
-## 4. Upload the Parts to the Cluster
-
-Upload every generated part object under:
-
-```text
-sys/maps/
-```
-
-The object key must be the target directory plus the local filename. Examples:
-
-```text
-sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-aa
-sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ab
-sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-aa
-sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ab
-```
-
-Use whichever Ironmesh upload path is appropriate for the deployment. Two
-common options are:
-
-```bash
-ironmesh \
-  --bootstrap-file /path/to/ironmesh-client-bootstrap.json \
-  --client-identity-file /path/to/ironmesh-client-bootstrap.client-identity.json \
-  serve-web
-```
-
-Then use the web Store view's binary upload flow with `sys/maps/` as the target
-prefix.
-
-Or mount the cluster and copy into the mounted namespace.
-
-Keep the upload process running until all parts have finished syncing before
-unmounting or shutting down the client.
-
-## 5. Upload the Manifests
-
-Upload the two manifest files shipped with this repository:
-
-```text
-docs/examples/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json
-docs/examples/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json
-```
-
-They must be stored in the cluster as:
-
-```text
-sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json
-sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json
-```
-
-The manifests are in `docs/examples/` in this repo. If an older note refers to
-`docs/assets/examples/`, use `docs/examples/` instead.
-
-## 6. Verify the Map View
-
-Check that the cluster contains the expected objects.
-The CLI for this is described here, but you can also do it differently.
-
-```bash
-ironmesh \
-  --bootstrap-file /path/to/ironmesh-client-bootstrap.json \
-  --client-identity-file /path/to/ironmesh-client-bootstrap.client-identity.json \
-  list --prefix sys/maps --depth 1
-```
-
-The listing should include:
-
-- 19 satellite part objects and the satellite manifest
-- 7 OSM part objects and the OSM manifest
-
-Finally, make sure the cluster contains at least a few gallery-visible images
-with EXIF GPS metadata. Photos copied through tools that strip metadata will not
-appear on the map.
-
-Open the gallery, switch to the map view, and verify that:
-
-- the basemap loads,
-- GPS-tagged image thumbnails appear at their recorded locations,
-- the grid view still works as the fallback.
+The admin card shows the exact logical file and manifest keys for an active or
+completed import. They can also be inspected through the normal cluster store
+view under `sys/maps/`.

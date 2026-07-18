@@ -69,6 +69,7 @@ export type GalleryRasterBasemapConfig = GalleryBasemapBaseConfig & {
 
 export type GalleryVectorBasemapConfig = GalleryBasemapBaseConfig & {
   kind: "vector";
+  vectorStyle?: "openmaptiles" | "natural_earth";
   metadataUrl: string;
   vectorTileUrlTemplate: string;
   glyphsUrlTemplate: string;
@@ -76,6 +77,7 @@ export type GalleryVectorBasemapConfig = GalleryBasemapBaseConfig & {
 
 export type GalleryHybridBasemapConfig = GalleryBasemapBaseConfig & {
   kind: "hybrid";
+  vectorStyle?: "openmaptiles" | "natural_earth";
   rasterMetadataUrl: string;
   rasterTileUrlTemplate: string;
   vectorMetadataUrl: string;
@@ -1029,6 +1031,15 @@ function buildVectorStyle(
 ): StyleSpecification {
   const absoluteTileUrlTemplate = absolutizeStyleUrl(basemap.vectorTileUrlTemplate);
   const absoluteGlyphsUrlTemplate = absolutizeStyleUrl(basemap.glyphsUrlTemplate);
+  if (basemap.vectorStyle === "natural_earth") {
+    return buildNaturalEarthVectorStyle(
+      absoluteTileUrlTemplate,
+      absoluteGlyphsUrlTemplate,
+      metadata,
+      basemap.attribution,
+      projection
+    );
+  }
   return {
     version: 8,
     projection: { type: projection },
@@ -1285,6 +1296,18 @@ function buildHybridStyle(
   const absoluteVectorTileUrlTemplate = absolutizeStyleUrl(basemap.vectorTileUrlTemplate);
   const absoluteGlyphsUrlTemplate = absolutizeStyleUrl(basemap.glyphsUrlTemplate);
 
+  if (basemap.vectorStyle === "natural_earth") {
+    return buildNaturalEarthHybridStyle(
+      absoluteRasterTileUrlTemplate,
+      absoluteVectorTileUrlTemplate,
+      absoluteGlyphsUrlTemplate,
+      rasterMetadata,
+      vectorMetadata,
+      basemap.attribution,
+      projection
+    );
+  }
+
   return {
     version: 8,
     projection: { type: projection },
@@ -1444,6 +1467,170 @@ function buildHybridStyle(
       }
     ]
   } as StyleSpecification;
+}
+
+/**
+ * Natural Earth does not use OpenMapTiles source-layer names. These are the
+ * intentionally small overlay layers produced for IronMesh Natural Earth
+ * packages: `ne_boundaries`, `ne_roads`, and `ne_places`. Missing optional
+ * layers are harmless in MapLibre, so an administrator can import a cities-
+ * only overlay before adding roads later.
+ */
+function buildNaturalEarthVectorStyle(
+  tileUrlTemplate: string,
+  glyphsUrlTemplate: string,
+  metadata: MbtilesMetadata,
+  attribution: string | undefined,
+  projection: GalleryMapProjection
+): StyleSpecification {
+  return {
+    version: 8,
+    projection: { type: projection },
+    glyphs: glyphsUrlTemplate,
+    sources: {
+      basemap: {
+        type: "vector",
+        tiles: [tileUrlTemplate],
+        attribution: attribution ?? metadata.attribution ?? "",
+        minzoom: metadata.minzoom ?? 0,
+        maxzoom: metadata.maxzoom ?? 10
+      }
+    },
+    layers: [
+      {
+        id: "natural-earth-background",
+        type: "background",
+        paint: { "background-color": "#b9d9e8" }
+      },
+      {
+        id: "natural-earth-land",
+        type: "fill",
+        source: "basemap",
+        "source-layer": "ne_land",
+        paint: { "fill-color": "#e8e4d8" }
+      },
+      {
+        id: "natural-earth-ocean",
+        type: "fill",
+        source: "basemap",
+        "source-layer": "ne_ocean",
+        paint: { "fill-color": "#8fc3dc" }
+      },
+      {
+        id: "natural-earth-lakes",
+        type: "fill",
+        source: "basemap",
+        "source-layer": "ne_lakes",
+        paint: { "fill-color": "#8fc3dc" }
+      },
+      ...naturalEarthOverlayLayers("basemap", false)
+    ]
+  } as StyleSpecification;
+}
+
+function buildNaturalEarthHybridStyle(
+  rasterTileUrlTemplate: string,
+  vectorTileUrlTemplate: string,
+  glyphsUrlTemplate: string,
+  rasterMetadata: MbtilesMetadata,
+  vectorMetadata: MbtilesMetadata,
+  attribution: string | undefined,
+  projection: GalleryMapProjection
+): StyleSpecification {
+  return {
+    version: 8,
+    projection: { type: projection },
+    glyphs: glyphsUrlTemplate,
+    sources: {
+      "natural-earth-base": {
+        type: "raster",
+        tiles: [rasterTileUrlTemplate],
+        tileSize: 256,
+        attribution: attribution ?? rasterMetadata.attribution ?? vectorMetadata.attribution ?? "",
+        minzoom: rasterMetadata.minzoom ?? 0,
+        maxzoom: rasterMetadata.maxzoom ?? 10
+      },
+      "natural-earth-overlay": {
+        type: "vector",
+        tiles: [vectorTileUrlTemplate],
+        attribution: "",
+        minzoom: vectorMetadata.minzoom ?? 0,
+        maxzoom: vectorMetadata.maxzoom ?? 10
+      }
+    },
+    layers: [
+      {
+        id: "natural-earth-raster-base",
+        type: "raster",
+        source: "natural-earth-base"
+      },
+      ...naturalEarthOverlayLayers("natural-earth-overlay", true)
+    ]
+  } as StyleSpecification;
+}
+
+function naturalEarthOverlayLayers(
+  source: string,
+  highContrast: boolean
+): StyleSpecification["layers"] {
+  const textColor = highContrast ? "#fff9e8" : "#403a32";
+  const haloColor = highContrast ? "rgba(23, 35, 43, 0.9)" : "rgba(255, 255, 255, 0.94)";
+  return [
+    {
+      id: `${source}-boundaries`,
+      type: "line",
+      source,
+      "source-layer": "ne_boundaries",
+      paint: {
+        "line-color": highContrast ? "#fff0b0" : "#82786a",
+        "line-dasharray": [2, 2],
+        "line-width": ["interpolate", ["linear"], ["zoom"], 1, 0.35, 5, 0.65, 9, 1.1]
+      }
+    },
+    {
+      id: `${source}-roads`,
+      type: "line",
+      source,
+      "source-layer": "ne_roads",
+      minzoom: 4,
+      paint: {
+        "line-color": highContrast ? "rgba(255, 255, 255, 0.9)" : "#f7f4ed",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 4, 0.35, 7, 0.8, 10, 1.5]
+      }
+    },
+    {
+      id: `${source}-country-labels`,
+      type: "symbol",
+      source,
+      "source-layer": "ne_places",
+      filter: ["==", ["get", "class"], "country"],
+      layout: {
+        "text-field": naturalEarthNameExpression(),
+        "text-font": ["Noto Sans Regular"],
+        "text-letter-spacing": 0.08,
+        "text-size": ["interpolate", ["linear"], ["zoom"], 1, 10, 4, 14, 7, 16]
+      },
+      paint: { "text-color": textColor, "text-halo-color": haloColor, "text-halo-width": 1.25 }
+    },
+    {
+      id: `${source}-city-labels`,
+      type: "symbol",
+      source,
+      "source-layer": "ne_places",
+      minzoom: 3,
+      filter: ["match", ["get", "class"], ["city", "town", "village"], true, false],
+      layout: {
+        "text-field": naturalEarthNameExpression(),
+        "text-font": ["Noto Sans Regular"],
+        "text-size": ["interpolate", ["linear"], ["zoom"], 3, 9, 6, 11, 9, 13]
+      },
+      paint: { "text-color": textColor, "text-halo-color": haloColor, "text-halo-width": 1.1 }
+    }
+  ] as StyleSpecification["layers"];
+}
+
+function naturalEarthNameExpression(): unknown[] {
+  return ["coalesce", ["get", "name_en"], ["get", "name"], ["get", "NAME"]];
 }
 
 function nameExpression(): unknown[] {

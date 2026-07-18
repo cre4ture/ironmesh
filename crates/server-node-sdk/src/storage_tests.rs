@@ -4664,6 +4664,55 @@ run_on_all_metadata_backends!(
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png_turso
 );
 
+async fn ensure_mobile_viewer_thumbnail_profile_can_be_generated_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-mobile-viewer-jpeg").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/portrait.jpg",
+            Bytes::from(sample_oriented_jpeg_bytes(6)),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let worker = store.media_cache_worker();
+    let payload = worker
+        .ensure_image_thumbnail_profile_payload(
+            &put.manifest_hash,
+            crate::storage::mobile_viewer_thumbnail_profile(),
+        )
+        .await
+        .unwrap()
+        .expect("expected mobile viewer thumbnail payload");
+
+    let thumb_path = store.media_thumbnail_path(
+        &metadata.content_fingerprint,
+        crate::storage::mobile_viewer_thumbnail_profile().name,
+    );
+    assert!(fs::try_exists(&thumb_path).await.unwrap());
+    assert_eq!(fs::read(&thumb_path).await.unwrap(), payload);
+
+    let rendered = image::load_from_memory(&payload).unwrap().to_rgb8();
+    assert_eq!(rendered.dimensions(), (1152, 1536));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_mobile_viewer_thumbnail_profile_can_be_generated_impl,
+    ensure_mobile_viewer_thumbnail_profile_can_be_generated,
+    ensure_mobile_viewer_thumbnail_profile_can_be_generated_turso
+);
+
 async fn ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("media-cache-oriented-jpeg").await;
 

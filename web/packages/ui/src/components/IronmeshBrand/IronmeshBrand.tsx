@@ -1,4 +1,4 @@
-import { Box, Group, Stack, Text, useMantineTheme } from "@mantine/core";
+import { Box, Group, Stack, Text } from "@mantine/core";
 import { ironmeshPrimaryColor } from "../../theme/ironmesh-theme";
 
 type IronmeshMarkProps = {
@@ -11,72 +11,45 @@ type IronmeshBrandProps = {
 };
 
 export function IronmeshMark({ size = 42 }: IronmeshMarkProps) {
-  const theme = useMantineTheme();
-  const brandColors = theme.colors[ironmeshPrimaryColor];
-
   return (
     <Box
       component="svg"
       width={size}
       height={size}
-      viewBox="0 0 256 256"
+      viewBox="0 0 200 200"
       role="img"
-      aria-label="ironmesh mark"
+      aria-label="berrykeep mark"
       style={{ flex: "0 0 auto", display: "block" }}
     >
       <defs>
-        <linearGradient id="ironmesh-panel" x1="36" y1="28" x2="214" y2="228" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor={brandColors[9]} />
-          <stop offset="0.52" stopColor={brandColors[8]} />
-          <stop offset="1" stopColor={brandColors[7]} />
+        <linearGradient id="ironmesh-panel" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#7c3aed" />
+          <stop offset="1" stopColor="#c026d3" />
         </linearGradient>
-        <linearGradient id="ironmesh-mesh" x1="72" y1="68" x2="184" y2="188" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor={brandColors[1]} />
-          <stop offset="0.45" stopColor={brandColors[3]} />
-          <stop offset="1" stopColor={brandColors[6]} />
+        <linearGradient id="ironmesh-leaf" x1="100" y1="6.24" x2="152.8" y2="37.92" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#86efac" />
+          <stop offset="1" stopColor="#22c55e" />
         </linearGradient>
       </defs>
 
-      <rect x="28" y="28" width="200" height="200" rx="54" fill="url(#ironmesh-panel)" />
-      <rect
-        x="28.75"
-        y="28.75"
-        width="198.5"
-        height="198.5"
-        rx="53.25"
-        fill="none"
-        stroke={brandColors[0]}
-        strokeOpacity="0.18"
-      />
+      <rect width="200" height="200" rx="44" fill="url(#ironmesh-panel)" />
+      <path d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z" fill="url(#ironmesh-leaf)" />
+      <line x1="100" y1="35.28" x2="100" y2="53.76" stroke="#22c55e" strokeWidth="6.6" strokeLinecap="round" />
 
-      <g fill="none" stroke="url(#ironmesh-mesh)" strokeWidth="10" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M128 68 L176 96 L176 160 L128 188 L80 160 L80 96 Z" />
-        <path d="M128 68 L128 188" />
-        <path d="M80 96 L176 160" />
-        <path d="M176 96 L80 160" />
-        <path d="M80 96 L176 96" />
-        <path d="M80 160 L176 160" />
+      <g stroke="#ffffff" strokeWidth="6.6" opacity={0.85} strokeLinecap="round">
+        <line x1="100" y1="69.6" x2="57.76" y2="109.2" />
+        <line x1="100" y1="69.6" x2="142.24" y2="109.2" />
+        <line x1="57.76" y1="109.2" x2="142.24" y2="109.2" />
+        <line x1="57.76" y1="109.2" x2="100" y2="162" />
+        <line x1="142.24" y1="109.2" x2="100" y2="162" />
       </g>
 
-      <g fill={brandColors[0]}>
-        <circle cx="128" cy="68" r="10" />
-        <circle cx="176" cy="96" r="10" />
-        <circle cx="176" cy="160" r="10" />
-        <circle cx="128" cy="188" r="10" />
-        <circle cx="80" cy="160" r="10" />
-        <circle cx="80" cy="96" r="10" />
-        <circle cx="128" cy="128" r="12" fill={brandColors[6]} />
-      </g>
-
-      <g fill={brandColors[9]}>
-        <circle cx="128" cy="68" r="4" />
-        <circle cx="176" cy="96" r="4" />
-        <circle cx="176" cy="160" r="4" />
-        <circle cx="128" cy="188" r="4" />
-        <circle cx="80" cy="160" r="4" />
-        <circle cx="80" cy="96" r="4" />
-        <circle cx="128" cy="128" r="4" fill={brandColors[0]} />
-      </g>
+      <circle cx="100" cy="69.6" r="18.48" fill="#ffffff" />
+      <circle cx="57.76" cy="109.2" r="18.48" fill="#ffffff" />
+      <circle cx="142.24" cy="109.2" r="18.48" fill="#ffffff" />
+      <circle cx="100" cy="162" r="18.48" fill="#ffffff" />
+      <circle cx="93.4" cy="63" r="5.016" fill="#e9d5ff" opacity={0.75} />
+      <circle cx="51.16" cy="102.6" r="5.016" fill="#e9d5ff" opacity={0.75} />
     </Box>
   );
 }
@@ -87,7 +60,7 @@ export function IronmeshBrand({ surfaceLabel, markSize = 42 }: IronmeshBrandProp
       <IronmeshMark size={markSize} />
       <Stack gap={0}>
         <Text fw={800} tt="uppercase" size="sm" c={ironmeshPrimaryColor}>
-          ironmesh
+          berrykeep
         </Text>
         <Text fw={700}>{surfaceLabel}</Text>
       </Stack>

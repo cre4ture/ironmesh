@@ -592,10 +592,7 @@ impl ClientEndpointRouter {
                 let state = lock_endpoint_state(&endpoint.state);
                 ClientConnectionRouteEndpointSnapshot {
                     index,
-                    path_kind: match endpoint.descriptor.path_kind {
-                        ClientEndpointPathKind::Direct => TransportPathKind::DirectHttps,
-                        ClientEndpointPathKind::Relay => TransportPathKind::RelayTunnel,
-                    },
+                    path_kind: endpoint.transport.transport_path_kind(),
                     locator: endpoint.descriptor.locator.clone(),
                     bootstrap_rank: endpoint.descriptor.bootstrap_rank,
                     target_node_id: endpoint.transport.target_node_id(),

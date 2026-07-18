@@ -1,44 +1,30 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
-  <title id="title">ironmesh favicon</title>
-  <desc id="desc">A geometric mesh icon with connected nodes in a steel and teal palette.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-labelledby="title desc">
+  <title id="title">BerryKeep icon</title>
+  <desc id="desc">A connected grape cluster with a green leaf on a violet-to-magenta panel.</desc>
   <defs>
-    <linearGradient id="panel" x1="36" y1="28" x2="214" y2="228" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#112523"/>
-      <stop offset="0.52" stop-color="#163f3a"/>
-      <stop offset="1" stop-color="#0d6b5c"/>
+    <linearGradient id="panel" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#c026d3"/>
     </linearGradient>
-    <linearGradient id="mesh" x1="72" y1="68" x2="184" y2="188" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#d9fff4"/>
-      <stop offset="0.45" stop-color="#74e4c8"/>
-      <stop offset="1" stop-color="#14b8a6"/>
+    <linearGradient id="leaf" x1="100" y1="6.24" x2="152.8" y2="37.92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#86efac"/>
+      <stop offset="1" stop-color="#22c55e"/>
     </linearGradient>
   </defs>
-  <rect x="28" y="28" width="200" height="200" rx="54" fill="url(#panel)"/>
-  <rect x="28.75" y="28.75" width="198.5" height="198.5" rx="53.25" fill="none" stroke="#d9fff4" stroke-opacity="0.18"/>
-  <g fill="none" stroke="url(#mesh)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M128 68 L176 96 L176 160 L128 188 L80 160 L80 96 Z"/>
-    <path d="M128 68 L128 188"/>
-    <path d="M80 96 L176 160"/>
-    <path d="M176 96 L80 160"/>
-    <path d="M80 96 L176 96"/>
-    <path d="M80 160 L176 160"/>
+  <rect width="200" height="200" rx="44" fill="url(#panel)"/>
+  <path d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z" fill="url(#leaf)"/>
+  <line x1="100" y1="35.28" x2="100" y2="53.76" stroke="#22c55e" stroke-width="6.6" stroke-linecap="round"/>
+  <g stroke="#ffffff" stroke-width="6.6" opacity="0.85" stroke-linecap="round">
+    <line x1="100" y1="69.6" x2="57.76" y2="109.2"/>
+    <line x1="100" y1="69.6" x2="142.24" y2="109.2"/>
+    <line x1="57.76" y1="109.2" x2="142.24" y2="109.2"/>
+    <line x1="57.76" y1="109.2" x2="100" y2="162"/>
+    <line x1="142.24" y1="109.2" x2="100" y2="162"/>
   </g>
-  <g fill="#effff9">
-    <circle cx="128" cy="68" r="10"/>
-    <circle cx="176" cy="96" r="10"/>
-    <circle cx="176" cy="160" r="10"/>
-    <circle cx="128" cy="188" r="10"/>
-    <circle cx="80" cy="160" r="10"/>
-    <circle cx="80" cy="96" r="10"/>
-    <circle cx="128" cy="128" r="12" fill="#14b8a6"/>
-  </g>
-  <g fill="#0d3d37">
-    <circle cx="128" cy="68" r="4"/>
-    <circle cx="176" cy="96" r="4"/>
-    <circle cx="176" cy="160" r="4"/>
-    <circle cx="128" cy="188" r="4"/>
-    <circle cx="80" cy="160" r="4"/>
-    <circle cx="80" cy="96" r="4"/>
-    <circle cx="128" cy="128" r="4" fill="#e9fff8"/>
-  </g>
+  <circle cx="100" cy="69.6" r="18.48" fill="#ffffff"/>
+  <circle cx="57.76" cy="109.2" r="18.48" fill="#ffffff"/>
+  <circle cx="142.24" cy="109.2" r="18.48" fill="#ffffff"/>
+  <circle cx="100" cy="162" r="18.48" fill="#ffffff"/>
+  <circle cx="93.4" cy="63" r="5.016" fill="#e9d5ff" opacity="0.75"/>
+  <circle cx="51.16" cy="102.6" r="5.016" fill="#e9d5ff" opacity="0.75"/>
 </svg>

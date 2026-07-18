@@ -95,7 +95,7 @@ pub fn starting_mount_sync_facet(mountpoint: &Path) -> StatusFacet {
     StatusFacet::new(
         "starting",
         "Preparing FUSE mount",
-        format!("Preparing IronMesh mount at {}", mountpoint.display()),
+        format!("Preparing BerryKeep mount at {}", mountpoint.display()),
         "view-refresh-symbolic",
     )
 }
@@ -104,7 +104,7 @@ pub fn mounted_sync_facet(mountpoint: &Path) -> StatusFacet {
     StatusFacet::new(
         "running",
         "Watching mounted namespace",
-        format!("IronMesh FUSE mount active at {}", mountpoint.display()),
+        format!("BerryKeep FUSE mount active at {}", mountpoint.display()),
         "folder-saved-search-symbolic",
     )
 }
@@ -113,7 +113,7 @@ pub fn stopped_mount_sync_facet(mountpoint: &Path) -> StatusFacet {
     StatusFacet::new(
         "stopped",
         "FUSE mount stopped",
-        format!("IronMesh mount stopped at {}", mountpoint.display()),
+        format!("BerryKeep mount stopped at {}", mountpoint.display()),
         "media-playback-stop-symbolic",
     )
 }

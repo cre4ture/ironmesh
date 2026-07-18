@@ -28,25 +28,20 @@ function New-RoundedRectanglePath {
     return $path
 }
 
-function New-ColorBlendBrush {
+function New-LinearBrush {
     param(
         [System.Drawing.PointF]$Start,
         [System.Drawing.PointF]$End,
-        [string[]]$ColorHex,
-        [float[]]$Positions
+        [string]$StartColor,
+        [string]$EndColor
     )
 
-    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+    return New-Object System.Drawing.Drawing2D.LinearGradientBrush(
         $Start,
         $End,
-        [System.Drawing.Color]::Black,
-        [System.Drawing.Color]::White
+        [System.Drawing.ColorTranslator]::FromHtml($StartColor),
+        [System.Drawing.ColorTranslator]::FromHtml($EndColor)
     )
-    $blend = New-Object System.Drawing.Drawing2D.ColorBlend
-    $blend.Colors = $ColorHex | ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
-    $blend.Positions = $Positions
-    $brush.InterpolationColors = $blend
-    return $brush
 }
 
 function Fill-Circle {
@@ -61,7 +56,7 @@ function Fill-Circle {
     $Graphics.FillEllipse($Brush, $Cx - $Radius, $Cy - $Radius, $Radius * 2.0, $Radius * 2.0)
 }
 
-function New-IronmeshBitmap {
+function New-BerryKeepBitmap {
     param([int]$Size)
 
     $bitmap = New-Object System.Drawing.Bitmap $Size, $Size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -71,74 +66,76 @@ function New-IronmeshBitmap {
     $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $graphics.Clear([System.Drawing.Color]::Transparent)
 
-    $scale = $Size / 256.0
-    $rectX = 28.0 * $scale
-    $rectY = 28.0 * $scale
-    $rectSize = 200.0 * $scale
-    $radius = 54.0 * $scale
+    # Source geometry is authored in a 200x200 space (see docs/assets/ironmesh-favicon.svg).
+    $scale = $Size / 200.0
 
-    $panelPath = New-RoundedRectanglePath -X $rectX -Y $rectY -Width $rectSize -Height $rectSize -Radius $radius
-    $panelBrush = New-ColorBlendBrush `
-        -Start ([System.Drawing.PointF]::new(36.0 * $scale, 28.0 * $scale)) `
-        -End ([System.Drawing.PointF]::new(214.0 * $scale, 228.0 * $scale)) `
-        -ColorHex @("#112523", "#163f3a", "#0d6b5c") `
-        -Positions @([float]0.0, [float]0.52, [float]1.0)
+    $panelPath = New-RoundedRectanglePath -X 0 -Y 0 -Width (200.0 * $scale) -Height (200.0 * $scale) -Radius (44.0 * $scale)
+    $panelBrush = New-LinearBrush `
+        -Start ([System.Drawing.PointF]::new(0, 0)) `
+        -End ([System.Drawing.PointF]::new(200.0 * $scale, 200.0 * $scale)) `
+        -StartColor "#7c3aed" -EndColor "#c026d3"
     $graphics.FillPath($panelBrush, $panelPath)
 
-    $borderPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(46, 217, 255, 244)), (1.5 * $scale)
-    $graphics.DrawPath($borderPen, $panelPath)
+    # Leaf: two quadratic Beziers (converted to cubic) closed back to the start point.
+    $leafP0 = [System.Drawing.PointF]::new(100.0 * $scale, 22.08 * $scale)
+    $leafC1a = [System.Drawing.PointF]::new(117.6 * $scale, 11.52 * $scale)
+    $leafC1b = [System.Drawing.PointF]::new(135.2 * $scale, 9.76 * $scale)
+    $leafP1 = [System.Drawing.PointF]::new(152.8 * $scale, 16.8 * $scale)
+    $leafC2a = [System.Drawing.PointF]::new(144.88 * $scale, 30.88 * $scale)
+    $leafC2b = [System.Drawing.PointF]::new(131.68 * $scale, 37.92 * $scale)
+    $leafP2 = [System.Drawing.PointF]::new(113.2 * $scale, 37.92 * $scale)
 
-    $meshBrush = New-ColorBlendBrush `
-        -Start ([System.Drawing.PointF]::new(72.0 * $scale, 68.0 * $scale)) `
-        -End ([System.Drawing.PointF]::new(184.0 * $scale, 188.0 * $scale)) `
-        -ColorHex @("#d9fff4", "#74e4c8", "#14b8a6") `
-        -Positions @([float]0.0, [float]0.45, [float]1.0)
-    $meshPen = New-Object System.Drawing.Pen($meshBrush, [Math]::Max(2.0, 10.0 * $scale))
-    $meshPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $meshPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $meshPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+    $leafPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $leafPath.AddBezier($leafP0, $leafC1a, $leafC1b, $leafP1)
+    $leafPath.AddBezier($leafP1, $leafC2a, $leafC2b, $leafP2)
+    $leafPath.CloseFigure()
 
-    $nodes = @(
-        [System.Drawing.PointF]::new(128.0 * $scale, 68.0 * $scale),
-        [System.Drawing.PointF]::new(176.0 * $scale, 96.0 * $scale),
-        [System.Drawing.PointF]::new(176.0 * $scale, 160.0 * $scale),
-        [System.Drawing.PointF]::new(128.0 * $scale, 188.0 * $scale),
-        [System.Drawing.PointF]::new(80.0 * $scale, 160.0 * $scale),
-        [System.Drawing.PointF]::new(80.0 * $scale, 96.0 * $scale)
-    )
+    $leafBrush = New-LinearBrush `
+        -Start ([System.Drawing.PointF]::new(100.0 * $scale, 6.24 * $scale)) `
+        -End ([System.Drawing.PointF]::new(152.8 * $scale, 37.92 * $scale)) `
+        -StartColor "#86efac" -EndColor "#22c55e"
+    $graphics.FillPath($leafBrush, $leafPath)
 
-    $graphics.DrawPolygon($meshPen, $nodes)
-    $graphics.DrawLine($meshPen, $nodes[0], $nodes[3])
-    $graphics.DrawLine($meshPen, $nodes[5], $nodes[2])
-    $graphics.DrawLine($meshPen, $nodes[1], $nodes[4])
-    $graphics.DrawLine($meshPen, $nodes[5], $nodes[1])
-    $graphics.DrawLine($meshPen, $nodes[4], $nodes[2])
+    $stemPen = New-Object System.Drawing.Pen(([System.Drawing.ColorTranslator]::FromHtml("#22c55e")), [Math]::Max(1.0, 6.6 * $scale))
+    $stemPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $stemPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $graphics.DrawLine($stemPen, (100.0 * $scale), (35.28 * $scale), (100.0 * $scale), (53.76 * $scale))
 
-    $outerNodeBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml("#effff9"))
-    $innerNodeBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml("#0d3d37"))
-    $centerNodeBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml("#14b8a6"))
-    $centerCoreBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml("#e9fff8"))
+    $branchPen = New-Object System.Drawing.Pen(([System.Drawing.Color]::FromArgb(217, 255, 255, 255)), [Math]::Max(1.0, 6.6 * $scale))
+    $branchPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $branchPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
 
-    $outerRadius = [Math]::Max(2.0, 10.0 * $scale)
-    $innerRadius = [Math]::Max(1.0, 4.0 * $scale)
-    foreach ($node in $nodes) {
-        Fill-Circle -Graphics $graphics -Brush $outerNodeBrush -Cx $node.X -Cy $node.Y -Radius $outerRadius
-        Fill-Circle -Graphics $graphics -Brush $innerNodeBrush -Cx $node.X -Cy $node.Y -Radius $innerRadius
-    }
+    $top = [System.Drawing.PointF]::new(100.0 * $scale, 69.6 * $scale)
+    $left = [System.Drawing.PointF]::new(57.76 * $scale, 109.2 * $scale)
+    $right = [System.Drawing.PointF]::new(142.24 * $scale, 109.2 * $scale)
+    $bottom = [System.Drawing.PointF]::new(100.0 * $scale, 162.0 * $scale)
 
-    $center = [System.Drawing.PointF]::new(128.0 * $scale, 128.0 * $scale)
-    Fill-Circle -Graphics $graphics -Brush $centerNodeBrush -Cx $center.X -Cy $center.Y -Radius ([Math]::Max(2.5, 12.0 * $scale))
-    Fill-Circle -Graphics $graphics -Brush $centerCoreBrush -Cx $center.X -Cy $center.Y -Radius ([Math]::Max(1.0, 4.0 * $scale))
+    $graphics.DrawLine($branchPen, $top, $left)
+    $graphics.DrawLine($branchPen, $top, $right)
+    $graphics.DrawLine($branchPen, $left, $right)
+    $graphics.DrawLine($branchPen, $left, $bottom)
+    $graphics.DrawLine($branchPen, $right, $bottom)
 
-    $meshPen.Dispose()
-    $meshBrush.Dispose()
-    $borderPen.Dispose()
+    $berryBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+    $berryRadius = [Math]::Max(1.0, 18.48 * $scale)
+    Fill-Circle -Graphics $graphics -Brush $berryBrush -Cx $top.X -Cy $top.Y -Radius $berryRadius
+    Fill-Circle -Graphics $graphics -Brush $berryBrush -Cx $left.X -Cy $left.Y -Radius $berryRadius
+    Fill-Circle -Graphics $graphics -Brush $berryBrush -Cx $right.X -Cy $right.Y -Radius $berryRadius
+    Fill-Circle -Graphics $graphics -Brush $berryBrush -Cx $bottom.X -Cy $bottom.Y -Radius $berryRadius
+
+    $highlightBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(191, 233, 213, 255))
+    $highlightRadius = [Math]::Max(0.5, 5.016 * $scale)
+    Fill-Circle -Graphics $graphics -Brush $highlightBrush -Cx (93.4 * $scale) -Cy (63.0 * $scale) -Radius $highlightRadius
+    Fill-Circle -Graphics $graphics -Brush $highlightBrush -Cx (51.16 * $scale) -Cy (102.6 * $scale) -Radius $highlightRadius
+
+    $stemPen.Dispose()
+    $branchPen.Dispose()
+    $berryBrush.Dispose()
+    $highlightBrush.Dispose()
+    $leafBrush.Dispose()
+    $leafPath.Dispose()
     $panelBrush.Dispose()
     $panelPath.Dispose()
-    $outerNodeBrush.Dispose()
-    $innerNodeBrush.Dispose()
-    $centerNodeBrush.Dispose()
-    $centerCoreBrush.Dispose()
     $graphics.Dispose()
 
     return $bitmap
@@ -206,7 +203,7 @@ $sizes = @(16, 24, 32, 48, 64, 128, 256)
 $images = @()
 
 foreach ($size in $sizes) {
-    $bitmap = New-IronmeshBitmap -Size $size
+    $bitmap = New-BerryKeepBitmap -Size $size
     try {
         $images += ,(Get-PngBytes -Bitmap $bitmap)
     }

@@ -1,8 +1,8 @@
 <resources>
-    <string name="app_name">Ironmesh Server Node</string>
-    <string name="notification_channel_name">Ironmesh server node</string>
-    <string name="notification_channel_description">Keeps the local Ironmesh server node running on Android.</string>
-    <string name="notification_title">Ironmesh Server Node</string>
+    <string name="app_name">BerryKeep Server Node</string>
+    <string name="notification_channel_name">BerryKeep server node</string>
+    <string name="notification_channel_description">Keeps the local BerryKeep server node running on Android.</string>
+    <string name="notification_title">BerryKeep Server Node</string>
     <string name="notification_starting">Starting local server node</string>
     <string name="notification_bootstrap_ready">Bootstrap setup UI is ready</string>
     <string name="notification_running">Server node listener is active</string>

@@ -12771,6 +12771,7 @@ async fn get_media_thumbnail_admin_requires_auth_and_serves_image_impl(backend: 
         snapshot: None,
         version: None,
         read_mode: None,
+        profile: None,
     };
 
     let unauthorized = axum::response::IntoResponse::into_response(
@@ -12815,6 +12816,143 @@ run_on_main_metadata_backends!(
     get_media_thumbnail_admin_requires_auth_and_serves_image_turso
 );
 
+async fn get_media_thumbnail_mobile_viewer_profile_serves_image_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let (manifest_hash, content_fingerprint) = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let put = locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let metadata = locked
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        (put.manifest_hash, metadata.content_fingerprint)
+    };
+
+    let response = super::get_media_thumbnail_response(
+        &state,
+        super::MediaThumbnailQuery {
+            key: "gallery/cat.png".to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: Some("mobile_viewer".to_string()),
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/jpeg")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!body.is_empty());
+
+    let thumbnail_path = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked.media_thumbnail_path(&content_fingerprint, "mobile_viewer")
+    };
+    assert!(fs::try_exists(&thumbnail_path).await.unwrap());
+
+    let lookup = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert!(lookup.metadata.is_some());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    get_media_thumbnail_mobile_viewer_profile_serves_image_impl,
+    get_media_thumbnail_mobile_viewer_profile_serves_image,
+    get_media_thumbnail_mobile_viewer_profile_serves_image_turso
+);
+
+async fn get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let (manifest_hash, content_fingerprint) = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked.set_media_cache_image_limits_for_test(3, 1_000, 1024 * 1024);
+        let put = locked
+            .put_object_versioned(
+                "gallery/oversized-thumb.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let metadata = locked
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.status, super::storage::MediaCacheStatus::Ready);
+        assert!(metadata.thumbnail.is_none());
+        (put.manifest_hash, metadata.content_fingerprint)
+    };
+
+    let response = super::get_media_thumbnail_response(
+        &state,
+        super::MediaThumbnailQuery {
+            key: "gallery/oversized-thumb.png".to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: Some("mobile_viewer".to_string()),
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(body.is_empty());
+
+    let thumbnail_path = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked.media_thumbnail_path(&content_fingerprint, "mobile_viewer")
+    };
+    assert!(!fs::try_exists(&thumbnail_path).await.unwrap());
+
+    let lookup = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let metadata = lookup.metadata.expect("expected cached metadata");
+    assert_eq!(metadata.status, super::storage::MediaCacheStatus::Ready);
+    assert!(metadata.thumbnail.is_none());
+    assert!(metadata.error.is_none());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image_impl,
+    get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image,
+    get_media_thumbnail_mobile_viewer_profile_returns_not_found_for_oversized_image_turso
+);
+
 #[cfg(unix)]
 async fn retry_media_cache_rebuilds_video_poster_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
@@ -12823,6 +12961,7 @@ async fn retry_media_cache_rebuilds_video_poster_impl(backend: MainTestBackend) 
         snapshot: None,
         version: None,
         read_mode: None,
+        profile: None,
     };
 
     let manifest_hash = {
@@ -12973,6 +13112,7 @@ async fn media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl
             snapshot: None,
             version: None,
             read_mode: None,
+            profile: None,
         },
     )
     .await;
@@ -13012,6 +13152,7 @@ async fn media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl
             snapshot: None,
             version: None,
             read_mode: None,
+            profile: None,
         },
     )
     .await;
@@ -13073,6 +13214,7 @@ async fn media_thumbnail_request_marks_cache_incomplete_when_no_peer_artifact_av
             snapshot: None,
             version: None,
             read_mode: None,
+            profile: None,
         },
     )
     .await;
@@ -13102,6 +13244,7 @@ async fn media_thumbnail_request_marks_cache_incomplete_when_no_peer_artifact_av
             snapshot: None,
             version: None,
             read_mode: None,
+            profile: None,
         },
     )
     .await;
@@ -13493,6 +13636,11 @@ async fn build_test_state(
             }),
             upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
+            map_dataset_import: Arc::new(Mutex::new(
+                super::map_dataset_import::MapDatasetImportRuntime::empty(
+                    root.join("state").join("map_dataset_import.json"),
+                ),
+            )),
             storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
             storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
             metadata_db_distribution_runtime: Arc::new(std::sync::Mutex::new(

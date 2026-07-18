@@ -100,6 +100,50 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(jsonPointer)
     }
 
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?
+    ) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(prefix) { prefixPointer in
+            withOptionalCString(snapshot) { snapshotPointer in
+                withOptionalCString(view) { viewPointer in
+                    withOptionalCString(sort) { sortPointer in
+                        withOptionalCString(mediaFilter) { mediaFilterPointer in
+                            ironmesh_ios_facade_store_index_with_options_json(
+                                handle,
+                                prefixPointer,
+                                numericCast(max(depth, 1)),
+                                snapshotPointer,
+                                viewPointer,
+                                offset ?? -1,
+                                limit ?? -1,
+                                sortPointer,
+                                mediaFilterPointer,
+                                &jsonPointer,
+                                &errorPointer
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no store index JSON.")
+        }
+        return consumeString(jsonPointer)
+    }
+
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String {
         var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
@@ -119,6 +163,23 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = withOptionalCString(key) { keyPointer in
             ironmesh_ios_facade_fetch_bytes(handle, keyPointer, &bytes, &errorPointer)
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let dataPointer = bytes.data else {
+            return Data()
+        }
+
+        let data = Data(bytes: dataPointer, count: Int(bytes.len))
+        ironmesh_ios_bytes_free(bytes)
+        return data
+    }
+
+    func fetchRelativeBytes(handle: AppleRustHandle, path: String) throws -> Data {
+        var bytes = IronmeshIosBytes(data: nil, len: 0, capacity: 0)
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(path) { pathPointer in
+            ironmesh_ios_facade_fetch_relative_bytes(handle, pathPointer, &bytes, &errorPointer)
         }
 
         try throwIfNeeded(status: status, errorPointer: errorPointer)
@@ -193,6 +254,23 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         try throwIfNeeded(status: status, errorPointer: errorPointer)
         guard let jsonPointer else {
             throw IronmeshRustFFIError(message: "Rust bridge returned no diagnostics JSON.")
+        }
+        return consumeString(jsonPointer)
+    }
+
+    func connectionRouteSnapshotJSON(handle: AppleRustHandle, refresh: Bool) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_connection_route_snapshot_json(
+            handle,
+            refresh ? 1 : 0,
+            &jsonPointer,
+            &errorPointer
+        )
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no connection paths JSON.")
         }
         return consumeString(jsonPointer)
     }

@@ -9,13 +9,15 @@ REPO_DIR="${APT_REPO_DIR:-${ROOT_DIR}/target/apt-repo}"
 SUITE="${APT_REPO_SUITE:-noble}"
 CODENAME="${APT_REPO_CODENAME:-${SUITE}}"
 COMPONENT="${APT_REPO_COMPONENT:-main}"
-ARCH="${APT_REPO_ARCH:-$(dpkg --print-architecture)}"
+DEFAULT_ARCH="${APT_REPO_ARCH:-$(dpkg --print-architecture)}"
 ORIGIN="${APT_REPO_ORIGIN:-Ironmesh}"
 LABEL="${APT_REPO_LABEL:-Ironmesh}"
 DESCRIPTION="${APT_REPO_DESCRIPTION:-Ironmesh Debian package repository}"
 SIGNING_KEY="${APT_REPO_SIGN_KEY:-${DEBUILD_KEYID:-${DEBSIGN_KEYID:-}}}"
+IMPORT_REMOTE="${APT_REPO_IMPORT_REMOTE:-}"
 SIGN_REPO=true
 DEB_PATHS=()
+REQUESTED_ARCHES=()
 
 log() {
   printf '[build-apt-repository] %s\n' "$*"
@@ -33,7 +35,12 @@ Options:
   --suite NAME         Apt suite/distribution. Defaults to noble.
   --codename NAME      Release codename. Defaults to the suite name.
   --component NAME     Apt component. Defaults to main.
-  --arch ARCH          Binary architecture. Defaults to dpkg --print-architecture.
+  --arch ARCH          Architecture to update. May be passed more than once.
+                       Without explicit package paths, defaults to
+                       dpkg --print-architecture.
+  --import-remote SRC  Rsync source for the published repository to import
+                       before updating it, for example
+                       creature@creax.de:/home/creature/html/apt/ironmesh.
   --sign-key KEY       GPG key ID or fingerprint used for Release signing.
   --no-sign            Build repository metadata without signing it.
   -h, --help           Show this help text.
@@ -41,7 +48,7 @@ Options:
 Environment defaults:
   APT_REPO_DIR, APT_REPO_SUITE, APT_REPO_CODENAME, APT_REPO_COMPONENT,
   APT_REPO_ARCH, APT_REPO_ORIGIN, APT_REPO_LABEL, APT_REPO_DESCRIPTION,
-  APT_REPO_SIGN_KEY, DEBUILD_KEYID, DEBSIGN_KEYID.
+  APT_REPO_IMPORT_REMOTE, APT_REPO_SIGN_KEY, DEBUILD_KEYID, DEBSIGN_KEYID.
 
 If no .deb paths are passed, the script expects the current changelog version
 artifacts in the parent directory of the checkout. Run
@@ -95,11 +102,19 @@ while (($# > 0)); do
       shift
       ;;
     --arch)
-      ARCH="$2"
+      REQUESTED_ARCHES+=("$2")
       shift 2
       ;;
     --arch=*)
-      ARCH="${1#*=}"
+      REQUESTED_ARCHES+=("${1#*=}")
+      shift
+      ;;
+    --import-remote)
+      IMPORT_REMOTE="$2"
+      shift 2
+      ;;
+    --import-remote=*)
+      IMPORT_REMOTE="${1#*=}"
       shift
       ;;
     --sign-key)
@@ -137,6 +152,7 @@ done
 
 require_command apt-ftparchive
 require_command dpkg
+require_command dpkg-deb
 require_command dpkg-parsechangelog
 require_command dpkg-scanpackages
 require_command gzip
@@ -162,12 +178,19 @@ if [[ -z "${REPO_DIR}" || "${REPO_DIR}" == "/" ]]; then
   exit 1
 fi
 
+if [[ -n "${IMPORT_REMOTE}" ]]; then
+  require_command rsync
+  log "importing existing repository from ${IMPORT_REMOTE}"
+  mkdir -p "${REPO_DIR}"
+  rsync -a --delete "${IMPORT_REMOTE%/}/" "${REPO_DIR%/}/"
+fi
+
 if ((${#DEB_PATHS[@]} == 0)); then
   VERSION="$(cd "${ROOT_DIR}" && dpkg-parsechangelog -SVersion)"
   DEB_PATHS=(
-    "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${DEFAULT_ARCH}.deb"
+    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${DEFAULT_ARCH}.deb"
+    "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${DEFAULT_ARCH}.deb"
   )
 fi
 
@@ -179,28 +202,86 @@ for path in "${DEB_PATHS[@]}"; do
   fi
 done
 
-PACKAGES_REL="dists/${SUITE}/${COMPONENT}/binary-${ARCH}/Packages"
+contains_architecture() {
+  local architecture="$1"
+  local candidate
+
+  for candidate in "${REQUESTED_ARCHES[@]}"; do
+    if [[ "${candidate}" == "${architecture}" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+add_architecture() {
+  local architecture="$1"
+
+  if ! contains_architecture "${architecture}"; then
+    REQUESTED_ARCHES+=("${architecture}")
+  fi
+}
+
+for path in "${DEB_PATHS[@]}"; do
+  package_architecture="$(dpkg-deb -f "${path}" Architecture)"
+  if [[ -z "${package_architecture}" || "${package_architecture}" == "all" ]]; then
+    printf 'package architecture must be a concrete architecture, not %s: %s\n' \
+      "${package_architecture:-empty}" "${path}" >&2
+    exit 1
+  fi
+
+  add_architecture "${package_architecture}"
+done
+
+if ((${#REQUESTED_ARCHES[@]} == 0)); then
+  add_architecture "${DEFAULT_ARCH}"
+fi
+
+for architecture in "${REQUESTED_ARCHES[@]}"; do
+  if [[ ! "${architecture}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    printf 'invalid Debian architecture: %s\n' "${architecture}" >&2
+    exit 1
+  fi
+done
+
 SUITE_DIR="${REPO_DIR}/dists/${SUITE}"
-POOL_DIR="${REPO_DIR}/pool/main/i/ironmesh"
+POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh"
 
 log "refreshing ${REPO_DIR}"
-rm -rf \
-  "${REPO_DIR}/dists" \
-  "${REPO_DIR}/pool" \
-  "${REPO_DIR}/ironmesh-archive-keyring.asc"
-mkdir -p \
-  "${REPO_DIR}/$(dirname "${PACKAGES_REL}")" \
-  "${POOL_DIR}"
+mkdir -p "${POOL_DIR}"
+
+for architecture in "${REQUESTED_ARCHES[@]}"; do
+  rm -f "${POOL_DIR}"/*_"${architecture}".deb
+  rm -rf "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
+  mkdir -p "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
+done
 
 log "copying packages"
 cp -f "${DEB_PATHS[@]}" "${POOL_DIR}/"
 
-log "writing Packages index"
-(
-  cd "${REPO_DIR}"
-  dpkg-scanpackages --arch "${ARCH}" pool /dev/null > "${PACKAGES_REL}"
-  gzip -9cn "${PACKAGES_REL}" > "${PACKAGES_REL}.gz"
+for architecture in "${REQUESTED_ARCHES[@]}"; do
+  packages_rel="dists/${SUITE}/${COMPONENT}/binary-${architecture}/Packages"
+  log "writing ${packages_rel}"
+  (
+    cd "${REPO_DIR}"
+    dpkg-scanpackages --arch "${architecture}" pool /dev/null > "${packages_rel}"
+    gzip -9cn "${packages_rel}" > "${packages_rel}.gz"
+  )
+done
+
+mapfile -t RELEASE_ARCHES < <(
+  find "${SUITE_DIR}/${COMPONENT}" -mindepth 1 -maxdepth 1 -type d -name 'binary-*' -printf '%f\n' \
+    | sed 's/^binary-//' \
+    | sort -u
 )
+
+if ((${#RELEASE_ARCHES[@]} == 0)); then
+  printf 'no package architectures found under %s\n' "${SUITE_DIR}/${COMPONENT}" >&2
+  exit 1
+fi
+
+RELEASE_ARCHITECTURES="${RELEASE_ARCHES[*]}"
 
 log "writing Release metadata"
 RELEASE_TMP="$(mktemp)"
@@ -210,7 +291,7 @@ apt-ftparchive \
   -o "APT::FTPArchive::Release::Label=${LABEL}" \
   -o "APT::FTPArchive::Release::Suite=${SUITE}" \
   -o "APT::FTPArchive::Release::Codename=${CODENAME}" \
-  -o "APT::FTPArchive::Release::Architectures=${ARCH}" \
+  -o "APT::FTPArchive::Release::Architectures=${RELEASE_ARCHITECTURES}" \
   -o "APT::FTPArchive::Release::Components=${COMPONENT}" \
   -o "APT::FTPArchive::Release::Description=${DESCRIPTION}" \
   release "${SUITE_DIR}" > "${RELEASE_TMP}"
@@ -228,6 +309,7 @@ if [[ "${SIGN_REPO}" == true ]]; then
     -o "${SUITE_DIR}/Release.gpg" "${SUITE_DIR}/Release"
 else
   log "leaving repository unsigned"
+  rm -f "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release.gpg"
 fi
 
 log "repository ready: ${REPO_DIR}"

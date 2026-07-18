@@ -7,27 +7,28 @@ export CARGO_HOME := $(CURDIR)/debian/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target/debian
 export CARGO_NET_OFFLINE := true
 
-CARGO_BIN := $(firstword \
-	$(wildcard /usr/bin/cargo-1.91) \
-	$(wildcard /usr/bin/cargo-1.89) \
-	$(wildcard /usr/bin/cargo-1.85) \
-	/usr/bin/cargo)
-RUSTC_BIN := $(firstword \
-	$(wildcard /usr/bin/rustc-1.91) \
-	$(wildcard /usr/bin/rustc-1.89) \
-	$(wildcard /usr/bin/rustc-1.85) \
-	/usr/bin/rustc)
+CARGO_BIN := $(firstword $(wildcard /usr/bin/cargo-1.91 /usr/bin/cargo-1.89 /usr/bin/cargo-1.85 /usr/bin/cargo $(HOME)/.cargo/bin/cargo))
+RUSTC_BIN := $(firstword $(wildcard /usr/bin/rustc-1.91 /usr/bin/rustc-1.89 /usr/bin/rustc-1.85 /usr/bin/rustc $(HOME)/.cargo/bin/rustc))
+CLANG_BIN := $(firstword $(wildcard /usr/bin/clang))
+CLANGXX_BIN := $(firstword $(wildcard /usr/bin/clang++))
+
+export CC := $(CLANG_BIN)
+export CXX := $(CLANGXX_BIN)
 
 CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/ironmesh-client/usr/lib/ironmesh-client
 CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
 
 %:
-	dh $@ --with installsysusers
+	dh $@ --with sysuser
 
 override_dh_clean:
 	dh_clean -XCargo.toml.orig
 
 override_dh_auto_configure:
+	test -n "$(CLANG_BIN)" || \
+		(echo "missing clang; install the Debian build dependencies" >&2; exit 1)
+	test -n "$(CLANGXX_BIN)" || \
+		(echo "missing clang++; install the Debian build dependencies" >&2; exit 1)
 	test -f $(CURDIR)/debian/prebuilt-web/server-admin/index.html || \
 		(echo "missing prebuilt server-admin assets; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)
 	test -f $(CURDIR)/debian/prebuilt-web/client-ui/index.html || \

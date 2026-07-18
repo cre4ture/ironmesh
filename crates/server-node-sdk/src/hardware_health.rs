@@ -812,7 +812,7 @@ fn log_pattern_findings(
             last_seen_at_unix: last_seen.unwrap_or(generated_at_unix),
             occurrence_count: count,
             summary: format!(
-                "Recent IronMesh runtime logs matched the {code} pattern {count} time{}.",
+                "Recent BerryKeep runtime logs matched the {code} pattern {count} time{}.",
                 if count == 1 { "" } else { "s" }
             ),
             evidence: json!({

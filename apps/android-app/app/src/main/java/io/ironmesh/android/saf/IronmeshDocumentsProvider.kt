@@ -12,6 +12,8 @@ import android.util.Log
 import android.webkit.MimeTypeMap
 import io.ironmesh.android.R
 import io.ironmesh.android.api.StoreIndexEntry
+import io.ironmesh.android.data.DeviceAuthState
+import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.data.RustPreferencesBridge
@@ -45,7 +47,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             rootId = ROOT_ID,
             documentId = rootDocumentId(),
             title = ROOT_TITLE,
-            summary = "Ironmesh distributed storage",
+            summary = "BerryKeep distributed storage",
             flags =
             DocumentsContract.Root.FLAG_SUPPORTS_CREATE or
                 DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD,
@@ -356,21 +358,28 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     }
 
     private fun resolveConnectionInput(): String {
-        val context = context ?: return ""
-        val auth = IronmeshPreferences.getDeviceAuthState(context)
-        return auth.preferredConnectionInput()
+        return resolveDeviceAuthState().preferredConnectionInput()
     }
 
     private fun resolveClientIdentityJson(): String? {
-        val context = context ?: return null
-        return IronmeshPreferences.getDeviceAuthState(context).toClientIdentityJson()
+        return resolveDeviceAuthState().toClientIdentityJson()
     }
 
     private fun resolveServerCaPem(): String? {
-        val context = context ?: return null
-        return IronmeshPreferences.getDeviceAuthState(context)
+        return resolveDeviceAuthState()
             .serverCaPem
             ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun resolveDeviceAuthState(): DeviceAuthState {
+        val context = context
+            ?: throw FileNotFoundException("Ironmesh application context is unavailable")
+        return try {
+            IronmeshPreferences.getDeviceAuthState(context)
+        } catch (error: DeviceIdentityStorageException) {
+            throw FileNotFoundException(error.message ?: "Protected device identity is unavailable")
+                .apply { initCause(error) }
+        }
     }
 
     private fun resolveRootProjection(projection: Array<out String>?): Array<String> {
@@ -482,7 +491,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     private companion object {
         private const val TAG = "IronmeshDocumentsProvider"
         private const val ROOT_ID = "ironmesh-root"
-        private const val ROOT_TITLE = "Ironmesh"
+        private const val ROOT_TITLE = "BerryKeep"
         private const val MAX_CONCURRENT_THUMBNAIL_STREAMS = 4
     }
 }
