@@ -338,7 +338,11 @@ jobs:
           chmod 600 $HOME/.android/debug.keystore
 
       - name: Restore Android internal release keystore
-        if: ${{ matrix.target.variant == 'release' }}
+        # Restore whenever the signing secret is present (not only for the
+        # release legs): build.gradle.kts validates the release signing config
+        # at configuration time for every task, including :app:testDebugUnitTest,
+        # so the debug legs also need STORE_FILE set to avoid a partial config.
+        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         run: |
           mkdir -p $HOME/.android
           printf '%s' "$IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64" | base64 --decode > $HOME/.android/ironmesh-internal-release.keystore
