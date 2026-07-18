@@ -71,9 +71,6 @@ override_dh_auto_install:
 	install -d $(CURDIR)/debian/ironmesh-server-node/usr/bin
 	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-server-node \
 		$(CURDIR)/debian/ironmesh-server-node/usr/bin/ironmesh-server-node
-	install -d $(CURDIR)/debian/ironmesh-server-node/usr/lib/systemd/system
-	install -m0644 debian/ironmesh-server-node.service \
-		$(CURDIR)/debian/ironmesh-server-node/usr/lib/systemd/system/ironmesh-server-node.service
 	install -d $(CURDIR)/debian/ironmesh-server-node/etc/ironmesh
 	install -m0644 debian/ironmesh-server-node.env \
 		$(CURDIR)/debian/ironmesh-server-node/etc/ironmesh/server-node.env
@@ -81,9 +78,6 @@ override_dh_auto_install:
 	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin
 	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-rendezvous-service \
 		$(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin/ironmesh-rendezvous-service
-	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/usr/lib/systemd/system
-	install -m0644 debian/ironmesh-rendezvous-service.service \
-		$(CURDIR)/debian/ironmesh-rendezvous-service/usr/lib/systemd/system/ironmesh-rendezvous-service.service
 	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh
 	install -m0644 debian/ironmesh-rendezvous-service.env \
 		$(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh/rendezvous-service.env
