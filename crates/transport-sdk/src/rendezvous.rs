@@ -289,7 +289,11 @@ impl RendezvousControlClient {
     }
 
     pub async fn list_presence(&self) -> Result<PresenceListResponse> {
-        self.get_json("/control/presence").await
+        self.get_json(&format!(
+            "/control/presence?cluster_id={}",
+            self.config.cluster_id
+        ))
+        .await
     }
 
     pub async fn fetch_mesh(&self) -> Result<RendezvousRuntimeState> {
@@ -302,7 +306,8 @@ impl RendezvousControlClient {
             let mut url = control_url(base_url, "/control/discovery")?;
             if let Some(node_id) = node_id {
                 url.query_pairs_mut()
-                    .append_pair("node_id", &node_id.to_string());
+                    .append_pair("node_id", &node_id.to_string())
+                    .append_pair("cluster_id", &self.config.cluster_id.to_string());
             }
 
             match self.http.get(url.clone()).send().await {
@@ -849,9 +854,11 @@ fn format_diagnostic_timestamp(unix: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Query;
     use axum::http::StatusCode;
     use axum::{Json, Router, routing::get};
     use common::NodeId;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     const TEST_RENDEZVOUS_CLIENT_CERT_PEM: &str = concat!(
@@ -880,14 +887,22 @@ mod tests {
             .expect("unused listener should expose addr");
         drop(unused_listener);
 
+        let observed_presence_clusters = Arc::new(Mutex::new(Vec::new()));
+        let observed_presence_clusters_for_handler = Arc::clone(&observed_presence_clusters);
         let router = Router::new().route(
             "/control/presence",
-            get(|| async {
-                Json(PresenceListResponse {
-                    registered_endpoints: 0,
-                    entries: Vec::new(),
-                })
-            }),
+            get(
+                move |Query(query): Query<HashMap<String, String>>| async move {
+                    observed_presence_clusters_for_handler
+                        .lock()
+                        .expect("observed presence query lock poisoned")
+                        .push(query.get("cluster_id").cloned());
+                    Json(PresenceListResponse {
+                        registered_endpoints: 0,
+                        entries: Vec::new(),
+                    })
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -915,6 +930,13 @@ mod tests {
             .list_presence()
             .await
             .expect("list presence should succeed");
+        assert_eq!(
+            observed_presence_clusters
+                .lock()
+                .expect("observed presence query lock poisoned")
+                .as_slice(),
+            &[Some(cluster_id.to_string())]
+        );
 
         let runtime_state = client.runtime_state();
         assert_eq!(
@@ -952,26 +974,30 @@ mod tests {
         let node_id = NodeId::now_v7();
         let router = Router::new().route(
             "/control/discovery",
-            get(move || async move {
-                Json(DiscoveryResponse {
-                    rendezvous_peers: vec![RendezvousEndpointStatus {
-                        url: "https://peer-rendezvous.example".to_string(),
-                        status: RendezvousEndpointConnectionState::Connected,
-                        last_attempt_unix: Some(10),
-                        last_success_unix: Some(10),
-                        consecutive_failures: 0,
-                        last_error: None,
-                        active: false,
-                    }],
-                    node_candidates: Some(vec![ConnectionCandidate {
-                        kind: crate::CandidateKind::ServerReflexive,
-                        endpoint: "https://203.0.113.10:7443".to_string(),
-                        rtt_ms: None,
-                        transport_hints: None,
-                    }]),
-                    node_relay_capable: true,
-                })
-            }),
+            get(
+                move |Query(query): Query<HashMap<String, String>>| async move {
+                    assert_eq!(query.get("node_id"), Some(&node_id.to_string()));
+                    assert_eq!(query.get("cluster_id"), Some(&cluster_id.to_string()));
+                    Json(DiscoveryResponse {
+                        rendezvous_peers: vec![RendezvousEndpointStatus {
+                            url: "https://peer-rendezvous.example".to_string(),
+                            status: RendezvousEndpointConnectionState::Connected,
+                            last_attempt_unix: Some(10),
+                            last_success_unix: Some(10),
+                            consecutive_failures: 0,
+                            last_error: None,
+                            active: false,
+                        }],
+                        node_candidates: Some(vec![ConnectionCandidate {
+                            kind: crate::CandidateKind::ServerReflexive,
+                            endpoint: "https://203.0.113.10:7443".to_string(),
+                            rtt_ms: None,
+                            transport_hints: None,
+                        }]),
+                        node_relay_capable: true,
+                    })
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

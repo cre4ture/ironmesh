@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
-use common::NodeId;
+use common::{ClusterId, NodeId};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use uuid::Uuid;
@@ -24,7 +24,7 @@ use crate::rendezvous::{PresenceEntry, PresenceRegistration};
 
 #[derive(Clone, Default)]
 pub struct PresenceRegistry {
-    entries: Arc<StdMutex<HashMap<String, PresenceEntry>>>,
+    entries: Arc<StdMutex<HashMap<(ClusterId, PeerIdentity), PresenceEntry>>>,
 }
 
 impl PresenceRegistry {
@@ -42,7 +42,10 @@ impl PresenceRegistry {
             registration,
             observed_source_addr,
         };
-        let key = entry.registration.identity.to_string();
+        let key = (
+            entry.registration.cluster_id,
+            entry.registration.identity.clone(),
+        );
         let mut entries = self
             .entries
             .lock()
@@ -51,12 +54,16 @@ impl PresenceRegistry {
         entry
     }
 
-    pub fn list(&self) -> Vec<PresenceEntry> {
+    pub fn list(&self, cluster_id: ClusterId) -> Vec<PresenceEntry> {
         let entries = self
             .entries
             .lock()
             .expect("presence registry lock poisoned");
-        let mut values = entries.values().cloned().collect::<Vec<_>>();
+        let mut values = entries
+            .iter()
+            .filter(|((entry_cluster_id, _), _)| *entry_cluster_id == cluster_id)
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>();
         values.sort_by(|left, right| {
             left.registration
                 .identity
@@ -66,16 +73,33 @@ impl PresenceRegistry {
         values
     }
 
-    pub fn entry_for_identity(&self, identity: &PeerIdentity) -> Option<PresenceEntry> {
+    pub fn entry_for_identity(
+        &self,
+        cluster_id: ClusterId,
+        identity: &PeerIdentity,
+    ) -> Option<PresenceEntry> {
         let entries = self
             .entries
             .lock()
             .expect("presence registry lock poisoned");
-        entries.get(&identity.to_string()).cloned()
+        entries.get(&(cluster_id, identity.clone())).cloned()
     }
 
-    pub fn contains_identity(&self, identity: &PeerIdentity) -> bool {
-        self.entry_for_identity(identity).is_some()
+    pub fn contains_identity(&self, cluster_id: ClusterId, identity: &PeerIdentity) -> bool {
+        self.entry_for_identity(cluster_id, identity).is_some()
+    }
+
+    /// Returns the cluster ID only when every registered endpoint belongs to it.
+    pub fn only_cluster_id(&self) -> Option<ClusterId> {
+        let entries = self
+            .entries
+            .lock()
+            .expect("presence registry lock poisoned");
+        let mut cluster_ids = entries.keys().map(|(cluster_id, _)| *cluster_id);
+        let cluster_id = cluster_ids.next()?;
+        cluster_ids
+            .all(|entry_cluster_id| entry_cluster_id == cluster_id)
+            .then_some(cluster_id)
     }
 
     pub fn len(&self) -> usize {
@@ -420,9 +444,9 @@ pub struct RelayTunnelBroker {
 
 #[derive(Default)]
 struct RelayTunnelBrokerState {
-    pending_sources_by_target: HashMap<String, VecDeque<PendingRelayTunnelSource>>,
-    waiting_targets_by_key: HashMap<String, VecDeque<WaitingRelayTunnelTarget>>,
-    wake_channels_by_target: HashMap<String, WakeRegistration>,
+    pending_sources_by_target: HashMap<RelayTargetKey, VecDeque<PendingRelayTunnelSource>>,
+    waiting_targets_by_key: HashMap<RelayTargetKey, VecDeque<WaitingRelayTunnelTarget>>,
+    wake_channels_by_target: HashMap<RelayTargetKey, WakeRegistration>,
     next_wake_connection_id: u64,
 }
 
@@ -440,6 +464,21 @@ struct WakeRegistration {
     notify: Arc<Notify>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayTargetKey {
+    cluster_id: ClusterId,
+    target: PeerIdentity,
+    session_kind: RelayTunnelSessionKind,
+}
+
+impl std::hash::Hash for RelayTargetKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.cluster_id.hash(state);
+        self.target.hash(state);
+        std::mem::discriminant(&self.session_kind).hash(state);
+    }
+}
+
 /// A live registration on the relay "wake" channel for a given target key. Holding
 /// this lets the owning connection unregister itself (via `connection_id`, which
 /// guards against a late unregister from a stale connection clobbering a newer one
@@ -447,7 +486,7 @@ struct WakeRegistration {
 /// instant a source registers for that target with nobody already waiting.
 #[derive(Clone)]
 pub struct WakeRegistrationHandle {
-    pub target_key: String,
+    target_key: RelayTargetKey,
     connection_id: u64,
     pub notify: Arc<Notify>,
 }
@@ -621,7 +660,10 @@ impl RelayTunnelBroker {
         }
     }
 
-    async fn try_pair_target(&self, target_key: &str) -> Result<Option<RelayTunnelEndpoint>> {
+    async fn try_pair_target(
+        &self,
+        target_key: &RelayTargetKey,
+    ) -> Result<Option<RelayTunnelEndpoint>> {
         let mut state = self.inner.lock().await;
         while let Some(source) =
             pop_pending_source(&mut state.pending_sources_by_target, target_key)
@@ -634,7 +676,7 @@ impl RelayTunnelBroker {
         Ok(None)
     }
 
-    async fn remove_pending_source(&self, target_key: &str, session_id: &str) {
+    async fn remove_pending_source(&self, target_key: &RelayTargetKey, session_id: &str) {
         let mut state = self.inner.lock().await;
         if let Some(queue) = state.pending_sources_by_target.get_mut(target_key) {
             queue.retain(|pending| pending.session.session_id != session_id);
@@ -644,7 +686,7 @@ impl RelayTunnelBroker {
         }
     }
 
-    async fn remove_waiting_target(&self, target_key: &str) {
+    async fn remove_waiting_target(&self, target_key: &RelayTargetKey) {
         let mut state = self.inner.lock().await;
         if let Some(queue) = state.waiting_targets_by_key.get_mut(target_key) {
             if !queue.is_empty() {
@@ -677,8 +719,8 @@ fn paired_tunnel_endpoints(
 }
 
 fn pop_pending_source(
-    pending_by_target: &mut HashMap<String, VecDeque<PendingRelayTunnelSource>>,
-    target_key: &str,
+    pending_by_target: &mut HashMap<RelayTargetKey, VecDeque<PendingRelayTunnelSource>>,
+    target_key: &RelayTargetKey,
 ) -> Option<PendingRelayTunnelSource> {
     loop {
         let pending = pending_by_target
@@ -699,8 +741,8 @@ fn pop_pending_source(
 }
 
 fn pop_waiting_target(
-    waiting_targets_by_key: &mut HashMap<String, VecDeque<WaitingRelayTunnelTarget>>,
-    target_key: &str,
+    waiting_targets_by_key: &mut HashMap<RelayTargetKey, VecDeque<WaitingRelayTunnelTarget>>,
+    target_key: &RelayTargetKey,
 ) -> Option<WaitingRelayTunnelTarget> {
     loop {
         let waiting = waiting_targets_by_key
@@ -721,11 +763,15 @@ fn pop_waiting_target(
 }
 
 fn relay_target_key(
-    cluster_id: uuid::Uuid,
+    cluster_id: ClusterId,
     target: &PeerIdentity,
     session_kind: RelayTunnelSessionKind,
-) -> String {
-    format!("{cluster_id}:{target}:{session_kind:?}")
+) -> RelayTargetKey {
+    RelayTargetKey {
+        cluster_id,
+        target: target.clone(),
+        session_kind,
+    }
 }
 
 fn retain_active_claims(state: &mut HashMap<String, BootstrapClaimRecord>) {
@@ -756,6 +802,59 @@ mod tests {
         TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
         TransportStreamKind,
     };
+
+    fn presence_registration(
+        cluster_id: ClusterId,
+        identity: PeerIdentity,
+        peer_api_url: &str,
+    ) -> PresenceRegistration {
+        PresenceRegistration {
+            cluster_id,
+            identity,
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: Some(peer_api_url.to_string()),
+            direct_candidates: Vec::new(),
+            labels: Default::default(),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: Vec::new(),
+            relay_mode: crate::RelayMode::Disabled,
+            connected_at_unix: 1,
+        }
+    }
+
+    #[test]
+    fn presence_registry_isolates_identical_identities_by_cluster() {
+        let registry = PresenceRegistry::new();
+        let cluster_a = Uuid::now_v7();
+        let cluster_b = Uuid::now_v7();
+        let identity = PeerIdentity::Node(Uuid::now_v7());
+
+        let entry_a = registry.register(
+            presence_registration(cluster_a, identity.clone(), "https://node-a.example:7443"),
+            None,
+        );
+        let entry_b = registry.register(
+            presence_registration(cluster_b, identity.clone(), "https://node-b.example:7443"),
+            None,
+        );
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.list(cluster_a), vec![entry_a.clone()]);
+        assert_eq!(registry.list(cluster_b), vec![entry_b.clone()]);
+        assert_eq!(
+            registry.entry_for_identity(cluster_a, &identity),
+            Some(entry_a)
+        );
+        assert_eq!(
+            registry.entry_for_identity(cluster_b, &identity),
+            Some(entry_b)
+        );
+        assert!(registry.contains_identity(cluster_a, &identity));
+        assert!(registry.contains_identity(cluster_b, &identity));
+        assert_eq!(registry.only_cluster_id(), None);
+    }
 
     #[tokio::test]
     async fn relay_tunnel_broker_pairs_source_and_target_and_relays_frames() {
@@ -997,6 +1096,69 @@ mod tests {
             .expect("target should pair after being woken");
         assert_eq!(target_endpoint.session().source, source);
 
+        source_task.await.expect("source task should join");
+    }
+
+    #[tokio::test]
+    async fn relay_wake_is_cluster_scoped_for_identical_target_identity() {
+        let broker = RelayTunnelBroker::new();
+        let cluster_a = Uuid::now_v7();
+        let cluster_b = Uuid::now_v7();
+        let target = PeerIdentity::Node(Uuid::now_v7());
+        let wake_a = broker
+            .register_wake(
+                cluster_a,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
+            .await;
+        let wake_b = broker
+            .register_wake(
+                cluster_b,
+                &target,
+                RelayTunnelSessionKind::MultiplexTransport,
+            )
+            .await;
+        let source = PeerIdentity::Device(Uuid::now_v7());
+        let ticket = issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id: cluster_a,
+                source: source.clone(),
+                target: target.clone(),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                requested_expires_in_secs: Some(60),
+            },
+            &["https://relay.example".to_string()],
+        );
+
+        let broker_for_source = broker.clone();
+        let source_task = tokio::spawn(async move {
+            broker_for_source
+                .connect_source(ticket)
+                .await
+                .expect("source should pair with the cluster A target")
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), wake_a.notify.notified())
+            .await
+            .expect("cluster A wake registration should be notified");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), wake_b.notify.notified())
+                .await
+                .is_err(),
+            "cluster B wake registration must not observe cluster A source"
+        );
+
+        let target_endpoint = broker
+            .accept_target(RelayTunnelAcceptRequest {
+                cluster_id: cluster_a,
+                target,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(2_000),
+            })
+            .await
+            .expect("cluster A target should pair");
+        assert_eq!(target_endpoint.session().source, source);
         source_task.await.expect("source task should join");
     }
 

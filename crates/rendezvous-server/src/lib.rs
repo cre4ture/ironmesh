@@ -169,6 +169,14 @@ async fn mesh_status(
 struct DiscoveryQuery {
     #[serde(default)]
     node_id: Option<NodeId>,
+    #[serde(default)]
+    cluster_id: Option<ClusterId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PresenceListQuery {
+    #[serde(default)]
+    cluster_id: Option<ClusterId>,
 }
 
 async fn discovery(
@@ -176,8 +184,14 @@ async fn discovery(
     authenticated_peer: MaybeAuthenticatedPeer,
     Query(query): Query<DiscoveryQuery>,
 ) -> std::result::Result<Json<DiscoveryResponse>, (StatusCode, String)> {
-    let cluster_id = authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
-        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    let authenticated_cluster_id =
+        authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
+            .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    let cluster_id = if query.node_id.is_some() {
+        resolve_presence_cluster_id(&state.presence, authenticated_cluster_id, query.cluster_id)?
+    } else {
+        None
+    };
     Ok(Json(discovery_response(&state, cluster_id, query.node_id)))
 }
 
@@ -220,16 +234,17 @@ async fn register_presence(
 async fn list_presence(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
+    Query(query): Query<PresenceListQuery>,
 ) -> std::result::Result<Json<PresenceListResponse>, (StatusCode, String)> {
-    let cluster_id = authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
-        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let entries = state
-        .presence
-        .list()
+    let authenticated_cluster_id =
+        authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
+            .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    let cluster_id =
+        resolve_presence_cluster_id(&state.presence, authenticated_cluster_id, query.cluster_id)?;
+    let entries = cluster_id
+        .map(|cluster_id| state.presence.list(cluster_id))
+        .unwrap_or_default()
         .into_iter()
-        .filter(|entry| {
-            cluster_id.is_none_or(|cluster_id| entry.registration.cluster_id == cluster_id)
-        })
         .map(response_presence_entry)
         .collect::<Vec<_>>();
     Ok(Json(PresenceListResponse {
@@ -366,6 +381,40 @@ fn empty_rendezvous_runtime_state() -> RendezvousRuntimeState {
     }
 }
 
+fn resolve_presence_cluster_id(
+    presence: &PresenceRegistry,
+    authenticated_cluster_id: Option<ClusterId>,
+    requested_cluster_id: Option<ClusterId>,
+) -> std::result::Result<Option<ClusterId>, (StatusCode, String)> {
+    if let (Some(authenticated_cluster_id), Some(requested_cluster_id)) =
+        (authenticated_cluster_id, requested_cluster_id)
+        && authenticated_cluster_id != requested_cluster_id
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "authenticated peer cluster_id {authenticated_cluster_id} does not match presence query cluster_id {requested_cluster_id}"
+            ),
+        ));
+    }
+    let single_cluster_id = presence.only_cluster_id();
+    let effective_cluster_id = authenticated_cluster_id
+        .or(requested_cluster_id)
+        .or(single_cluster_id);
+
+    let Some(effective_cluster_id) = effective_cluster_id else {
+        if presence.is_empty() {
+            return Ok(None);
+        }
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cluster_id is required when rendezvous serves multiple clusters".to_string(),
+        ));
+    };
+
+    Ok(Some(effective_cluster_id))
+}
+
 fn discovery_response(
     state: &RendezvousAppState,
     cluster_id: Option<ClusterId>,
@@ -378,14 +427,12 @@ fn discovery_response(
         .unwrap_or_else(empty_rendezvous_runtime_state)
         .endpoint_statuses;
 
-    let (node_candidates, node_relay_capable) = node_id
-        .and_then(|node_id| {
+    let (node_candidates, node_relay_capable) = cluster_id
+        .zip(node_id)
+        .and_then(|(cluster_id, node_id)| {
             state
                 .presence
-                .entry_for_identity(&PeerIdentity::Node(node_id))
-                .filter(|entry| {
-                    cluster_id.is_none_or(|cluster_id| entry.registration.cluster_id == cluster_id)
-                })
+                .entry_for_identity(cluster_id, &PeerIdentity::Node(node_id))
                 .map(response_presence_entry)
         })
         .map(|entry| {
@@ -437,13 +484,15 @@ async fn issue_relay_ticket(
 
 async fn redeem_bootstrap_claim(
     State(state): State<RendezvousAppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<ClientBootstrapClaimRedeemRequest>,
 ) -> std::result::Result<impl axum::response::IntoResponse, (StatusCode, String)> {
     request
         .validate()
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let response = relay_bootstrap_claim_redeem_over_tunnel(&state, &request).await?;
+    let response =
+        relay_bootstrap_claim_redeem_over_tunnel(&state, &authenticated_peer, &request).await?;
 
     Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
 }
@@ -482,18 +531,23 @@ fn bootstrap_claim_transport_request(
 
 async fn relay_bootstrap_claim_redeem_over_tunnel(
     state: &RendezvousAppState,
+    authenticated_peer: &MaybeAuthenticatedPeer,
     request: &ClientBootstrapClaimRedeemRequest,
 ) -> std::result::Result<ClientBootstrapClaimRedeemResponse, (StatusCode, String)> {
+    let target_presence = bootstrap_claim_target_presence(state, request)?;
     let target = PeerIdentity::Node(request.target_node_id);
-    let target_presence = state.presence.entry_for_identity(&target).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "bootstrap claim target node {} is not currently connected to rendezvous",
-                request.target_node_id
-            ),
+
+    // Bootstrap-claim redemption is intentionally usable before a client certificate
+    // exists. When a certificate is presented, it must be bound to the target cluster.
+    if authenticated_peer.identity().is_some() {
+        ensure_authenticated_peer_cluster(
+            state.config.mtls.is_some(),
+            authenticated_peer,
+            target_presence.registration.cluster_id,
+            "bootstrap claim target",
         )
-    })?;
+        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    }
 
     let ticket = issue_runtime_relay_ticket(
         RelayTicketRequest {
@@ -574,6 +628,31 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
         .validate()
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
     Ok(redeemed)
+}
+
+fn bootstrap_claim_target_presence(
+    state: &RendezvousAppState,
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> std::result::Result<transport_sdk::PresenceEntry, (StatusCode, String)> {
+    // Older clients did not send cluster_id. Keep them working only while the
+    // rendezvous registry is unambiguously single-cluster.
+    let cluster_id = request
+        .cluster_id
+        .or_else(|| state.presence.only_cluster_id())
+        .ok_or_else(|| bootstrap_claim_target_unavailable(request.target_node_id))?;
+    state
+        .presence
+        .entry_for_identity(cluster_id, &PeerIdentity::Node(request.target_node_id))
+        .ok_or_else(|| bootstrap_claim_target_unavailable(request.target_node_id))
+}
+
+fn bootstrap_claim_target_unavailable(target_node_id: NodeId) -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "bootstrap claim target node {target_node_id} is not currently connected to rendezvous"
+        ),
+    )
 }
 
 async fn relay_tunnel_ws(
@@ -1156,6 +1235,32 @@ mod tests {
         RelayMode, RendezvousClientConfig, RendezvousControlClient, TransportCapability,
     };
 
+    fn presence_registration(
+        cluster_id: ClusterId,
+        identity: PeerIdentity,
+        candidate_endpoint: &str,
+    ) -> PresenceRegistration {
+        PresenceRegistration {
+            cluster_id,
+            identity,
+            public_api_url: None,
+            public_direct_urls: Vec::new(),
+            peer_api_url: None,
+            direct_candidates: vec![ConnectionCandidate {
+                kind: CandidateKind::DirectHttps,
+                endpoint: candidate_endpoint.to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            }],
+            labels: Default::default(),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: vec![TransportCapability::DirectHttps],
+            relay_mode: RelayMode::Disabled,
+            connected_at_unix: 1,
+        }
+    }
+
     fn mtls_test_state() -> RendezvousAppState {
         RendezvousAppState::new(RendezvousServerConfig {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
@@ -1182,112 +1287,6 @@ mod tests {
         }))
     }
 
-    fn presence_registration(
-        cluster_id: ClusterId,
-        identity: PeerIdentity,
-    ) -> PresenceRegistration {
-        PresenceRegistration {
-            cluster_id,
-            identity,
-            public_api_url: None,
-            public_direct_urls: Vec::new(),
-            peer_api_url: None,
-            direct_candidates: Vec::new(),
-            labels: Default::default(),
-            capacity_bytes: None,
-            free_bytes: None,
-            capabilities: Vec::new(),
-            relay_mode: RelayMode::Disabled,
-            connected_at_unix: 1,
-        }
-    }
-
-    #[tokio::test]
-    async fn mtls_cluster_san_rejects_foreign_presence_and_relay_operations() {
-        let cluster_a = ClusterId::now_v7();
-        let cluster_b = ClusterId::now_v7();
-        let identity = PeerIdentity::Node(NodeId::now_v7());
-        let state = mtls_test_state();
-        let cluster_a_peer = authenticated_peer(identity.clone(), cluster_a);
-
-        let registration_error = register_presence(
-            State(state.clone()),
-            cluster_a_peer.clone(),
-            MaybeObservedPeerAddr::default(),
-            Json(presence_registration(cluster_b, identity.clone())),
-        )
-        .await
-        .expect_err("cluster A certificate must not register in cluster B");
-        assert_eq!(registration_error.0, StatusCode::UNAUTHORIZED);
-
-        let ticket_error = issue_relay_ticket(
-            State(state.clone()),
-            cluster_a_peer.clone(),
-            Json(RelayTicketRequest {
-                cluster_id: cluster_b,
-                source: identity.clone(),
-                target: PeerIdentity::Node(NodeId::now_v7()),
-                session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                requested_expires_in_secs: Some(30),
-            }),
-        )
-        .await
-        .expect_err("cluster A certificate must not issue a cluster B relay ticket");
-        assert_eq!(ticket_error.0, StatusCode::UNAUTHORIZED);
-
-        let Err(source_error) = establish_relay_tunnel_endpoint(
-            &state,
-            &cluster_a_peer,
-            RelayTunnelControlMessage::ConnectSource {
-                ticket: RelayTicket {
-                    cluster_id: cluster_b,
-                    session_id: "foreign-cluster-source".to_string(),
-                    source: identity.clone(),
-                    target: PeerIdentity::Node(NodeId::now_v7()),
-                    session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                    relay_urls: state.config.relay_public_urls.clone(),
-                    issued_at_unix: 1,
-                    expires_at_unix: 2,
-                },
-            },
-        )
-        .await
-        else {
-            panic!("cluster A certificate must not connect a cluster B relay source");
-        };
-        assert!(source_error.to_string().contains("does not match"));
-
-        let Err(target_error) = establish_relay_tunnel_endpoint(
-            &state,
-            &cluster_a_peer,
-            RelayTunnelControlMessage::AcceptTarget {
-                request: transport_sdk::RelayTunnelAcceptRequest {
-                    cluster_id: cluster_b,
-                    target: identity.clone(),
-                    session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                    wait_timeout_ms: Some(100),
-                },
-            },
-        )
-        .await
-        else {
-            panic!("cluster A certificate must not accept a cluster B relay target");
-        };
-        assert!(target_error.to_string().contains("does not match"));
-
-        let wake_error = ensure_relay_wake_registration_authorized(
-            &state,
-            &cluster_a_peer,
-            &RelayWakeRegistration {
-                cluster_id: cluster_b,
-                target: identity,
-                session_kind: RelayTunnelSessionKind::MultiplexTransport,
-            },
-        )
-        .expect_err("cluster A certificate must not register a cluster B relay wake channel");
-        assert!(wake_error.to_string().contains("does not match"));
-    }
-
     #[tokio::test]
     async fn mtls_presence_reads_are_filtered_by_authenticated_cluster() {
         let cluster_a = ClusterId::now_v7();
@@ -1296,30 +1295,33 @@ mod tests {
         let node_b = NodeId::now_v7();
         let state = mtls_test_state();
 
-        let mut registration_a = presence_registration(cluster_a, PeerIdentity::Node(node_a));
-        registration_a.direct_candidates = vec![ConnectionCandidate {
-            kind: CandidateKind::DirectHttps,
-            endpoint: "https://node-a.example:7443".to_string(),
-            rtt_ms: None,
-            transport_hints: None,
-        }];
-        state.presence.register(registration_a, None);
-
-        let mut registration_b = presence_registration(cluster_b, PeerIdentity::Node(node_b));
-        registration_b.direct_candidates = vec![ConnectionCandidate {
-            kind: CandidateKind::DirectHttps,
-            endpoint: "https://node-b.example:7443".to_string(),
-            rtt_ms: None,
-            transport_hints: None,
-        }];
-        state.presence.register(registration_b, None);
+        state.presence.register(
+            presence_registration(
+                cluster_a,
+                PeerIdentity::Node(node_a),
+                "https://node-a.example:7443",
+            ),
+            None,
+        );
+        state.presence.register(
+            presence_registration(
+                cluster_b,
+                PeerIdentity::Node(node_b),
+                "https://node-b.example:7443",
+            ),
+            None,
+        );
 
         let cluster_a_peer =
             authenticated_peer(PeerIdentity::Device(DeviceId::now_v7()), cluster_a);
-        let presence = list_presence(State(state.clone()), cluster_a_peer.clone())
-            .await
-            .expect("cluster A presence read should succeed")
-            .0;
+        let presence = list_presence(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            Query(PresenceListQuery { cluster_id: None }),
+        )
+        .await
+        .expect("cluster A presence read should succeed")
+        .0;
         assert_eq!(presence.registered_endpoints, 1);
         assert_eq!(presence.entries[0].registration.cluster_id, cluster_a);
 
@@ -1328,6 +1330,7 @@ mod tests {
             cluster_a_peer.clone(),
             Query(DiscoveryQuery {
                 node_id: Some(node_a),
+                cluster_id: None,
             }),
         )
         .await
@@ -1348,6 +1351,7 @@ mod tests {
             cluster_a_peer,
             Query(DiscoveryQuery {
                 node_id: Some(node_b),
+                cluster_id: None,
             }),
         )
         .await
@@ -1360,15 +1364,20 @@ mod tests {
             identity: PeerIdentity::Device(DeviceId::now_v7()),
             cluster_id: None,
         }));
-        let list_error = list_presence(State(state.clone()), legacy_peer.clone())
-            .await
-            .expect_err("presence reads require a cluster SAN under mTLS");
+        let list_error = list_presence(
+            State(state.clone()),
+            legacy_peer.clone(),
+            Query(PresenceListQuery { cluster_id: None }),
+        )
+        .await
+        .expect_err("presence reads require a cluster SAN under mTLS");
         assert_eq!(list_error.0, StatusCode::UNAUTHORIZED);
         let discovery_error = discovery(
             State(state),
             legacy_peer,
             Query(DiscoveryQuery {
                 node_id: Some(node_a),
+                cluster_id: None,
             }),
         )
         .await
@@ -1560,6 +1569,316 @@ mod tests {
         let _ = server.await;
     }
 
+    #[test]
+    fn bootstrap_claim_target_resolution_is_cluster_scoped() {
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let target_node_id = NodeId::now_v7();
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("rendezvous app state should build");
+        state.presence.register(
+            presence_registration(
+                cluster_b,
+                PeerIdentity::Node(target_node_id),
+                "https://node-b.example:7443",
+            ),
+            None,
+        );
+
+        let mut request = ClientBootstrapClaimRedeemRequest {
+            claim_token: "claim-token".to_string(),
+            cluster_id: None,
+            target_node_id,
+            device_id: Some(DeviceId::now_v7().to_string()),
+            label: Some("Phone".to_string()),
+            public_key_pem: "public-key".to_string(),
+        };
+        let legacy_target = bootstrap_claim_target_presence(&state, &request)
+            .expect("legacy request should resolve in a single-cluster registry");
+        assert_eq!(legacy_target.registration.cluster_id, cluster_b);
+
+        state.presence.register(
+            presence_registration(
+                cluster_a,
+                PeerIdentity::Node(NodeId::now_v7()),
+                "https://node-a.example:7443",
+            ),
+            None,
+        );
+        request.cluster_id = Some(cluster_b);
+        let scoped_target = bootstrap_claim_target_presence(&state, &request)
+            .expect("cluster-scoped request should resolve its target");
+        assert_eq!(scoped_target.registration.cluster_id, cluster_b);
+
+        request.cluster_id = None;
+        let ambiguous_target = bootstrap_claim_target_presence(&state, &request)
+            .expect_err("legacy request must not cross a multi-cluster registry");
+        assert_eq!(ambiguous_target.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn presence_list_and_discovery_are_cluster_scoped() {
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let node_id = NodeId::now_v7();
+        let identity = PeerIdentity::Node(node_id);
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+            public_url: "http://rendezvous.example".to_string(),
+            relay_public_urls: Vec::new(),
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("rendezvous app state should build");
+        let entry_a = state.presence.register(
+            presence_registration(cluster_a, identity.clone(), "https://node-a.example:7443"),
+            None,
+        );
+        let entry_b = state.presence.register(
+            presence_registration(cluster_b, identity, "https://node-b.example:7443"),
+            None,
+        );
+
+        let list_a = list_presence(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(PresenceListQuery {
+                cluster_id: Some(cluster_a),
+            }),
+        )
+        .await
+        .expect("cluster A presence list should succeed")
+        .0;
+        let list_b = list_presence(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(PresenceListQuery {
+                cluster_id: Some(cluster_b),
+            }),
+        )
+        .await
+        .expect("cluster B presence list should succeed")
+        .0;
+
+        assert_eq!(list_a.registered_endpoints, 1);
+        assert_eq!(list_a.entries, vec![entry_a]);
+        assert_eq!(list_b.registered_endpoints, 1);
+        assert_eq!(list_b.entries, vec![entry_b]);
+        let unscoped_list = list_presence(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(PresenceListQuery { cluster_id: None }),
+        )
+        .await
+        .expect_err("multi-cluster list must require a cluster_id");
+        assert_eq!(unscoped_list.0, StatusCode::BAD_REQUEST);
+        let mesh_only_discovery = discovery(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(DiscoveryQuery {
+                node_id: None,
+                cluster_id: None,
+            }),
+        )
+        .await
+        .expect("mesh-only discovery must not require a cluster_id")
+        .0;
+        assert_eq!(mesh_only_discovery.node_candidates, None);
+        assert!(!mesh_only_discovery.node_relay_capable);
+        let unscoped_node_discovery = discovery(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(DiscoveryQuery {
+                node_id: Some(node_id),
+                cluster_id: None,
+            }),
+        )
+        .await
+        .expect_err("multi-cluster node discovery must require a cluster_id");
+        assert_eq!(unscoped_node_discovery.0, StatusCode::BAD_REQUEST);
+
+        let discovery_a = discovery(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(DiscoveryQuery {
+                node_id: Some(node_id),
+                cluster_id: Some(cluster_a),
+            }),
+        )
+        .await
+        .expect("cluster A discovery should succeed")
+        .0;
+        let discovery_b = discovery(
+            State(state.clone()),
+            MaybeAuthenticatedPeer::default(),
+            Query(DiscoveryQuery {
+                node_id: Some(node_id),
+                cluster_id: Some(cluster_b),
+            }),
+        )
+        .await
+        .expect("cluster B discovery should succeed")
+        .0;
+
+        assert_eq!(
+            discovery_a.node_candidates,
+            Some(vec![ConnectionCandidate {
+                kind: CandidateKind::DirectHttps,
+                endpoint: "https://node-a.example:7443".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            }])
+        );
+        assert_eq!(
+            discovery_b.node_candidates,
+            Some(vec![ConnectionCandidate {
+                kind: CandidateKind::DirectHttps,
+                endpoint: "https://node-b.example:7443".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            }])
+        );
+        assert!(!discovery_a.node_relay_capable);
+        assert!(!discovery_b.node_relay_capable);
+    }
+
+    #[tokio::test]
+    async fn mtls_cluster_san_rejects_foreign_presence_and_relay_operations() {
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let node_id = NodeId::now_v7();
+        let identity = PeerIdentity::Node(node_id);
+        let state = mtls_test_state();
+        state.presence.register(
+            presence_registration(cluster_a, identity.clone(), "https://node-a.example:7443"),
+            None,
+        );
+        state.presence.register(
+            presence_registration(cluster_b, identity.clone(), "https://node-b.example:7443"),
+            None,
+        );
+        let cluster_a_peer = authenticated_peer(identity.clone(), cluster_a);
+
+        let foreign_list = list_presence(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            Query(PresenceListQuery {
+                cluster_id: Some(cluster_b),
+            }),
+        )
+        .await
+        .expect_err("cluster A certificate must not list cluster B presence");
+        assert_eq!(foreign_list.0, StatusCode::UNAUTHORIZED);
+        let foreign_discovery = discovery(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            Query(DiscoveryQuery {
+                node_id: Some(node_id),
+                cluster_id: Some(cluster_b),
+            }),
+        )
+        .await
+        .expect_err("cluster A certificate must not discover cluster B presence");
+        assert_eq!(foreign_discovery.0, StatusCode::UNAUTHORIZED);
+        let foreign_registration = register_presence(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            MaybeObservedPeerAddr::default(),
+            Json(presence_registration(
+                cluster_b,
+                identity.clone(),
+                "https://new-node-b.example:7443",
+            )),
+        )
+        .await
+        .expect_err("cluster A certificate must not register in cluster B");
+        assert_eq!(foreign_registration.0, StatusCode::UNAUTHORIZED);
+        let foreign_ticket = issue_relay_ticket(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            Json(RelayTicketRequest {
+                cluster_id: cluster_b,
+                source: identity.clone(),
+                target: PeerIdentity::Node(NodeId::now_v7()),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                requested_expires_in_secs: Some(30),
+            }),
+        )
+        .await
+        .expect_err("cluster A certificate must not issue cluster B relay ticket");
+        assert_eq!(foreign_ticket.0, StatusCode::UNAUTHORIZED);
+
+        let source_ticket = issue_runtime_relay_ticket(
+            RelayTicketRequest {
+                cluster_id: cluster_b,
+                source: identity.clone(),
+                target: PeerIdentity::Node(NodeId::now_v7()),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                requested_expires_in_secs: Some(30),
+            },
+            &state.config.relay_public_urls,
+        );
+        assert!(
+            establish_relay_tunnel_endpoint(
+                &state,
+                &cluster_a_peer,
+                RelayTunnelControlMessage::ConnectSource {
+                    ticket: source_ticket,
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            establish_relay_tunnel_endpoint(
+                &state,
+                &cluster_a_peer,
+                RelayTunnelControlMessage::AcceptTarget {
+                    request: transport_sdk::RelayTunnelAcceptRequest {
+                        cluster_id: cluster_b,
+                        target: identity.clone(),
+                        session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                        wait_timeout_ms: Some(100),
+                    },
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            ensure_relay_wake_registration_authorized(
+                &state,
+                &cluster_a_peer,
+                &RelayWakeRegistration {
+                    cluster_id: cluster_b,
+                    target: identity.clone(),
+                    session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                },
+            )
+            .is_err()
+        );
+
+        let own_cluster_list = list_presence(
+            State(state),
+            cluster_a_peer,
+            Query(PresenceListQuery { cluster_id: None }),
+        )
+        .await
+        .expect("cluster SAN should select its own tenant without a query")
+        .0;
+        assert_eq!(own_cluster_list.registered_endpoints, 1);
+        assert_eq!(
+            own_cluster_list.entries[0].registration.cluster_id,
+            cluster_a
+        );
+    }
+
     #[tokio::test]
     async fn mesh_status_reports_connected_peer_after_probe() {
         let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1626,6 +1945,7 @@ mod tests {
             .expect("peer rendezvous should run");
         });
 
+        let cluster_id = ClusterId::now_v7();
         let node_id = NodeId::now_v7();
         let state = RendezvousAppState::new(RendezvousServerConfig {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
@@ -1637,7 +1957,7 @@ mod tests {
         .expect("rendezvous app state should build");
         state.presence.register(
             PresenceRegistration {
-                cluster_id: ClusterId::now_v7(),
+                cluster_id,
                 identity: PeerIdentity::Node(node_id),
                 public_api_url: None,
                 public_direct_urls: Vec::new(),
@@ -1665,6 +1985,7 @@ mod tests {
             MaybeAuthenticatedPeer::default(),
             Query(DiscoveryQuery {
                 node_id: Some(node_id),
+                cluster_id: None,
             }),
         )
         .await
