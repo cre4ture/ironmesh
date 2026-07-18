@@ -18,6 +18,9 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,8 +56,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Run system tests
         run: cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml

@@ -12,6 +12,9 @@ permissions:
 jobs:
   workspace-check:
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,8 +39,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Run workspace check
         run: cargo check --workspace
@@ -62,6 +70,9 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     needs: workspace-check
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,8 +99,13 @@ jobs:
         with:
           components: clippy
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -97,6 +113,9 @@ jobs:
   unit-tests:
     runs-on: ubuntu-latest
     needs: workspace-check
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -121,8 +140,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Run unit tests
         run: cargo test --workspace
@@ -144,6 +168,9 @@ jobs:
             command: pnpm test:e2e:server-admin-rust
           - name: server-admin-setup-rust
             command: pnpm test:e2e:server-admin-setup-rust
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -168,8 +195,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Install Playwright browser
         working-directory: web
@@ -193,6 +225,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: workspace-check
     env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
       IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 }}
       IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD }}
       IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS }}
@@ -237,8 +271,13 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -350,6 +389,8 @@ jobs:
     runs-on: macos-latest
     needs: workspace-check
     env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
       IRONMESH_IOS_SIGNING_CERT_B64: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_B64 }}
       IRONMESH_IOS_SIGNING_CERT_PASSWORD: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_PASSWORD }}
       IRONMESH_IOS_APP_PROFILE_B64: ${{ secrets.IRONMESH_IOS_APP_PROFILE_B64 }}
@@ -418,8 +459,13 @@ jobs:
           toolchain: nightly-2026-02-17
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Show Xcode version
         run: |
@@ -557,6 +603,9 @@ jobs:
   android-instrumentation-tests:
     runs-on: ubuntu-latest
     needs: workspace-check
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -583,8 +632,13 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -659,6 +713,9 @@ jobs:
   fuse-mount-build:
     runs-on: ubuntu-latest
     needs: workspace-check
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -688,8 +745,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libfuse3-dev pkg-config
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Build Linux FUSE mount binary
         run: cargo build -p os-integration --bin ironmesh-os-integration --release
@@ -704,6 +766,9 @@ jobs:
   windows-cfapi-check:
     runs-on: windows-latest
     needs: workspace-check
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -730,8 +795,13 @@ jobs:
         with:
           components: clippy
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Check Windows CFAPI adapter crate
         run: cargo check -p adapter-windows-cfapi --all-targets
