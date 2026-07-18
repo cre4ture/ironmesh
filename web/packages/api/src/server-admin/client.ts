@@ -2,6 +2,8 @@ import { fetchJson } from "../shared/http";
 import type { StoreIndexMedia } from "../shared/store-index";
 import type {
   AdminMapDatasetImportStatusResponse,
+  AdminGalleryMapConfiguration,
+  AdminGalleryMapConfigurationResponse,
   AdminMediaCacheClearResponse,
   AdminStoreGetResponse,
   AdminSnapshotSummary,
@@ -250,10 +252,31 @@ export async function getAdminMapDatasetImportStatus(
   });
 }
 
+export async function getAdminGalleryMapConfiguration(
+  adminTokenOverride?: string
+): Promise<AdminGalleryMapConfigurationResponse> {
+  return fetchAdminJson<AdminGalleryMapConfigurationResponse>(apiV1("/auth/maps/config"), {
+    adminTokenOverride
+  });
+}
+
+export async function updateAdminGalleryMapConfiguration(
+  configuration: AdminGalleryMapConfiguration,
+  adminTokenOverride?: string
+): Promise<AdminGalleryMapConfigurationResponse> {
+  return fetchAdminJson<AdminGalleryMapConfigurationResponse>(apiV1("/auth/maps/config"), {
+    method: "PUT",
+    adminTokenOverride,
+    body: configuration
+  });
+}
+
 export async function startAdminMapDatasetImport(
   request: {
     source: string;
     part_size_bytes: number;
+    variant_id?: string;
+    asset?: "raster" | "vector";
   },
   adminTokenOverride?: string
 ): Promise<StartAdminMapDatasetImportResponse> {

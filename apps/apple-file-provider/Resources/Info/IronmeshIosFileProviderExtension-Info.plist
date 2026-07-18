@@ -23,7 +23,7 @@
     <key>IronmeshAppGroupIdentifier</key>
     <string>group.dev.ironmesh.apple.shared</string>
     <key>IronmeshDomainDisplayName</key>
-    <string>IronMesh</string>
+    <string>BerryKeep</string>
     <key>IronmeshDomainIdentifier</key>
     <string>dev.ironmesh.default</string>
     <key>NSExtension</key>

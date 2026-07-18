@@ -11,6 +11,7 @@ import java.io.File
 import java.io.FileNotFoundException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class TestTreeDocumentsProvider : DocumentsProvider() {
     override fun onCreate(): Boolean = true
@@ -99,6 +100,28 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
         }
     }
 
+    override fun renameDocument(documentId: String, displayName: String): String {
+        val injectedFailure = failNextRenameDisplayName.get()
+        if (
+            injectedFailure == displayName &&
+            failNextRenameDisplayName.compareAndSet(injectedFailure, null)
+        ) {
+            throw FileNotFoundException("injected rename failure for $displayName")
+        }
+
+        val source = fileForDocumentId(documentId)
+        val parent = source.parentFile ?: throw FileNotFoundException("document has no parent")
+        val destination = File(parent, displayName)
+        if (destination.exists()) {
+            throw FileNotFoundException("destination already exists: $displayName")
+        }
+        if (!source.renameTo(destination)) {
+            throw FileNotFoundException("failed to rename $documentId to $displayName")
+        }
+        notifyParentChanged(documentIdForFile(parent))
+        return documentIdForFile(destination)
+    }
+
     override fun openDocument(
         documentId: String,
         mode: String,
@@ -122,20 +145,41 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
     private fun includeDocument(cursor: MatrixCursor, documentId: String) {
         val file = fileForDocumentId(documentId)
         val row = cursor.newRow()
-        row.add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
-        row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, if (documentId == ROOT_DOCUMENT_ID) "root" else file.name)
-        row.add(
+        row.addIfProjected(cursor, DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
+        row.addIfProjected(
+            cursor,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            if (documentId == ROOT_DOCUMENT_ID) "root" else file.name,
+        )
+        row.addIfProjected(
+            cursor,
             DocumentsContract.Document.COLUMN_MIME_TYPE,
             if (file.isDirectory) DocumentsContract.Document.MIME_TYPE_DIR else "application/octet-stream",
         )
-        row.add(
+        row.addIfProjected(
+            cursor,
             DocumentsContract.Document.COLUMN_FLAGS,
             DocumentsContract.Document.FLAG_SUPPORTS_DELETE or
                 DocumentsContract.Document.FLAG_SUPPORTS_WRITE or
+                DocumentsContract.Document.FLAG_SUPPORTS_RENAME or
                 if (file.isDirectory) DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE else 0,
         )
-        row.add(DocumentsContract.Document.COLUMN_SIZE, if (file.isFile) file.length() else 0L)
-        row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, file.lastModified())
+        row.addIfProjected(
+            cursor,
+            DocumentsContract.Document.COLUMN_SIZE,
+            if (file.isFile) file.length() else 0L,
+        )
+        row.addIfProjected(cursor, DocumentsContract.Document.COLUMN_LAST_MODIFIED, file.lastModified())
+    }
+
+    private fun MatrixCursor.RowBuilder.addIfProjected(
+        cursor: MatrixCursor,
+        columnName: String,
+        value: Any?,
+    ) {
+        if (cursor.getColumnIndex(columnName) >= 0) {
+            add(columnName, value)
+        }
     }
 
     private fun resolveDocumentProjection(projection: Array<out String>?): Array<String> {
@@ -198,6 +242,7 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
             }
             root.mkdirs()
             openCounts.clear()
+            failNextRenameDisplayName.set(null)
         }
 
         fun seedFile(context: Context, relativePath: String, bytes: ByteArray) {
@@ -214,6 +259,21 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
             return openCounts[relativePath.replace('\\', '/')]?.get() ?: 0
         }
 
+        fun failNextRenameTo(displayName: String) {
+            failNextRenameDisplayName.set(displayName)
+        }
+
+        fun relativePaths(context: Context): Set<String> {
+            val root = rootDir(context)
+            if (!root.exists()) {
+                return emptySet()
+            }
+            return root.walkTopDown()
+                .drop(1)
+                .map { it.relativeTo(root).invariantSeparatorsPath }
+                .toSet()
+        }
+
         private fun rootDir(context: Context): File =
             File(context.cacheDir, "test-tree-documents-provider")
 
@@ -226,6 +286,7 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
         private var instanceContext: Context? = null
 
         private val openCounts = ConcurrentHashMap<String, AtomicInteger>()
+        private val failNextRenameDisplayName = AtomicReference<String?>()
 
         private fun recordReadOpen(file: File) {
             val relativePath = file.canonicalFile

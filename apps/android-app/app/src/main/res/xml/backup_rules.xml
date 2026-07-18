@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Device identity metadata and pre-migration cleartext must never leave this device. -->
+    <exclude domain="sharedpref" path="ironmesh_prefs.xml" />
+</full-backup-content>

@@ -64,7 +64,15 @@ https://creax.de/apt/ironmesh
 These packages follow the experimental status above and are intended for
 evaluation and controlled self-hosted testing.
 
-The current package build targets Ubuntu 24.04 LTS (`noble`) on `amd64`.
+Published package targets are:
+
+| Ubuntu release | Architecture |
+| --- | --- |
+| 24.04 LTS (`noble`) | `amd64` |
+| 20.04 LTS (`focal`) | `arm64` |
+
+Use the entry matching both the Ubuntu release and the host architecture. For
+example, an Ubuntu 20.04 ARM64 host uses `focal` and `arm64` below.
 
 First install the basic apt transport/key tools:
 
@@ -81,9 +89,17 @@ curl -fsSL https://creax.de/apt/ironmesh/ironmesh-archive-keyring.asc \
   | sudo gpg --dearmor --yes -o /usr/share/keyrings/ironmesh-archive-keyring.gpg
 ```
 
-Add the apt source:
+Add exactly one apt source, matching the Ubuntu release and architecture of the
+host:
 
 ```bash
+# Ubuntu 20.04 ARM64
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
+  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+```
+
+```bash
+# Ubuntu 24.04 AMD64
 echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```

@@ -324,7 +324,7 @@ class MainActivity : ComponentActivity() {
 
         try {
             startActivity(launchIntent)
-            vm.setStatus("Opened Files picker at Ironmesh root")
+            vm.setStatus("Opened Files picker at BerryKeep root")
         } catch (_: ActivityNotFoundException) {
             vm.setStatus("No compatible Files app found on this device")
         }

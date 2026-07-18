@@ -80,7 +80,11 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   });
 
   await page.getByText("Gallery", { exact: true }).click();
-  await expect(page.getByText(/No (image|media) objects in view/)).toBeVisible();
+  await expect(
+    page
+      .getByText(/No (image|media) objects in view/)
+      .or(page.getByText("0 items", { exact: true }))
+  ).toBeVisible();
 
   await page.getByText("S3", { exact: true }).click();
   await expect(page.getByText("Listener and replication status", { exact: true })).toBeVisible();

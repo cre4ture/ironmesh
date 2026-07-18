@@ -1,6 +1,11 @@
 import type { VersionGraphResponse } from "../client-ui/types";
 import type { LogsResponse, ServerLogEntry } from "../shared/logs";
 import type {
+  GalleryMapConfiguration,
+  GalleryMapConfigurationResponse,
+  GalleryMapVariantAsset
+} from "../shared/map-config";
+import type {
   StoreIndexEntry,
   StoreIndexMediaSummary,
   StoreIndexResponse,
@@ -52,6 +57,8 @@ export type AdminMapDatasetImportJobView = {
   state: AdminMapDatasetImportState;
   dataset_filename: string;
   source_display: string;
+  variant_id?: string | null;
+  asset?: GalleryMapVariantAsset | null;
   logical_key: string;
   manifest_key: string;
   part_size_bytes: number;
@@ -83,6 +90,9 @@ export type StartAdminMapDatasetImportResponse = {
   started: boolean;
   status: AdminMapDatasetImportStatusResponse;
 };
+
+export type AdminGalleryMapConfiguration = GalleryMapConfiguration;
+export type AdminGalleryMapConfigurationResponse = GalleryMapConfigurationResponse;
 
 export type DataChangeAction = "upload" | "rename" | "copy" | "delete";
 

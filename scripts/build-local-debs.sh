@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARTIFACT_DIR="$(cd "${ROOT_DIR}/.." && pwd)"
 RUN_PREPARE=true
 RUN_LINTIAN=false
+CHECK_BUILD_DEPENDENCIES=true
 DPKG_BUILD_ARGS=()
 
 log() {
@@ -30,11 +31,15 @@ usage() {
 Build installable local Debian binary packages from the current checkout.
 
 Usage:
-  ./scripts/build-local-debs.sh [--no-prepare] [--lintian] [-- <dpkg-buildpackage args>]
+  ./scripts/build-local-debs.sh [options] [-- <dpkg-buildpackage args>]
 
 Options:
   --no-prepare  Skip ./scripts/prepare-ppa-source.sh.
   --lintian     Run lintian on the generated .changes file after a successful build.
+  --no-check-build-deps
+                Skip dpkg-checkbuilddeps and pass -d to dpkg-buildpackage.
+                This is for native builders that provide the required Rust
+                toolchain outside the distribution package manager.
   -h, --help    Show this help text.
 
 Notes:
@@ -80,6 +85,10 @@ while (($# > 0)); do
       RUN_LINTIAN=true
       shift
       ;;
+    --no-check-build-deps)
+      CHECK_BUILD_DEPENDENCIES=false
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -109,7 +118,12 @@ fi
 
 require_clean_repository
 "${ROOT_DIR}/scripts/sync-debian-version.sh"
-check_build_dependencies
+if [[ "${CHECK_BUILD_DEPENDENCIES}" == true ]]; then
+  check_build_dependencies
+else
+  log "skipping dpkg build-dependency check"
+  DPKG_BUILD_ARGS=(-d "${DPKG_BUILD_ARGS[@]}")
+fi
 
 if [[ "${RUN_PREPARE}" == true ]]; then
   log "preparing vendored crates and prebuilt web assets"
