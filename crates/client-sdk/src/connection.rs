@@ -14,7 +14,8 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use transport_sdk::{
-    ClientIdentityMaterial, ConnectionCandidate, RendezvousClientConfig, TransportPathKind,
+    ClientIdentityMaterial, ConnectionCandidate, RelayTunnelSourceSecurityConfig,
+    RelayTunnelTlsIdentity, RendezvousClientConfig, TransportPathKind,
 };
 
 use crate::latency_probe::LatencyProbeConfig;
@@ -185,12 +186,30 @@ pub fn build_http_client_with_identity_from_planned_target(
     let target_node_id = target
         .target_node_id
         .ok_or_else(|| anyhow!("relay-backed client transport target is missing target_node_id"))?;
-    let rendezvous_client_identity_pem = identity.rendezvous_client_identity_pem.as_deref();
-    if target.rendezvous_mtls_required && rendezvous_client_identity_pem.is_none() {
-        bail!(
-            "relay-backed client transport requires rendezvous_client_identity_pem when rendezvous_mtls_required is true"
-        );
-    }
+    let cluster_ca_pem = target
+        .cluster_ca_pem
+        .as_deref()
+        .filter(|pem| !pem.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "relay-backed client transport requires target.cluster_ca_pem for inner relay mTLS"
+            )
+        })?;
+    let rendezvous_client_identity_pem = identity
+        .rendezvous_client_identity_pem
+        .as_deref()
+        .filter(|pem| !pem.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "relay-backed client transport requires rendezvous_client_identity_pem for inner relay mTLS"
+            )
+        })?;
+    let relay_security = RelayTunnelSourceSecurityConfig {
+        cluster_id: target.cluster_id,
+        expected_target_node_id: target_node_id,
+        cluster_ca_pem: cluster_ca_pem.as_bytes().to_vec(),
+        identity: RelayTunnelTlsIdentity::from_combined_pem(rendezvous_client_identity_pem),
+    };
     let rendezvous = transport_sdk::RendezvousControlClient::new(
         RendezvousClientConfig {
             cluster_id: target.cluster_id,
@@ -201,13 +220,16 @@ pub fn build_http_client_with_identity_from_planned_target(
             .rendezvous_ca_pem
             .as_deref()
             .or(target.cluster_ca_pem.as_deref()),
-        rendezvous_client_identity_pem.map(str::as_bytes),
+        Some(rendezvous_client_identity_pem.as_bytes()),
     )?;
 
-    Ok(
-        IronMeshClient::with_relay_transport(RELAY_REQUEST_BASE_URL, rendezvous, target_node_id)
-            .with_client_identity(identity.clone()),
+    Ok(IronMeshClient::with_relay_transport(
+        RELAY_REQUEST_BASE_URL,
+        rendezvous,
+        target_node_id,
+        relay_security,
     )
+    .with_client_identity(identity.clone()))
 }
 
 pub fn build_http_client_with_identity_from_planned_targets(
@@ -741,13 +763,15 @@ mod tests {
     }
 
     #[test]
-    fn build_http_client_with_identity_from_planned_target_requires_rendezvous_identity_for_mtls() {
-        let identity = sample_identity();
+    fn build_http_client_with_identity_from_planned_target_requires_cluster_ca_for_inner_relay_mtls()
+     {
+        let mut identity = sample_identity();
+        identity.rendezvous_client_identity_pem = Some("rendezvous-identity".to_string());
         let error = match build_http_client_with_identity_from_planned_target(
             &PlannedConnectionBootstrapTarget {
                 cluster_id: identity.cluster_id,
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
-                rendezvous_mtls_required: true,
+                rendezvous_mtls_required: false,
                 relay_mode: RelayMode::Required,
                 path_kind: TransportPathKind::RelayTunnel,
                 direct_candidate: None,
@@ -762,6 +786,40 @@ mod tests {
             },
             &identity,
         ) {
+            Ok(_) => panic!("missing cluster CA should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires target.cluster_ca_pem for inner relay mTLS")
+        );
+    }
+
+    #[test]
+    fn build_http_client_with_identity_from_planned_target_requires_rendezvous_identity_for_inner_relay_mtls()
+     {
+        let identity = sample_identity();
+        let error = match build_http_client_with_identity_from_planned_target(
+            &PlannedConnectionBootstrapTarget {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                relay_mode: RelayMode::Required,
+                path_kind: TransportPathKind::RelayTunnel,
+                direct_candidate: None,
+                server_base_url: None,
+                target_node_id: Some(NodeId::new_v4()),
+                server_ca_pem: None,
+                cluster_ca_pem: Some("cluster-ca".to_string()),
+                rendezvous_ca_pem: None,
+                pairing_token: None,
+                device_label: None,
+                device_id: None,
+            },
+            &identity,
+        ) {
             Ok(_) => panic!("missing rendezvous identity should fail"),
             Err(error) => error,
         };
@@ -769,7 +827,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires rendezvous_client_identity_pem")
+                .contains("requires rendezvous_client_identity_pem for inner relay mTLS")
         );
     }
 

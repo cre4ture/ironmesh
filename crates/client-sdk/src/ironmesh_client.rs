@@ -34,9 +34,10 @@ use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, ConnectionCandidate, PeerIdentity, RelayHttpHeader,
-    RendezvousControlClient, TransportHeader, TransportPathKind, TransportRequestHead,
-    TransportStreamKind, build_signed_request_headers, read_buffered_transport_response,
-    read_transport_response_head, write_buffered_transport_request, write_transport_request_head,
+    RelayTunnelSourceSecurityConfig, RendezvousControlClient, TransportHeader, TransportPathKind,
+    TransportRequestHead, TransportStreamKind, build_signed_request_headers,
+    read_buffered_transport_response, read_transport_response_head,
+    write_buffered_transport_request, write_transport_request_head,
 };
 use uuid::Uuid;
 
@@ -2066,9 +2067,11 @@ impl IronMeshClient {
         request_base_url: impl Into<String>,
         rendezvous: RendezvousControlClient,
         target_node_id: NodeId,
+        source_security: RelayTunnelSourceSecurityConfig,
     ) -> Self {
         let request_base_url = request_base_url.into().trim_end_matches('/').to_string();
-        let session_pool = TransportSessionPool::new_relay(rendezvous.clone(), target_node_id);
+        let session_pool =
+            TransportSessionPool::new_relay(rendezvous.clone(), target_node_id, source_security);
         Self {
             transport_router: ClientEndpointRouter::new(vec![ClientEndpoint::new(
                 ClientTransport::Relay(ClientRelayTransport {

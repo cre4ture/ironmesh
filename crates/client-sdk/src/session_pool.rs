@@ -8,10 +8,11 @@ use tokio::sync::Mutex;
 use transport_sdk::{
     ClientIdentityMaterial, ConnectionCandidate, DEFAULT_DIRECT_QUIC_ALPN, DirectQuicEndpoint,
     DirectQuicEndpointConfig, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
-    RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind, RendezvousControlClient,
-    TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
-    WebSocketByteStream, build_signed_request_headers, connect_websocket,
-    perform_transport_client_handshake, websocket_url,
+    RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind,
+    RelayTunnelSourceSecurityConfig, RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION,
+    TransportSessionControlMessage, TransportSessionRole, WebSocketByteStream,
+    build_signed_request_headers, connect_websocket, perform_transport_client_handshake,
+    websocket_url,
 };
 
 #[derive(Clone)]
@@ -35,6 +36,7 @@ enum SessionPoolTarget {
     Relay {
         rendezvous: RendezvousControlClient,
         target_node_id: NodeId,
+        source_security: RelayTunnelSourceSecurityConfig,
     },
 }
 
@@ -87,11 +89,16 @@ impl TransportSessionPool {
         }
     }
 
-    pub(crate) fn new_relay(rendezvous: RendezvousControlClient, target_node_id: NodeId) -> Self {
+    pub(crate) fn new_relay(
+        rendezvous: RendezvousControlClient,
+        target_node_id: NodeId,
+        source_security: RelayTunnelSourceSecurityConfig,
+    ) -> Self {
         Self {
             target: SessionPoolTarget::Relay {
                 rendezvous,
                 target_node_id,
+                source_security,
             },
             cached_session: Arc::new(Mutex::new(None)),
             stats: Arc::new(TransportSessionPoolStats::default()),
@@ -209,6 +216,7 @@ impl TransportSessionPool {
         let SessionPoolTarget::Relay {
             rendezvous,
             target_node_id,
+            source_security,
         } = &self.target
         else {
             bail!("attempted to open a relay session from a direct transport session pool");
@@ -235,12 +243,24 @@ impl TransportSessionPool {
                     target_node_id
                 )
             })?;
-        let (relay_session, multiplexed) = rendezvous
-            .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
+        let relay_tunnel = rendezvous
+            .connect_relay_tunnel_source(&ticket)
             .await
             .with_context(|| {
                 format!(
-                    "failed opening multiplex relay session for client target node {}",
+                    "failed opening relay tunnel source for client target node {}",
+                    target_node_id
+                )
+            })?;
+        let (relay_session, multiplexed) = relay_tunnel
+            .into_secure_multiplexed_source_session(
+                source_security.clone(),
+                MultiplexConfig::default(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed establishing inner mTLS relay session for client target node {}",
                     target_node_id
                 )
             })?;
