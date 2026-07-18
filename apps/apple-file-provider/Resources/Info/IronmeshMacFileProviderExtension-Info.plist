@@ -25,7 +25,7 @@
     <key>IronmeshKeychainAccessGroup</key>
     <string>$(AppIdentifierPrefix)dev.ironmesh.apple.shared-keychain</string>
     <key>IronmeshDomainDisplayName</key>
-    <string>IronMesh</string>
+    <string>BerryKeep</string>
     <key>IronmeshDomainIdentifier</key>
     <string>dev.ironmesh.default</string>
     <key>LSMinimumSystemVersion</key>

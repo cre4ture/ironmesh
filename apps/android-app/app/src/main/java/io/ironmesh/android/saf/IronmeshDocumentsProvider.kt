@@ -47,7 +47,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             rootId = ROOT_ID,
             documentId = rootDocumentId(),
             title = ROOT_TITLE,
-            summary = "Ironmesh distributed storage",
+            summary = "BerryKeep distributed storage",
             flags =
             DocumentsContract.Root.FLAG_SUPPORTS_CREATE or
                 DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD,
@@ -491,7 +491,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     private companion object {
         private const val TAG = "IronmeshDocumentsProvider"
         private const val ROOT_ID = "ironmesh-root"
-        private const val ROOT_TITLE = "Ironmesh"
+        private const val ROOT_TITLE = "BerryKeep"
         private const val MAX_CONCURRENT_THUMBNAIL_STREAMS = 4
     }
 }

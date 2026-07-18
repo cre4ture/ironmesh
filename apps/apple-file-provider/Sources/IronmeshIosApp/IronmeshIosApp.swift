@@ -491,6 +491,14 @@ private struct IronmeshFilesView: View {
                             .buttonStyle(.bordered)
                         }
 
+                        NavigationLink {
+                            IronmeshConnectionPathsView()
+                        } label: {
+                            Label("Inspect connection paths", systemImage: "point.3.connected.trianglepath.dotted")
+                        }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
                         if model.orderedConnectionEndpoints.isEmpty {
                             Text("No route attempts recorded yet.")
                                 .foregroundStyle(.secondary)
@@ -559,6 +567,211 @@ private struct IronmeshFilesView: View {
                 model.noteFilesSelection(url)
             }
         }
+    }
+}
+
+private struct IronmeshConnectionPathsView: View {
+    @EnvironmentObject private var model: IronmeshBrowserModel
+
+    var body: some View {
+        List {
+            if let error = model.connectionRoutesErrorMessage {
+                Section {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                }
+            }
+
+            if let snapshot = model.connectionRouteSnapshot {
+                overview(snapshot)
+
+                Section("Ranked paths") {
+                    ForEach(Array(snapshot.rankedEndpoints.enumerated()), id: \.element.id) { rank, endpoint in
+                        IronmeshConnectionPathRow(
+                            endpoint: endpoint,
+                            rank: rank + 1,
+                            snapshotTimestamp: snapshot.generatedAtUnixMs
+                        )
+                    }
+                }
+            } else if model.isRefreshingConnectionRoutes {
+                Section {
+                    HStack {
+                        Spacer()
+                        ProgressView("Evaluating connection paths…")
+                        Spacer()
+                    }
+                }
+            } else {
+                Section {
+                    VStack(spacing: 8) {
+                        Image(systemName: "point.3.connected.trianglepath.dotted")
+                            .font(.title)
+                            .foregroundStyle(.secondary)
+                        Text("No connection paths yet")
+                            .font(.headline)
+                        Text("Evaluate routes to inspect direct and relay candidates.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                }
+            }
+        }
+        .navigationTitle("Connection paths")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    model.refreshConnectionPaths()
+                } label: {
+                    if model.isRefreshingConnectionRoutes {
+                        ProgressView()
+                    } else {
+                        Label("Re-evaluate", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(model.isRefreshingConnectionRoutes)
+            }
+        }
+        .task {
+            if model.connectionRouteSnapshot == nil && !model.isRefreshingConnectionRoutes {
+                model.refreshConnectionPaths()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func overview(_ snapshot: AppleConnectionRouteSnapshot) -> some View {
+        Section("Overview") {
+            IronmeshKeyValueRow(
+                label: "Selected path",
+                value: snapshot.activeEndpoint?.pathKind.displayName ?? "None"
+            )
+            IronmeshKeyValueRow(label: "Candidates", value: "\(snapshot.endpoints.count)")
+            IronmeshKeyValueRow(label: "Direct", value: "\(snapshot.directEndpointCount)")
+            IronmeshKeyValueRow(label: "Relay", value: "\(snapshot.relayEndpointCount)")
+            IronmeshKeyValueRow(
+                label: "Evaluated",
+                value: unixMillisecondsTimestamp(snapshot.generatedAtUnixMs)
+            )
+            Text("Routes are evaluated only when this view opens or you explicitly refresh it.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct IronmeshConnectionPathRow: View {
+    let endpoint: AppleConnectionRouteEndpoint
+    let rank: Int
+    let snapshotTimestamp: UInt64
+
+    private var coolingDown: Bool {
+        endpoint.isCoolingDown(atUnixMs: currentUnixMilliseconds)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(endpoint.pathKind.displayName, systemImage: pathIcon)
+                    .font(.headline)
+                Spacer()
+                Text("#\(rank)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(endpoint.locator)
+                .font(.footnote.monospaced())
+                .textSelection(.enabled)
+
+            HStack(spacing: 8) {
+                if endpoint.active {
+                    IronmeshConnectionPathBadge(title: "Active", color: .green)
+                }
+                if endpoint.backgroundProbeInFlight {
+                    IronmeshConnectionPathBadge(title: "Probing", color: .blue)
+                }
+                if coolingDown {
+                    IronmeshConnectionPathBadge(title: "Cooldown", color: .orange)
+                }
+                if !endpoint.active && !endpoint.backgroundProbeInFlight && !coolingDown {
+                    IronmeshConnectionPathBadge(title: "Standby", color: .gray)
+                }
+            }
+
+            Group {
+                IronmeshKeyValueRow(label: "EWMA latency", value: milliseconds(endpoint.ewmaLatencyMs))
+                IronmeshKeyValueRow(label: "EWMA throughput", value: bytesPerSecond(endpoint.ewmaThroughputBytesPerSec))
+                IronmeshKeyValueRow(label: "Score", value: String(format: "%.2f", endpoint.score))
+                IronmeshKeyValueRow(label: "Successes", value: "\(endpoint.totalSuccesses)")
+                IronmeshKeyValueRow(
+                    label: "Failures",
+                    value: "\(endpoint.consecutiveFailures) consecutive, \(endpoint.totalFailures) total"
+                )
+                IronmeshKeyValueRow(label: "Bootstrap rank", value: "\(endpoint.bootstrapRank)")
+                if let targetNodeId = endpoint.targetNodeId {
+                    IronmeshKeyValueRow(label: "Target node", value: targetNodeId)
+                }
+                IronmeshKeyValueRow(
+                    label: "Last measurement",
+                    value: unixMillisecondsTimestamp(endpoint.lastMeasurementUnixMs)
+                )
+                IronmeshKeyValueRow(
+                    label: "Last success",
+                    value: unixMillisecondsTimestamp(endpoint.lastSuccessUnixMs)
+                )
+                IronmeshKeyValueRow(
+                    label: "Last failure",
+                    value: unixMillisecondsTimestamp(endpoint.lastFailureUnixMs)
+                )
+                IronmeshKeyValueRow(
+                    label: "Last probe",
+                    value: unixMillisecondsTimestamp(endpoint.lastBackgroundProbeUnixMs)
+                )
+                if let circuitOpenUntilUnixMs = endpoint.circuitOpenUntilUnixMs {
+                    IronmeshKeyValueRow(
+                        label: "Cooldown until",
+                        value: unixMillisecondsTimestamp(circuitOpenUntilUnixMs)
+                    )
+                }
+                if let lastError = endpoint.lastError {
+                    IronmeshKeyValueRow(label: "Last error", value: lastError)
+                }
+            }
+            .font(.footnote)
+        }
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .contain)
+        .accessibilityHint("Ranked at \(rank), snapshot \(unixMillisecondsTimestamp(snapshotTimestamp))")
+    }
+
+    private var pathIcon: String {
+        switch endpoint.pathKind {
+        case .directHTTPS:
+            return "lock.shield"
+        case .directQUIC:
+            return "bolt.horizontal"
+        case .relayTunnel:
+            return "arrow.triangle.branch"
+        case .unknown:
+            return "questionmark.circle"
+        }
+    }
+}
+
+private struct IronmeshConnectionPathBadge: View {
+    let title: String
+    let color: Color
+
+    var body: some View {
+        Text(title)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(color.opacity(0.12), in: Capsule())
     }
 }
 
@@ -1250,6 +1463,26 @@ private func unixMillisecondsTimestamp(_ timestamp: UInt64?) -> String {
     return IronmeshDateFormatters.timestamp.string(
         from: Date(timeIntervalSince1970: TimeInterval(timestamp) / 1_000)
     )
+}
+
+private var currentUnixMilliseconds: UInt64 {
+    UInt64(Date().timeIntervalSince1970 * 1_000)
+}
+
+private func milliseconds(_ value: Double?) -> String {
+    guard let value, value.isFinite else {
+        return "Unavailable"
+    }
+    return String(format: "%.1f ms", value)
+}
+
+private func bytesPerSecond(_ value: Double?) -> String {
+    guard let value, value.isFinite, value >= 0, value <= Double(Int64.max) else {
+        return "Unavailable"
+    }
+    let formatter = ByteCountFormatter()
+    formatter.countStyle = .file
+    return "\(formatter.string(fromByteCount: Int64(value.rounded())))/s"
 }
 
 private func byteCount(_ bytes: Int64?) -> String {

@@ -292,7 +292,7 @@ fn show_tray_menu(hwnd: HWND) {
         return;
     }
 
-    let label = utf16_null("Open IronMesh Config");
+    let label = utf16_null("Open BerryKeep Config");
     unsafe {
         AppendMenuW(menu, MF_STRING, TRAY_MENU_OPEN_ID, label.as_ptr());
         SetForegroundWindow(hwnd);
@@ -340,7 +340,7 @@ fn fallback_document(status_file: &std::path::Path, web_ui_url: &str) -> Desktop
         ),
         sync: StatusFacet::new(
             "starting",
-            "Starting IronMesh desktop status",
+            "Starting BerryKeep desktop status",
             "The config app is preparing the merged status document",
             "view-refresh-symbolic",
         ),
@@ -351,16 +351,16 @@ fn fallback_document(status_file: &std::path::Path, web_ui_url: &str) -> Desktop
             "dialog-question-symbolic",
         ),
     };
-    let mut document = build_status_document("IronMesh", status_file, web_ui_url, &snapshot);
+    let mut document = build_status_document("BerryKeep", status_file, web_ui_url, &snapshot);
     document.web_ui_url = Some(web_ui_url.to_string());
     document
 }
 
 fn build_tooltip(document: &DesktopStatusDocument) -> String {
     match document.overall.state.as_str() {
-        "syncing" => format!("IronMesh: {}", document.sync.detail),
-        "error" | "warning" => format!("IronMesh: {}", document.overall.summary),
-        _ => format!("IronMesh: {}", document.overall.summary),
+        "syncing" => format!("BerryKeep: {}", document.sync.detail),
+        "error" | "warning" => format!("BerryKeep: {}", document.overall.summary),
+        _ => format!("BerryKeep: {}", document.overall.summary),
     }
 }
 

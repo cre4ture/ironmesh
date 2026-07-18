@@ -43,7 +43,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-os-integration")]
-#[command(about = "Mount an Ironmesh FUSE view from a SyncSnapshot JSON or a live server-node")]
+#[command(about = "Mount a BerryKeep FUSE view from a SyncSnapshot JSON or a live server-node")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]

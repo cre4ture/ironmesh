@@ -124,7 +124,7 @@ pub fn derive_profile_label(prefix: Option<&str>, root_dir: &Path) -> String {
                 .and_then(|value| value.to_str())
                 .map(ToString::to_string)
         })
-        .unwrap_or_else(|| "IronMesh".to_string())
+        .unwrap_or_else(|| "BerryKeep".to_string())
 }
 
 #[must_use]
@@ -137,7 +137,7 @@ pub fn starting_snapshot(root_dir: &Path, connection_target: &str) -> StatusSnap
     StatusSnapshot {
         connection: StatusFacet::new(
             "starting",
-            "Connecting to IronMesh",
+            "Connecting to BerryKeep",
             format!("Preparing status for {connection_target}"),
             "network-transmit-receive-symbolic",
         ),
@@ -265,7 +265,7 @@ pub fn overall_status_facet(snapshot: &StatusSnapshot) -> StatusFacet {
     {
         return StatusFacet::new(
             "error",
-            "IronMesh needs attention",
+            "BerryKeep needs attention",
             format!(
                 "Connection: {}; Sync: {}; Replication: {}",
                 snapshot.connection.summary, snapshot.sync.summary, snapshot.replication.summary
@@ -277,7 +277,7 @@ pub fn overall_status_facet(snapshot: &StatusSnapshot) -> StatusFacet {
     if facet_is_warning(&snapshot.connection) || facet_is_warning(&snapshot.replication) {
         return StatusFacet::new(
             "warning",
-            "IronMesh is degraded",
+            "BerryKeep is degraded",
             format!(
                 "Connection: {}; Replication: {}",
                 snapshot.connection.detail, snapshot.replication.detail
@@ -298,7 +298,7 @@ pub fn overall_status_facet(snapshot: &StatusSnapshot) -> StatusFacet {
     if snapshot.sync.state == "stopped" {
         return StatusFacet::new(
             "stopped",
-            "IronMesh is idle",
+            "BerryKeep is idle",
             "Folder sync is not currently running",
             "media-playback-stop-symbolic",
         );
@@ -310,7 +310,7 @@ pub fn overall_status_facet(snapshot: &StatusSnapshot) -> StatusFacet {
     {
         return StatusFacet::new(
             "running",
-            "IronMesh is healthy",
+            "BerryKeep is healthy",
             format!(
                 "Connection: {}; Sync: {}; Replication: {}",
                 snapshot.connection.detail, snapshot.sync.detail, snapshot.replication.detail
@@ -321,7 +321,7 @@ pub fn overall_status_facet(snapshot: &StatusSnapshot) -> StatusFacet {
 
     StatusFacet::new(
         "unknown",
-        "Waiting for IronMesh status",
+        "Waiting for BerryKeep status",
         format!(
             "Connection: {}; Sync: {}; Replication: {}",
             snapshot.connection.summary, snapshot.sync.summary, snapshot.replication.summary
@@ -365,7 +365,7 @@ fn cluster_connection_facet(cluster: &ClusterSummaryView) -> StatusFacet {
     } else {
         StatusFacet::new(
             "connected",
-            "Connected to IronMesh",
+            "Connected to BerryKeep",
             summary,
             "network-transmit-receive-symbolic",
         )
@@ -376,7 +376,7 @@ fn health_connection_facet(health: &HealthStatusView) -> StatusFacet {
     if health.online {
         StatusFacet::new(
             "connected",
-            "Connected to IronMesh",
+            "Connected to BerryKeep",
             format!("Connected to {} endpoint", health.role),
             "network-transmit-receive-symbolic",
         )

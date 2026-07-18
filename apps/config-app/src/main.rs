@@ -50,7 +50,7 @@ use tokio::sync::{Mutex, oneshot};
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-config-app")]
-#[command(about = "Local configuration UI for packaged IronMesh background services")]
+#[command(about = "Local configuration UI for packaged BerryKeep background services")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -867,7 +867,7 @@ fn publish_config_app_desktop_status(
         ),
     };
     let mut document = build_status_document(
-        "IronMesh",
+        "BerryKeep",
         &state.instance_store_path,
         web_ui_url.to_string(),
         &snapshot,
@@ -2612,7 +2612,7 @@ const APP_HTML: &str = r###"<!doctype html>
       document.documentElement.setAttribute("data-mantine-color-scheme", computedColorScheme);
     } catch {}
   </script>
-  <title>IronMesh Desktop Config</title>
+  <title>BerryKeep Desktop Config</title>
   <link rel="icon" type="image/svg+xml" href="/ironmesh-favicon.svg" />
   <link rel="stylesheet" href="/app.css" />
 </head>
@@ -2621,50 +2621,36 @@ const APP_HTML: &str = r###"<!doctype html>
     <header class="shell-header">
       <div class="shell-header-bar">
         <div class="brand">
-          <svg class="brand-mark" viewBox="0 0 256 256" role="img" aria-label="ironmesh mark">
+          <svg class="brand-mark" viewBox="0 0 200 200" role="img" aria-label="berrykeep mark">
             <defs>
-              <linearGradient id="config-brand-panel" x1="36" y1="28" x2="214" y2="228" gradientUnits="userSpaceOnUse">
-                <stop offset="0" stop-color="#112523" />
-                <stop offset="0.52" stop-color="#163f3a" />
-                <stop offset="1" stop-color="#0d6b5c" />
+              <linearGradient id="config-brand-panel" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#7c3aed" />
+                <stop offset="1" stop-color="#c026d3" />
               </linearGradient>
-              <linearGradient id="config-brand-mesh" x1="72" y1="68" x2="184" y2="188" gradientUnits="userSpaceOnUse">
-                <stop offset="0" stop-color="#d9fff4" />
-                <stop offset="0.45" stop-color="#74e4c8" />
-                <stop offset="1" stop-color="#14b8a6" />
+              <linearGradient id="config-brand-leaf" x1="100" y1="6.24" x2="152.8" y2="37.92" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#86efac" />
+                <stop offset="1" stop-color="#22c55e" />
               </linearGradient>
             </defs>
-            <rect x="28" y="28" width="200" height="200" rx="54" fill="url(#config-brand-panel)" />
-            <rect x="28.75" y="28.75" width="198.5" height="198.5" rx="53.25" fill="none" stroke="#d9fff4" stroke-opacity="0.18" />
-            <g fill="none" stroke="url(#config-brand-mesh)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M128 68 L176 96 L176 160 L128 188 L80 160 L80 96 Z" />
-              <path d="M128 68 L128 188" />
-              <path d="M80 96 L176 160" />
-              <path d="M176 96 L80 160" />
-              <path d="M80 96 L176 96" />
-              <path d="M80 160 L176 160" />
+            <rect width="200" height="200" rx="44" fill="url(#config-brand-panel)" />
+            <path d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z" fill="url(#config-brand-leaf)" />
+            <line x1="100" y1="35.28" x2="100" y2="53.76" stroke="#22c55e" stroke-width="6.6" stroke-linecap="round" />
+            <g stroke="#ffffff" stroke-width="6.6" opacity="0.85" stroke-linecap="round">
+              <line x1="100" y1="69.6" x2="57.76" y2="109.2" />
+              <line x1="100" y1="69.6" x2="142.24" y2="109.2" />
+              <line x1="57.76" y1="109.2" x2="142.24" y2="109.2" />
+              <line x1="57.76" y1="109.2" x2="100" y2="162" />
+              <line x1="142.24" y1="109.2" x2="100" y2="162" />
             </g>
-            <g fill="#effff9">
-              <circle cx="128" cy="68" r="10" />
-              <circle cx="176" cy="96" r="10" />
-              <circle cx="176" cy="160" r="10" />
-              <circle cx="128" cy="188" r="10" />
-              <circle cx="80" cy="160" r="10" />
-              <circle cx="80" cy="96" r="10" />
-              <circle cx="128" cy="128" r="12" fill="#14b8a6" />
-            </g>
-            <g fill="#0d3d37">
-              <circle cx="128" cy="68" r="4" />
-              <circle cx="176" cy="96" r="4" />
-              <circle cx="176" cy="160" r="4" />
-              <circle cx="128" cy="188" r="4" />
-              <circle cx="80" cy="160" r="4" />
-              <circle cx="80" cy="96" r="4" />
-              <circle cx="128" cy="128" r="4" fill="#e9fff8" />
-            </g>
+            <circle cx="100" cy="69.6" r="18.48" fill="#ffffff" />
+            <circle cx="57.76" cy="109.2" r="18.48" fill="#ffffff" />
+            <circle cx="142.24" cy="109.2" r="18.48" fill="#ffffff" />
+            <circle cx="100" cy="162" r="18.48" fill="#ffffff" />
+            <circle cx="93.4" cy="63" r="5.016" fill="#e9d5ff" opacity="0.75" />
+            <circle cx="51.16" cy="102.6" r="5.016" fill="#e9d5ff" opacity="0.75" />
           </svg>
           <div class="brand-copy">
-            <span class="brand-name">ironmesh</span>
+            <span class="brand-name">berrykeep</span>
             <span class="brand-surface">Desktop Config</span>
           </div>
         </div>
@@ -4057,7 +4043,7 @@ function applyOsPlatformUi(platform) {
   document.getElementById('os-root-path-label').textContent = isWindows ? 'Local Folder Location' : 'Mountpoint';
   document.getElementById('os-root-path-help').textContent = isWindows
     ? 'Local folder path where this sync root is mounted.'
-    : 'Directory where the IronMesh FUSE filesystem should be mounted.';
+    : 'Directory where the BerryKeep FUSE filesystem should be mounted.';
   document.getElementById('os-submit-button').textContent = isWindows
     ? 'Save Explorer Sync Root'
     : isLinux
@@ -4070,10 +4056,10 @@ function applyOsPlatformUi(platform) {
 function renderConfig(config) {
   currentConfig = config;
   document.title = config.platform === 'windows'
-    ? 'IronMesh Windows Config'
+    ? 'BerryKeep Windows Config'
     : config.platform === 'linux'
-      ? 'IronMesh Linux Config'
-      : 'IronMesh Desktop Config';
+      ? 'BerryKeep Linux Config'
+      : 'BerryKeep Desktop Config';
   document.getElementById('desktop-config-version').textContent = formatFullVersion(
     config.desktop_config_version,
     config.desktop_config_revision

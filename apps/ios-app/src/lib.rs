@@ -2,10 +2,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use client_sdk::{
     BootstrapEnrollmentResult, ClientConnectionAttempt, ClientConnectionDiagnostics,
-    ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexRequestOptions,
-    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, VersionGraphSummary,
-    enroll_connection_input_blocking, normalize_server_base_url,
+    ClientConnectionRouteSnapshot, ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode,
+    ConnectionBootstrap, ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter,
+    StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder, StoreIndexView,
+    VersionGraphSummary, enroll_connection_input_blocking, normalize_server_base_url,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
@@ -377,6 +377,15 @@ impl IosStorageApp {
         )
     }
 
+    pub fn connection_route_snapshot(&self, refresh: bool) -> ClientConnectionRouteSnapshot {
+        if refresh {
+            self.runtime
+                .block_on(self.sdk.refresh_connection_route_snapshot())
+        } else {
+            self.sdk.connection_route_snapshot()
+        }
+    }
+
     pub fn store_index_with_options(
         &self,
         prefix: Option<&str>,
@@ -691,6 +700,13 @@ fn connection_diagnostics_json(handle: *mut c_void) -> Result<String> {
         .context("failed to serialize Apple connection diagnostics")
 }
 
+#[allow(unsafe_code)]
+fn connection_route_snapshot_json(handle: *mut c_void, refresh: bool) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    serde_json::to_string(&app.connection_route_snapshot(refresh))
+        .context("failed to serialize Apple connection route snapshot")
+}
+
 pub fn enroll_connection_input_json(
     connection_input: impl AsRef<str>,
     device_id_override: Option<&str>,
@@ -888,6 +904,21 @@ pub extern "C" fn ironmesh_ios_facade_connection_diagnostics_json(
     clear_string_out(out_json);
     clear_error(out_error);
     run_ffi_string_result(out_json, out_error, || connection_diagnostics_json(handle))
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_connection_route_snapshot_json(
+    handle: *mut c_void,
+    refresh: c_int,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        connection_route_snapshot_json(handle, refresh != 0)
+    })
 }
 
 #[allow(unsafe_code)]
@@ -1753,6 +1784,52 @@ mod tests {
             response.enrollment.label.as_deref()
         );
         assert!(persisted_bootstrap.pairing_token.is_none());
+    }
+
+    #[test]
+    fn connection_route_snapshot_ffi_serializes_the_rich_cached_route_contract() {
+        let addr = spawn_test_server();
+        let handle = create_handle_for_server(addr);
+        let mut json_out = ptr::null_mut();
+        let mut error_out = ptr::null_mut();
+
+        let status = ironmesh_ios_facade_connection_route_snapshot_json(
+            handle,
+            0,
+            &mut json_out,
+            &mut error_out,
+        );
+
+        assert_eq!(status, FFI_OK);
+        assert!(error_out.is_null());
+        let snapshot: serde_json::Value = serde_json::from_str(&read_string(json_out))
+            .expect("route snapshot response should parse");
+        assert!(snapshot["generated_at_unix_ms"].as_u64().is_some());
+        assert_eq!(snapshot["active_index"], 0);
+        assert_eq!(snapshot["ranked_indices"], serde_json::json!([0]));
+
+        let endpoint = &snapshot["endpoints"][0];
+        assert_eq!(endpoint["path_kind"], "direct_https");
+        assert_eq!(endpoint["active"], true);
+        for field in [
+            "score",
+            "ewma_latency_ms",
+            "ewma_throughput_bytes_per_sec",
+            "consecutive_failures",
+            "total_failures",
+            "total_successes",
+            "last_measurement_unix_ms",
+            "last_success_unix_ms",
+            "last_failure_unix_ms",
+            "circuit_open_until_unix_ms",
+            "background_probe_in_flight",
+            "last_background_probe_unix_ms",
+            "last_error",
+        ] {
+            assert!(endpoint.get(field).is_some(), "missing JSON field {field}");
+        }
+
+        ironmesh_ios_facade_free(handle);
     }
 
     #[test]
