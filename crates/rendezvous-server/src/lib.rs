@@ -35,7 +35,7 @@ use transport_sdk::{
 
 use crate::auth::{
     MaybeAuthenticatedPeer, MaybeObservedPeerAddr, MtlsAuthenticatedPeerAcceptor,
-    build_mtls_rustls_config, ensure_authenticated_peer_cluster,
+    authenticated_peer_cluster, build_mtls_rustls_config, ensure_authenticated_peer_cluster,
     ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
 
@@ -184,15 +184,11 @@ async fn discovery(
     authenticated_peer: MaybeAuthenticatedPeer,
     Query(query): Query<DiscoveryQuery>,
 ) -> std::result::Result<Json<DiscoveryResponse>, (StatusCode, String)> {
-    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
-        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    let authenticated_cluster_id =
+        authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
+            .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
     let cluster_id = if query.node_id.is_some() {
-        resolve_presence_cluster_id(
-            &state.presence,
-            state.config.mtls.is_some(),
-            &authenticated_peer,
-            query.cluster_id,
-        )?
+        resolve_presence_cluster_id(&state.presence, authenticated_cluster_id, query.cluster_id)?
     } else {
         None
     };
@@ -240,14 +236,11 @@ async fn list_presence(
     authenticated_peer: MaybeAuthenticatedPeer,
     Query(query): Query<PresenceListQuery>,
 ) -> std::result::Result<Json<PresenceListResponse>, (StatusCode, String)> {
-    require_any_authenticated_peer(state.config.mtls.is_some(), &authenticated_peer)
-        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let cluster_id = resolve_presence_cluster_id(
-        &state.presence,
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        query.cluster_id,
-    )?;
+    let authenticated_cluster_id =
+        authenticated_peer_cluster(state.config.mtls.is_some(), &authenticated_peer)
+            .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    let cluster_id =
+        resolve_presence_cluster_id(&state.presence, authenticated_cluster_id, query.cluster_id)?;
     let entries = cluster_id
         .map(|cluster_id| state.presence.list(cluster_id))
         .unwrap_or_default()
@@ -390,13 +383,23 @@ fn empty_rendezvous_runtime_state() -> RendezvousRuntimeState {
 
 fn resolve_presence_cluster_id(
     presence: &PresenceRegistry,
-    mtls_enabled: bool,
-    authenticated_peer: &MaybeAuthenticatedPeer,
+    authenticated_cluster_id: Option<ClusterId>,
     requested_cluster_id: Option<ClusterId>,
 ) -> std::result::Result<Option<ClusterId>, (StatusCode, String)> {
+    if let (Some(authenticated_cluster_id), Some(requested_cluster_id)) =
+        (authenticated_cluster_id, requested_cluster_id)
+        && authenticated_cluster_id != requested_cluster_id
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "authenticated peer cluster_id {authenticated_cluster_id} does not match presence query cluster_id {requested_cluster_id}"
+            ),
+        ));
+    }
     let single_cluster_id = presence.only_cluster_id();
-    let effective_cluster_id = requested_cluster_id
-        .or_else(|| authenticated_peer.cluster_id())
+    let effective_cluster_id = authenticated_cluster_id
+        .or(requested_cluster_id)
         .or(single_cluster_id);
 
     let Some(effective_cluster_id) = effective_cluster_id else {
@@ -409,13 +412,6 @@ fn resolve_presence_cluster_id(
         ));
     };
 
-    ensure_authenticated_peer_cluster(
-        mtls_enabled,
-        authenticated_peer,
-        effective_cluster_id,
-        "presence query",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
     Ok(Some(effective_cluster_id))
 }
 
@@ -1289,6 +1285,104 @@ mod tests {
             identity,
             cluster_id: Some(cluster_id),
         }))
+    }
+
+    #[tokio::test]
+    async fn mtls_presence_reads_are_filtered_by_authenticated_cluster() {
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let node_a = NodeId::now_v7();
+        let node_b = NodeId::now_v7();
+        let state = mtls_test_state();
+
+        state.presence.register(
+            presence_registration(
+                cluster_a,
+                PeerIdentity::Node(node_a),
+                "https://node-a.example:7443",
+            ),
+            None,
+        );
+        state.presence.register(
+            presence_registration(
+                cluster_b,
+                PeerIdentity::Node(node_b),
+                "https://node-b.example:7443",
+            ),
+            None,
+        );
+
+        let cluster_a_peer =
+            authenticated_peer(PeerIdentity::Device(DeviceId::now_v7()), cluster_a);
+        let presence = list_presence(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            Query(PresenceListQuery { cluster_id: None }),
+        )
+        .await
+        .expect("cluster A presence read should succeed")
+        .0;
+        assert_eq!(presence.registered_endpoints, 1);
+        assert_eq!(presence.entries[0].registration.cluster_id, cluster_a);
+
+        let own_discovery = discovery(
+            State(state.clone()),
+            cluster_a_peer.clone(),
+            Query(DiscoveryQuery {
+                node_id: Some(node_a),
+                cluster_id: None,
+            }),
+        )
+        .await
+        .expect("cluster A should discover its own node")
+        .0;
+        assert_eq!(
+            own_discovery.node_candidates,
+            Some(vec![ConnectionCandidate {
+                kind: CandidateKind::DirectHttps,
+                endpoint: "https://node-a.example:7443".to_string(),
+                rtt_ms: None,
+                transport_hints: None,
+            }])
+        );
+
+        let foreign_discovery = discovery(
+            State(state.clone()),
+            cluster_a_peer,
+            Query(DiscoveryQuery {
+                node_id: Some(node_b),
+                cluster_id: None,
+            }),
+        )
+        .await
+        .expect("foreign node discovery should return an empty result")
+        .0;
+        assert!(foreign_discovery.node_candidates.is_none());
+        assert!(!foreign_discovery.node_relay_capable);
+
+        let legacy_peer = MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
+            identity: PeerIdentity::Device(DeviceId::now_v7()),
+            cluster_id: None,
+        }));
+        let list_error = list_presence(
+            State(state.clone()),
+            legacy_peer.clone(),
+            Query(PresenceListQuery { cluster_id: None }),
+        )
+        .await
+        .expect_err("presence reads require a cluster SAN under mTLS");
+        assert_eq!(list_error.0, StatusCode::UNAUTHORIZED);
+        let discovery_error = discovery(
+            State(state),
+            legacy_peer,
+            Query(DiscoveryQuery {
+                node_id: Some(node_a),
+                cluster_id: None,
+            }),
+        )
+        .await
+        .expect_err("discovery reads require a cluster SAN under mTLS");
+        assert_eq!(discovery_error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

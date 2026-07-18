@@ -32,10 +32,6 @@ impl MaybeAuthenticatedPeer {
     pub(crate) fn identity(&self) -> Option<&PeerIdentity> {
         self.0.as_ref().map(|peer| &peer.identity)
     }
-
-    pub(crate) fn cluster_id(&self) -> Option<ClusterId> {
-        self.0.as_ref().and_then(|peer| peer.cluster_id)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -100,6 +96,23 @@ pub(crate) fn require_any_authenticated_peer(
     } else {
         bail!("rendezvous mTLS requires an authenticated peer certificate")
     }
+}
+
+pub(crate) fn authenticated_peer_cluster(
+    mtls_enabled: bool,
+    authenticated_peer: &MaybeAuthenticatedPeer,
+) -> Result<Option<ClusterId>> {
+    if !mtls_enabled {
+        return Ok(None);
+    }
+
+    let Some(authenticated_peer) = authenticated_peer.0.as_ref() else {
+        bail!("rendezvous mTLS requires an authenticated peer certificate");
+    };
+    let cluster_id = authenticated_peer
+        .cluster_id
+        .context("authenticated rendezvous client certificate is missing a cluster URI SAN")?;
+    Ok(Some(cluster_id))
 }
 
 pub(crate) fn ensure_authenticated_peer_identity(
@@ -471,6 +484,14 @@ mod tests {
             "relay ticket",
         )
         .expect_err("cluster-bound requests require a cluster SAN");
+
+        assert!(error.to_string().contains("missing a cluster URI SAN"));
+    }
+
+    #[test]
+    fn authenticated_cluster_read_rejects_legacy_certificate_without_cluster_san() {
+        let error = authenticated_peer_cluster(true, &authenticated_peer(None))
+            .expect_err("cluster-scoped reads require a cluster SAN");
 
         assert!(error.to_string().contains("missing a cluster URI SAN"));
     }
