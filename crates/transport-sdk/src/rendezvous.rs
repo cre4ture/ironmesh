@@ -347,7 +347,15 @@ impl RendezvousControlClient {
                 self.config.cluster_id
             );
         }
-        self.post_json("/control/relay/ticket", request).await
+        let ticket: RelayTicket = self.post_json("/control/relay/ticket", request).await?;
+        if ticket.security_mode != request.security_mode {
+            bail!(
+                "rendezvous relay ticket security mode {:?} does not match requested mode {:?}",
+                ticket.security_mode,
+                request.security_mode
+            );
+        }
+        Ok(ticket)
     }
 
     pub async fn publish_bootstrap_claim(
@@ -879,8 +887,12 @@ fn format_diagnostic_timestamp(unix: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::{RelayTunnelSecurityMode, RelayTunnelSessionKind};
     use axum::http::StatusCode;
-    use axum::{Json, Router, routing::get};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
     use common::NodeId;
     use uuid::Uuid;
 
@@ -898,6 +910,61 @@ mod tests {
         "jkjn2HXRB0g2pB2aeAIhALe+yYYMAqULo8WmhjcudAgQm/1vYSjowEWtUcMCY2J3\n",
         "-----END CERTIFICATE-----\n"
     );
+
+    #[tokio::test]
+    async fn issue_relay_ticket_rejects_inner_mtls_downgrade() {
+        let cluster_id = Uuid::now_v7();
+        let router = Router::new().route(
+            "/control/relay/ticket",
+            post(|Json(request): Json<RelayTicketRequest>| async move {
+                Json(serde_json::json!({
+                    "cluster_id": request.cluster_id,
+                    "session_id": "legacy-response",
+                    "source": request.source,
+                    "target": request.target,
+                    "session_kind": request.session_kind,
+                    "relay_urls": ["https://relay.example"],
+                    "issued_at_unix": 1,
+                    "expires_at_unix": 61
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test rendezvous server should run");
+        });
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let error = client
+            .issue_relay_ticket(&RelayTicketRequest {
+                cluster_id,
+                source: PeerIdentity::Device(Uuid::now_v7()),
+                target: PeerIdentity::Node(NodeId::now_v7()),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::InnerMtls,
+                requested_expires_in_secs: Some(60),
+            })
+            .await
+            .expect_err("a legacy response must not downgrade an inner-mTLS request");
+
+        assert!(error.to_string().contains("does not match requested mode"));
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn runtime_state_tracks_failed_and_active_rendezvous_endpoints() {
