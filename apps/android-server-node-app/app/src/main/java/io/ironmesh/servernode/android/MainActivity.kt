@@ -82,11 +82,11 @@ private fun MainScreen(
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Image(
                 painter = painterResource(R.drawable.ic_ironmesh_mark),
-                contentDescription = "Ironmesh logo",
+                contentDescription = "BerryKeep logo",
                 modifier = Modifier.size(52.dp),
             )
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Ironmesh", style = MaterialTheme.typography.headlineSmall)
+                Text("BerryKeep", style = MaterialTheme.typography.headlineSmall)
                 Text(
                     "Android Server Node",
                     style = MaterialTheme.typography.titleMedium,
@@ -170,7 +170,7 @@ private fun MainScreen(
         DetailCard(
             title = "Notes",
             lines = listOf(
-                "The app runs the Ironmesh managed bootstrap flow directly on Android.",
+                "The app runs the BerryKeep managed bootstrap flow directly on Android.",
                 "The foreground service keeps the local node alive while the app is backgrounded.",
                 "The embedded WebView accepts the local node's self-signed certificate for the active host.",
             ),

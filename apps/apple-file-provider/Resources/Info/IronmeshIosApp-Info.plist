@@ -23,11 +23,11 @@
     <key>IronmeshAppGroupIdentifier</key>
     <string>group.dev.ironmesh.apple.shared</string>
     <key>IronmeshDomainDisplayName</key>
-    <string>IronMesh</string>
+    <string>BerryKeep</string>
     <key>IronmeshDomainIdentifier</key>
     <string>dev.ironmesh.default</string>
     <key>NSCameraUsageDescription</key>
-    <string>IronMesh uses the camera to scan bootstrap claim QR codes during device enrollment.</string>
+    <string>BerryKeep uses the camera to scan bootstrap claim QR codes during device enrollment.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>

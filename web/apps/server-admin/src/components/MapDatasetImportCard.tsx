@@ -94,7 +94,7 @@ export function MapDatasetImportCard() {
               <Text c="dimmed" size="sm" maw={860}>
                 Paste the MapTiler URL or the full copied <Code>wget -c ...</Code> command. The
                 server node downloads the MBTiles file with resumable range requests, ingests it
-                directly into IronMesh chunks, finalizes configurable part objects under{" "}
+                directly into BerryKeep chunks, finalizes configurable part objects under{" "}
                 <Code>sys/maps/</Code>, and resumes automatically after server restarts.
               </Text>
             </div>
@@ -121,7 +121,7 @@ export function MapDatasetImportCard() {
           <Group align="flex-end">
             <NumberInput
               label="Part size"
-              description="Each finalized part object keeps its own IronMesh object key under sys/maps/."
+              description="Each finalized part object keeps its own BerryKeep object key under sys/maps/."
               value={partSizeGiB}
               min={1}
               max={64}
