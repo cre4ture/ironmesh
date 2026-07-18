@@ -9,7 +9,6 @@
 /* Begin PBXBuildFile section */
 		082E983DBE4DD0A288B7E0B2 /* IronmeshMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */; };
 		09176176A1A35D7D95E20B12 /* IronmeshIosProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A36A32CA7808E8CC71993FEC /* IronmeshIosProjectTests.swift */; };
-		0A7DB1E9C4F248B49A625B31 /* IronmeshGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D91A6F7B3C84E58A10479D2 /* IronmeshGalleryModel.swift */; };
 		0BC42E8828E7FB463CEA0761 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 		0DBC3C31113B92CB3CFE0EFD /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
 		1596A1C38F950315CB507483 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 220FA7A03D50518BD537F1CB /* AVFoundation.framework */; };
@@ -17,12 +16,13 @@
 		1F30F9EE22B86F396DAEA0DF /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
 		3ECD32BAAD7E1074A209E6A9 /* IronmeshAppleProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7920A3DC35240252C623BC7 /* IronmeshAppleProjectTests.swift */; };
 		43C79B50B668310E1E948E7A /* IronmeshIosFileProviderExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D65743C5EC88BC86B9CCD14F /* IronmeshIosFileProviderExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		4C9B2B93D3EF1DDA5309B64C /* IronmeshGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB0FEF4247443AA0C0D393D /* IronmeshGalleryModel.swift */; };
 		5325406375A4DA8E66293157 /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
 		5392619423EF7380FFA0BA73 /* IronmeshBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */; };
 		5AA87421C5EE2962F1348EEC /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
 		5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */; };
+		61DE2DC4A82685AF6F6554D2 /* IronmeshGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB0FEF4247443AA0C0D393D /* IronmeshGalleryModel.swift */; };
 		6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */; };
-		65C3E8A14B724D9FA8062E57 /* IronmeshGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F52C9D08E634AB1B49730C6 /* IronmeshGalleryView.swift */; };
 		63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 		6F3E03595FD2D97919630E3B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */; };
 		71AE453247F18B2C6C8A3FD4 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 4CADBC90D590EDBD274936BB /* AppleFileProviderShared */; };
@@ -32,6 +32,7 @@
 		8E3B91407FEE58B371BDCA83 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */; };
 		98957DAEF45FB9170691016A /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
 		9937DD5D5A6AEBD58A6F5689 /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
+		AB81FE36B1A8884EB22E1A2C /* IronmeshGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAE325C40BA870C788A02A49 /* IronmeshGalleryView.swift */; };
 		B1CEF3BBBCCA99EB5A2C2F17 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 648AE487A41AA72E53A73C09 /* AppleFileProviderShared */; };
 		B34CFEFE0F3CACD159AFC871 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = D4758290C2F46CB307E07F32 /* AppleCore */; };
 		B36DE238EE6B5D64A18A7FB8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 610C745899D565B8093E9493 /* AppleCore */; };
@@ -87,7 +88,6 @@
 
 /* Begin PBXFileReference section */
 		220FA7A03D50518BD537F1CB /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
-		2D91A6F7B3C84E58A10479D2 /* IronmeshGalleryModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryModel.swift; sourceTree = "<group>"; };
 		244B38CABFC537484ED1F06D /* apple-file-provider */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "apple-file-provider"; path = .; sourceTree = SOURCE_ROOT; };
 		3AF23604A81569FFBE88C99C /* IronmeshMacFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshMacFileProviderExtension.swift; sourceTree = "<group>"; };
 		490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
@@ -95,7 +95,6 @@
 		6DED46198314AD32D59D4EEE /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosApp.swift; sourceTree = "<group>"; };
 		7DA129FD959C0FD0D040070D /* IronmeshIosProjectTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = IronmeshIosProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		7F52C9D08E634AB1B49730C6 /* IronmeshGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryView.swift; sourceTree = "<group>"; };
 		7DD73EE64ADF4D79132C4282 /* IronmeshAppleFFI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IronmeshAppleFFI-Bridging-Header.h"; sourceTree = "<group>"; };
 		8F5701975DDED656D7A9B6A6 /* IronmeshMacFileProviderExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = IronmeshMacFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		987EDC104DA47B5CF20BED0D /* IronmeshMacApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IronmeshMacApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -106,8 +105,10 @@
 		B88EA20710228EA5788F3224 /* IronmeshIosApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = IronmeshIosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshMacApp.swift; sourceTree = "<group>"; };
 		C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshRustFFIAdapter.swift; sourceTree = "<group>"; };
+		CAE325C40BA870C788A02A49 /* IronmeshGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryView.swift; sourceTree = "<group>"; };
 		D65743C5EC88BC86B9CCD14F /* IronmeshIosFileProviderExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = IronmeshIosFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		E936F23DD46DDF6D86D2F447 /* IronmeshBootstrapScannerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshBootstrapScannerSheet.swift; sourceTree = "<group>"; };
+		EBB0FEF4247443AA0C0D393D /* IronmeshGalleryModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryModel.swift; sourceTree = "<group>"; };
 		EC4454FA337C8FA97EBDD917 /* FileProvider.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FileProvider.framework; path = System/Library/Frameworks/FileProvider.framework; sourceTree = SDKROOT; };
 		F7920A3DC35240252C623BC7 /* IronmeshAppleProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshAppleProjectTests.swift; sourceTree = "<group>"; };
 		F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderRuntime.swift; sourceTree = "<group>"; };
@@ -240,8 +241,8 @@
 		6A4777D0C0506B8D27B6198F /* AppleAppSupport */ = {
 			isa = PBXGroup;
 			children = (
-				2D91A6F7B3C84E58A10479D2 /* IronmeshGalleryModel.swift */,
 				A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */,
+				EBB0FEF4247443AA0C0D393D /* IronmeshGalleryModel.swift */,
 			);
 			name = AppleAppSupport;
 			path = Sources/AppleAppSupport;
@@ -305,7 +306,7 @@
 			isa = PBXGroup;
 			children = (
 				E936F23DD46DDF6D86D2F447 /* IronmeshBootstrapScannerSheet.swift */,
-				7F52C9D08E634AB1B49730C6 /* IronmeshGalleryView.swift */,
+				CAE325C40BA870C788A02A49 /* IronmeshGalleryView.swift */,
 				6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */,
 			);
 			name = IronmeshIosApp;
@@ -616,6 +617,7 @@
 			files = (
 				5392619423EF7380FFA0BA73 /* IronmeshBrowserModel.swift in Sources */,
 				F02D4D63B27E99F45F6B05C9 /* IronmeshFileProviderRuntime.swift in Sources */,
+				4C9B2B93D3EF1DDA5309B64C /* IronmeshGalleryModel.swift in Sources */,
 				082E983DBE4DD0A288B7E0B2 /* IronmeshMacApp.swift in Sources */,
 				F13F3F0DA872B57AFD30EE67 /* IronmeshRustFFIAdapter.swift in Sources */,
 			);
@@ -634,10 +636,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				EA5CEAEDBC7AE459CDEF1C8B /* IronmeshBootstrapScannerSheet.swift in Sources */,
-				0A7DB1E9C4F248B49A625B31 /* IronmeshGalleryModel.swift in Sources */,
-				65C3E8A14B724D9FA8062E57 /* IronmeshGalleryView.swift in Sources */,
 				5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */,
 				1F30F9EE22B86F396DAEA0DF /* IronmeshFileProviderRuntime.swift in Sources */,
+				61DE2DC4A82685AF6F6554D2 /* IronmeshGalleryModel.swift in Sources */,
+				AB81FE36B1A8884EB22E1A2C /* IronmeshGalleryView.swift in Sources */,
 				6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */,
 				E5578688033BE7CDB458989B /* IronmeshRustFFIAdapter.swift in Sources */,
 			);
@@ -673,6 +675,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
@@ -695,7 +698,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosApp-Info.plist";
@@ -741,7 +744,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosApp-Info.plist";
@@ -865,6 +868,7 @@
 		438673375255170381B484EA /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";
@@ -974,7 +978,7 @@
 			buildSettings = {
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosFileProviderExtension-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
@@ -996,6 +1000,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
@@ -1015,6 +1020,7 @@
 		C8D904EEB4580E12BF4D2C45 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";
@@ -1037,7 +1043,7 @@
 			buildSettings = {
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAppGroup.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/IronmeshSharedAccess.entitlements;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/IronmeshIosFileProviderExtension-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
