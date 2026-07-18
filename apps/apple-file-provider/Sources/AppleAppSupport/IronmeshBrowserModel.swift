@@ -113,6 +113,9 @@ struct IronmeshWebUIPresentation: Identifiable, Equatable, Sendable {
 final class IronmeshBrowserModel: ObservableObject {
     @Published var draft: IronmeshConnectionDraft {
         didSet {
+            if oldValue.connectionConfiguration != draft.connectionConfiguration {
+                invalidateConnectionRouteState()
+            }
             persistDraft()
         }
     }
@@ -153,6 +156,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     private var didActivate = false
     private var pendingOperations = 0
+    private var connectionRouteRequests = AppleLatestRequestCoordinator()
 
     init(
         userDefaults: UserDefaults = .standard,
@@ -320,8 +324,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
         hasCompletedOnboarding = true
         lastErrorMessage = nil
-        connectionRouteSnapshot = nil
-        connectionRoutesErrorMessage = nil
+        invalidateConnectionRouteState()
         statusText = "Onboarding complete. Connecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Completed onboarding", detail: draft.enrollmentSummary)
         refreshDomainState()
@@ -356,8 +359,7 @@ final class IronmeshBrowserModel: ObservableObject {
         }
 
         lastErrorMessage = nil
-        connectionRouteSnapshot = nil
-        connectionRoutesErrorMessage = nil
+        invalidateConnectionRouteState()
         statusText = "Applied connection settings. Reconnecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Applied settings", detail: draft.setupSummary)
         refreshDomainState()
@@ -434,6 +436,7 @@ final class IronmeshBrowserModel: ObservableObject {
     func resetToBundleDefaults() {
         draft = bundleDefaults
         try? syncSharedSettingsFromDraft()
+        invalidateConnectionRouteState()
         lastErrorMessage = nil
         statusText = "Restored bundled defaults."
         addAction("Restored defaults", detail: draft.setupSummary)
@@ -453,8 +456,7 @@ final class IronmeshBrowserModel: ObservableObject {
         lastSuccessfulConnectionAt = nil
         lastErrorMessage = nil
         connectionDiagnostics = nil
-        connectionRouteSnapshot = nil
-        connectionRoutesErrorMessage = nil
+        invalidateConnectionRouteState()
         webUIPresentation = nil
         settingsStore.clear()
         statusText = "Setup cleared. Finish onboarding to reconnect."
@@ -469,6 +471,7 @@ final class IronmeshBrowserModel: ObservableObject {
             hasCompletedOnboarding = false
         }
         try? syncSharedSettingsFromDraft()
+        invalidateConnectionRouteState()
         addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
     }
 
@@ -534,8 +537,7 @@ final class IronmeshBrowserModel: ObservableObject {
                 draft.enrolledDeviceID = enrollment.deviceID
                 draft.deviceLabel = enrollment.label ?? draft.deviceLabel
                 try syncSharedSettingsFromDraft()
-                connectionRouteSnapshot = nil
-                connectionRoutesErrorMessage = nil
+                invalidateConnectionRouteState()
 
                 if let configuration = draft.connectionConfiguration {
                     connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
@@ -589,6 +591,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     func refreshConnectionPaths() {
         guard let configuration = draft.connectionConfiguration else {
+            invalidateConnectionRouteState()
             let message = "A bootstrap bundle or direct route is required."
             connectionRoutesErrorMessage = message
             statusText = message
@@ -596,11 +599,14 @@ final class IronmeshBrowserModel: ObservableObject {
         }
 
         let remoteSession = remoteSession
+        let requestToken = connectionRouteRequests.begin()
         isRefreshingConnectionRoutes = true
         beginOperation()
         Task {
             defer {
-                isRefreshingConnectionRoutes = false
+                if connectionRouteRequests.complete(requestToken) {
+                    isRefreshingConnectionRoutes = false
+                }
                 endOperation()
             }
 
@@ -611,11 +617,17 @@ final class IronmeshBrowserModel: ObservableObject {
                         refresh: true
                     )
                 }.value
+                guard connectionRouteRequests.isCurrent(requestToken) else {
+                    return
+                }
                 connectionRouteSnapshot = snapshot
                 connectionRoutesErrorMessage = nil
                 statusText = "Re-evaluated \(snapshot.endpoints.count) connection path(s)."
                 addAction("Re-evaluated connection paths", detail: "\(snapshot.endpoints.count) path(s)")
             } catch {
+                guard connectionRouteRequests.isCurrent(requestToken) else {
+                    return
+                }
                 connectionRoutesErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Connection paths failed", detail: error.localizedDescription)
@@ -791,6 +803,13 @@ final class IronmeshBrowserModel: ObservableObject {
         try settingsStore.save(
             draft.appliedConnectionState(defaultConnectionInput: bundleDefaults.directConnectionInput)
         )
+    }
+
+    private func invalidateConnectionRouteState() {
+        connectionRouteRequests.invalidate()
+        connectionRouteSnapshot = nil
+        connectionRoutesErrorMessage = nil
+        isRefreshingConnectionRoutes = false
     }
 
     private func addAction(_ title: String, detail: String) {
