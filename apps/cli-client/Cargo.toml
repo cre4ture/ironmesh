@@ -32,6 +32,8 @@ web-ui-backend = { path = "../../crates/web-ui-backend" }
 
 [dev-dependencies]
 assert_cmd.workspace = true
+rcgen = { version = "0.14", features = ["crypto", "pem", "ring"] }
+rendezvous-server = { path = "../../crates/rendezvous-server" }
 transport-sdk = { path = "../../crates/transport-sdk" }
 uuid.workspace = true
 

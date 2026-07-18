@@ -185,23 +185,6 @@ if [[ -n "${IMPORT_REMOTE}" ]]; then
   rsync -a --delete "${IMPORT_REMOTE%/}/" "${REPO_DIR%/}/"
 fi
 
-if ((${#DEB_PATHS[@]} == 0)); then
-  VERSION="$(cd "${ROOT_DIR}" && dpkg-parsechangelog -SVersion)"
-  DEB_PATHS=(
-    "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${DEFAULT_ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${DEFAULT_ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${DEFAULT_ARCH}.deb"
-  )
-fi
-
-for path in "${DEB_PATHS[@]}"; do
-  if [[ ! -f "${path}" ]]; then
-    printf 'package not found: %s\n' "${path}" >&2
-    printf 'Run ./scripts/build-local-debs.sh first, or pass explicit .deb paths.\n' >&2
-    exit 1
-  fi
-done
-
 contains_architecture() {
   local architecture="$1"
   local candidate
@@ -222,6 +205,34 @@ add_architecture() {
     REQUESTED_ARCHES+=("${architecture}")
   fi
 }
+
+if ((${#DEB_PATHS[@]} == 0)); then
+  VERSION="$(cd "${ROOT_DIR}" && dpkg-parsechangelog -SVersion)"
+  IMPLICIT_ARCHES=("${REQUESTED_ARCHES[@]}")
+
+  if ((${#IMPLICIT_ARCHES[@]} == 0)); then
+    IMPLICIT_ARCHES=("${DEFAULT_ARCH}")
+  fi
+
+  REQUESTED_ARCHES=()
+  DEB_PATHS=()
+  for architecture in "${IMPLICIT_ARCHES[@]}"; do
+    add_architecture "${architecture}"
+    DEB_PATHS+=(
+      "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
+      "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
+      "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
+    )
+  done
+fi
+
+for path in "${DEB_PATHS[@]}"; do
+  if [[ ! -f "${path}" ]]; then
+    printf 'package not found: %s\n' "${path}" >&2
+    printf 'Run ./scripts/build-local-debs.sh first, or pass explicit .deb paths.\n' >&2
+    exit 1
+  fi
+done
 
 for path in "${DEB_PATHS[@]}"; do
   package_architecture="$(dpkg-deb -f "${path}" Architecture)"

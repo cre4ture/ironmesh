@@ -81,6 +81,22 @@ Configure these repository secrets for signed iOS artifacts:
 - `IRONMESH_IOS_APP_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosapp`
 - `IRONMESH_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosapp.fileprovider`
 
+Both provisioning profiles must grant the App Group `group.dev.ironmesh.apple.shared`
+and the resolved Keychain Sharing group
+`<AppIdentifierPrefix>dev.ironmesh.apple.shared-keychain`. The source entitlement uses
+`$(AppIdentifierPrefix)`; Xcode expands that build-setting placeholder to the signing
+team/app-identifier prefix in the built plist and entitlement. Regenerate the profiles
+after enabling either capability. Any future signed macOS host and extension profiles
+must grant the same pair of shared-access entitlements.
+
+Integration note: PR #93 changes the final iOS File Provider bundle identifier from
+`dev.ironmesh.apple.iosfileprovider` to `dev.ironmesh.apple.iosapp.fileprovider` and
+overlaps `project.yml`, the generated `project.pbxproj`, and this signing setup. After
+both changes land, replace the extension profile with one for the nested PR #93 bundle
+identifier that grants both shared-access capabilities above. Whichever PR lands second
+must reconcile the generated project and preserve `IronmeshSharedAccess.entitlements`
+for both the iOS host and extension configurations.
+
 Optional repository variable:
 
 - `IRONMESH_IOS_EXPORT_METHOD` — defaults to `development`; set to `ad-hoc` when you want shareable sideload builds for registered devices.

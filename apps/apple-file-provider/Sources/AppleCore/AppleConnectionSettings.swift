@@ -223,39 +223,164 @@ public protocol AppleBootstrapEnroller: Sendable {
 
 public final class AppleConnectionSettingsStore: @unchecked Sendable {
     public static let defaultStateKey = "ironmesh.connection.state"
+    public static let defaultLegacyDraftStateKey = "IronmeshIosApp.connectionDraft"
 
     private let defaults: UserDefaults
     private let stateKey: String
+    let secretStore: any AppleSecretStore
 
-    public init(defaults: UserDefaults = .standard, stateKey: String = defaultStateKey) {
+    public init(
+        defaults: UserDefaults = .standard,
+        stateKey: String = defaultStateKey,
+        secretStore: any AppleSecretStore = AppleKeychainSecretStore()
+    ) {
         self.defaults = defaults
         self.stateKey = stateKey
+        self.secretStore = secretStore
     }
 
-    public convenience init(suiteName: String?, stateKey: String = defaultStateKey) {
-        if let suiteName = suiteName?.nilIfBlank,
+    public convenience init(
+        preferencesSuiteName: String?,
+        keychainAccessGroup: String?,
+        stateKey: String = defaultStateKey,
+        secretStore: (any AppleSecretStore)? = nil
+    ) {
+        let normalizedSuiteName = preferencesSuiteName?.nilIfBlank
+        let resolvedSecretStore = secretStore ?? AppleKeychainSecretStore(
+            accessGroup: keychainAccessGroup
+        )
+        if let suiteName = normalizedSuiteName,
            let defaults = UserDefaults(suiteName: suiteName) {
-            self.init(defaults: defaults, stateKey: stateKey)
+            self.init(
+                defaults: defaults,
+                stateKey: stateKey,
+                secretStore: resolvedSecretStore
+            )
         } else {
-            self.init(defaults: .standard, stateKey: stateKey)
+            self.init(
+                defaults: .standard,
+                stateKey: stateKey,
+                secretStore: resolvedSecretStore
+            )
         }
     }
 
-    public func load() -> AppleStoredConnectionState? {
-        guard let data = defaults.data(forKey: stateKey) else {
-            return nil
+    public func load(
+        legacyDraftDefaults: UserDefaults? = nil,
+        legacyDraftStateKey: String = defaultLegacyDraftStateKey
+    ) throws -> AppleStoredConnectionState? {
+        let storedState = try loadPersistedState()
+        let draftRecord = try legacyDraftDefaults.flatMap {
+            try Self.legacyDraftRecord(defaults: $0, stateKey: legacyDraftStateKey)
         }
-        return try? JSONDecoder().decode(AppleStoredConnectionState.self, from: data)
+        let keychainIdentity = try secretStore.load()?.nilIfBlank
+        let legacyIdentity = storedState?.clientIdentityJSON?.nilIfBlank
+            ?? draftRecord?.identity
+        let clientIdentity = keychainIdentity ?? legacyIdentity
+        let hasLegacyPreferences =
+            storedState?.clientIdentityJSON != nil || draftRecord != nil
+
+        let sanitizedStateData: Data?
+        if let storedState, storedState.clientIdentityJSON != nil {
+            sanitizedStateData = try Self.encode(storedState.withoutClientIdentity)
+        } else {
+            sanitizedStateData = nil
+        }
+
+        if hasLegacyPreferences {
+            if let clientIdentity {
+                try secretStore.save(clientIdentity)
+            } else {
+                try secretStore.clear()
+            }
+        }
+
+        // Remove legacy values only after the Keychain write above has succeeded.
+        if let sanitizedStateData {
+            defaults.set(sanitizedStateData, forKey: stateKey)
+        }
+        if let draftRecord, let legacyDraftDefaults {
+            legacyDraftDefaults.set(
+                draftRecord.sanitizedData,
+                forKey: legacyDraftStateKey
+            )
+        }
+
+        guard var state = storedState?.withoutClientIdentity else {
+            return clientIdentity.map {
+                AppleStoredConnectionState(clientIdentityJSON: $0)
+            }
+        }
+        state.clientIdentityJSON = clientIdentity
+        return state
     }
 
     public func save(_ state: AppleStoredConnectionState) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        defaults.set(try encoder.encode(state), forKey: stateKey)
+        let sanitizedData = try Self.encode(state.withoutClientIdentity)
+        if let clientIdentity = state.clientIdentityJSON?.nilIfBlank {
+            try secretStore.save(clientIdentity)
+        } else {
+            try secretStore.clear()
+        }
+        defaults.set(sanitizedData, forKey: stateKey)
     }
 
-    public func clear() {
+    public func clear() throws {
+        try secretStore.clear()
         defaults.removeObject(forKey: stateKey)
+    }
+
+    private func loadPersistedState() throws -> AppleStoredConnectionState? {
+        guard let data = defaults.data(forKey: stateKey) else {
+            return nil
+        }
+        return try JSONDecoder().decode(AppleStoredConnectionState.self, from: data)
+    }
+
+    private static func encode(_ state: AppleStoredConnectionState) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(state)
+    }
+
+    private static func legacyDraftRecord(
+        defaults: UserDefaults,
+        stateKey: String
+    ) throws -> LegacyDraftRecord? {
+        guard let data = defaults.data(forKey: stateKey),
+              var object = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              object.keys.contains("clientIdentityJSON")
+        else {
+            return nil
+        }
+        let identity = (object.removeValue(forKey: "clientIdentityJSON") as? String)?
+            .nilIfBlank
+        return LegacyDraftRecord(
+            identity: identity,
+            sanitizedData: try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.sortedKeys]
+            )
+        )
+    }
+}
+
+private struct LegacyDraftRecord {
+    let identity: String?
+    let sanitizedData: Data
+}
+
+extension AppleStoredConnectionState {
+    fileprivate var withoutClientIdentity: AppleStoredConnectionState {
+        AppleStoredConnectionState(
+            connectionInput: connectionInput,
+            serverCAPem: serverCAPem,
+            clientIdentityJSON: nil,
+            deviceID: deviceID,
+            deviceLabel: deviceLabel,
+            bootstrapInputDraft: bootstrapInputDraft
+        )
     }
 }
 
