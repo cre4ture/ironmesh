@@ -62,7 +62,7 @@ jobs:
               CARGO_BUILD_JOBS=2 ./scripts/build-local-debs.sh \
                 --no-prepare --no-check-build-deps -- -j2
               find /build -maxdepth 1 -type f \
-                \( -name "ironmesh_*_arm64.deb" \
+                \( -name "ironmesh-*_*_arm64.deb" \
                   -o -name "ironmesh_*_arm64.changes" \
                   -o -name "ironmesh_*_arm64.buildinfo" \) \
                 -exec cp -v {} /build/ironmesh/artifacts/ \;
