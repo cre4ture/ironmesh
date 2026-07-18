@@ -140,8 +140,9 @@ if [[ "${DRY_RUN}" == true ]]; then
 fi
 
 if [[ "${DRY_RUN}" == false ]]; then
-  log "ensuring ${REMOTE}:${REMOTE_DIR} exists"
-  ssh "${REMOTE}" "mkdir -p $(shell_quote "${REMOTE_DIR}")"
+  log "ensuring ${REMOTE}:${REMOTE_DIR}/dists/${SUITE} exists"
+  ssh "${REMOTE}" \
+    "mkdir -p $(shell_quote "${REMOTE_DIR%/}/dists/${SUITE}")"
 fi
 
 log "syncing ${SUITE} metadata"
