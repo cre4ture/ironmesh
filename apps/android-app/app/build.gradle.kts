@@ -316,8 +316,11 @@ android {
     }
 
     sourceSets {
-        getByName("main") {
-            jniLibs.srcDir(layout.buildDirectory.dir("generated/rustJniLibs"))
+        getByName("debug") {
+            jniLibs.srcDir(layout.buildDirectory.dir("generated/rustJniLibs/debug"))
+        }
+        getByName("release") {
+            jniLibs.srcDir(layout.buildDirectory.dir("generated/rustJniLibs/release"))
         }
     }
 }
@@ -326,15 +329,14 @@ val androidComponents = extensions.getByType<ApplicationAndroidComponentsExtensi
 val ndkDirectoryProvider = androidComponents.sdkComponents.ndkDirectory
 val sdkDirectoryProvider = androidComponents.sdkComponents.sdkDirectory
 
-val buildRust = tasks.register<Exec>("buildRust") {
+fun registerRustBuildTask(taskName: String, buildType: String) = tasks.register<Exec>(taskName) {
     group = "build"
-
-    val isRelease = gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
-    val outDir = layout.buildDirectory.dir("generated/rustJniLibs").get().asFile
+    val outDir = layout.buildDirectory.dir("generated/rustJniLibs/$buildType").get().asFile
 
     workingDir = workspaceRoot
 
     doFirst {
+        outDir.deleteRecursively()
         outDir.mkdirs()
 
         val ndkDir = resolveInstalledNdk(
@@ -353,16 +355,24 @@ val buildRust = tasks.register<Exec>("buildRust") {
 
     val argsList = mutableListOf<String>()
     argsList.addAll(listOf("ndk", "-t", "arm64-v8a", "-t", "x86_64", "-o", outDir.absolutePath, "build", "-p", "android-app"))
-    if (isRelease) {
+    if (buildType == "release") {
         argsList.add("--release")
     }
 
     args(argsList)
 }
 
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }
+val buildRustDebug = registerRustBuildTask("buildRustDebug", "debug")
+val buildRustRelease = registerRustBuildTask("buildRustRelease", "release")
+
+tasks.matching { it.name == "mergeDebugJniLibFolders" }
     .configureEach {
-        dependsOn(buildRust)
+        dependsOn(buildRustDebug)
+    }
+
+tasks.matching { it.name == "mergeReleaseJniLibFolders" }
+    .configureEach {
+        dependsOn(buildRustRelease)
     }
 
 dependencies {

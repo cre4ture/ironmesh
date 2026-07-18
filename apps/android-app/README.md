@@ -24,7 +24,8 @@ Android Studio will sync Gradle and let you run the `app` module.
 Rust JNI integration is wired into the app Gradle build:
 
 - `preBuild` runs `cargo ndk ... build` for Android ABIs
-- generated `.so` files are packaged from `app/build/generated/rustJniLibs`
+- generated `.so` files are packaged from the variant-specific
+  `app/build/generated/rustJniLibs/debug` or `app/build/generated/rustJniLibs/release` directory
 - JNI load name is `android_app` (`System.loadLibrary("android_app")`)
 
 Prerequisites for native bridge builds:
