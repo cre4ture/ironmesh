@@ -1,0 +1,23 @@
+# systemd *user* service template: one ephemeral-runner slot per instance.
+# Install per user (linger must be enabled) and start N instances:
+#   systemctl --user enable --now ironmesh-runner@0.service
+#   systemctl --user enable --now ironmesh-runner@1.service
+#
+# Requires: the user is in the `docker` group (re-login after adding) and `gh`
+# is authenticated for the user. %i is the slot index.
+[Unit]
+Description=ironmesh ephemeral self-hosted GitHub Actions runner (slot %i)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust if the repo lives elsewhere:
+ExecStart=%h/rust-dev/ironmesh/ci/self-hosted-runner/linux/supervisor.sh %i
+Restart=always
+RestartSec=5
+# Give the runner a predictable HOME/PATH; gh + docker must be on PATH.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+
+[Install]
+WantedBy=default.target
