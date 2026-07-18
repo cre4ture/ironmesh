@@ -6,6 +6,7 @@ mod client_sdk_test;
 mod cluster_test;
 mod config_app_test;
 mod framework;
+mod relay_security_e2e_test;
 mod s3_test;
 #[path = "web-ui-backend_test.rs"]
 mod web_ui_backend_test;
