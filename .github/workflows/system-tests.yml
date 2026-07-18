@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # sccache (RUSTC_WRAPPER) cannot cache incremental compilation; disabling it
+  # lets sccache actually cache rustc invocations across CI runs.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   system-tests:
     runs-on: ${{ matrix.os }}

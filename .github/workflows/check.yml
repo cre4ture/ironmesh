@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # sccache (RUSTC_WRAPPER) cannot cache incremental compilation, so the
+  # dev-profile check/test/clippy jobs got almost no cross-run reuse from it.
+  # Disabling incremental lets sccache actually cache rustc invocations.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   workspace-check:
     runs-on: ubuntu-latest
