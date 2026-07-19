@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -357,7 +357,13 @@ fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>
             path.display()
         )
     })?;
-    File::open(parent)
+    sync_registry_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_registry_directory(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
         .with_context(|| {
             format!(
                 "failed opening cluster CA registry directory {}",
@@ -365,7 +371,13 @@ fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>
             )
         })?
         .sync_all()
-        .context("failed syncing cluster CA registry directory")?;
+        .context("failed syncing cluster CA registry directory")
+}
+
+#[cfg(not(unix))]
+fn sync_registry_directory(_parent: &Path) -> Result<()> {
+    // Windows does not expose a portable, openable directory handle for fsync.
+    // The registry file itself has already been fully synced before its rename.
     Ok(())
 }
 
