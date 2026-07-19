@@ -13,10 +13,14 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import io.ironmesh.android.data.EmbeddedWebUiSession
+import io.ironmesh.android.data.RustClientBridge
 import io.ironmesh.android.ui.components.IronmeshEmbeddedWebUi
+import io.ironmesh.android.ui.components.clearEmbeddedWebUiSession
 
 class WebUiActivity : ComponentActivity() {
     private var hostedWebView: WebView? = null
+    private var session: EmbeddedWebUiSession? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -32,17 +36,20 @@ class WebUiActivity : ComponentActivity() {
         }
 
         val url = intent.getStringExtra(EXTRA_WEB_UI_URL).orEmpty()
-        if (url.isBlank()) {
+        val authorization = intent.getStringExtra(EXTRA_WEB_UI_AUTHORIZATION).orEmpty()
+        if (url.isBlank() || authorization.isBlank()) {
             finish()
             return
         }
+        val session = EmbeddedWebUiSession(url, authorization)
+        this.session = session
 
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     IronmeshEmbeddedWebUi(
                         modifier = Modifier.fillMaxSize(),
-                        url = url,
+                        session = session,
                         onCreated = { hostedWebView = it },
                     )
                 }
@@ -57,6 +64,19 @@ class WebUiActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) {
+            hostedWebView?.apply {
+                clearHistory()
+                clearCache(true)
+            }
+            session?.let { clearEmbeddedWebUiSession(it.url) }
+            RustClientBridge.stopWebUi()
+            finish()
+        }
+    }
+
     private fun hideStatusBar() {
         WindowInsetsControllerCompat(window, window.decorView).apply {
             systemBarsBehavior =
@@ -67,8 +87,11 @@ class WebUiActivity : ComponentActivity() {
 
     companion object {
         private const val EXTRA_WEB_UI_URL = "io.ironmesh.android.extra.WEB_UI_URL"
+        private const val EXTRA_WEB_UI_AUTHORIZATION = "io.ironmesh.android.extra.WEB_UI_AUTHORIZATION"
 
-        fun intent(context: Context, webUiUrl: String): Intent =
-            Intent(context, WebUiActivity::class.java).putExtra(EXTRA_WEB_UI_URL, webUiUrl)
+        fun intent(context: Context, session: EmbeddedWebUiSession): Intent =
+            Intent(context, WebUiActivity::class.java)
+                .putExtra(EXTRA_WEB_UI_URL, session.url)
+                .putExtra(EXTRA_WEB_UI_AUTHORIZATION, session.authorization)
     }
 }

@@ -155,11 +155,14 @@ fn android_web_log_buffer() -> Arc<common::logging::LogBuffer> {
 }
 
 struct WebUiServer {
-    connection_input: String,
-    server_ca_pem: Option<String>,
-    client_identity_json: Option<String>,
-    local_url: String,
     task: JoinHandle<()>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddedWebUiLaunch {
+    url: String,
+    authorization: String,
 }
 
 fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
@@ -1020,7 +1023,7 @@ fn start_embedded_web_ui(
     connection_input: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-) -> Result<String> {
+) -> Result<EmbeddedWebUiLaunch> {
     let rt = runtime()?;
     let connection_input = normalized_connection_input_string(connection_input)?;
     let server_ca_pem = normalize_optional_string(server_ca_pem);
@@ -1028,15 +1031,6 @@ fn start_embedded_web_ui(
     let mut state = web_ui_server_state()
         .lock()
         .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
-
-    if let Some(existing) = state.as_ref()
-        && existing.connection_input == connection_input
-        && existing.server_ca_pem == server_ca_pem
-        && existing.client_identity_json == client_identity_json
-        && !existing.task.is_finished()
-    {
-        return Ok(existing.local_url.clone());
-    }
 
     if let Some(previous) = state.take() {
         previous.task.abort();
@@ -1074,21 +1068,34 @@ fn start_embedded_web_ui(
     if let Some(identity) = configured.client_identity {
         web_ui_config = web_ui_config.with_client_identity(identity);
     }
-    let app = web_ui_backend::router(web_ui_config.with_log_buffer(android_web_log_buffer()));
+    let authorization = web_ui_backend::EmbeddedWebUiSessionAuthorization::new();
+    let launch = EmbeddedWebUiLaunch {
+        url: local_url,
+        authorization: authorization.token().to_string(),
+    };
+    let app = web_ui_backend::router(
+        web_ui_config
+            .with_log_buffer(android_web_log_buffer())
+            .with_embedded_session_authorization(authorization),
+    );
 
     let task = rt.spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
 
-    *state = Some(WebUiServer {
-        connection_input,
-        server_ca_pem,
-        client_identity_json,
-        local_url: local_url.clone(),
-        task,
-    });
+    *state = Some(WebUiServer { task });
 
-    Ok(local_url)
+    Ok(launch)
+}
+
+fn stop_embedded_web_ui() -> Result<()> {
+    let mut state = web_ui_server_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
+    if let Some(server) = state.take() {
+        server.task.abort();
+    }
+    Ok(())
 }
 
 fn throw_java_error(env: &mut JNIEnv, message: impl AsRef<str>) {
@@ -1527,7 +1534,12 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         initialize_android_preferences_bridge(&mut env)?;
-        start_embedded_web_ui(connection_input, server_ca_pem, client_identity_json)
+        serde_json::to_string(&start_embedded_web_ui(
+            connection_input,
+            server_ca_pem,
+            client_identity_json,
+        )?)
+        .context("failed to serialize embedded web ui launch")
     })();
 
     match result {
@@ -1545,6 +1557,19 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
             throw_java_error(&mut env, format!("rust startWebUi failed: {err:#}"));
             std::ptr::null_mut()
         }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopWebUi(
+    mut env: JNIEnv,
+    _class: JClass,
+) {
+    if let Err(err) = stop_embedded_web_ui() {
+        throw_java_error(&mut env, format!("rust stopWebUi failed: {err:#}"));
     }
 }
 

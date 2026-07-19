@@ -2,14 +2,20 @@ package io.ironmesh.android.ui
 
 import android.app.Application
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.DeviceAuthState
+import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.AppConnectionStatus
@@ -146,7 +152,7 @@ data class MainUiState(
     val connectionRoutesLoading: Boolean = false,
     val connectionRoutesError: String? = null,
     val connectionRoutesLastLoadedUnixMs: Long = 0L,
-    val webUiUrl: String = "",
+    val webUiSession: EmbeddedWebUiSession? = null,
     val galleryMode: GalleryViewMode = GalleryViewMode.FLATTENED_ALL_IMAGES,
     val galleryCollection: GalleryCollectionState? = null,
     val galleryPages: Map<Int, GalleryPageState> = emptyMap(),
@@ -168,6 +174,16 @@ class MainViewModel(
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
     private var connectionRoutesMonitorJob: Job? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
+    private var processLifecycleObserverActive = true
+    private var processLifecycleObserverRegistered = false
+    private val processLifecycleObserver = LifecycleEventObserver { _, event ->
+        if (event == Lifecycle.Event.ON_STOP) {
+            repository.stopWebUi()
+            uiState.value = uiState.value.copy(webUiSession = null)
+        }
+    }
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
@@ -194,6 +210,40 @@ class MainViewModel(
         )
         FolderSyncScheduler.reschedule(getApplication())
         observeFolderSyncStatus()
+        registerProcessLifecycleObserver()
+    }
+
+    override fun onCleared() {
+        processLifecycleObserverActive = false
+        unregisterProcessLifecycleObserver()
+        repository.stopWebUi()
+        super.onCleared()
+    }
+
+    private fun registerProcessLifecycleObserver() {
+        runOnMainThread {
+            if (processLifecycleObserverActive && !processLifecycleObserverRegistered) {
+                ProcessLifecycleOwner.get().lifecycle.addObserver(processLifecycleObserver)
+                processLifecycleObserverRegistered = true
+            }
+        }
+    }
+
+    private fun unregisterProcessLifecycleObserver() {
+        runOnMainThread {
+            if (processLifecycleObserverRegistered) {
+                ProcessLifecycleOwner.get().lifecycle.removeObserver(processLifecycleObserver)
+                processLifecycleObserverRegistered = false
+            }
+        }
+    }
+
+    private fun runOnMainThread(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action()
+        } else {
+            mainHandler.post(action)
+        }
     }
 
     fun updateKey(value: String) {
@@ -294,6 +344,11 @@ class MainViewModel(
     }
 
     fun selectSection(section: MainSection) {
+        val wasShowingGalleryMap = uiState.value.selectedSection == MainSection.GALLERY_MAP
+        if (wasShowingGalleryMap && section != MainSection.GALLERY_MAP) {
+            repository.stopWebUi()
+            uiState.value = uiState.value.copy(webUiSession = null)
+        }
         uiState.value = uiState.value.copy(selectedSection = section)
         if (section == MainSection.CONNECTIVITY) {
             startConnectionRoutesMonitor()
@@ -311,7 +366,7 @@ class MainViewModel(
         ) {
             refreshGallery()
         }
-        if (section == MainSection.GALLERY_MAP && uiState.value.webUiUrl.isBlank() && !uiState.value.loading) {
+        if (section == MainSection.GALLERY_MAP && uiState.value.webUiSession == null && !uiState.value.loading) {
             startWebUi()
         }
     }
@@ -819,7 +874,7 @@ class MainViewModel(
             currentDeviceAuthState()
         } catch (error: DeviceIdentityStorageException) {
             uiState.value = uiState.value.copy(
-                webUiUrl = "",
+                webUiSession = null,
                 status = "Device identity unavailable: ${error.message}",
             )
             return
@@ -828,14 +883,14 @@ class MainViewModel(
         val clientIdentityJson = deviceAuth.toClientIdentityJson()
         if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
             uiState.value = uiState.value.copy(
-                webUiUrl = "",
+                webUiSession = null,
                 status = "Enroll this device before opening the Web UI.",
             )
             return
         }
         uiState.value = uiState.value.copy(
             loading = true,
-            webUiUrl = "",
+            webUiSession = null,
             status = "Starting Web UI...",
         )
         viewModelScope.launch {
@@ -857,11 +912,11 @@ class MainViewModel(
                     return@launch
                 }
             result
-                .onSuccess { url ->
+                .onSuccess { session ->
                     uiState.value = uiState.value.copy(
                         loading = false,
-                        webUiUrl = url,
-                        status = "Web UI ready at $url",
+                        webUiSession = session,
+                        status = "Web UI ready.",
                     )
                 }
                 .onFailure { error ->
@@ -895,6 +950,7 @@ class MainViewModel(
                 uiState.value = uiState.value.copy(status = "Verifying enrollment...")
                 withContext(Dispatchers.IO) {
                     repository.verifyEnrollmentAccess(authState)
+                    repository.stopWebUi()
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
                 }
                 authState
@@ -910,7 +966,7 @@ class MainViewModel(
                         connectionRoutesError = null,
                         connectionRoutesLastLoadedUnixMs = 0L,
                         selectedSection = MainSection.HOME,
-                        webUiUrl = "",
+                        webUiSession = null,
                         status = "Device enrolled: ${authState.deviceId}",
                     )
                     FolderSyncScheduler.reschedule(getApplication())

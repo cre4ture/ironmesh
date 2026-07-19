@@ -261,7 +261,7 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var relativeResponseData = Data()
     var diagnosticsResponseJSON = #"{"endpoints":[]}"#
     var routeSnapshotResponseJSON = #"{"ranked_indices":[],"endpoints":[]}"#
-    var webUIURL = "http://127.0.0.1:4100/"
+    var webUIURL = #"{"url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
     var lastRouteSnapshotRefresh: Bool?
 
     func createHandle(
@@ -287,8 +287,10 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = connectionInput
         _ = serverCAPem
         _ = clientIdentityJSON
-        return "http://127.0.0.1:3000"
+        return #"{"url":"http://127.0.0.1:3000/","authorization":"test-session"}"#
     }
+
+    func stopWebUi() throws {}
 
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String {
         _ = handle
@@ -398,4 +400,6 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = clientIdentityJSON
         return webUIURL
     }
+
+    func stopWebUI() throws {}
 }

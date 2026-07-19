@@ -1,8 +1,8 @@
 import AppleCore
-import SafariServices
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+import WebKit
 #if canImport(Vision)
 import Vision
 #endif
@@ -27,6 +27,7 @@ struct IronmeshIosApp: App {
 
 private struct IronmeshIosRootView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -39,10 +40,19 @@ private struct IronmeshIosRootView: View {
         .sheet(
             item: Binding(
                 get: { model.webUIPresentation },
-                set: { model.webUIPresentation = $0 }
+                set: { presentation in
+                    if presentation == nil {
+                        model.closeWebUI()
+                    }
+                }
             )
         ) { presentation in
-            IronmeshHostedWebView(url: presentation.url)
+            IronmeshHostedWebView(session: presentation.session)
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase != .active {
+                model.closeWebUI()
+            }
         }
     }
 }
@@ -1063,17 +1073,58 @@ struct IronmeshFilesHandoffPicker: UIViewControllerRepresentable {
 }
 
 private struct IronmeshHostedWebView: UIViewControllerRepresentable {
-    let url: URL
+    let session: AppleWebUiSession
 
-    func makeUIViewController(context: Context) -> SFSafariViewController {
-        let controller = SFSafariViewController(url: url)
-        controller.dismissButtonStyle = .close
+    func makeCoordinator() -> Coordinator {
+        Coordinator(origin: session.url)
+    }
+
+    func makeUIViewController(context: Context) -> UIViewController {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.allowsLinkPreview = false
+        webView.navigationDelegate = context.coordinator
+        context.coordinator.webView = webView
+
+        var request = URLRequest(url: session.url)
+        request.setValue(session.authorization, forHTTPHeaderField: "X-IronMesh-Web-Ui-Session")
+        webView.load(request)
+
+        let controller = UIViewController()
+        controller.view = webView
         return controller
     }
 
-    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
         _ = uiViewController
         _ = context
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        private let origin: URL
+        weak var webView: WKWebView?
+
+        init(origin: URL) {
+            self.origin = origin
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let candidate = navigationAction.request.url,
+                  candidate.scheme == origin.scheme,
+                  candidate.host == origin.host,
+                  candidate.port == origin.port else {
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
     }
 }
 

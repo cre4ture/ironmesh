@@ -26,6 +26,15 @@ data class BootstrapEnrollmentData(
     val server_ca_pem: String? = null,
 )
 
+class EmbeddedWebUiSession(
+    val url: String,
+    val authorization: String,
+) {
+    fun withUrl(url: String): EmbeddedWebUiSession = EmbeddedWebUiSession(url, authorization)
+
+    override fun toString(): String = "EmbeddedWebUiSession(url=$url, authorization=<redacted>)"
+}
+
 class IronmeshRepository {
     private fun normalizedClientIdentityJson(clientIdentityJson: String?): String? {
         return clientIdentityJson?.trim()?.takeIf { it.isNotEmpty() }
@@ -348,16 +357,23 @@ class IronmeshRepository {
         connectionInput: String,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
-    ): String {
+    ): EmbeddedWebUiSession {
         val normalizedIdentityJson = normalizedClientIdentityJson(clientIdentityJson)
         check(connectionInput.isNotBlank() && !normalizedIdentityJson.isNullOrBlank()) {
             "Enroll this device before opening the Web UI."
         }
-        return RustClientBridge.startWebUi(
-            normalizedConnectionInput(connectionInput),
-            serverCaPem,
-            normalizedIdentityJson,
+        return decodeJson(
+            RustClientBridge.startWebUi(
+                normalizedConnectionInput(connectionInput),
+                serverCaPem,
+                normalizedIdentityJson,
+            ),
+            EmbeddedWebUiSession::class.java,
         )
+    }
+
+    fun stopWebUi() {
+        RustClientBridge.stopWebUi()
     }
 
     fun getConnectionRouteSnapshot(

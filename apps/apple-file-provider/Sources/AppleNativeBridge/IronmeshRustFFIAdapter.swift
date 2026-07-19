@@ -77,6 +77,12 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(urlPointer)
     }
 
+    func stopWebUi() throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_stop_web_ui(&errorPointer)
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+    }
+
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String {
         var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
@@ -335,6 +341,10 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
             throw IronmeshRustFFIError(message: "Rust bridge returned no web UI URL.")
         }
         return consumeString(urlPointer)
+    }
+
+    func stopWebUI() throws {
+        try stopWebUi()
     }
 
     func enrollConnectionInput(

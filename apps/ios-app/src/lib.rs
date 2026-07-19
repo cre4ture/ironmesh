@@ -150,11 +150,14 @@ pub struct AppleConnectionDiagnosticsResponse {
 }
 
 struct WebUiServer {
-    connection_input: String,
-    server_ca_pem: Option<String>,
-    client_identity_json: Option<String>,
-    local_url: String,
     task: JoinHandle<()>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddedWebUiLaunch {
+    url: String,
+    authorization: String,
 }
 
 impl AppleConnectionAttempt {
@@ -555,7 +558,7 @@ fn start_embedded_web_ui(
     connection_input: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-) -> Result<String> {
+) -> Result<EmbeddedWebUiLaunch> {
     let runtime = web_ui_runtime()?;
     let connection_input = normalized_connection_input_string(connection_input)?;
     let server_ca_pem = normalize_optional_string(server_ca_pem);
@@ -564,15 +567,6 @@ fn start_embedded_web_ui(
     let mut state = web_ui_server_state()
         .lock()
         .map_err(|_| anyhow!("web ui state lock poisoned"))?;
-    if let Some(existing) = state.as_ref()
-        && existing.connection_input == connection_input
-        && existing.server_ca_pem == server_ca_pem
-        && existing.client_identity_json == client_identity_json
-        && !existing.task.is_finished()
-    {
-        return Ok(existing.local_url.clone());
-    }
-
     if let Some(previous) = state.take() {
         previous.task.abort();
     }
@@ -604,20 +598,30 @@ fn start_embedded_web_ui(
     if let Some(identity) = configured.client_identity.clone() {
         web_ui_config = web_ui_config.with_client_identity(identity);
     }
-    let app = web_ui_backend::router(web_ui_config);
+    let authorization = web_ui_backend::EmbeddedWebUiSessionAuthorization::new();
+    let launch = EmbeddedWebUiLaunch {
+        url: local_url,
+        authorization: authorization.token().to_string(),
+    };
+    let app =
+        web_ui_backend::router(web_ui_config.with_embedded_session_authorization(authorization));
     let task = runtime.spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
 
-    *state = Some(WebUiServer {
-        connection_input,
-        server_ca_pem,
-        client_identity_json,
-        local_url: local_url.clone(),
-        task,
-    });
+    *state = Some(WebUiServer { task });
 
-    Ok(local_url)
+    Ok(launch)
+}
+
+fn stop_embedded_web_ui() -> Result<()> {
+    let mut state = web_ui_server_state()
+        .lock()
+        .map_err(|_| anyhow!("web ui state lock poisoned"))?;
+    if let Some(server) = state.take() {
+        server.task.abort();
+    }
+    Ok(())
 }
 
 pub fn create_handle(
@@ -1180,12 +1184,20 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
     clear_string_out(out_url);
     clear_error(out_error);
     run_ffi_string_result(out_url, out_error, || {
-        start_embedded_web_ui(
+        serde_json::to_string(&start_embedded_web_ui(
             required_c_string(connection_input, "connection_input")?,
             optional_c_string(server_ca_pem)?,
             optional_c_string(client_identity_json)?,
-        )
+        )?)
+        .context("failed to serialize embedded web ui launch")
     })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_stop_web_ui(out_error: *mut *mut c_char) -> c_int {
+    clear_error(out_error);
+    run_ffi_unit_result(out_error, stop_embedded_web_ui)
 }
 
 fn build_runtime() -> Result<Runtime> {

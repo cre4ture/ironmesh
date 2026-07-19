@@ -2,7 +2,6 @@ package io.ironmesh.android
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
@@ -12,7 +11,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.foundation.layout.Box
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -28,6 +26,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
+import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.ui.MainSection
@@ -135,9 +134,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 val onOpenWebConsole: () -> Unit = {
-                    if (state.webUiUrl.isNotBlank() && !state.loading) {
-                        openWebUi(state.webUiUrl, vm::setStatus)
-                    } else {
+                    if (!state.loading) {
                         openWebUiWhenReady = true
                         vm.startWebUi()
                     }
@@ -146,12 +143,12 @@ class MainActivity : ComponentActivity() {
                 val hasWifiNamePermissions = missingWifiNameAccessPermissions(context).isEmpty()
                 val isLocationEnabled = isDeviceLocationEnabled(context)
 
-                LaunchedEffect(openWebUiWhenReady, state.loading, state.webUiUrl) {
+                LaunchedEffect(openWebUiWhenReady, state.loading, state.webUiSession) {
                     if (!openWebUiWhenReady || state.loading) {
                         return@LaunchedEffect
                     }
-                    if (state.webUiUrl.isNotBlank()) {
-                        openWebUi(state.webUiUrl, vm::setStatus)
+                    state.webUiSession?.let { session ->
+                        openWebUi(session, vm::setStatus)
                     }
                     openWebUiWhenReady = false
                 }
@@ -268,27 +265,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openWebUi(
-        webUiUrl: String,
+        session: EmbeddedWebUiSession,
         onStatus: (String) -> Unit,
     ) {
-        if (webUiUrl.isBlank()) {
+        if (session.url.isBlank() || session.authorization.isBlank()) {
             onStatus("Web UI is not ready yet")
             return
         }
 
-        val customTabsIntent = CustomTabsIntent.Builder()
-            .setShowTitle(false)
-            .setUrlBarHidingEnabled(true)
-            .setShareState(CustomTabsIntent.SHARE_STATE_OFF)
-            .build()
-
-        try {
-            customTabsIntent.launchUrl(this, Uri.parse(webUiUrl))
-            onStatus("Opened Web UI in a browser-powered tab")
-        } catch (_: ActivityNotFoundException) {
-            startActivity(WebUiActivity.intent(this, webUiUrl))
-            onStatus("No compatible browser tab found, using the embedded Web UI")
-        }
+        startActivity(WebUiActivity.intent(this, session))
+        onStatus("Opened embedded Web UI")
     }
 
     private fun openFilesAtIronmeshRoot(vm: MainViewModel) {

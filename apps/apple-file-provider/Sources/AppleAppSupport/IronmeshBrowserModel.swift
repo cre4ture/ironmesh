@@ -102,10 +102,10 @@ struct IronmeshConnectionDiagnosticsSnapshot: Codable, Equatable, Sendable {
 }
 
 struct IronmeshWebUIPresentation: Identifiable, Equatable, Sendable {
-    let url: URL
+    let session: AppleWebUiSession
 
     var id: String {
-        url.absoluteString
+        session.url.absoluteString
     }
 }
 
@@ -705,6 +705,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func resetToBundleDefaults() {
+        closeWebUI()
         do {
             try settingsStore.save(
                 bundleDefaults.appliedConnectionState(
@@ -731,6 +732,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func clearAppSetup() {
+        closeWebUI()
         do {
             try settingsStore.clear()
         } catch {
@@ -756,6 +758,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func clearIdentity() {
+        closeWebUI()
         var clearedDraft = draft
         clearedDraft.clientIdentityJSON = ""
         clearedDraft.serverCAPem = ""
@@ -955,18 +958,27 @@ final class IronmeshBrowserModel: ObservableObject {
             defer { endOperation() }
 
             do {
-                let url = try await Task.detached(priority: .userInitiated) {
+                let session = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
-                webUIPresentation = IronmeshWebUIPresentation(url: url)
+                webUIPresentation = IronmeshWebUIPresentation(session: session)
                 lastErrorMessage = nil
                 statusText = "Opened embedded web UI."
-                addAction("Opened web UI", detail: url.absoluteString)
+                addAction("Opened web UI", detail: "Started isolated loopback session.")
             } catch {
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Web UI failed", detail: error.localizedDescription)
             }
+        }
+    }
+
+    func closeWebUI() {
+        webUIPresentation = nil
+        do {
+            try remoteSession.stopWebUI()
+        } catch {
+            lastErrorMessage = error.localizedDescription
         }
     }
 
@@ -1231,12 +1243,12 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         return try decode(AppleConnectionRouteSnapshot.self, from: json)
     }
 
-    func startWebUI(configuration: AppleConnectionConfiguration) throws -> URL {
-        let urlString = try bridge.startWebUI(configuration: configuration)
-        guard let url = URL(string: urlString) else {
-            throw AppleManualCBridgeError.invalidResponse("Invalid embedded web UI URL: \(urlString)")
-        }
-        return url
+    func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
+        try bridge.startWebUI(configuration: configuration)
+    }
+
+    func stopWebUI() throws {
+        try bridge.stopWebUI()
     }
 
     private func connectIfNeeded(_ configuration: AppleConnectionConfiguration) throws {

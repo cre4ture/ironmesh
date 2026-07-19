@@ -24,6 +24,7 @@ extension IronmeshFileProviderService {
     }
 
     func saveConnectionState(_ state: AppleStoredConnectionState, reconnect: Bool = true) throws {
+        try ffi.stopWebUi()
         try settingsStore.save(state)
         if reconnect {
             resetConnection()
@@ -31,22 +32,20 @@ extension IronmeshFileProviderService {
     }
 
     func clearStoredConnectionState() throws {
+        try ffi.stopWebUi()
         try settingsStore.clear()
         resetConnection()
     }
 
-    func startWebUi() throws -> URL {
+    func startWebUi() throws -> AppleWebUiSession {
         try enforceProfileConstraints()
         let connectionConfiguration = try currentConnectionConfiguration()
-        let urlString = try ffi.startWebUi(
+        let responseJSON = try ffi.startWebUi(
             connectionInput: connectionConfiguration.normalizedConnectionInput,
             serverCAPem: connectionConfiguration.serverCAPem,
             clientIdentityJSON: connectionConfiguration.clientIdentityJSON
         )
-        guard let url = URL(string: urlString) else {
-            throw AppleManualCBridgeError.invalidResponse("invalid Web UI URL '\(urlString)'")
-        }
-        return url
+        return try AppleWebUiSession(responseJSON: responseJSON)
     }
 
     func connectIfNeeded() throws {
@@ -96,6 +95,7 @@ extension IronmeshFileProviderService {
     }
 
     func resetConnection() {
+        try? ffi.stopWebUi()
         lock.lock()
         connected = false
         connectedConfiguration = nil

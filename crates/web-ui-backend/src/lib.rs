@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, anyhow};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
+    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, RANGE, SET_COOKIE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -23,12 +24,14 @@ use common::logging::{LogBuffer, LogBufferEntry};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::info;
+use uuid::Uuid;
 
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKEND_REVISION: &str = git_version::git_version!(
@@ -40,6 +43,9 @@ const WEB_LATENCY_PROBE_TIMEOUT_MIN_MS: u64 = 8_000;
 const WEB_LATENCY_PROBE_TIMEOUT_CONNECT_SLACK_MS: u64 = 3_000;
 const WEB_LATENCY_PROBE_TIMEOUT_PER_REQUEST_SLACK_MS: u64 = 3_000;
 const WEB_API_V1_PREFIX: &str = "/api/v1";
+pub const EMBEDDED_WEB_UI_SESSION_HEADER: &str = "x-ironmesh-web-ui-session";
+const EMBEDDED_WEB_UI_SESSION_COOKIE: &str = "ironmesh_web_ui_session";
+const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 
 mod mbtiles;
 
@@ -104,6 +110,69 @@ pub mod assets {
     }
 }
 
+/// Authorizes one isolated embedded Web UI session without putting credentials in its URL.
+///
+/// The native host submits this secret only on the initial document request. The router then
+/// exchanges it for an HttpOnly, same-site cookie scoped to its ephemeral loopback listener.
+#[derive(Clone)]
+pub struct EmbeddedWebUiSessionAuthorization {
+    token: Arc<str>,
+    expires_at: Instant,
+}
+
+impl EmbeddedWebUiSessionAuthorization {
+    pub fn new() -> Self {
+        Self::with_ttl(EMBEDDED_WEB_UI_SESSION_TTL)
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            token: Uuid::new_v4().simple().to_string().into(),
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn accepts(&self, candidate: Option<&str>) -> bool {
+        !self.is_expired() && candidate.is_some_and(|candidate| candidate == self.token.as_ref())
+    }
+
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+
+    fn cookie(&self) -> Option<HeaderValue> {
+        let seconds_remaining = self
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .max(1);
+        HeaderValue::from_str(&format!(
+            "{EMBEDDED_WEB_UI_SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={seconds_remaining}",
+            self.token
+        ))
+        .ok()
+    }
+}
+
+impl Default for EmbeddedWebUiSessionAuthorization {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for EmbeddedWebUiSessionAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EmbeddedWebUiSessionAuthorization")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct WebUiConfig {
     pub server_url: String,
@@ -115,6 +184,7 @@ pub struct WebUiConfig {
     pub transport_client: Option<IronMeshClient>,
     pub log_buffer: Option<Arc<LogBuffer>>,
     pub map_glyphs_root: Option<PathBuf>,
+    embedded_session_authorization: Option<EmbeddedWebUiSessionAuthorization>,
 }
 
 type PersistBootstrapFn = dyn Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync;
@@ -157,6 +227,7 @@ impl WebUiConfig {
             transport_client: None,
             log_buffer: None,
             map_glyphs_root: None,
+            embedded_session_authorization: None,
         }
     }
 
@@ -171,6 +242,7 @@ impl WebUiConfig {
             transport_client: Some(client),
             log_buffer: None,
             map_glyphs_root: None,
+            embedded_session_authorization: None,
         }
     }
 
@@ -216,6 +288,14 @@ impl WebUiConfig {
         self.map_glyphs_root = Some(map_glyphs_root.into());
         self
     }
+
+    pub fn with_embedded_session_authorization(
+        mut self,
+        authorization: EmbeddedWebUiSessionAuthorization,
+    ) -> Self {
+        self.embedded_session_authorization = Some(authorization);
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -244,6 +324,7 @@ struct WebRendezvousRuntimeConfig {
 }
 
 pub fn router(config: WebUiConfig) -> Router {
+    let embedded_session_authorization = config.embedded_session_authorization.clone();
     let sdk = match config.transport_client {
         Some(client) => client,
         None if config.connection_bootstrap.is_some() => config
@@ -409,13 +490,69 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/latency-test", post(web_latency_test))
         .route("/api/ping", get(web_ping));
 
-    Router::new()
+    let app = Router::new()
         .route("/", get(web_static_index))
         .route("/ironmesh-favicon.svg", get(web_static_favicon))
         .nest(WEB_API_V1_PREFIX, api_v1)
         .merge(legacy_api)
         .route("/{*path}", get(web_static_file))
-        .with_state(state)
+        .with_state(state);
+
+    match embedded_session_authorization {
+        Some(authorization) => app.layer(middleware::from_fn_with_state(
+            authorization,
+            require_embedded_web_ui_session,
+        )),
+        None => app,
+    }
+}
+
+async fn require_embedded_web_ui_session(
+    State(authorization): State<EmbeddedWebUiSessionAuthorization>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let supplied_header = request
+        .headers()
+        .get(EMBEDDED_WEB_UI_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let authorized_by_header = authorization.accepts(supplied_header);
+    let authorized_by_cookie = authorization.accepts(cookie_value(
+        request.headers(),
+        EMBEDDED_WEB_UI_SESSION_COOKIE,
+    ));
+
+    if !authorized_by_header && !authorized_by_cookie {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    if authorized_by_header && let Some(cookie) = authorization.cookie() {
+        response.headers_mut().append(SET_COOKIE, cookie);
+    }
+    response
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|part| {
+            let (candidate_name, value) = part.trim().split_once('=')?;
+            (candidate_name == name).then_some(value)
+        })
 }
 
 fn resolve_map_glyphs_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
@@ -3223,12 +3360,37 @@ async fn web_update_rendezvous(
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorResponseBody, error_response, normalize_store_restore_path, web_latency_probe_timeout,
+        EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
+        EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, error_response,
+        normalize_store_restore_path, router, web_latency_probe_timeout,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
-    use client_sdk::LatencyProbeConfig;
+    use client_sdk::{IronMeshClient, LatencyProbeConfig};
     use std::time::Duration;
+    use tokio::task::JoinHandle;
+
+    async fn start_session_test_server(
+        authorization: EmbeddedWebUiSessionAuthorization,
+    ) -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        assert!(address.ip().is_loopback());
+
+        let app = router(
+            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+                .with_embedded_session_authorization(authorization),
+        );
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), task)
+    }
 
     #[test]
     fn normalize_store_restore_path_distinguishes_files_and_prefixes() {
@@ -3291,5 +3453,91 @@ mod tests {
                 error: "bad input".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn embedded_session_rejects_unauthenticated_and_stale_requests() {
+        let current = EmbeddedWebUiSessionAuthorization::new();
+        let stale = EmbeddedWebUiSessionAuthorization::new();
+        let (base_url, server) = start_session_test_server(current.clone()).await;
+        let client = reqwest::Client::new();
+
+        let unauthenticated = client
+            .get(format!("{base_url}/api/v1/ping"))
+            .send()
+            .await
+            .expect("unauthenticated request should complete");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let stale_request = client
+            .get(format!("{base_url}/api/v1/ping"))
+            .header(EMBEDDED_WEB_UI_SESSION_HEADER, stale.token())
+            .send()
+            .await
+            .expect("stale request should complete");
+        assert_eq!(stale_request.status(), StatusCode::UNAUTHORIZED);
+
+        let expired = EmbeddedWebUiSessionAuthorization::with_ttl(Duration::ZERO);
+        let expired_request = client
+            .get(format!("{base_url}/api/v1/ping"))
+            .header(EMBEDDED_WEB_UI_SESSION_HEADER, expired.token())
+            .send()
+            .await
+            .expect("expired request should complete");
+        assert_eq!(expired_request.status(), StatusCode::UNAUTHORIZED);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn embedded_session_exchanges_header_for_private_cookie() {
+        let authorization = EmbeddedWebUiSessionAuthorization::new();
+        let (base_url, server) = start_session_test_server(authorization.clone()).await;
+        let client = reqwest::Client::new();
+
+        let bootstrap = client
+            .get(format!("{base_url}/api/v1/ping"))
+            .header(EMBEDDED_WEB_UI_SESSION_HEADER, authorization.token())
+            .send()
+            .await
+            .expect("authorized bootstrap request should complete");
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+        assert_eq!(
+            bootstrap
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        assert_eq!(
+            bootstrap
+                .headers()
+                .get("referrer-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer")
+        );
+        let cookie = bootstrap
+            .headers()
+            .get("set-cookie")
+            .expect("bootstrap response should set a session cookie")
+            .to_str()
+            .expect("session cookie should be valid header text");
+        assert!(cookie.starts_with(&format!("{EMBEDDED_WEB_UI_SESSION_COOKIE}=")));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+
+        let cookie_value = cookie
+            .split(';')
+            .next()
+            .expect("session cookie should have a name and value");
+        let cookie_authenticated = client
+            .get(format!("{base_url}/api/v1/ping"))
+            .header("cookie", cookie_value)
+            .send()
+            .await
+            .expect("cookie-authenticated request should complete");
+        assert_eq!(cookie_authenticated.status(), StatusCode::OK);
+
+        server.abort();
     }
 }

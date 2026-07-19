@@ -15,6 +15,7 @@ public protocol AppleManualCBridgeFFI: Sendable {
         serverCAPem: String?,
         clientIdentityJSON: String?
     ) throws -> String
+    func stopWebUi() throws
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String
     func storeIndexJSON(
         handle: AppleRustHandle,
@@ -55,6 +56,42 @@ public protocol AppleManualCBridgeFFI: Sendable {
         serverCAPem: String?,
         clientIdentityJSON: String?
     ) throws -> String
+    func stopWebUI() throws
+}
+
+private struct AppleWebUiLaunchResponse: Decodable {
+    let url: String
+    let authorization: String
+}
+
+public struct AppleWebUiSession: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let url: URL
+    public let authorization: String
+
+    public init(responseJSON: String) throws {
+        let response: AppleWebUiLaunchResponse
+        do {
+            response = try JSONDecoder().decode(
+                AppleWebUiLaunchResponse.self,
+                from: Data(responseJSON.utf8)
+            )
+        } catch {
+            throw AppleManualCBridgeError.invalidResponse("invalid embedded web UI launch response")
+        }
+        guard let url = URL(string: response.url), !response.authorization.isEmpty else {
+            throw AppleManualCBridgeError.invalidResponse("invalid embedded web UI launch response")
+        }
+        self.url = url
+        self.authorization = response.authorization
+    }
+
+    public var description: String {
+        "AppleWebUiSession(url: \(url.absoluteString), authorization: <redacted>)"
+    }
+
+    public var debugDescription: String {
+        description
+    }
 }
 
 public enum AppleManualCBridgeError: Error, Sendable, Equatable, LocalizedError {
@@ -248,12 +285,16 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
         }
     }
 
-    public func startWebUI(configuration: AppleConnectionConfiguration) throws -> String {
-        try ffi.startWebUI(
+    public func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
+        try AppleWebUiSession(responseJSON: ffi.startWebUI(
             connectionInput: configuration.normalizedConnectionInput,
             serverCAPem: configuration.serverCAPem,
             clientIdentityJSON: configuration.clientIdentityJSON
-        )
+        ))
+    }
+
+    public func stopWebUI() throws {
+        try ffi.stopWebUI()
     }
 
     private func disconnectIfNeeded() {

@@ -105,6 +105,9 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
+    external fun stopWebUi()
+
+    @JvmStatic
     external fun getConnectionRouteSnapshot(
         connectionInput: String,
         serverCaPem: String?,

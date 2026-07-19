@@ -128,4 +128,6 @@ int ironmesh_ios_facade_start_web_ui(const char *connection_input,
                                      char **out_url,
                                      char **out_error);
 
+int ironmesh_ios_facade_stop_web_ui(char **out_error);
+
 #endif  /* IRONMESH_IOS_APP_H */

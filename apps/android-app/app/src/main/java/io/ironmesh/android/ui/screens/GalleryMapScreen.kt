@@ -1,6 +1,5 @@
 package io.ironmesh.android.ui.screens
 
-import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.ui.MainUiState
+import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.ui.components.IronmeshEmbeddedWebUi
 
 @Composable
@@ -24,11 +24,11 @@ fun GalleryMapScreen(
     state: MainUiState,
     onStartGalleryMap: () -> Unit,
 ) {
-    val galleryMapUrl = galleryMapWebUiUrl(state.webUiUrl)
+    val galleryMapSession = galleryMapWebUiSession(state.webUiSession)
 
-    if (galleryMapUrl != null) {
+    if (galleryMapSession != null) {
         IronmeshEmbeddedWebUi(
-            url = galleryMapUrl,
+            session = galleryMapSession,
             modifier = Modifier.fillMaxSize(),
         )
         return
@@ -81,14 +81,12 @@ fun GalleryMapScreen(
     }
 }
 
-private fun galleryMapWebUiUrl(baseUrl: String): String? {
-    if (baseUrl.isBlank()) {
-        return null
-    }
-
-    return Uri.parse(baseUrl)
+private fun galleryMapWebUiSession(session: EmbeddedWebUiSession?): EmbeddedWebUiSession? {
+    return session?.withUrl(
+        android.net.Uri.parse(session.url)
         .buildUpon()
         .appendQueryParameter("embedded", "gallery_map")
         .build()
-        .toString()
+        .toString(),
+    )
 }
