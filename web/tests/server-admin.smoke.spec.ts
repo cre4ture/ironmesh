@@ -384,6 +384,96 @@ test("server-admin explorer restores snapshot entries", async ({ page }) => {
   await expect(page.getByRole("cell", { name: "restored/readme-restored.txt" })).toBeVisible();
 });
 
+test("server-admin validates and saves storage-pool configuration with Cockpit guidance", async ({ page }) => {
+  const mockState = await installServerAdminMocks(page, { cockpitStatus: "optional" });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page
+    .getByLabel("Primary navigation")
+    .locator("a, button")
+    .filter({ hasText: "Metadata" })
+    .first()
+    .click();
+  const configuration = page.getByLabel("Storage-pool JSON");
+  await expect(configuration).toHaveValue(/"id": "primary"/);
+
+  await configuration.fill("{");
+  await page.getByRole("button", { name: "Validate configuration" }).click();
+  await expect(page.getByText("Invalid JSON", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Reset to running configuration" }).click();
+  await expect(configuration).toHaveValue(/"id": "primary"/);
+
+  await configuration.fill(
+    JSON.stringify({
+      version: 1,
+      paths: [
+        {
+          id: "rejected",
+          path: "/srv/ironmesh/primary",
+          state: "active",
+          weight: 1,
+          reserve_bytes: 0
+        }
+      ]
+    })
+  );
+  await page.getByRole("button", { name: "Validate configuration" }).click();
+  await expect(page.getByText(/mocked storage-pool validation failure/)).toBeVisible();
+
+  const nextConfig = {
+    version: 1,
+    paths: [
+      {
+        id: "primary",
+        path: "/srv/ironmesh/primary",
+        state: "active",
+        weight: 1,
+        reserve_bytes: 0
+      },
+      {
+        id: "secondary",
+        path: "/mnt/storage/ironmesh",
+        state: "active",
+        weight: 2,
+        reserve_bytes: 4096
+      }
+    ]
+  };
+  await configuration.fill(JSON.stringify(nextConfig));
+  await page.getByRole("button", { name: "Validate configuration" }).click();
+  await expect(page.getByText("Configuration is valid", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Save configuration" }).click();
+  await expect(page.getByText("Configuration saved — restart required", { exact: true })).toBeVisible();
+  await expect.poll(() => mockState.storagePoolSaveRequests()).toEqual([nextConfig]);
+
+  await page.getByText("Dependencies", { exact: true }).click();
+  await expect(page.getByText("Optional host administration tooling unavailable", { exact: true })).toBeVisible();
+  await expect(page.getByText("Cockpit host administration", { exact: true })).toBeVisible();
+  await expect(page.getByText("optional", { exact: true })).toBeVisible();
+});
+
+test("server-admin Dependencies reports a detected Cockpit installation", async ({ page }) => {
+  await installServerAdminMocks(page, { cockpitStatus: "ready" });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Dependencies", { exact: true }).click();
+  await expect(page.getByText("Optional host administration tooling unavailable", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Cockpit web service found at /usr/lib/cockpit/cockpit-ws")).toBeVisible();
+  await expect(page.getByText("ready", { exact: true })).toBeVisible();
+});
+
 test("server-admin explorer loads version history with thumbnails", async ({ page }) => {
   const mockState = await installServerAdminMocks(page);
 
@@ -819,6 +909,7 @@ async function installServerAdminMocks(
     postLoginUnauthenticatedSessionResponses?: number;
     protectDashboardAdminRoutesUntilSessionConfirmed?: boolean;
     galleryEntries?: AdminMockStoreEntry[];
+    cockpitStatus?: "ready" | "optional";
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -921,6 +1012,19 @@ async function installServerAdminMocks(
     persisted: true
   };
   const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
+  let storagePoolConfig: StoragePoolMockConfig = {
+    version: 1,
+    paths: [
+      {
+        id: "primary",
+        path: "/srv/ironmesh/primary",
+        state: "active",
+        weight: 1,
+        reserve_bytes: 0
+      }
+    ]
+  };
+  const storagePoolSaveRequests: StoragePoolMockConfig[] = [];
   const requestedPaths = new Set<string>();
   const scrubTriggerScopes = new Set<string>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
@@ -1050,6 +1154,68 @@ async function installServerAdminMocks(
       sessionConfirmed = false;
       remainingPostLoginUnauthenticatedSessionResponses = 0;
       return json(route, { status: "ok" });
+    }
+
+    if (pathname === apiV1("/auth/host/dependencies") && method === "GET") {
+      const cockpitReady = options?.cockpitStatus === "ready";
+      return json(route, {
+        host_os: "linux",
+        generated_at_unix: 1_900_000_333,
+        checks: [
+          {
+            id: "image-thumbnails",
+            feature: "Image thumbnails and metadata",
+            status: "builtin",
+            summary: "Ready without extra host packages",
+            detail: "Built into the test node.",
+            configured_path: null,
+            resolved_path: null,
+            install_hint: null
+          },
+          {
+            id: "cockpit",
+            feature: "Cockpit host administration",
+            status: cockpitReady ? "ready" : "optional",
+            summary: cockpitReady
+              ? "Cockpit web service found at /usr/lib/cockpit/cockpit-ws"
+              : "Cockpit web service was not found on this host",
+            detail: "Cockpit remains separately authenticated from IronMesh.",
+            configured_path: null,
+            resolved_path: cockpitReady ? "/usr/lib/cockpit/cockpit-ws" : null,
+            install_hint: cockpitReady ? null : "Install Cockpit with the host package manager."
+          }
+        ]
+      });
+    }
+
+    if (pathname === apiV1("/auth/storage/pool") && method === "GET") {
+      return json(route, storagePoolStatus(storagePoolConfig));
+    }
+
+    if (pathname === apiV1("/auth/storage/pool/config/validate") && method === "POST") {
+      const config = route.request().postDataJSON() as StoragePoolMockConfig;
+      if (config.paths.some((path) => path.id === "rejected")) {
+        await route.fulfill({
+          status: 400,
+          contentType: "application/json; charset=utf-8",
+          body: JSON.stringify({ error: "mocked storage-pool validation failure" })
+        });
+        return;
+      }
+      return json(route, {
+        config_path: "/var/lib/ironmesh/state/storage-pool.json",
+        restart_required: true
+      });
+    }
+
+    if (pathname === apiV1("/auth/storage/pool/config") && method === "PUT") {
+      const config = route.request().postDataJSON() as StoragePoolMockConfig;
+      storagePoolSaveRequests.push(config);
+      storagePoolConfig = config;
+      return json(route, {
+        config_path: "/var/lib/ironmesh/state/storage-pool.json",
+        restart_required: true
+      });
     }
 
     if (pathname === apiV1("/auth/store/snapshots") && method === "GET") {
@@ -2233,7 +2399,37 @@ async function installServerAdminMocks(
   return {
     requestedPaths: () => Array.from(requestedPaths),
     scrubTriggerScopes: () => Array.from(scrubTriggerScopes),
-    restoredVersions: () => restoredVersions.slice()
+    restoredVersions: () => restoredVersions.slice(),
+    storagePoolSaveRequests: () => storagePoolSaveRequests.slice()
+  };
+}
+
+type StoragePoolMockConfig = {
+  version: number;
+  paths: Array<{
+    id: string;
+    path: string;
+    state: "active" | "draining" | "disabled";
+    weight: number;
+    reserve_bytes: number;
+  }>;
+};
+
+function storagePoolStatus(config: StoragePoolMockConfig) {
+  return {
+    config_path: "/var/lib/ironmesh/state/storage-pool.json",
+    config,
+    paths: config.paths.map((path) => ({
+      id: path.id,
+      path: path.path,
+      state: path.state,
+      available: true,
+      capacity_bytes: 2_000_000_000,
+      free_bytes: 1_500_000_000,
+      chunk_store_bytes: 1024,
+      manifest_store_bytes: 256,
+      last_error: null
+    }))
   };
 }
 

@@ -23588,6 +23588,26 @@ async fn update_storage_pool_config(
             Err(status) => return status.into_response(),
         };
 
+    let validation = {
+        let store = read_store(&state, "storage_pool.config_save_validate").await;
+        store.validate_storage_pool_config(&config).await
+    };
+    if let Err(err) = validation {
+        let message = err.to_string();
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            false,
+            true,
+            "validation_failed",
+            json!({ "error": message, "version": config.version, "path_count": config.paths.len() }),
+        )
+        .await;
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+    }
+
     let result = {
         let store = lock_store(&state, "storage_pool.config_save").await;
         let config_path = store.storage_pool_config_path();
@@ -23620,6 +23640,7 @@ async fn update_storage_pool_config(
         }
         Err(err) => {
             let message = err.to_string();
+            tracing::error!(error = %err, "failed saving storage pool configuration");
             append_admin_audit(
                 &state,
                 action,
@@ -23631,7 +23652,11 @@ async fn update_storage_pool_config(
                 json!({ "error": message, "version": config.version, "path_count": config.paths.len() }),
             )
             .await;
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to save storage pool configuration" })),
+            )
+                .into_response()
         }
     }
 }
