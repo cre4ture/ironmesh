@@ -7,17 +7,26 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::extract::{FromRequestParts, connect_info::ConnectInfo};
 use common::ClusterId;
-use rustls::RootCertStore;
+use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{
+    CertificateError, DigitallySignedStruct, DistinguishedName, Error as RustlsError,
+    RootCertStore, SignatureScheme,
+};
 use tokio_rustls::server::TlsStream;
 use tower::Service;
 use transport_sdk::peer::PeerIdentity;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
-use crate::{RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerTlsIdentity};
+use crate::cluster_registry::cluster_ca_root_store;
+use crate::{
+    ClusterCaRegistry, GlobalRendezvousMtlsConfig, RendezvousClientCa, RendezvousMtlsConfig,
+    RendezvousServerTlsIdentity,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AuthenticatedPeer {
@@ -310,7 +319,48 @@ pub(crate) fn build_mtls_rustls_config(
         }
     }
 
-    let (cert_chain, key) = match &mtls.server_identity {
+    let (cert_chain, key) = load_server_tls_identity(&mtls.server_identity)?;
+
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
+        .build()
+        .context("failed creating rendezvous client certificate verifier")?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .context("failed creating rendezvous rustls server config")?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(config),
+    ))
+}
+
+pub(crate) fn build_global_mtls_rustls_config(
+    global: &GlobalRendezvousMtlsConfig,
+) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (cert_chain, key) = load_server_tls_identity(&global.server_identity)?;
+    let verifier = GlobalClusterClientCertVerifier::new(global.cluster_registry.clone());
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(verifier))
+        .with_single_cert(cert_chain, key)
+        .context("failed creating global rendezvous rustls server config")?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(config),
+    ))
+}
+
+fn load_server_tls_identity(
+    server_identity: &RendezvousServerTlsIdentity,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    match server_identity {
         RendezvousServerTlsIdentity::Files {
             cert_path,
             key_path,
@@ -330,7 +380,7 @@ pub(crate) fn build_mtls_rustls_config(
             );
             let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_reader)
                 .context("failed parsing rendezvous TLS private key")?;
-            (cert_chain, key)
+            Ok((cert_chain, key))
         }
         RendezvousServerTlsIdentity::InlinePem { cert_pem, key_pem } => {
             let mut cert_reader = BufReader::new(cert_pem.as_bytes());
@@ -342,24 +392,127 @@ pub(crate) fn build_mtls_rustls_config(
             let mut key_reader = BufReader::new(key_pem.as_bytes());
             let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_reader)
                 .context("failed parsing rendezvous TLS private key")?;
-            (cert_chain, key)
+            Ok((cert_chain, key))
         }
-    };
+    }
+}
 
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-        .allow_unauthenticated()
-        .build()
-        .context("failed creating rendezvous client certificate verifier")?;
+/// rustls client verifier for a global Option-1 rendezvous service.
+///
+/// A presented certificate is never tested against every registered CA. Its
+/// cluster URI SAN chooses one active registry record first, then WebPKI
+/// validates the chain and handshake signature against that exact CA only.
+#[derive(Debug, Clone)]
+pub struct GlobalClusterClientCertVerifier {
+    registry: ClusterCaRegistry,
+}
 
-    let mut config = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(cert_chain, key)
-        .context("failed creating rendezvous rustls server config")?;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+impl GlobalClusterClientCertVerifier {
+    pub fn new(registry: ClusterCaRegistry) -> Self {
+        Self { registry }
+    }
 
-    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
-        Arc::new(config),
-    ))
+    fn verifier_for_certificate(
+        &self,
+        certificate: &CertificateDer<'_>,
+    ) -> std::result::Result<(ClusterId, Arc<dyn ClientCertVerifier>), RustlsError> {
+        let cluster_id = cluster_id_from_certificate(certificate)
+            .map_err(|_| client_certificate_verification_error())?;
+        let record = self
+            .registry
+            .active_ca(cluster_id)
+            .ok_or_else(client_certificate_verification_error)?;
+        let roots = cluster_ca_root_store(&record.ca_pem)
+            .map_err(|_| client_certificate_verification_error())?;
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .allow_unauthenticated()
+            .build()
+            .map_err(|_| client_certificate_verification_error())?;
+        Ok((cluster_id, verifier))
+    }
+}
+
+impl ClientCertVerifier for GlobalClusterClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        // The registry is dynamic. Advertising every root would both leak the
+        // global trust set and invite clients to treat it as a fallback bundle.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, RustlsError> {
+        let (cluster_id, verifier) = self.verifier_for_certificate(end_entity)?;
+        verifier.verify_client_cert(end_entity, intermediates, now)?;
+        self.registry
+            .observe_access(cluster_id)
+            .map_err(|_| client_certificate_verification_error())?;
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        let (_, verifier) = self.verifier_for_certificate(cert)?;
+        verifier.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        let (_, verifier) = self.verifier_for_certificate(cert)?;
+        verifier.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_certificate_verification_error() -> RustlsError {
+    RustlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
+}
+
+fn cluster_id_from_certificate(certificate: &CertificateDer<'_>) -> Result<ClusterId> {
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate.as_ref())
+        .context("failed parsing peer certificate")?;
+    let mut cluster_id = None;
+    for extension in parsed.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+            for name in &san.general_names {
+                if let x509_parser::extensions::GeneralName::URI(uri) = name
+                    && let Some(parsed_cluster_id) = parse_cluster_id_from_san_uri(uri)?
+                {
+                    if let Some(existing_cluster_id) = cluster_id
+                        && existing_cluster_id != parsed_cluster_id
+                    {
+                        bail!("peer certificate contains conflicting ironmesh cluster URI SANs");
+                    }
+                    cluster_id = Some(parsed_cluster_id);
+                }
+            }
+        }
+    }
+    cluster_id.context("peer certificate is missing an ironmesh cluster URI SAN")
 }
 
 fn extract_authenticated_peer_from_peer_certs(
@@ -434,8 +587,70 @@ fn parse_cluster_id_from_san_uri(uri: &str) -> Result<Option<ClusterId>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use common::{ClusterId, DeviceId};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType,
+    };
+
+    struct TestCa {
+        pem: String,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn test_registry_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ironmesh-{name}-{}.json", ClusterId::now_v7()))
+    }
+
+    fn test_ca(common_name: &str) -> TestCa {
+        let key = KeyPair::generate().expect("test CA key generation should succeed");
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let pem = params
+            .self_signed(&key)
+            .expect("test CA certificate generation should succeed")
+            .pem();
+        TestCa {
+            pem,
+            issuer: Issuer::new(params, key),
+        }
+    }
+
+    fn client_certificate(ca: &TestCa, cluster_id: ClusterId) -> CertificateDer<'static> {
+        let key = KeyPair::generate().expect("test client key generation should succeed");
+        let mut params = CertificateParams::new(Vec::new())
+            .expect("test client certificate parameters should initialize");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "ironmesh-test-client");
+        let identity = DeviceId::now_v7();
+        params.subject_alt_names = vec![
+            SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("urn:ironmesh:device:{identity}"))
+                    .expect("device URI SAN should be valid"),
+            ),
+            SanType::URI(
+                rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+                    .expect("cluster URI SAN should be valid"),
+            ),
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let certificate = params
+            .signed_by(&key, &ca.issuer)
+            .expect("test client certificate generation should succeed");
+        CertificateDer::from(certificate.der().to_vec())
+    }
 
     fn authenticated_peer(cluster_id: Option<ClusterId>) -> MaybeAuthenticatedPeer {
         MaybeAuthenticatedPeer(Some(AuthenticatedPeer {
@@ -511,5 +726,77 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn global_verifier_selects_only_the_ca_registered_for_the_cluster_san() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let path = test_registry_path("global-verifier-selection");
+        let cluster_a = ClusterId::now_v7();
+        let cluster_b = ClusterId::now_v7();
+        let unknown_cluster = ClusterId::now_v7();
+        let ca_a = test_ca("cluster-a-ca");
+        let ca_b = test_ca("cluster-b-ca");
+        let registry = ClusterCaRegistry::open(&path).expect("registry should open");
+        registry
+            .register_or_update(cluster_a, ca_a.pem.clone(), "proof-a".to_string())
+            .expect("cluster A registration should succeed");
+        registry
+            .register_or_update(cluster_b, ca_b.pem.clone(), "proof-b".to_string())
+            .expect("cluster B registration should succeed");
+        let verifier = GlobalClusterClientCertVerifier::new(registry);
+
+        assert!(!verifier.client_auth_mandatory());
+        assert!(verifier.root_hint_subjects().is_empty());
+        assert!(
+            verifier
+                .verify_client_cert(&client_certificate(&ca_a, cluster_a), &[], UnixTime::now())
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .verify_client_cert(&client_certificate(&ca_a, cluster_b), &[], UnixTime::now())
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_client_cert(&client_certificate(&ca_b, cluster_a), &[], UnixTime::now())
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_client_cert(
+                    &client_certificate(&ca_a, unknown_cluster),
+                    &[],
+                    UnixTime::now(),
+                )
+                .is_err()
+        );
+
+        fs::remove_file(path).expect("test registry should be removable");
+    }
+
+    #[test]
+    fn global_verifier_rejects_a_suspended_cluster() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let path = test_registry_path("global-verifier-suspended");
+        let cluster_id = ClusterId::now_v7();
+        let ca = test_ca("suspended-cluster-ca");
+        let registry = ClusterCaRegistry::open(&path).expect("registry should open");
+        registry
+            .register_or_update(cluster_id, ca.pem.clone(), "proof".to_string())
+            .expect("cluster registration should succeed");
+        registry
+            .set_suspended(cluster_id, true)
+            .expect("suspension should succeed");
+        let verifier = GlobalClusterClientCertVerifier::new(registry);
+
+        assert!(
+            verifier
+                .verify_client_cert(&client_certificate(&ca, cluster_id), &[], UnixTime::now())
+                .is_err()
+        );
+
+        fs::remove_file(path).expect("test registry should be removable");
     }
 }
