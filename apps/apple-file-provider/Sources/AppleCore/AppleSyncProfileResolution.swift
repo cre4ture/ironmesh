@@ -21,11 +21,11 @@ public enum AppleSyncProfileResolution {
         if let storedProfile {
             return storedProfile
         }
-        if let configuredProfile {
-            return configuredProfile
-        }
         if domainIdentifier.hasPrefix(AppleSyncProfile.managedDomainPrefix) {
             throw AppleSyncProfileResolutionError.missingManagedProfile(domainIdentifier)
+        }
+        if let configuredProfile {
+            return configuredProfile
         }
         return AppleSyncProfile(
             id: "legacy-default",

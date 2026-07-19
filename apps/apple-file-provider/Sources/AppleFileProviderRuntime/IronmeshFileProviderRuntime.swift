@@ -415,9 +415,14 @@ final class IronmeshFileProviderService: @unchecked Sendable {
                 }
                 cache.movePathPrefix(from: currentItem.path, to: destinationPath)
                 workingPath = destinationPath
-                workingRevision = try bridge.metadata(
+                let postMoveRevision = try bridge.metadata(
                     pathOrIdentifier: pathMapper.remotePath(forLocalPath: destinationPath)
                 )?.revisionHint
+                workingRevision = try ApplePostMoveRevisionPolicy.expectedRevision(
+                    metadataRevision: postMoveRevision,
+                    includesContentUpdate: changedFields.contains(.contents),
+                    path: destinationPath
+                )
             }
         }
 
@@ -948,7 +953,7 @@ final class IronmeshFileProviderItem: NSObject, NSFileProviderItem {
     }
 
     var itemVersion: NSFileProviderItemVersion {
-        let metadata = truncatedVersionData(bridgeItem.identifier.serialized)
+        let metadata = AppleItemVersionFingerprint.metadataVersion(for: bridgeItem)
         let content = truncatedVersionData(bridgeItem.revisionHint ?? bridgeItem.identifier.serialized)
         return NSFileProviderItemVersion(contentVersion: content, metadataVersion: metadata)
     }

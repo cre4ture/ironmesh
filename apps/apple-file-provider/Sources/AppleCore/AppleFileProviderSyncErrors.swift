@@ -44,3 +44,26 @@ public func ironmeshRevisionConflictError(
         ]
     )
 }
+
+public enum ApplePostMoveRevisionPolicy {
+    public static func expectedRevision(
+        metadataRevision: String?,
+        includesContentUpdate: Bool,
+        path: String
+    ) throws -> String? {
+        let revision = metadataRevision.nilIfBlank
+        guard includesContentUpdate, revision == nil else {
+            return revision
+        }
+        throw NSError(
+            domain: NSFileProviderErrorDomain,
+            code: NSFileProviderError.Code.cannotSynchronize.rawValue,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "The destination revision for \(path) could not be verified after moving the item. "
+                    + "Refresh before retrying the content update.",
+                "IronmeshConflictReason": "missing_post_move_revision",
+            ]
+        )
+    }
+}

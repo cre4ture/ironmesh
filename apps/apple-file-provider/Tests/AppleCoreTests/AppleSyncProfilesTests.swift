@@ -19,6 +19,24 @@ final class AppleSyncProfilesTests: XCTestCase {
         }
     }
 
+    func testManagedDomainWithoutStoredProfileIgnoresStaleConfiguredProfile() {
+        let staleProfile = AppleSyncProfile(id: "removed", displayName: "Removed")
+
+        XCTAssertThrowsError(
+            try AppleSyncProfileResolution.resolve(
+                domainIdentifier: staleProfile.domainIdentifier,
+                storedProfile: nil,
+                configuredProfile: staleProfile,
+                legacyDisplayName: staleProfile.displayName
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AppleSyncProfileResolutionError,
+                .missingManagedProfile(staleProfile.domainIdentifier)
+            )
+        }
+    }
+
     func testLegacyDomainRetainsExplicitUnrestrictedFallback() throws {
         let profile = try AppleSyncProfileResolution.resolve(
             domainIdentifier: "dev.ironmesh.default",
