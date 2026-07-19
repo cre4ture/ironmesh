@@ -47,7 +47,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rand::RngCore;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    SanType,
+    SanType, SigningKey,
 };
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -75,12 +75,15 @@ use transport_sdk::{
     BootstrapClaimBroker, BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial,
     BootstrapServerTlsFiles, BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
     BufferedTransportRequest, BufferedTransportResponse, CLIENT_BOOTSTRAP_CLAIM_VERSION,
-    CandidateKind, ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
+    CLUSTER_REGISTRATION_PROTOCOL_VERSION, CandidateKind,
+    ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
     ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
-    ClientBootstrapClaimTrust, ClientEnrollmentRequest, ConnectionCandidate, DirectQuicEndpoint,
-    DirectQuicEndpointConfig, DirectQuicSession, MultiplexConfig, MultiplexMode,
-    MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
+    ClientBootstrapClaimTrust, ClientEnrollmentRequest, ClusterRegistrationChallengeRequest,
+    ClusterRegistrationChallengeResponse, ClusterRegistrationCompleteRequest,
+    ClusterRegistrationProofAlgorithm, ClusterRegistrationRecord, ConnectionCandidate,
+    DirectQuicEndpoint, DirectQuicEndpointConfig, DirectQuicSession, MultiplexConfig,
+    MultiplexMode, MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
     NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
     RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSecurityMode,
@@ -110,6 +113,10 @@ const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
+const GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV: &str =
+    "IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED";
+const GLOBAL_RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 10;
+const GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -2953,6 +2960,7 @@ pub struct ServerNodeConfig {
     pub rendezvous_ca_cert_path: Option<PathBuf>,
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
+    pub global_rendezvous_registration_enabled: bool,
     pub rendezvous_mtls_required: bool,
     pub managed_rendezvous: Option<ManagedRendezvousConfig>,
     pub relay_mode: RelayMode,
@@ -3014,7 +3022,13 @@ pub struct LocalNodeHandle {
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .ok()
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
+        .map(|value| parse_env_flag_enabled(Some(value.as_str())))
+        .unwrap_or_else(|| parse_env_flag_enabled(None))
+}
+
+fn parse_env_flag_enabled(value: Option<&str>) -> bool {
+    value
+        .map(|value| !matches!(value, "0" | "false" | "no"))
         .unwrap_or(false)
 }
 
@@ -4835,6 +4849,280 @@ fn build_rendezvous_control_clients(
     Ok((Some(shared), endpoints))
 }
 
+struct GlobalRendezvousRegistrationClient {
+    http: reqwest::Client,
+    rendezvous_urls: Vec<reqwest::Url>,
+    challenge_request: ClusterRegistrationChallengeRequest,
+    cluster_ca_fingerprint_sha256: String,
+    cluster_ca_key: KeyPair,
+}
+
+fn build_global_rendezvous_registration_client(
+    cluster_id: ClusterId,
+    rendezvous_urls: &[String],
+    cluster_ca_pem: Option<&str>,
+    cluster_ca_key_pem: Option<&str>,
+    rendezvous_service_ca_pem: Option<&str>,
+) -> Result<GlobalRendezvousRegistrationClient> {
+    if rendezvous_urls.is_empty() {
+        bail!("global rendezvous registration requires at least one rendezvous URL");
+    }
+
+    let cluster_ca_pem = cluster_ca_pem
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("global rendezvous registration requires a cluster CA certificate")?;
+    let cluster_ca_key_pem = cluster_ca_key_pem
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("global rendezvous registration requires a cluster CA private key")?;
+    let rendezvous_service_ca_pem = rendezvous_service_ca_pem
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("global rendezvous registration requires a rendezvous service CA certificate")?;
+
+    let challenge_request = ClusterRegistrationChallengeRequest {
+        protocol_version: CLUSTER_REGISTRATION_PROTOCOL_VERSION,
+        cluster_id,
+        cluster_ca_pem: cluster_ca_pem.to_string(),
+        proof_algorithm: ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1,
+    };
+    challenge_request
+        .validate()
+        .context("invalid cluster CA for global rendezvous registration")?;
+    let cluster_ca_fingerprint_sha256 = challenge_request
+        .cluster_ca_fingerprint_sha256()
+        .context("failed computing cluster CA fingerprint for global rendezvous registration")?;
+    let cluster_ca_key = KeyPair::from_pem(cluster_ca_key_pem)
+        .context("failed parsing cluster CA private key for global rendezvous registration")?;
+
+    let mut parsed_rendezvous_urls = Vec::with_capacity(rendezvous_urls.len());
+    for rendezvous_url in rendezvous_urls {
+        let parsed = reqwest::Url::parse(rendezvous_url)
+            .with_context(|| format!("invalid global rendezvous URL {rendezvous_url:?}"))?;
+        if parsed.scheme() != "https" {
+            bail!("global rendezvous registration requires an HTTPS URL, got {parsed}");
+        }
+        if parsed.host_str().is_none() {
+            bail!("global rendezvous registration URL must include a host: {parsed}");
+        }
+        parsed_rendezvous_urls.push(parsed);
+    }
+
+    ensure_rustls_crypto_provider_installed();
+    let service_ca = reqwest::Certificate::from_pem(rendezvous_service_ca_pem.as_bytes())
+        .context("failed parsing global rendezvous service CA certificate")?;
+    let request_timeout = Duration::from_secs(GLOBAL_RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS);
+    let http = reqwest::Client::builder()
+        .https_only(true)
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(service_ca)
+        .connect_timeout(request_timeout)
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed building global rendezvous registration HTTPS client")?;
+
+    Ok(GlobalRendezvousRegistrationClient {
+        http,
+        rendezvous_urls: parsed_rendezvous_urls,
+        challenge_request,
+        cluster_ca_fingerprint_sha256,
+        cluster_ca_key,
+    })
+}
+
+fn global_rendezvous_registration_endpoint_url(
+    rendezvous_url: &reqwest::Url,
+    endpoint_path: &str,
+) -> Result<reqwest::Url> {
+    rendezvous_url.join(endpoint_path).with_context(|| {
+        format!("failed building global rendezvous registration endpoint from {rendezvous_url}")
+    })
+}
+
+async fn read_global_rendezvous_registration_response_body(
+    mut response: reqwest::Response,
+    request_url: &reqwest::Url,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES as u64)
+    {
+        bail!(
+            "global rendezvous registration response from {request_url} exceeds {GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES} bytes"
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.with_context(|| {
+        format!("failed reading global rendezvous registration response from {request_url}")
+    })? {
+        if bytes.len().saturating_add(chunk.len())
+            > GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES
+        {
+            bail!(
+                "global rendezvous registration response from {request_url} exceeds {GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES} bytes"
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn post_global_rendezvous_registration_json<Request, Response>(
+    http: &reqwest::Client,
+    rendezvous_url: &reqwest::Url,
+    endpoint_path: &str,
+    request: &Request,
+) -> Result<Option<Response>>
+where
+    Request: Serialize,
+    Response: DeserializeOwned,
+{
+    let request_url = global_rendezvous_registration_endpoint_url(rendezvous_url, endpoint_path)?;
+    let response = http
+        .post(request_url.clone())
+        .json(request)
+        .send()
+        .await
+        .with_context(|| {
+            format!("failed sending global rendezvous registration request to {request_url}")
+        })?;
+    let status = response.status();
+    let body = read_global_rendezvous_registration_response_body(response, &request_url).await?;
+
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&body);
+        let detail = if detail.trim().is_empty() {
+            "empty response body"
+        } else {
+            detail.trim()
+        };
+        bail!(
+            "global rendezvous registration request to {request_url} returned HTTP {status}: {detail}"
+        );
+    }
+
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+
+    serde_json::from_slice(&body).map(Some).with_context(|| {
+        format!(
+            "failed decoding successful global rendezvous registration response from {request_url}"
+        )
+    })
+}
+
+fn validate_global_rendezvous_registration_record(
+    record: &ClusterRegistrationRecord,
+    cluster_id: ClusterId,
+    cluster_ca_fingerprint_sha256: &str,
+) -> Result<()> {
+    record
+        .validate()
+        .context("global rendezvous registration returned an invalid record")?;
+    if record.cluster_id != cluster_id {
+        bail!("global rendezvous registration returned a record for a different cluster");
+    }
+    if record.cluster_ca_fingerprint_sha256 != cluster_ca_fingerprint_sha256 {
+        bail!(
+            "global rendezvous registration returned a record with a different cluster CA fingerprint"
+        );
+    }
+    if record.proof_algorithm != ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1 {
+        bail!(
+            "global rendezvous registration returned a record with an unexpected proof algorithm"
+        );
+    }
+    Ok(())
+}
+
+async fn register_cluster_with_global_rendezvous_services(
+    cluster_id: ClusterId,
+    rendezvous_urls: &[String],
+    cluster_ca_pem: Option<&str>,
+    cluster_ca_key_pem: Option<&str>,
+    rendezvous_service_ca_pem: Option<&str>,
+) -> Result<()> {
+    let registration = build_global_rendezvous_registration_client(
+        cluster_id,
+        rendezvous_urls,
+        cluster_ca_pem,
+        cluster_ca_key_pem,
+        rendezvous_service_ca_pem,
+    )?;
+
+    for rendezvous_url in &registration.rendezvous_urls {
+        let challenge: ClusterRegistrationChallengeResponse =
+            post_global_rendezvous_registration_json::<_, ClusterRegistrationChallengeResponse>(
+                &registration.http,
+                rendezvous_url,
+                "/global/cluster-registration/challenge",
+                &registration.challenge_request,
+            )
+            .await?
+            .context("global rendezvous registration challenge response was empty")?;
+        challenge.validate_at(unix_ts()).with_context(|| {
+            format!("invalid global rendezvous registration challenge from {rendezvous_url}")
+        })?;
+        if challenge.cluster_id != cluster_id {
+            bail!(
+                "global rendezvous registration challenge from {rendezvous_url} has a different cluster ID"
+            );
+        }
+        if challenge.cluster_ca_fingerprint_sha256 != registration.cluster_ca_fingerprint_sha256 {
+            bail!(
+                "global rendezvous registration challenge from {rendezvous_url} has a different cluster CA fingerprint"
+            );
+        }
+        if challenge.proof_algorithm != ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1 {
+            bail!(
+                "global rendezvous registration challenge from {rendezvous_url} has an unexpected proof algorithm"
+            );
+        }
+
+        let proof_message = challenge.canonical_proof_message_v1().with_context(|| {
+            format!("failed building global rendezvous registration proof for {rendezvous_url}")
+        })?;
+        let proof_signature = registration
+            .cluster_ca_key
+            .sign(&proof_message)
+            .context("failed signing global rendezvous registration proof with cluster CA key")?;
+        let completion = ClusterRegistrationCompleteRequest {
+            protocol_version: challenge.protocol_version,
+            cluster_id: challenge.cluster_id,
+            cluster_ca_fingerprint_sha256: challenge.cluster_ca_fingerprint_sha256.clone(),
+            proof_algorithm: challenge.proof_algorithm,
+            challenge_id: challenge.challenge_id,
+            challenge_nonce_b64u: challenge.challenge_nonce_b64u.clone(),
+            expires_at_unix: challenge.expires_at_unix,
+            proof_signature_b64u: BASE64_URL_SAFE_NO_PAD.encode(proof_signature),
+        };
+        completion
+            .validate_at(unix_ts())
+            .context("failed validating global rendezvous registration completion proof")?;
+
+        if let Some(record) =
+            post_global_rendezvous_registration_json::<_, ClusterRegistrationRecord>(
+                &registration.http,
+                rendezvous_url,
+                "/global/cluster-registration/complete",
+                &completion,
+            )
+            .await?
+        {
+            validate_global_rendezvous_registration_record(
+                &record,
+                cluster_id,
+                &registration.cluster_ca_fingerprint_sha256,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 fn build_outbound_clients_with_urls(
     state: &ServerState,
     rendezvous_urls: &[String],
@@ -5223,6 +5511,9 @@ impl ServerNodeConfig {
             rendezvous_ca_cert_path: None,
             rendezvous_urls: bootstrap.rendezvous_urls,
             rendezvous_registration_enabled: rendezvous_configured,
+            global_rendezvous_registration_enabled: env_flag_enabled(
+                GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV,
+            ),
             rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
             managed_rendezvous: None,
             relay_mode: bootstrap.relay_mode,
@@ -5413,6 +5704,8 @@ impl ServerNodeConfig {
             })
             .filter(|urls| !urls.is_empty());
         let rendezvous_registration_enabled = explicit_rendezvous_urls.is_some();
+        let global_rendezvous_registration_enabled =
+            env_flag_enabled(GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV);
         let rendezvous_urls = explicit_rendezvous_urls
             .clone()
             .or_else(|| public_url.as_ref().map(|url| vec![url.clone()]))
@@ -5521,6 +5814,7 @@ impl ServerNodeConfig {
             rendezvous_ca_cert_path,
             rendezvous_urls,
             rendezvous_registration_enabled,
+            global_rendezvous_registration_enabled,
             rendezvous_mtls_required,
             managed_rendezvous: None,
             relay_mode,
@@ -6376,7 +6670,7 @@ async fn run_inner(
             None
         }
     });
-    let rendezvous_ca_pem = config
+    let configured_rendezvous_service_ca_pem = config
         .rendezvous_ca_cert_path
         .clone()
         .map(|path| {
@@ -6388,15 +6682,27 @@ async fn run_inner(
             })
         })
         .transpose()?
-        .or(embedded_trust_roots.rendezvous_ca_pem.clone())
+        .or(embedded_trust_roots.rendezvous_ca_pem.clone());
+    let rendezvous_ca_pem = configured_rendezvous_service_ca_pem
+        .clone()
         .or_else(|| public_ca_pem.clone())
         .or_else(|| cluster_ca_pem.clone());
+    let normalized_rendezvous_urls = normalize_rendezvous_url_list(&config.rendezvous_urls)?;
+    if config.global_rendezvous_registration_enabled {
+        register_cluster_with_global_rendezvous_services(
+            config.cluster_id,
+            &normalized_rendezvous_urls,
+            cluster_ca_pem.as_deref(),
+            internal_ca_key_pem.as_deref(),
+            configured_rendezvous_service_ca_pem.as_deref(),
+        )
+        .await?;
+    }
     let rendezvous_client_identity_pem = config
         .internal_tls
         .as_ref()
         .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
         .transpose()?;
-    let normalized_rendezvous_urls = normalize_rendezvous_url_list(&config.rendezvous_urls)?;
     let (rendezvous_control, rendezvous_controls) = if config.rendezvous_registration_enabled {
         match build_rendezvous_control_clients(
             config.cluster_id,
