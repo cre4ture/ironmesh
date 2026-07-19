@@ -2,6 +2,8 @@ package io.ironmesh.android.ui
 
 import android.app.Application
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -172,6 +174,10 @@ class MainViewModel(
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
     private var connectionRoutesMonitorJob: Job? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
+    private var processLifecycleObserverActive = true
+    private var processLifecycleObserverRegistered = false
     private val processLifecycleObserver = LifecycleEventObserver { _, event ->
         if (event == Lifecycle.Event.ON_STOP) {
             repository.stopWebUi()
@@ -204,13 +210,40 @@ class MainViewModel(
         )
         FolderSyncScheduler.reschedule(getApplication())
         observeFolderSyncStatus()
-        ProcessLifecycleOwner.get().lifecycle.addObserver(processLifecycleObserver)
+        registerProcessLifecycleObserver()
     }
 
     override fun onCleared() {
-        ProcessLifecycleOwner.get().lifecycle.removeObserver(processLifecycleObserver)
+        processLifecycleObserverActive = false
+        unregisterProcessLifecycleObserver()
         repository.stopWebUi()
         super.onCleared()
+    }
+
+    private fun registerProcessLifecycleObserver() {
+        runOnMainThread {
+            if (processLifecycleObserverActive && !processLifecycleObserverRegistered) {
+                ProcessLifecycleOwner.get().lifecycle.addObserver(processLifecycleObserver)
+                processLifecycleObserverRegistered = true
+            }
+        }
+    }
+
+    private fun unregisterProcessLifecycleObserver() {
+        runOnMainThread {
+            if (processLifecycleObserverRegistered) {
+                ProcessLifecycleOwner.get().lifecycle.removeObserver(processLifecycleObserver)
+                processLifecycleObserverRegistered = false
+            }
+        }
+    }
+
+    private fun runOnMainThread(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action()
+        } else {
+            mainHandler.post(action)
+        }
     }
 
     fun updateKey(value: String) {
