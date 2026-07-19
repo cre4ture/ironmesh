@@ -10,6 +10,7 @@ use super::{
 };
 use axum::Extension;
 use axum_server::accept::Accept;
+use base64::Engine;
 use common::{ClusterId, NodeId};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
@@ -508,6 +509,7 @@ fn test_cluster_config_without_internal_tls(
         rendezvous_ca_cert_path: None,
         rendezvous_urls: vec![format!("http://{bind_addr}")],
         rendezvous_registration_enabled: false,
+        global_rendezvous_registration_enabled: false,
         rendezvous_mtls_required: false,
         managed_rendezvous: None,
         relay_mode: super::RelayMode::Fallback,
@@ -1091,6 +1093,337 @@ fn spawn_https_rendezvous_server(
             .await
             .unwrap();
     })
+}
+
+#[derive(Clone)]
+struct OptionalClientCertificateCaptureAcceptor {
+    inner: axum_server::tls_rustls::RustlsAcceptor,
+    captured_client_certificate: Arc<Mutex<Option<Option<String>>>>,
+}
+
+impl OptionalClientCertificateCaptureAcceptor {
+    fn new(
+        config: axum_server::tls_rustls::RustlsConfig,
+        captured_client_certificate: Arc<Mutex<Option<Option<String>>>>,
+    ) -> Self {
+        Self {
+            inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
+            captured_client_certificate,
+        }
+    }
+}
+
+impl<S> Accept<tokio::net::TcpStream, S> for OptionalClientCertificateCaptureAcceptor
+where
+    axum_server::tls_rustls::RustlsAcceptor: Accept<
+            tokio::net::TcpStream,
+            S,
+            Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        >,
+    <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Service:
+        Send + 'static,
+    <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Future:
+        Send + 'static,
+    S: Send + 'static,
+{
+    type Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Service =
+        <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Service;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let fut = self.inner.accept(stream, service);
+        let captured_client_certificate = self.captured_client_certificate.clone();
+        Box::pin(async move {
+            let (tls_stream, service) = fut.await?;
+            let fingerprint = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|cert| blake3::hash(cert.as_ref()).to_hex().to_string());
+            *captured_client_certificate.lock().await = Some(fingerprint);
+            Ok((tls_stream, service))
+        })
+    }
+}
+
+fn build_optional_client_auth_rustls_config(
+    client_ca_cert_path: &std::path::Path,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> axum_server::tls_rustls::RustlsConfig {
+    super::ensure_rustls_crypto_provider_installed();
+    let roots = load_root_store_from_pem_file(client_ca_cert_path);
+    let (cert_chain, key) = load_client_identity_from_pem_files(cert_path, key_path);
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
+        .build()
+        .unwrap();
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config))
+}
+
+#[derive(Clone)]
+struct GlobalRendezvousRegistrationCaptureState {
+    challenge: transport_sdk::ClusterRegistrationChallengeResponse,
+    challenge_request: Arc<Mutex<Option<transport_sdk::ClusterRegistrationChallengeRequest>>>,
+    completion_request: Arc<Mutex<Option<transport_sdk::ClusterRegistrationCompleteRequest>>>,
+}
+
+async fn capture_global_rendezvous_registration_challenge(
+    State(state): State<GlobalRendezvousRegistrationCaptureState>,
+    Json(request): Json<transport_sdk::ClusterRegistrationChallengeRequest>,
+) -> Json<transport_sdk::ClusterRegistrationChallengeResponse> {
+    *state.challenge_request.lock().await = Some(request);
+    Json(state.challenge)
+}
+
+async fn capture_global_rendezvous_registration_completion(
+    State(state): State<GlobalRendezvousRegistrationCaptureState>,
+    Json(request): Json<transport_sdk::ClusterRegistrationCompleteRequest>,
+) -> Json<transport_sdk::ClusterRegistrationRecord> {
+    *state.completion_request.lock().await = Some(request.clone());
+    Json(transport_sdk::ClusterRegistrationRecord {
+        cluster_id: request.cluster_id,
+        cluster_ca_fingerprint_sha256: request.cluster_ca_fingerprint_sha256,
+        proof_algorithm: request.proof_algorithm,
+        created_at_unix: super::unix_ts(),
+        last_seen_at_unix: None,
+        suspension: transport_sdk::ClusterSuspendStatus::default(),
+    })
+}
+
+fn spawn_global_rendezvous_registration_capture_server(
+    listener: TcpListener,
+    client_ca_cert_path: &std::path::Path,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    state: GlobalRendezvousRegistrationCaptureState,
+    captured_client_certificate: Arc<Mutex<Option<Option<String>>>>,
+) -> tokio::task::JoinHandle<()> {
+    let app = Router::new()
+        .route(
+            "/global/cluster-registration/challenge",
+            post(capture_global_rendezvous_registration_challenge),
+        )
+        .route(
+            "/global/cluster-registration/complete",
+            post(capture_global_rendezvous_registration_completion),
+        )
+        .with_state(state);
+    let tls_config =
+        build_optional_client_auth_rustls_config(client_ca_cert_path, cert_path, key_path);
+    let acceptor =
+        OptionalClientCertificateCaptureAcceptor::new(tls_config, captured_client_certificate);
+
+    tokio::spawn(async move {
+        axum_server::from_tcp(listener)
+            .unwrap()
+            .acceptor(acceptor)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    })
+}
+
+#[test]
+fn global_rendezvous_registration_flag_defaults_to_false_and_parses_env_values() {
+    assert!(!super::parse_env_flag_enabled(None));
+    assert!(!super::parse_env_flag_enabled(Some("false")));
+    assert!(super::parse_env_flag_enabled(Some("true")));
+}
+
+#[test]
+fn global_rendezvous_registration_rejects_insecure_urls_and_missing_material() {
+    let cluster_id = Uuid::now_v7();
+    let (cluster_ca_pem, cluster_ca_key_pem) = generate_test_internal_ca();
+    let (service_ca_pem, _) = generate_test_internal_ca();
+
+    let error = match super::build_global_rendezvous_registration_client(
+        cluster_id,
+        &["http://rendezvous.example".to_string()],
+        Some(&cluster_ca_pem),
+        Some(&cluster_ca_key_pem),
+        Some(&service_ca_pem),
+    ) {
+        Ok(_) => panic!("non-HTTPS rendezvous URL must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("HTTPS URL"));
+
+    let error = match super::build_global_rendezvous_registration_client(
+        cluster_id,
+        &[],
+        Some(&cluster_ca_pem),
+        Some(&cluster_ca_key_pem),
+        Some(&service_ca_pem),
+    ) {
+        Ok(_) => panic!("empty rendezvous URL list must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("at least one rendezvous URL"));
+
+    let error = match super::build_global_rendezvous_registration_client(
+        cluster_id,
+        &["https://rendezvous.example".to_string()],
+        None,
+        Some(&cluster_ca_key_pem),
+        Some(&service_ca_pem),
+    ) {
+        Ok(_) => panic!("missing cluster CA must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("cluster CA certificate"));
+
+    let error = match super::build_global_rendezvous_registration_client(
+        cluster_id,
+        &["https://rendezvous.example".to_string()],
+        Some(&cluster_ca_pem),
+        None,
+        Some(&service_ca_pem),
+    ) {
+        Ok(_) => panic!("missing cluster CA private key must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("cluster CA private key"));
+
+    let error = match super::build_global_rendezvous_registration_client(
+        cluster_id,
+        &["https://rendezvous.example".to_string()],
+        Some(&cluster_ca_pem),
+        Some(&cluster_ca_key_pem),
+        None,
+    ) {
+        Ok(_) => panic!("missing rendezvous service CA must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("rendezvous service CA certificate")
+    );
+}
+
+#[tokio::test]
+async fn global_rendezvous_registration_signs_canonical_proof_without_client_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "ironmesh-global-rendezvous-registration-{}",
+        Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bind_addr = listener.local_addr().unwrap();
+    let cluster_id = Uuid::now_v7();
+    let (cluster_ca_pem, cluster_ca_key_pem) = generate_test_internal_ca();
+    let (service_ca_pem, _, service_cert_pem, service_key_pem) =
+        generate_test_https_ca_and_server_material(bind_addr, "global-rendezvous");
+    let client_ca_cert_path = root.join("cluster-ca.pem");
+    let service_cert_path = root.join("service.pem");
+    let service_key_path = root.join("service.key");
+    std::fs::write(&client_ca_cert_path, &cluster_ca_pem).unwrap();
+    std::fs::write(&service_cert_path, service_cert_pem).unwrap();
+    std::fs::write(&service_key_path, service_key_pem).unwrap();
+
+    let cluster_ca_fingerprint_sha256 =
+        transport_sdk::cluster_ca_fingerprint_sha256(&cluster_ca_pem).unwrap();
+    let challenge = transport_sdk::ClusterRegistrationChallengeResponse {
+        protocol_version: transport_sdk::CLUSTER_REGISTRATION_PROTOCOL_VERSION,
+        cluster_id,
+        cluster_ca_fingerprint_sha256: cluster_ca_fingerprint_sha256.clone(),
+        proof_algorithm: transport_sdk::ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1,
+        challenge_id: Uuid::now_v7(),
+        challenge_nonce_b64u: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 16]),
+        expires_at_unix: super::unix_ts() + 60,
+    };
+    let state = GlobalRendezvousRegistrationCaptureState {
+        challenge: challenge.clone(),
+        challenge_request: Arc::new(Mutex::new(None)),
+        completion_request: Arc::new(Mutex::new(None)),
+    };
+    let captured_client_certificate = Arc::new(Mutex::new(None));
+    let server = spawn_global_rendezvous_registration_capture_server(
+        listener,
+        &client_ca_cert_path,
+        &service_cert_path,
+        &service_key_path,
+        state.clone(),
+        captured_client_certificate.clone(),
+    );
+
+    super::register_cluster_with_global_rendezvous_services(
+        cluster_id,
+        &[format!("https://{bind_addr}")],
+        Some(&cluster_ca_pem),
+        Some(&cluster_ca_key_pem),
+        Some(&service_ca_pem),
+    )
+    .await
+    .unwrap();
+
+    let challenge_request = state
+        .challenge_request
+        .lock()
+        .await
+        .clone()
+        .expect("registration must send a challenge request");
+    assert_eq!(challenge_request.cluster_id, cluster_id);
+    assert_eq!(challenge_request.cluster_ca_pem, cluster_ca_pem.trim());
+    assert_eq!(
+        challenge_request.proof_algorithm,
+        transport_sdk::ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1
+    );
+
+    let completion = state
+        .completion_request
+        .lock()
+        .await
+        .clone()
+        .expect("registration must send a completion request");
+    assert_eq!(completion.cluster_id, challenge.cluster_id);
+    assert_eq!(
+        completion.cluster_ca_fingerprint_sha256,
+        challenge.cluster_ca_fingerprint_sha256
+    );
+    assert_eq!(completion.challenge_id, challenge.challenge_id);
+    assert_eq!(
+        completion.challenge_nonce_b64u,
+        challenge.challenge_nonce_b64u
+    );
+    assert_eq!(completion.expires_at_unix, challenge.expires_at_unix);
+    completion.validate().unwrap();
+
+    let proof_message = challenge.canonical_proof_message_v1().unwrap();
+    assert_eq!(
+        completion.canonical_proof_message_v1().unwrap(),
+        proof_message
+    );
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&completion.proof_signature_b64u)
+        .unwrap();
+    let mut reader = std::io::Cursor::new(cluster_ca_pem.as_bytes());
+    let certificates = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let certificate = certificates.first().unwrap();
+    let certificate = webpki::EndEntityCert::try_from(certificate).unwrap();
+    certificate
+        .verify_signature(webpki::ring::ECDSA_P256_SHA256, &proof_message, &signature)
+        .unwrap();
+    assert_eq!(
+        *captured_client_certificate.lock().await,
+        Some(None),
+        "initial global registration must not send a rendezvous client identity"
+    );
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

@@ -1880,6 +1880,7 @@ mod tests {
             rendezvous_ca_cert_path: None,
             rendezvous_urls: vec![format!("http://{bind_addr}")],
             rendezvous_registration_enabled: false,
+            global_rendezvous_registration_enabled: false,
             rendezvous_mtls_required: false,
             managed_rendezvous: None,
             relay_mode: RelayMode::Fallback,

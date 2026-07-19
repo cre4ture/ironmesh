@@ -9,24 +9,28 @@ authors.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+base64 = "0.22"
 common = { path = "../common" }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
+rand = "0.8"
+p256 = { version = "0.13", features = ["ecdsa"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+subtle = "2"
 tokio.workspace = true
 tokio-rustls = "0.26"
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tracing.workspace = true
 transport-sdk = { path = "../transport-sdk" }
+uuid.workspace = true
 x509-parser = "0.16"
 
 [dev-dependencies]
 futures-util = "0.3"
 rcgen = { version = "0.14", features = ["crypto", "pem", "ring"] }
 tokio-tungstenite = "0.24"
-uuid = { workspace = true }
 
 [lints]
 workspace = true
