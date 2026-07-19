@@ -91,6 +91,26 @@ export type StartAdminMapDatasetImportResponse = {
   status: AdminMapDatasetImportStatusResponse;
 };
 
+export type NaturalEarthImportState = "running" | "ready" | "failed";
+
+export type NaturalEarthImportJobView = {
+  id: string;
+  state: NaturalEarthImportState;
+  phase: string;
+  source_url: string;
+  logical_key: string;
+  manifest_key: string;
+  logical_size_bytes: number;
+  error?: string | null;
+  started_at_unix: number;
+  updated_at_unix: number;
+};
+
+export type NaturalEarthImportStatusResponse = {
+  active_job?: NaturalEarthImportJobView | null;
+  can_start_new: boolean;
+};
+
 export type AdminGalleryMapConfiguration = GalleryMapConfiguration;
 export type AdminGalleryMapConfigurationResponse = GalleryMapConfigurationResponse;
 

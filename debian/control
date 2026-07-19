@@ -18,7 +18,9 @@ Section: net
 Architecture: any
 Depends:
  ${misc:Depends},
- ${shlibs:Depends}
+ ${shlibs:Depends},
+ gdal-bin,
+ unzip
 Description: Ironmesh storage server node
  Ironmesh server node for the distributed storage platform workspace.
  This package ships the `ironmesh-server-node` service binary with the embedded

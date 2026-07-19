@@ -100,6 +100,22 @@ worldwide raster MBTiles base and, if desired, a separate vector MBTiles
 overlay. Point the profile's manifest keys at those two artifacts and import
 them through the admin UI.
 
+### Automatic physical base map
+
+For the standard `natural-earth-globe` raster profile, **Server Admin → Gallery
+→ Map dataset import** also offers **Download and convert Natural Earth**. The
+node downloads the fixed official Natural Earth 10m physical archive, renders
+ocean, land, lakes, rivers, and coastlines with the built-in colors, creates
+Web-Mercator PNG MBTiles, validates them, and publishes the configured manifest
+only after all generated artifact parts are stored.
+
+This automatic path has no administrator-provided URL or converter arguments.
+It requires `unzip`, `gdal_rasterize`, `gdalwarp`, `gdal_translate`, and
+`gdaladdo` on the server `PATH`. The Debian package installs `unzip` and
+`gdal-bin`; other deployments must provide the same tools. The existing manual
+import remains appropriate for a custom physical rendering, a labels overlay,
+or data from another provider.
+
 For the `natural_earth` vector style, the overlay uses this compact source-layer
 contract:
 

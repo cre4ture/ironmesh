@@ -14952,6 +14952,9 @@ async fn build_test_state(
                     root.join("state").join("map_dataset_import.json"),
                 ),
             )),
+            natural_earth_import: Arc::new(Mutex::new(
+                super::natural_earth_import::NaturalEarthImportRuntime::default(),
+            )),
             storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
             storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
             metadata_db_distribution_runtime: Arc::new(std::sync::Mutex::new(

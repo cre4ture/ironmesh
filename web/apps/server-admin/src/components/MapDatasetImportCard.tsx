@@ -1,7 +1,9 @@
 import {
   getAdminGalleryMapConfiguration,
   getAdminMapDatasetImportStatus,
+  getNaturalEarthMapImportStatus,
   startAdminMapDatasetImport,
+  startNaturalEarthMapImport,
   type AdminMapDatasetImportJobView
 } from "@ironmesh/api";
 import { ironmeshPrimaryColor } from "@ironmesh/ui";
@@ -81,6 +83,13 @@ export function MapDatasetImportCard() {
     refetchInterval: (query) =>
       query.state.data?.active_job?.state === "running" ? 2_000 : false
   });
+  const naturalEarthImportStatusQuery = useQuery({
+    queryKey: ["gallery-page", "natural-earth-map-import", normalizedAdminTokenOverride],
+    queryFn: () => getNaturalEarthMapImportStatus(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectMapImport,
+    refetchInterval: (query) =>
+      query.state.data?.active_job?.state === "running" ? 2_000 : false
+  });
   const startMapImportMutation = useMutation({
     mutationFn: () =>
       startAdminMapDatasetImport(
@@ -103,13 +112,32 @@ export function MapDatasetImportCard() {
       });
     }
   });
+  const startNaturalEarthImportMutation = useMutation({
+    mutationFn: () => startNaturalEarthMapImport(normalizedAdminTokenOverride || undefined),
+    onSuccess: async (job) => {
+      queryClient.setQueryData(
+        ["gallery-page", "natural-earth-map-import", normalizedAdminTokenOverride],
+        { active_job: job, can_start_new: false }
+      );
+      await queryClient.refetchQueries({
+        queryKey: ["gallery-page", "natural-earth-map-import", normalizedAdminTokenOverride],
+        exact: true
+      });
+    }
+  });
 
   const mapImportStatus = canInspectMapImport ? mapImportStatusQuery.data ?? null : null;
   const activeMapImport = mapImportStatus?.active_job ?? null;
+  const naturalEarthImportStatus = canInspectMapImport
+    ? naturalEarthImportStatusQuery.data ?? null
+    : null;
+  const naturalEarthJob = naturalEarthImportStatus?.active_job ?? null;
   const mapImportError = firstErrorMessage([
     mapImportStatusQuery.error,
+    naturalEarthImportStatusQuery.error,
     mapConfigurationQuery.error,
-    startMapImportMutation.error
+    startMapImportMutation.error,
+    startNaturalEarthImportMutation.error
   ]);
   const canStartMapImport =
     canInspectMapImport &&
@@ -118,6 +146,10 @@ export function MapDatasetImportCard() {
     mapImportSource.trim().length > 0 &&
     Number.isFinite(partSizeGiB) &&
     partSizeGiB > 0;
+  const canStartNaturalEarthImport =
+    canInspectMapImport &&
+    naturalEarthImportStatus?.can_start_new !== false &&
+    mapImportStatus?.can_start_new !== false;
 
   return (
     <>
@@ -146,6 +178,43 @@ export function MapDatasetImportCard() {
             The source filename is no longer significant. This import writes the selected variant
             asset to its manifest key from the replicated map configuration, so each map package
             can be downloaded and enabled independently.
+          </Alert>
+
+          <Alert color="blue" variant="light" title="Automatic Natural Earth physical map">
+            <Stack gap="xs">
+              <Text size="sm">
+                Download the official Natural Earth 10m physical source data and convert its land,
+                water, lake, river, and coastline layers into the configured
+                <Code> natural-earth-globe </Code> raster MBTiles artifact. This node needs
+                GDAL and unzip installed.
+              </Text>
+              <Group justify="space-between" align="center">
+                <Text size="xs" c="dimmed">
+                  {naturalEarthJob
+                    ? `${naturalEarthJob.state}: ${naturalEarthJob.phase}`
+                    : "No automatic Natural Earth conversion has been started."}
+                </Text>
+                <Button
+                  size="xs"
+                  variant="light"
+                  loading={startNaturalEarthImportMutation.isPending}
+                  disabled={!canStartNaturalEarthImport}
+                  onClick={() => void startNaturalEarthImportMutation.mutateAsync()}
+                >
+                  Download and convert Natural Earth
+                </Button>
+              </Group>
+              {naturalEarthJob?.logical_size_bytes ? (
+                <Text size="xs" c="dimmed">
+                  Published artifact: {formatBytes(naturalEarthJob.logical_size_bytes)}
+                </Text>
+              ) : null}
+              {naturalEarthJob?.error ? (
+                <Text size="xs" c="red">
+                  {naturalEarthJob.error}
+                </Text>
+              ) : null}
+            </Stack>
           </Alert>
 
           <Select
