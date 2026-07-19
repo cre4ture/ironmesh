@@ -345,6 +345,10 @@ export function GallerySurface({
     persistMapProjection(activeMapProjection);
   }, [activeMapProjection]);
 
+  const switchToGridView = useCallback(() => {
+    setViewMode("grid");
+  }, []);
+
   const compactGalleryGrid = galleryGridWidth > 0 && galleryGridWidth < 540;
   const galleryGridGap = showMetadata ? (compactGalleryGrid ? 8 : 10) : 0;
   const galleryGridColumns = resolveGalleryGridColumns(
@@ -1348,13 +1352,15 @@ export function GallerySurface({
                     <Button
                       variant={viewMode === "grid" ? "filled" : "default"}
                       leftSection={<IconLayoutGrid size={14} />}
-                      onClick={() => setViewMode("grid")}
+                      aria-pressed={viewMode === "grid"}
+                      onClick={switchToGridView}
                     >
                       Grid
                     </Button>
                     <Button
                       variant={viewMode === "map" ? "filled" : "default"}
                       leftSection={<IconMap2 size={14} />}
+                      aria-pressed={viewMode === "map"}
                       onClick={() => setViewMode("map")}
                     >
                       Map
@@ -1477,6 +1483,7 @@ export function GallerySurface({
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selection?.path ?? null}
                   getMarkerRequest={(entry) => getMediaRequests(entry, activeSnapshotId).thumbnail ?? null}
+                  onSwitchToGrid={switchToGridView}
                   onSelectPath={(path, visiblePaths) => {
                     const nextVisiblePaths = buildGalleryMapSelectionScope(
                       mapMediaEntries,
@@ -2007,6 +2014,7 @@ type GalleryMapPanelProps = {
   hiddenOnMapCount: number;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
+  onSwitchToGrid: () => void;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
 };
 
@@ -2020,11 +2028,19 @@ function GalleryMapPanel({
   hiddenOnMapCount,
   selectedPath,
   getMarkerRequest,
+  onSwitchToGrid,
   onSelectPath
 }: GalleryMapPanelProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const pushedFullscreenHistoryRef = useRef(false);
   const toggleFullscreen = () => setIsFullscreen((current) => !current);
+  const switchToGrid = () => {
+    if (isFullscreen && pushedFullscreenHistoryRef.current && typeof window !== "undefined") {
+      window.history.back();
+    }
+    setIsFullscreen(false);
+    onSwitchToGrid();
+  };
 
   useEffect(() => {
     if (!isFullscreen || typeof document === "undefined" || typeof window === "undefined") {
@@ -2096,6 +2112,7 @@ function GalleryMapPanel({
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
       onToggleFullscreen={toggleFullscreen}
+      onSwitchToGrid={switchToGrid}
       fallback={fallbackMap}
     />
   );

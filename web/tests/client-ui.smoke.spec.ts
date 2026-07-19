@@ -467,6 +467,39 @@ test("client-ui gallery cards stay compact on narrow viewports", async ({ page }
   await expect(page.locator('[data-gallery-card-metadata="true"]')).toHaveCount(0);
 });
 
+test("client-ui gallery recovers from a basemap metadata failure", async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
+
+  await installClientUiMocks(page, { mapMetadataStatus: 502 });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect(page.getByText("Self-hosted basemap unavailable")).toBeVisible();
+  await expect(
+    page.getByText("failed to load self-hosted basemap metadata: HTTP 502")
+  ).toBeVisible();
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByRole("button", { name: "Switch to grid view" })).toBeVisible();
+  expect(pageErrors).toEqual([]);
+
+  await page.getByRole("button", { name: "Switch to grid view" }).click();
+  await expect(page.getByRole("button", { name: "Grid" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator('[data-gallery-grid="true"]').last()).toBeVisible();
+  expect(await page.evaluate(() => window.localStorage.getItem("ironmesh.gallery.view_mode"))).toBe(
+    "grid"
+  );
+
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("button", { name: "Grid" })).toHaveAttribute("aria-pressed", "true");
+  expect(pageErrors).toEqual([]);
+});
+
 test("client-ui gallery exposes all sort orders", async ({ page }) => {
   await installClientUiMocks(page);
   await page.goto("/");
@@ -648,6 +681,7 @@ test("client-ui desktop navigation can collapse and scroll on short viewports", 
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
+  mapMetadataStatus?: number;
 };
 
 async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOptions) {
@@ -1024,6 +1058,15 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/maps/mbtiles-metadata") && method === "GET") {
+      if (options?.mapMetadataStatus) {
+        await route.fulfill({
+          status: options.mapMetadataStatus,
+          contentType: "application/json",
+          body: JSON.stringify({ message: "mocked map metadata failure" })
+        });
+        return;
+      }
+
       return json(route, {
         attribution: "Made with Natural Earth.",
         center: [0, 20, 1],

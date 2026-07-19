@@ -1,5 +1,5 @@
 import { Alert, Badge, Button, Card, Center, Group, Loader, Modal, Stack, Text } from "@mantine/core";
-import { IconMapPin } from "@tabler/icons-react";
+import { IconLayoutGrid, IconMapPin, IconRefresh } from "@tabler/icons-react";
 import maplibregl, { type LngLatLike, type StyleSpecification } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { createDbWorker, type WorkerHttpvfs } from "sql.js-httpvfs";
@@ -101,6 +101,7 @@ type GalleryBasemapMapProps = {
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
   onSelectPath: (path: string, visiblePaths: string[]) => void;
   onToggleFullscreen: () => void;
+  onSwitchToGrid: () => void;
   fallback: ReactNode;
 };
 
@@ -164,6 +165,7 @@ export function GalleryBasemapMap({
   getMarkerRequest,
   onSelectPath,
   onToggleFullscreen,
+  onSwitchToGrid,
   fallback
 }: GalleryBasemapMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -174,6 +176,7 @@ export function GalleryBasemapMap({
     isFullscreen && typeof document !== "undefined" ? document.body : null;
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [isInteracting, setIsInteracting] = useState(false);
   const [viewportVersion, setViewportVersion] = useState(0);
   const [fitSignature, setFitSignature] = useState("");
@@ -338,7 +341,8 @@ export function GalleryBasemapMap({
     basemap.kind === "hybrid" ? basemap.vectorMetadataUrl : null,
     basemap.kind === "hybrid" ? basemap.vectorTileUrlTemplate : null,
     basemap.kind === "hybrid" ? basemap.glyphsUrlTemplate : null,
-    isFullscreen
+    isFullscreen,
+    loadAttempt
   ]);
 
   useEffect(() => {
@@ -403,21 +407,6 @@ export function GalleryBasemapMap({
 
     return () => window.cancelAnimationFrame(frameId);
   }, [isFullscreen]);
-
-  if (mapError) {
-    if (isFullscreen) {
-      return <>{fallback}</>;
-    }
-
-    return (
-      <Stack gap="md">
-        <Alert color="yellow">
-          Self-hosted basemap unavailable. Falling back to the built-in atlas view.
-        </Alert>
-        {fallback}
-      </Stack>
-    );
-  }
 
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;
@@ -505,6 +494,72 @@ export function GalleryBasemapMap({
     }
 
     setClusterDialogEntries(cluster.points.map((point) => point.item));
+  }
+
+  // Keep the error return below all hooks so a failed metadata request cannot
+  // change this component's hook order on its next render.
+  if (mapError) {
+    const errorNotice = (
+      <Card
+        withBorder
+        radius="md"
+        padding="md"
+        style={
+          isFullscreen
+            ? {
+                position: "fixed",
+                left: 16,
+                right: 16,
+                bottom: 16,
+                zIndex: 151,
+                maxWidth: 680,
+                margin: "0 auto",
+                boxShadow: "0 10px 30px rgba(0, 0, 0, 0.35)"
+              }
+            : undefined
+        }
+      >
+        <Stack gap="sm">
+          <Alert color="red" title="Self-hosted basemap unavailable">
+            The gallery is showing the built-in atlas instead. {mapError}
+          </Alert>
+          <Group gap="sm">
+            <Button
+              leftSection={<IconLayoutGrid size={16} />}
+              onClick={onSwitchToGrid}
+            >
+              Switch to grid view
+            </Button>
+            <Button
+              variant="default"
+              leftSection={<IconRefresh size={16} />}
+              onClick={() => {
+                setMapError(null);
+                setLoadAttempt((current) => current + 1);
+              }}
+            >
+              Retry basemap
+            </Button>
+          </Group>
+        </Stack>
+      </Card>
+    );
+
+    if (isFullscreen && fullscreenPortalTarget) {
+      return (
+        <>
+          {fallback}
+          {createPortal(errorNotice, fullscreenPortalTarget)}
+        </>
+      );
+    }
+
+    return (
+      <Stack gap="md">
+        {errorNotice}
+        {fallback}
+      </Stack>
+    );
   }
 
   const mapViewport = (
