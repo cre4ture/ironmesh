@@ -80,14 +80,14 @@ final class AppleItemVersionFingerprintTests: XCTestCase {
         XCTAssertEqual(
             AppleDeletePathPolicy.remotePath(
                 forRemotePath: "profile/documents",
-                kind: .directory
+                kind: AppleFileProviderItemKind.directory
             ),
             "profile/documents/"
         )
         XCTAssertEqual(
             AppleDeletePathPolicy.remotePath(
                 forRemotePath: "profile/documents/report.txt",
-                kind: .file
+                kind: AppleFileProviderItemKind.file
             ),
             "profile/documents/report.txt"
         )

@@ -86,7 +86,7 @@ public enum AppleDeletionCapabilityPolicy {
 public enum AppleDeletePathPolicy {
     public static func remotePath(
         forRemotePath remotePath: String,
-        kind: AppleFileProviderItemIdentifierKind
+        kind: AppleFileProviderItemKind
     ) -> String {
         let normalized = normalizedPath(remotePath)
         guard kind == .directory, !normalized.isEmpty else {
