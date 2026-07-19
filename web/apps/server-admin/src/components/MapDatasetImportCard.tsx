@@ -365,6 +365,13 @@ function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView })
             {job.error}
           </Alert>
         ) : null}
+        {includesLabels && job.state === "ready" ? (
+          <Alert color="blue" variant="light" title="Enable the labels map variant">
+            The label overlay is published. In Gallery map variants, make{" "}
+            <Code>Natural Earth Globe + labels</Code> visible and select it as the initial map when
+            you want the gallery to use it.
+          </Alert>
+        ) : null}
         {job.log_entries.length > 0 ? (
           <Accordion variant="contained">
             <Accordion.Item value="natural-earth-import-log">
