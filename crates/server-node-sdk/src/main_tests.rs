@@ -28,8 +28,8 @@ use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
 use super::storage::{
-    DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord,
-    VersionConsistencyState,
+    DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord, StoragePathConfig,
+    StoragePathState, StoragePoolConfig, VersionConsistencyState,
 };
 use axum::Router;
 use axum::body::Body;
@@ -1686,6 +1686,201 @@ run_on_main_metadata_backends!(
     admin_authorization_requires_token_when_configured_impl,
     admin_authorization_requires_token_when_configured,
     admin_authorization_requires_token_when_configured_turso
+);
+
+fn storage_pool_config_request(
+    method: Method,
+    path: &str,
+    config: &StoragePoolConfig,
+    admin_token: Option<&str>,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Some(admin_token) = admin_token {
+        request = request.header(super::ADMIN_TOKEN_HEADER, admin_token);
+    }
+    request
+        .body(Body::from(serde_json::to_vec(config).unwrap()))
+        .unwrap()
+}
+
+fn storage_pool_path_config(id: &str, path: PathBuf) -> StoragePathConfig {
+    StoragePathConfig {
+        id: id.to_string(),
+        path,
+        state: StoragePathState::Active,
+        weight: 1,
+        reserve_bytes: 0,
+    }
+}
+
+async fn storage_pool_config_api_validates_persists_and_rejects_invalid_requests_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("storage-pool-admin");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+
+    let root = {
+        let store = read_store(&state, "tests.storage_pool_config.root").await;
+        store.root_dir().to_path_buf()
+    };
+    let first = root.join("pool-first");
+    let second = root.join("pool-second");
+    let overlap = root.join("pool-overlap");
+    let overlap_nested = overlap.join("nested");
+    let non_directory = root.join("not-a-storage-directory");
+    fs::create_dir_all(&first).await.unwrap();
+    fs::create_dir_all(&second).await.unwrap();
+    fs::create_dir_all(&overlap_nested).await.unwrap();
+    fs::write(&non_directory, b"not a directory").await.unwrap();
+
+    let config = StoragePoolConfig {
+        version: 1,
+        paths: vec![
+            storage_pool_path_config("first", first),
+            storage_pool_path_config("second", second),
+        ],
+    };
+    let config_path = {
+        let store = read_store(&state, "tests.storage_pool_config.path").await;
+        PathBuf::from(store.storage_pool_config_path())
+    };
+    assert!(!config_path.exists());
+
+    let app = super::build_server_apps(&state).public_app;
+    let unauthorized = app
+        .clone()
+        .oneshot(storage_pool_config_request(
+            Method::POST,
+            "/api/v1/auth/storage/pool/config/validate",
+            &config,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let validation = app
+        .clone()
+        .oneshot(storage_pool_config_request(
+            Method::POST,
+            "/api/v1/auth/storage/pool/config/validate",
+            &config,
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(validation.status(), StatusCode::OK);
+    let validation_body = to_bytes(validation.into_body(), usize::MAX).await.unwrap();
+    let validation_payload: serde_json::Value = serde_json::from_slice(&validation_body).unwrap();
+    assert_eq!(
+        validation_payload["config_path"],
+        serde_json::Value::String(config_path.display().to_string())
+    );
+    assert_eq!(validation_payload["restart_required"], true);
+    assert!(
+        !config_path.exists(),
+        "validation must not write the configuration"
+    );
+
+    let saved = app
+        .clone()
+        .oneshot(storage_pool_config_request(
+            Method::PUT,
+            "/api/v1/auth/storage/pool/config",
+            &config,
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_body = to_bytes(saved.into_body(), usize::MAX).await.unwrap();
+    let saved_payload: serde_json::Value = serde_json::from_slice(&saved_body).unwrap();
+    assert_eq!(
+        saved_payload["config_path"],
+        serde_json::Value::String(config_path.display().to_string())
+    );
+    assert_eq!(saved_payload["restart_required"], true);
+
+    let saved_config: StoragePoolConfig =
+        serde_json::from_slice(&fs::read(&config_path).await.unwrap()).unwrap();
+    assert_eq!(saved_config, config);
+    let saved_payload = fs::read(&config_path).await.unwrap();
+    let reloaded = PersistentStore::init_with_metadata_backend(root.clone(), backend.kind())
+        .await
+        .unwrap();
+    assert_eq!(reloaded.storage_pool_config(), config);
+    drop(reloaded);
+
+    let mut unsupported_version = config.clone();
+    unsupported_version.version = 2;
+    let mut duplicate_id = config.clone();
+    duplicate_id.paths[1].id = duplicate_id.paths[0].id.clone();
+    let mut zero_weight = config.clone();
+    zero_weight.paths[0].weight = 0;
+    let mut file_path = config.clone();
+    file_path.paths[1].path = non_directory;
+    let overlapping_paths = StoragePoolConfig {
+        version: 1,
+        paths: vec![
+            storage_pool_path_config("overlap", overlap),
+            storage_pool_path_config("nested", overlap_nested),
+        ],
+    };
+
+    for invalid_config in [
+        unsupported_version,
+        duplicate_id,
+        zero_weight,
+        file_path,
+        overlapping_paths,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(storage_pool_config_request(
+                Method::PUT,
+                "/api/v1/auth/storage/pool/config",
+                &invalid_config,
+                Some(&admin_token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fs::read(&config_path).await.unwrap(), saved_payload);
+    }
+
+    fs::remove_file(&config_path).await.unwrap();
+    fs::create_dir(&config_path).await.unwrap();
+    let write_failure = app
+        .oneshot(storage_pool_config_request(
+            Method::PUT,
+            "/api/v1/auth/storage/pool/config",
+            &config,
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(write_failure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let write_failure_body = to_bytes(write_failure.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let write_failure_payload: serde_json::Value =
+        serde_json::from_slice(&write_failure_body).unwrap();
+    assert_eq!(
+        write_failure_payload["error"],
+        "failed to save storage pool configuration"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    storage_pool_config_api_validates_persists_and_rejects_invalid_requests_impl,
+    storage_pool_config_api_validates_persists_and_rejects_invalid_requests,
+    storage_pool_config_api_validates_persists_and_rejects_invalid_requests_turso
 );
 
 async fn admin_authorization_requires_explicit_approval_for_destructive_action_impl(
