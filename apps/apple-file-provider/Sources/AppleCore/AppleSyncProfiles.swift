@@ -40,6 +40,8 @@ public enum AppleSyncProfileContentPolicy: String, Codable, CaseIterable, Sendab
 }
 
 public struct AppleSyncProfile: Codable, Equatable, Identifiable, Sendable {
+    public static let managedDomainPrefix = "dev.ironmesh.profile."
+
     public var id: String
     public var displayName: String
     public var remotePrefix: String
@@ -73,7 +75,7 @@ public struct AppleSyncProfile: Codable, Equatable, Identifiable, Sendable {
     }
 
     public var domainIdentifier: String {
-        "dev.ironmesh.profile.\(id)"
+        "\(Self.managedDomainPrefix)\(id)"
     }
 
     public var scopeSummary: String {

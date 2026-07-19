@@ -3,6 +3,36 @@ import XCTest
 @testable import AppleCore
 
 final class AppleSyncProfilesTests: XCTestCase {
+    func testManagedDomainWithoutProfileFailsClosedInsteadOfExposingRemoteRoot() {
+        XCTAssertThrowsError(
+            try AppleSyncProfileResolution.resolve(
+                domainIdentifier: "dev.ironmesh.profile.orphaned",
+                storedProfile: nil,
+                configuredProfile: nil,
+                legacyDisplayName: "Orphaned"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AppleSyncProfileResolutionError,
+                .missingManagedProfile("dev.ironmesh.profile.orphaned")
+            )
+        }
+    }
+
+    func testLegacyDomainRetainsExplicitUnrestrictedFallback() throws {
+        let profile = try AppleSyncProfileResolution.resolve(
+            domainIdentifier: "dev.ironmesh.default",
+            storedProfile: nil,
+            configuredProfile: nil,
+            legacyDisplayName: "Legacy"
+        )
+
+        XCTAssertEqual(profile.remotePrefix, "")
+        XCTAssertTrue(profile.networkPolicy.allowsExpensiveNetwork)
+        XCTAssertTrue(profile.networkPolicy.allowsConstrainedNetwork)
+        XCTAssertFalse(profile.powerPolicy.defersInLowPowerMode)
+    }
+
     func testProfileStorePersistsMultipleScopesAndLifecycleAcrossRestart() throws {
         let suiteName = "AppleSyncProfilesTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

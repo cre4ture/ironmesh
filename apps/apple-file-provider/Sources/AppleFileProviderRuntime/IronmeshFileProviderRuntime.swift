@@ -600,23 +600,18 @@ final class IronmeshFileProviderService: @unchecked Sendable {
     }
 
     private func currentProfile() throws -> AppleSyncProfile {
-        if let storedProfile = try profileStore.profile(
-            domainIdentifier: configuration.domainIdentifier
-        ) {
-            return storedProfile
+        do {
+            return try AppleSyncProfileResolution.resolve(
+                domainIdentifier: configuration.domainIdentifier,
+                storedProfile: try profileStore.profile(
+                    domainIdentifier: configuration.domainIdentifier
+                ),
+                configuredProfile: configuration.syncProfile,
+                legacyDisplayName: configuration.domainDisplayName
+            )
+        } catch let error as AppleSyncProfileResolutionError {
+            throw ironmeshConstraintError(error.localizedDescription)
         }
-        if let configuredProfile = configuration.syncProfile {
-            return configuredProfile
-        }
-        return AppleSyncProfile(
-            id: "legacy-default",
-            displayName: configuration.domainDisplayName,
-            networkPolicy: AppleSyncProfileNetworkPolicy(
-                allowsExpensiveNetwork: true,
-                allowsConstrainedNetwork: true
-            ),
-            powerPolicy: AppleSyncProfilePowerPolicy(defersInLowPowerMode: false)
-        )
     }
 
     private func resetConnection() {
