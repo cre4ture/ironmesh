@@ -56,7 +56,6 @@ fun SettingsScreen(
     onOpenLocationSettings: () -> Unit,
     onOpenFiles: () -> Unit,
     onOpenWebConsole: () -> Unit,
-    onClearEnrollment: () -> Unit,
     onThemeAccentColorChange: (String) -> Unit,
     onKeyChange: (String) -> Unit,
     onPayloadChange: (String) -> Unit,
@@ -94,9 +93,6 @@ fun SettingsScreen(
                 text = state.deviceAuthState.label.orEmpty().ifBlank { "No device label set" },
                 style = MaterialTheme.typography.bodyLarge,
             )
-            OutlinedButton(onClick = onClearEnrollment) {
-                Text(stringResource(R.string.clear_device_identity))
-            }
         }
 
         SectionCard(title = stringResource(R.string.settings_permissions)) {
