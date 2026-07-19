@@ -14,131 +14,138 @@ Related documents:
   one central service" precedent (rendezvous).
 - `docs/data-scrub-auto-repair-strategy.md` — existing IronMesh-runtime-derived reliability findings.
 - `docs/node-memory-footprint-reduction-plan.md` — precedent for resource-conscious background work.
-- `docs/zero-touch-cluster-setup-strategy.md` — precedent for guided, low-friction admin UX.
+- `docs/zero-touch-cluster-setup-strategy.md` — precedent for guided, low-friction admin UX, and the
+  anchor point for the bootstrap-time consent step described in Section 4.4.
 
-## 1. Motivation / Kontext
+## 1. Motivation / Context
 
-`docs/server-node-hardware-health-strategy.md` hat bereits einen soliden, node-lokalen Baustein
-geschaffen: jeder Server-Node sammelt eine normalisierte Hardware-Inventur (System/Board/BIOS, CPU,
-RAM, Storage inkl. optionalem `smartctl`-Enrichment, NICs), führt eine Lifecycle-Historie
-(`node_first_seen_at_unix`, Component-Sichtungen, kumulierte Uptime) und leitet daraus strukturierte
-`findings` sowie generierte `health_notes` ab. Das Ergebnis ist über einen admin-authentifizierten
-Endpoint (`GET /api/v1/auth/hardware/health`) und eine dedizierte `HardwarePage` im `server-admin`
-sichtbar — aber ausdrücklich **nur node-lokal**: "This slice does not implement a central fleet
-collector. It deliberately stops at producing a safe, structured per-node report that a future
-central service can ingest as-is."
+`docs/server-node-hardware-health-strategy.md` already built a solid, node-local building block: every
+server node collects a normalized hardware inventory (system/board/BIOS, CPU, RAM, storage including
+optional `smartctl` enrichment, NICs), maintains a lifecycle history (`node_first_seen_at_unix`,
+component sightings, cumulative uptime), and derives structured `findings` and generated
+`health_notes` from it. The result is visible via an admin-authenticated endpoint
+(`GET /api/v1/auth/hardware/health`) and a dedicated `HardwarePage` in `server-admin` — but explicitly
+**node-local only**: "This slice does not implement a central fleet collector. It deliberately stops
+at producing a safe, structured per-node report that a future central service can ingest as-is."
 
-Dieses Dokument beschreibt genau diesen nächsten Schritt: die **freiwillige (Opt-out, also
-standardmäßig aktive) Übertragung** einer bereinigten, projektweit vergleichbaren Teilmenge dieser
-Daten an einen zentralen Statistiksammelserver.
+This document describes exactly that next step: the **opt-out (i.e. enabled by default) transmission**
+of a cleaned, project-wide comparable subset of this data to a central statistics collector service.
 
-Nutzen für das Projekt:
+Benefits for the project:
 
-- Fleet-weite Auswertung, welche Hardware-Modelle/Firmware-Kombinationen überdurchschnittlich oft
-  SMART-Warnungen, Scrub-Fehler oder Ausfälle produzieren — over Zeit und über alle Installationen,
-  nicht nur den einzelnen Cluster eines Betreibers.
-- Frühwarnung für Nutzer und Projekt-Maintainer: "Modell X mit Firmware Y zeigt in der Flotte
-  auffällig oft `media_errors`."
-- Belastbarere Kapazitätsplanung/Empfehlungen ("welche NVMe-Klassen laufen in der Praxis wie lange").
-- Datenbasis für zukünftige automatisierte Warnungen im Admin-UI ("dieses Modell hat fleet-weit eine
-  erhöhte Ausfallquote").
+- Fleet-wide analysis of which hardware model/firmware combinations produce above-average SMART
+  warnings, scrub errors, or failures — over time and across all installations, not just a single
+  operator's own cluster.
+- Early warning for users and project maintainers: "Model X with firmware Y shows an unusually high
+  rate of `media_errors` across the fleet."
+- More robust capacity planning/recommendations ("which NVMe classes hold up how long in practice").
+- A data foundation for future automated warnings in the admin UI ("this model has an elevated
+  fleet-wide failure rate").
 
-Nutzen für den einzelnen Betreiber: im Gegenzug für die Teilnahme kann `server-admin` künftig
-Fleet-Vergleichswerte anzeigen (z. B. "dein Node liegt bei Power-On-Hours im Fleet-Median"), was ohne
-zentrale Sammlung nicht möglich ist.
+Benefit for the individual operator: in exchange for participating, `server-admin` can in the future
+show fleet comparison values (e.g. "your node is at the fleet median for power-on hours"), which is not
+possible without central collection.
 
-Diese Funktion ist ausdrücklich von `docs/server-node-hardware-health-strategy.md` und
-`docs/server-node-storage-stats-strategy.md` abzugrenzen: Beide bestehenden Dokumente/Implementierungen
-bleiben node-lokal und "nicht anonym" (das Board erlaubt dort explizit `reporting_node_id` und exakte
-Hardware-Details, da der Admin des eigenen Clusters ohnehin Zugriff hat). Sobald Daten den
-Cluster-Vertrauensbereich verlassen und an einen von Dritten (den Projektbetreibern) kontrollierten
-Dienst gehen, gelten strengere Datensparsamkeits- und Anonymisierungsregeln (siehe Abschnitt 4). Dieses
-Dokument definiert daher einen **Export-/Reduktionsschritt**, keine 1:1-Weiterleitung des bestehenden
-`hardware_health_report`.
+This feature is explicitly distinct from `docs/server-node-hardware-health-strategy.md` and
+`docs/server-node-storage-stats-strategy.md`: both existing documents/implementations stay node-local
+and "not anonymous" (the board there explicitly allows `reporting_node_id` and exact hardware details,
+since the operator of their own cluster has access anyway). Once data leaves the cluster's trust
+boundary and goes to a service controlled by a third party (the project maintainers), stricter data
+minimization and anonymization rules apply (see Section 4). This document therefore defines an
+**export/reduction step**, not a 1:1 forwarding of the existing `hardware_health_report`.
 
-## 2. Erfasste Metriken
+## 2. Collected Metrics
 
-Basis ist, wo möglich, das bereits implementierte Sammlungsmodell aus `hardware_health.rs`
-(Linux-Zielplattform: sysfs/procfs, `sysinfo`, optional `smartctl --json`). Für jede Metrik:
-Erfassbarkeit unter Linux, Aufwand, Nutzen.
+The basis is, wherever possible, the collection model already implemented in `hardware_health.rs`
+(Linux target platform: sysfs/procfs, `sysinfo`, optional `smartctl --json`). For each metric:
+collectability on Linux, effort, benefit.
 
-### 2.1 Storage / SMART (bereits implementiert, wiederverwendbar)
+### 2.1 Storage / SMART (already implemented, reusable)
 
-| Metrik | Erfassbarkeit Linux | Aufwand | Nutzen |
+| Metric | Collectability on Linux | Effort | Benefit |
 | --- | --- | --- | --- |
-| `reallocated_sector_count` | `smartctl --json`, bereits im Code (`HardwareStorageSmartInfo`) | keiner (reuse) | starker Frühindikator für HDD/SATA-SSD-Ausfall |
-| `pending_sector_count` | dito | keiner | starker Frühindikator |
-| `offline_uncorrectable_sector_count` | dito | keiner | starker Frühindikator |
-| `crc_error_count` | dito | keiner | Kabel-/Interface-Probleme, kein reiner Medienfehler |
-| `power_on_hours` | dito | keiner | Alters-/Abnutzungsvergleich pro Modell |
-| `power_cycle_count` | dito | keiner | Belastungsprofil |
-| `unsafe_shutdown_count` | dito | keiner | Korrelation mit Filesystem-/Metadaten-Fehlern |
-| `percentage_used` / `available_spare_percent` | dito (NVMe) | keiner | NVMe-Lebensdauer |
-| `media_errors` / `error_log_entries` | dito (NVMe) | keiner | direkte Fehlerindikatoren |
-| `temperature_celsius` | dito | keiner | Betriebsbedingungen, Korrelation mit Ausfallraten |
-| `smart_passed` (Gesamturteil) | dito | keiner | Kompakter Health-Status |
-| `is_rotational`, `interface_type`, `bus_type` | bereits im Inventar | keiner | Segmentierung der Auswertung nach Laufwerkstyp |
+| `reallocated_sector_count` | `smartctl --json`, already in code (`HardwareStorageSmartInfo`) | none (reuse) | strong early indicator of HDD/SATA-SSD failure |
+| `pending_sector_count` | same | none | strong early indicator |
+| `offline_uncorrectable_sector_count` | same | none | strong early indicator |
+| `crc_error_count` | same | none | cable/interface problems, not a pure media error |
+| `power_on_hours` | same | none | age/wear comparison per model |
+| `power_cycle_count` | same | none | usage load profile |
+| `unsafe_shutdown_count` | same | none | correlates with filesystem/metadata errors |
+| `percentage_used` / `available_spare_percent` | same (NVMe) | none | NVMe lifespan |
+| `media_errors` / `error_log_entries` | same (NVMe) | none | direct error indicators |
+| `temperature_celsius` | same | none | operating conditions, correlates with failure rates |
+| `smart_passed` (overall verdict) | same | none | compact health status |
+| `is_rotational`, `interface_type`, `bus_type` | already in inventory | none | segments the analysis by drive type |
 
-Alle diese Felder existieren bereits 1:1 in `HardwareStorageSmartInfo` /
-`HardwareStorageDevice` und müssen nur selektiert, nicht neu erfasst werden.
+All of these fields already exist 1:1 in `HardwareStorageSmartInfo` / `HardwareStorageDevice` and only
+need to be selected, not newly collected.
 
-### 2.2 Node-Lifecycle / Uptime (bereits implementiert)
+### 2.2 Node Lifecycle / Uptime (already implemented)
 
-| Metrik | Erfassbarkeit | Aufwand | Nutzen |
+| Metric | Collectability | Effort | Benefit |
 | --- | --- | --- | --- |
-| `uptime_seconds`, `cumulative_observed_uptime_seconds` | bereits erfasst (`HardwareNodeLifecycle`) | keiner | Zuverlässigkeits-/Crash-Häufigkeits-Proxy (viele kurze Uptimes = instabil) |
-| `boot_id`-Wechselrate | ableitbar aus persistiertem State | gering | Reboot-/Crash-Frequenz pro Hardwareprofil |
-| `hardware_profile_id` | bereits erfasst (deterministischer Hash über normalisiertes Inventar) | keiner | Gruppierungsschlüssel für Fleet-Vergleich, ohne Rohdaten preiszugeben |
+| `uptime_seconds`, `cumulative_observed_uptime_seconds` | already collected (`HardwareNodeLifecycle`) | none | proxy for reliability/crash frequency (many short uptimes = unstable) |
+| `boot_id` change rate | derivable from persisted state | low | reboot/crash frequency per hardware profile |
+| `hardware_profile_id` | already collected (deterministic hash over normalized inventory) | none | grouping key for fleet comparison, without exposing raw data |
 
-### 2.3 IronMesh-Runtime-Zuverlässigkeit (teilweise implementiert)
+### 2.3 IronMesh Runtime Reliability (partially implemented)
 
-| Metrik | Erfassbarkeit | Aufwand | Nutzen |
+| Metric | Collectability | Effort | Benefit |
 | --- | --- | --- | --- |
-| Data-Scrub-Findings nach `finding_code` (siehe `docs/data-scrub-auto-repair-strategy.md`) | bereits vorhanden als Scrub-Historie | gering (Aggregation zu Zählern) | zeigt Storage-Instabilität, die SMART noch nicht meldet |
-| Repair-Erfolg/-Fehlschlagsraten | bereits vorhanden als Repair-Historie | gering | Zuverlässigkeit des Selbstheilungspfads über die Flotte |
-| Sampler-/Collector-Fehler (Storage-Stats-, Process-Stats-Sampler) | bereits im `hardware_health`-Collector-Status-Modell vorgesehen | keiner | erkennt Umgebungen, in denen Collector strukturell fehlschlagen (z. B. fehlendes `smartctl`) |
+| Data-scrub findings by `finding_code` (see `docs/data-scrub-auto-repair-strategy.md`) | already available as scrub history | low (aggregation into counters) | reveals storage instability that SMART doesn't yet report |
+| Repair success/failure rates | already available as repair history | low | reliability of the self-healing path across the fleet |
+| Sampler/collector errors (storage-stats, process-stats samplers) | already anticipated in the `hardware_health` collector-status model | none | identifies environments where a collector structurally fails (e.g. missing `smartctl`) |
 
-### 2.4 RAM/CPU-Fehler (nicht implementiert, Grenzen)
+### 2.4 RAM/CPU Errors (included in v1 for RAM ECC; CPU errors remain out of scope)
 
-- **ECC-Fehler (RAM):** Unter Linux grundsätzlich über `EDAC` (`/sys/devices/system/edac/mc/mc*/ce_count`,
-  `.../ue_count`) auslesbar — *aber nur*, wenn das Board/BIOS ECC-RAM und den EDAC-Treiber unterstützt.
-  Auf der Mehrzahl der Consumer-Boards (kein ECC) liefert das nichts. Aufwand: gering (sysfs-Parsing,
-  optionales Feld analog zu `smartctl`), Nutzen: mittel, aber nur für einen Teil der Flotte (Server-/
-  Workstation-Boards) aussagekräftig. Empfehlung: als optionales Feld mit `available: bool` analog zu
-  den bestehenden Collector-Status-Mustern aufnehmen, nicht blockierend für den ersten Schritt.
-- **CPU-Fehler:** Es gibt keine verlässliche, breit verfügbare Linux-Schnittstelle für korrigierte
-  CPU-interne Fehler auf Consumer-Hardware (MCE/`mcelog` existiert, ist aber uneinheitlich verfügbar
-  und erfordert oft Root-Rechte über das Server-Prozess-Sandboxing hinaus). Statt echter CPU-Fehler
-  zunächst nur **CPU-Throttling-Ereignisse** über `/sys/class/thermal` als Proxy für thermische
-  Probleme erfassen (gering Aufwand, mittlerer Nutzen). Echtes MCE-Logging bleibt offene Frage
-  (Abschnitt 8).
+- **ECC errors (RAM):** on Linux, generally readable via `EDAC`
+  (`/sys/devices/system/edac/mc/mc*/ce_count`, `.../ue_count`) — *but only* if the board/BIOS supports
+  ECC RAM and the EDAC driver. On most consumer boards (no ECC) this yields nothing. Effort: low
+  (sysfs parsing, an optional field analogous to `smartctl`). **Decision (per project owner
+  feedback):** include this in the initial (v1) implementation, not deferred, precisely *because* the
+  effort is low — this lets us see, from real fleet data, how valuable the signal actually is, even
+  though only a subset of the fleet (server/workstation boards) will report it. It is modeled as an
+  optional field with `available: bool`, following the existing collector-status conventions, so
+  boards without ECC support simply report `available: false` instead of a misleading zero.
+- **CPU errors:** there is no reliable, broadly available Linux interface for corrected CPU-internal
+  errors on consumer hardware (MCE/`mcelog` exists but is inconsistently available and often requires
+  root privileges beyond the server process's sandboxing). Instead of true CPU errors, the v1 scope is
+  limited to **CPU throttling events** via `/sys/class/thermal` as a proxy for thermal problems (low
+  effort, medium benefit). True MCE logging remains excluded for now — the interface is not reliable
+  enough across the fleet's hardware diversity to justify the effort at this stage, unlike ECC where
+  the interface is uniform and simply reports "unsupported" where absent.
 
-### 2.5 Netzwerk-Fehlerraten (nicht implementiert, geringer Zusatzaufwand)
+### 2.5 Network Error Rates (not implemented, low additional effort)
 
-- `rx_errors`, `tx_errors`, `rx_dropped`, `rx_crc_errors` je Interface sind unter Linux direkt über
-  `/sys/class/net/<iface>/statistics/*` lesbar (kein Root, kein Zusatztool nötig). Aufwand: gering.
-  Nutzen: mittel — vor allem als Korrelationssignal für Replikations-/Transport-Probleme, weniger als
-  eigenständiger "Hardware-Reliability"-Indikator. Für die erste Ausbaustufe als optionale, niedrig
-  priorisierte Ergänzung vorgesehen, nicht Teil des minimalen Kernschemas (Abschnitt 7).
+- `rx_errors`, `tx_errors`, `rx_dropped`, `rx_crc_errors` per interface are directly readable on Linux
+  via `/sys/class/net/<iface>/statistics/*` (no root, no extra tooling needed). Effort: low. Benefit:
+  medium — mainly as a correlation signal for replication/transport problems, less so as a standalone
+  "hardware reliability" indicator. Planned as an optional, low-priority addition for the first rollout
+  stage, not part of the minimal core schema (Section 7).
 
-### 2.6 Bewusst ausgeschlossen
+### 2.6 Deliberately Excluded
 
-Analog zur "Forbidden"-Liste in `docs/server-node-hardware-health-strategy.md`, aber für den
-zentralen Sammelserver zusätzlich verschärft (siehe Abschnitt 4): keine `hostnames`, `IP-Adressen`,
-`MAC-Adressen`, `object keys`/`paths`, rohe Seriennummern, rohe Log-Zeilen, `public_url`,
-`cluster_id`, Nutzer-/Adminlabels.
+Analogous to the "forbidden" list in `docs/server-node-hardware-health-strategy.md`, but tightened
+further for the central collector (see Section 4): no `hostnames`, IP addresses, MAC addresses, object
+keys/paths, raw serial numbers, raw log lines, `public_url`, `cluster_id`, user/admin labels. This
+applies even to the coarse location feature in Section 4.2: the raw source IP used to derive a country
+code is never persisted, logged, or forwarded — only the resulting country code is kept.
 
-## 3. Opt-out-Mechanik
+## 3. Opt-out Mechanism
 
-### 3.1 Standardverhalten
+### 3.1 Default Behavior
 
-Die Übertragung ist **standardmäßig aktiv** ("Opt-out", nicht "Opt-in"), analog zum bestehenden
-Muster für andere Hintergrund-Features im Node (`IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED`,
+Transmission is **enabled by default** ("opt-out", not "opt-in"), consistent with the existing pattern
+for other background features on the node (`IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED`,
 `IRONMESH_REPLICATION_REPAIR_ENABLED`, `IRONMESH_STARTUP_REPAIR_ENABLED`,
-`IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED` — alle in `crates/server-node-sdk/src/lib.rs` mit
-`.unwrap_or(true)` und der gleichen `"0" | "false" | "no"`-Parsing-Konvention implementiert).
+`IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED` — all in `crates/server-node-sdk/src/lib.rs`, implemented with
+`.unwrap_or(true)` and the same `"0" | "false" | "no"` parsing convention).
 
-Vorschlag für die neue Umgebungsvariable, exakt im bestehenden Stil:
+However, as described in Section 4.4, the *primary* rollout plan pairs this default-on toggle with a
+mandatory, pre-selected confirmation step in the bootstrap/setup flow, rather than relying on a silent
+background default alone.
+
+Proposed new environment variable, in the exact existing style:
 
 ```rust
 telemetry_enabled: std::env::var("IRONMESH_RELIABILITY_TELEMETRY_ENABLED")
@@ -147,236 +154,267 @@ telemetry_enabled: std::env::var("IRONMESH_RELIABILITY_TELEMETRY_ENABLED")
     .unwrap_or(true),
 ```
 
-### 3.2 Abschaltwege
+### 3.2 Ways to Disable
 
-- **Env-Var / Config** (primär, konsistent mit allen bestehenden Feature-Togglen im Node):
+- **Env var / config** (primary, consistent with all existing feature toggles on the node):
   `IRONMESH_RELIABILITY_TELEMETRY_ENABLED=0`.
-- **Admin-UI-Toggle** (für Betreiber, die nicht an der Konfigurationsdatei/Umgebung arbeiten
-  wollen): ein Schalter in der bestehenden `HardwarePage` in `server-admin`
-  (`web/apps/server-admin/src/pages/HardwarePage.tsx`) direkt neben der bestehenden
-  Hardware-Health-Anzeige, da dort inhaltlich der engste Bezug besteht. Die Umschaltung müsste
-  persistent im Node-State gespeichert werden (nicht nur env), damit sie einen Neustart übersteht —
-  hierfür wird ein neuer, kleiner persistenter Zustandseintrag benötigt (analog zum Muster
-  `health/hardware-health-state.json`), der die Env-Var als Default, aber die UI-Einstellung als
-  Override behandelt.
-- Admin-Endpoint zum Lesen/Setzen, nach dem bestehenden Auth-Muster (`authorize_admin_request`,
-  wie in `hardware_health_current`): z. B. `GET/PUT /api/v1/auth/telemetry/settings`.
+- **Admin UI toggle** (for operators who don't want to work with config files/environment variables
+  directly): a switch on the existing `HardwarePage` in `server-admin`
+  (`web/apps/server-admin/src/pages/HardwarePage.tsx`), right next to the existing hardware-health
+  display, since that's where the content is most closely related. The toggle needs to be persisted in
+  node state (not just env), so it survives a restart — this requires a new, small persistent state
+  entry (analogous to the `health/hardware-health-state.json` pattern) that treats the env var as the
+  default but the UI setting as an override.
+- Admin endpoint to read/set, following the existing auth pattern (`authorize_admin_request`, as in
+  `hardware_health_current`): e.g. `GET/PUT /api/v1/auth/telemetry/settings`.
 
-### 3.3 Transparenz vor dem Senden
+### 3.3 Transparency Before Sending
 
-Wichtig für Vertrauen und DSGVO-Transparenzpflicht: der Betreiber muss **vor** jeder Übertragung genau
-sehen können, was gesendet würde. Analog zur bereits im Hardware-Health-Dokument formulierten
-Anforderung ("The page should make export easy by exposing the exact JSON payload"):
+Important for trust and GDPR transparency obligations: the operator must be able to see **exactly**
+what would be sent **before** every transmission. Analogous to the requirement already formulated in
+the hardware-health document ("The page should make export easy by exposing the exact JSON payload"):
 
-- Neuer Preview-Endpoint `GET /api/v1/auth/telemetry/preview`, der exakt das JSON-Objekt liefert,
-  das beim nächsten Batch tatsächlich gesendet würde (gleicher Serialisierungscode wie der echte
-  Versand, kein separat gepflegtes "Beispielschema").
-- Server-admin zeigt diesen Preview in der HardwarePage/Settings-Sektion an, inklusive eines
-  Zeitstempels "zuletzt gesendet am ..." und eines Links/Buttons "letzten gesendeten Payload
-  erneut anzeigen" (dafür wird der zuletzt gesendete Payload zusätzlich node-lokal aufbewahrt,
-  z. B. die letzten N Batches, nicht nur der aktuelle Preview).
-- Ein lokales Log-Ereignis (via bestehende `tracing`/`LogBuffer`-Infrastruktur, die bereits für den
-  `server-admin` Logs-Tab existiert) bei jedem tatsächlichen Sendevorgang, sodass Betreiber es auch im
-  Logs-Tab nachvollziehen können.
+- A new preview endpoint `GET /api/v1/auth/telemetry/preview` that returns exactly the JSON object that
+  would actually be sent in the next batch (the same serialization code as the real transmission, no
+  separately maintained "example schema").
+- `server-admin` shows this preview in the HardwarePage/settings section, including a "last sent at
+  ..." timestamp and a link/button to "show the last sent payload again" (for this, the last-sent
+  payload is additionally kept node-locally, e.g. the last N batches, not just the current preview).
+- A local log event (via the existing `tracing`/`LogBuffer` infrastructure already used for the
+  `server-admin` Logs tab) on every actual send, so operators can also trace it in the Logs tab.
 
-## 4. Datenschutz (DSGVO-relevant)
+## 4. Data Protection (GDPR-relevant)
 
-Die im Hardware-Health-Dokument bereits definierten Datensparsamkeitsregeln (keine Pfade, URLs, IPs,
-Hostnames, MACs, rohen Seriennummern, rohen Logs) gelten hier unverändert als Untergrenze — sie
-gelten für die Daten, die *überhaupt* aus dem `hardware_health_report` extrahiert werden dürfen.
-Zusätzlich, weil die Daten jetzt einen fremdkontrollierten zentralen Dienst erreichen:
+The data minimization rules already defined in the hardware-health document (no paths, URLs, IPs,
+hostnames, MACs, raw serial numbers, raw logs) remain unchanged as a floor — they apply to the data
+that may be extracted from the `hardware_health_report` at all. In addition, because this data now
+reaches a service controlled by a third party:
 
-### 4.1 Pseudonymisierung statt Klartext-Node-Identität
+### 4.1 Pseudonymization Instead of Plaintext Node Identity
 
-Der bestehende `reporting_node_id` (stabile, im Cluster sichtbare Node-UUID) darf **nicht** direkt an
-den zentralen Sammelserver übertragen werden, da er potenziell mit anderen cluster-internen
-Informationen (z. B. durch den Betreiber selbst) re-identifizierbar ist und über Zeit ein stabiles
-Tracking-Merkmal für Betreiber-Infrastruktur wäre.
+The existing `reporting_node_id` (a stable, cluster-visible node UUID) **must not** be transmitted
+directly to the central collector, since it is potentially re-identifiable in combination with other
+cluster-internal information (e.g. by the operator themselves) and would be a stable tracking feature
+for operator infrastructure over time.
 
-Stattdessen: ein lokal abgeleiteter **Telemetrie-Pseudonym-Schlüssel**
+Instead: a locally derived **telemetry pseudonym key**
 
 ```text
 telemetry_subject_id = HMAC-SHA256(local_random_salt, "ironmesh-telemetry-v1" || node_id)
 ```
 
-- `local_random_salt` wird beim ersten Opt-in-Zustand (bzw. beim ersten aktivierten Versand) einmalig
-  lokal generiert und persistiert (z. B. in derselben State-Datei wie der Telemetrie-Toggle), nie
-  übertragen.
-- Damit ist `telemetry_subject_id` über die Zeit stabil genug für Longitudinal-Auswertung
-  ("dieser Node zeigt seit 3 Wochen steigende `reallocated_sector_count`"), aber nicht auf den
-  cluster-internen `node_id` rückführbar, ohne den lokalen Salt zu kennen.
-- Rotation: analog zur 90-Tage-Retention-Konvention aus `docs/server-node-storage-stats-strategy.md`
-  kann eine optionale periodische Rotation (z. B. alle 180 Tage) angeboten werden, um Langzeit-Tracking
-  zusätzlich zu erschweren — das trennt aber bestehende Zeitreihen; das genaue Rotationsintervall ist
-  eine offene Frage (Abschnitt 8) mit Zielkonflikt Statistik-Kontinuität vs. Datenschutz.
-- **Keine** `cluster_id`, `public_url`, Node-Labels oder sonstige Cluster-Zuordnung wird mitgeschickt.
+- `local_random_salt` is generated once locally and persisted (e.g. in the same state file as the
+  telemetry toggle) the first time telemetry is enabled (i.e. at first confirmed send), and is never
+  transmitted.
+- This makes `telemetry_subject_id` stable enough over time for longitudinal analysis ("this node has
+  shown rising `reallocated_sector_count` for 3 weeks"), but not traceable back to the cluster-internal
+  `node_id` without knowing the local salt.
+- Rotation: analogous to the 90-day retention convention from
+  `docs/server-node-storage-stats-strategy.md`, an optional periodic rotation (e.g. every 180 days)
+  could be offered to further complicate long-term tracking — this does break existing time series
+  though; the exact rotation interval is an open question (Section 8) with a trade-off between
+  statistical continuity and privacy.
+- **No** `cluster_id`, `public_url`, node labels, or any other cluster affiliation is sent along.
 
-### 4.2 Keine Standortdaten
+### 4.2 Coarse Location Data
 
-Es werden keinerlei Geo-/Standortinformationen erfasst oder übertragen (ohnehin nicht Teil des
-bestehenden Hardware-Health-Modells). Auch grobe Ableitungen (Zeitzone, Spracheinstellung) sind
-ausgeschlossen.
+Unlike a strict "no location data at all" stance, this document includes an **opt-out-covered, coarse,
+country-level** location signal, per explicit project-owner feedback: seeing roughly where in the world
+IronMesh is deployed (as other open-source projects with telemetry/usage maps do) is considered
+valuable enough to include, as long as it cannot be used to narrow down a specific installation.
 
-### 4.3 Aggregation zur Vermeidung von Rückschlüssen
+- **What is collected:** only an ISO-3166-1 alpha-2 **country code** (e.g. `"DE"`, `"US"`), nothing
+  finer (no region, city, postal code, coordinates, or timezone/locale-derived signals).
+- **How it is derived:** server-side, at ingestion time, from the TCP source IP address of the
+  request — never self-reported by the node, and never derived from GPS/Wi-Fi/IP lookups performed on
+  the node itself. This avoids adding any new geolocation logic or dependency to the server-node
+  binary.
+- **What is *not* persisted:** the raw source IP address is used only in-memory to resolve the country
+  code and is discarded immediately afterwards — it is never logged, stored, or forwarded, consistent
+  with the "no IP addresses" rule in Section 2.6.
+- **Aggregation safeguard:** the public "where in the world is IronMesh used" view only ever shows
+  counts per country (e.g. on a world map), never a per-`telemetry_subject_id` breakdown. Section 4.3's
+  k-anonymity threshold applies to any cross-tabulation of `country_code` with `hardware_profile_id` as
+  well, so that a rare hardware profile in a low-population country cannot be used to single out one
+  installation.
+- This keeps the original reasoning intact — no fine-grained location, no cross-linkable identifiers —
+  while still delivering the "rough world map of usage" the project owner asked for.
 
-- `hardware_profile_id` (bereits deterministisch aus normalisiertem Inventar gehasht, siehe
-  Hardware-Health-Doku) bleibt der Gruppierungsschlüssel für Fleet-Vergleiche, nicht das exakte
-  Rohinventar. Für seltene Hardwarekombinationen (z. B. ein einzigartiges Custom-Board) sollte der
-  zentrale Dienst Gruppen unterhalb einer Mindestgröße (z. B. < 5 Nodes je `hardware_profile_id`)
-  nicht in öffentlich/aggregiert zugänglichen Auswertungen einzeln ausweisen, um De-Anonymisierung
-  durch Kombination seltener Merkmale zu verhindern (k-Anonymitäts-Schwelle).
-- Rohdaten (pro-`telemetry_subject_id`-Batches) werden getrennt von aggregierten/veröffentlichten
-  Statistiken gespeichert und sind nicht öffentlich einsehbar (siehe Abschnitt 5.3).
+### 4.3 Aggregation to Avoid Inference
 
-### 4.4 Rechtsgrundlage bei Opt-out-Modell
+- `hardware_profile_id` (already deterministically hashed from the normalized inventory, see the
+  hardware-health document) remains the grouping key for fleet comparisons, not the exact raw
+  inventory. For rare hardware combinations (e.g. a unique custom board) — and, per Section 4.2, for
+  rare `country_code` × `hardware_profile_id` combinations — the central service should not expose
+  groups below a minimum size (e.g. < 5 nodes per grouping key) individually in publicly/aggregated
+  views, to prevent de-anonymization through combination of rare attributes (k-anonymity threshold).
+- Raw data (per-`telemetry_subject_id` batches) is stored separately from aggregated/published
+  statistics and is not publicly accessible (see Section 5.3).
 
-Ein "aktiv per Default, abschaltbar"-Modell ist datenschutzrechtlich anspruchsvoller als echtes
-Opt-in, weil Art. 6 Abs. 1 DSGVO grundsätzlich eine Einwilligung (Opt-in) oder eine andere
-Rechtsgrundlage verlangt — eine bloße Widerspruchsmöglichkeit ersetzt keine Einwilligung, wenn
-personenbezogene Daten verarbeitet werden. Da Hardware-/Zuverlässigkeitsdaten von Server-Infrastruktur
-in der Regel keine unmittelbaren Personendaten sind, aber ein pseudonymisierter, über Zeit
-verfolgbarer Datensatz grundsätzlich als personenbezogen gelten *kann* (Re-Identifizierbarkeit über
-Zusatzwissen des Betreibers), wird empfohlen:
+### 4.4 Legal Basis Under the Opt-out Model
 
-- Rechtsgrundlage **berechtigtes Interesse** (Art. 6 Abs. 1 lit. f DSGVO) des Projekts an
-  Zuverlässigkeitsstatistik, gestützt auf:
-  - starke Datenminimierung (Abschnitt 4.1–4.3),
-  - volle Transparenz vor jedem Versand (Abschnitt 3.3),
-  - einfacher, jederzeit wirksamer Widerspruch (Opt-out),
-  - keine Übertragung von Nutzerinhalten/Objektdaten.
-- Diese Einschätzung ist **kein Ersatz für eine juristische Prüfung** vor Produktivbetrieb
-  (siehe Abschnitt 8) — insbesondere bei Nutzern in der EU sollte vor dem Rollout eine
-  Datenschutz-Folgenabschätzung bzw. zumindest eine Kurzprüfung erfolgen, da "Opt-out per Default"
-  in Teilen der DSGVO-Auslegung kritisch gesehen wird (vgl. z. B. Cookie-Rechtsprechung, die für
-  vergleichbare Fälle Opt-in verlangt). Eine denkbare Alternative wäre, den ersten Start nach Rollout
-  dieser Funktion mit einer expliziten, aber vorausgewählten Bestätigung im Setup-/Bootstrap-Flow
-  zu verbinden (Anknüpfungspunkt: `docs/zero-touch-cluster-setup-strategy.md`, Schritt "Start a new
-  cluster" / "Join an existing cluster"), um Transparenz zu erhöhen, ohne ein echtes Opt-in-Muster
-  im laufenden Betrieb zu erzwingen.
+**Primary plan (per project owner feedback):** rather than relying purely on a silent, background
+opt-out default, the rollout is anchored on an **explicit-but-preselected confirmation step in the
+first-run bootstrap/setup flow**, tied into `docs/zero-touch-cluster-setup-strategy.md`'s "Start a new
+cluster" / "Join an existing cluster" steps. The telemetry toggle is pre-checked "on" (so the default
+outcome is still opt-out, not opt-in), but the operator must consciously view and pass through a
+disclosure screen — listing what is collected, linking to this document, and offering the same preview
+described in Section 3.3 — before initial setup can complete. After this first-run confirmation, the
+ongoing opt-out mechanics from Section 3 (env var, admin UI toggle) apply for later changes without
+repeating the full disclosure flow.
 
-### 4.5 Lösch- und Auskunftsrechte
+This resolves most of the "opt-out vs. opt-in" tension in practice: the outcome is still opt-out
+(pre-selected, no action needed to keep it enabled), but it is never silent — every operator sees the
+disclosure at least once, at the point where they are already making comparable decisions (cluster
+name, admin credentials, etc.).
 
-- Da `telemetry_subject_id` ohne den lokal gehaltenen Salt nicht auf einen Node rückführbar ist,
-  kann der zentrale Dienst selbst keine Auskunfts-/Löschanfrage einem Betreiber zuordnen — der
-  Betreiber muss dafür seinen eigenen `telemetry_subject_id`-Wert vorlegen (im Preview/Settings-UI
-  sichtbar zu machen, siehe Abschnitt 3.3).
-- Admin-UI erhält daher zusätzlich eine "Lösch-/Auskunftsanfrage stellen"-Aktion, die
-  `telemetry_subject_id` anzeigt und einen vorbereiteten Kontaktweg/E-Mail-Text anbietet
-  (Ausgestaltung offen, Abschnitt 8).
-- Der zentrale Dienst muss auf Anfrage eines `telemetry_subject_id` alle zugehörigen Rohdatensätze
-  löschen können, ohne aggregierte aber bereits k-anonymisierte Statistiken rückwirkend korrigieren
-  zu müssen (Standardvorgehen bei Aggregatstatistiken).
+The underlying legal basis remains **legitimate interest** (Art. 6(1)(f) GDPR) in reliability
+statistics, now further strengthened by:
 
-### 4.6 Speicherfristen
+- the mandatory first-run disclosure (Section 4.4, above),
+- strong data minimization (Sections 4.1–4.3),
+- full transparency before every transmission (Section 3.3),
+- a simple, always-effective objection mechanism (opt-out, Section 3.2),
+- no transmission of user content/object data.
 
-Angelehnt an die bestehende 90-Tage-Konvention für Storage-Stats-Historie
+This assessment is **not a substitute for a legal review** before production rollout (see Section 8) —
+in particular for EU-based users, a data protection impact assessment, or at least a short review,
+should be carried out before rollout, since "opt-out by default" is viewed critically in parts of GDPR
+interpretation (cf. e.g. cookie-consent case law that requires opt-in for comparable cases). The
+bootstrap confirmation step above is this document's proposed way of addressing that risk without
+resorting to a full interactive opt-in flow during normal operation.
+
+### 4.5 Right to Erasure and Access
+
+Still needed, even though the collected data is pseudonymized rather than tied to a real-world
+identity: pseudonymous data is not the same as truly anonymous data under GDPR, since a
+`telemetry_subject_id` remains a stable identifier that its holder (the operator) can use to single out
+"their" data over time — that re-identifiability by the data subject themselves is exactly why a
+deletion path is still warranted, not optional.
+
+The practical implementation, however, is intentionally lightweight *because* the data is pseudonymous:
+
+- Since `telemetry_subject_id` cannot be mapped back to a node without the locally held salt, the
+  central service itself cannot match an erasure/access request to an operator — the operator supplies
+  their own `telemetry_subject_id` value (made visible in the preview/settings UI, see Section 3.3).
+- No identity verification is required for this request: knowledge of the `telemetry_subject_id` value
+  is sufficient proof of "ownership", since it isn't personally identifying information to begin with.
+  This keeps the process self-service and low-effort compared to a typical GDPR access request.
+- The admin UI therefore gets a "request deletion/access" action that displays `telemetry_subject_id`
+  and offers a prepared contact route/email text (exact form still open, Section 8).
+- On request for a given `telemetry_subject_id`, the central service must be able to delete all
+  associated raw records, without needing to retroactively correct aggregated statistics that are
+  already k-anonymized (standard practice for aggregate statistics).
+
+### 4.6 Retention Periods
+
+Following the existing 90-day convention for storage-stats history
 (`docs/server-node-storage-stats-strategy.md`):
 
-- Rohdaten-Batches (pro `telemetry_subject_id`, mit Zeitstempel): Vorschlag 180 Tage Aufbewahrung,
-  danach automatische Löschung oder Reduktion auf grob aggregierte Zeitreihen ohne
-  `telemetry_subject_id`-Bezug.
-- Aggregierte/anonymisierte Fleet-Statistiken (z. B. "Ausfallrate je `hardware_profile_id` und
-  Monat"): unbegrenzt aufbewahrbar, da nicht mehr personenbezogen, sofern die k-Anonymitäts-Schwelle
-  aus 4.3 eingehalten wird.
+- Raw data batches (per `telemetry_subject_id`, timestamped): proposed 180-day retention, after which
+  they are automatically deleted or reduced to coarsely aggregated time series with no
+  `telemetry_subject_id` reference.
+- Aggregated/anonymized fleet statistics (e.g. "failure rate by `hardware_profile_id` and month"): may
+  be retained indefinitely, since they are no longer personal data, provided the k-anonymity threshold
+  from Section 4.3 is respected.
 
-## 5. Architektur des zentralen Statistiksammelservers
+## 5. Central Statistics Collector Architecture
 
-### 5.1 Bestehende zentrale Dienste als Vorbild
+### 5.1 Existing Central Services as Precedent
 
-Der Code kennt aktuell zwei zentrale, von vielen Nodes/Clients angesprochene Dienste:
+The codebase currently has two central services addressed by many nodes/clients:
 
-- `crates/rendezvous-server` — der einzige bestehende "viele Nodes/Clients sprechen mit einem
-  zentralen Dienst"-Baustein im Projekt, mit HTTPS-Control-API, optionalem mTLS
-  (`docs/security-architecture.md`, Abschnitt 4.2.1) und WebSocket-Relay.
-- `crates/web-ui-backend` — ist dagegen kein zentraler Multi-Tenant-Dienst, sondern ein pro
-  Client-Session laufendes Backend, das mit genau einem oder mehreren vom Nutzer verbundenen
-  Server-Nodes spricht. Kein geeignetes Vorbild für einen fleet-weiten Sammler.
+- `crates/rendezvous-server` — the only existing "many nodes/clients talk to one central service"
+  building block in the project, with an HTTPS control API, optional mTLS
+  (`docs/security-architecture.md`, Section 4.2.1), and a WebSocket relay.
+- `crates/web-ui-backend` — by contrast, is not a central multi-tenant service, but a backend that runs
+  per client session and talks to one or more server nodes connected by the user. Not a good precedent
+  for a fleet-wide collector.
 
-Der neue Statistiksammelserver ist funktional näher an `rendezvous-server` (viele unabhängige
-Installationen sprechen mit einem zentralen, vom Projekt betriebenen Dienst) als an
-`web-ui-backend`. Empfehlung: **ein neuer, eigenständiger Dienst** (z. B. `crates/stats-collector-server`)
-statt eines Andockens an `web-ui-backend` oder `rendezvous-server` — beide bestehenden Dienste haben
-ein anderes Vertrauens- und Betriebsmodell (Cluster-intern bzw. Verbindungsvermittlung), und eine
-Vermischung mit fleet-weiter Telemetrie würde deren Sicherheitsgrenzen unnötig verkomplizieren.
+The new statistics collector is functionally closer to `rendezvous-server` (many independent
+installations talking to one central, project-operated service) than to `web-ui-backend`.
+Recommendation: **a new, standalone service** (e.g. `crates/stats-collector-server`) rather than
+docking onto `web-ui-backend` or `rendezvous-server` — both existing services have a different trust and
+operational model (cluster-internal, or connection brokering respectively), and mixing in fleet-wide
+telemetry would unnecessarily complicate their security boundaries.
 
-### 5.2 Ingestion-Endpoint
+### 5.2 Ingestion Endpoint
 
-- Protokoll: HTTPS (TLS 1.3), analog zu allen anderen Ironmesh-HTTP-Diensten.
-- Auth: bewusst **kein** node-individuelles mTLS wie im Cluster-internen Fall — der Sammelserver soll
-  gerade nicht wissen, welchem Cluster/Betreiber ein Datensatz zuzuordnen ist. Stattdessen:
-  - kein Client-Identitätsnachweis über den `telemetry_subject_id` hinaus, der bereits Teil des
-    Payloads ist,
-  - Missbrauchsschutz über Rate-Limiting pro Quell-IP und pro `telemetry_subject_id` (nicht über
-    Login/Token), plus eine einfache Plausibilitätsprüfung des Payload-Schemas.
-  - Optional (offene Frage, Abschnitt 8): ein anonymes, bei der ersten Aktivierung einmalig
-    ausgestelltes Ingestion-Token, um Spam/Fälschung zu erschweren, ohne Identität preiszugeben.
-- Endpoint-Form: `POST /v1/ingest/hardware-reliability` mit dem in Abschnitt 7 skizzierten
-  versionierten Payload.
+- **Hosting assumption (per project owner):** the central service is assumed to be hosted at
+  `creax.de`, port `44044`.
+- Protocol: HTTPS (TLS 1.3), consistent with all other IronMesh HTTP services.
+- Auth: deliberately **no** per-node mTLS as in the cluster-internal case — the collector should
+  specifically *not* know which cluster/operator a given record belongs to. Instead:
+  - no client identity proof beyond the `telemetry_subject_id` that is already part of the payload,
+  - abuse protection via rate limiting per source IP and per `telemetry_subject_id` (not via
+    login/token), plus a simple plausibility check of the payload schema,
+  - optionally (open question, Section 8): an anonymous ingestion token issued once on first
+    activation, to make spam/forgery harder without exposing identity.
+- Endpoint shape: `POST https://creax.de:44044/v1/ingest/hardware-reliability` with the versioned
+  payload sketched in Section 7.
 
-### 5.3 Speicherung / Zugriffskontrolle
+### 5.3 Storage / Access Control
 
-- Rohdaten-Ingestion: einfache, anhängende Speicherung (z. B. relationale DB oder Zeitreihen-Store)
-  getrennt von der öffentlich zugänglichen Aggregat-Ansicht.
-- Aggregation: periodischer Batch-Job, der Rohdaten zu k-anonymen Fleet-Statistiken je
-  `hardware_profile_id` verdichtet (siehe 4.3).
-- Für die Zeitreihen-Aggregation selbst ist, anders als bei der Einzel-Node-Storage-Stats-Historie
-  (wo `docs/server-node-storage-stats-strategy.md` bewusst gegen eine externe Zeitreihen-DB pro Node
-  entscheidet), ein dedizierter Zeitreihen-/Analyse-Store hier tatsächlich passend, weil es sich um
-  *einen* zentralen Dienst statt vieler Einzel-Node-Instanzen handelt. Die im Storage-Stats-Dokument
-  bereits notierte "GreptimeDB als künftiges zentrales Backend"-Idee passt hier besser als beim
-  Node-lokalen Fall.
-- Zugriffskontrolle:
-  - Rohdaten (inkl. `telemetry_subject_id`-Zuordnung über Zeit): nur Projekt-Maintainer/Betreiber
-    des Sammelservers, admin-authentifiziert analog zum bestehenden `IRONMESH_ADMIN_TOKEN`/RBAC-Modell
-    aus `docs/security-architecture.md`.
-  - Aggregierte, k-anonyme aufbereitete Statistiken: öffentlich einsehbar (z. B. künftiges
-    "Fleet Reliability"-Dashboard), da genau das den Community-Nutzen dieser Funktion ausmacht.
+- Raw data ingestion: simple append-only storage (e.g. a relational DB or a time-series store),
+  separate from the publicly accessible aggregate view.
+- Aggregation: a periodic batch job that condenses raw data into k-anonymous fleet statistics per
+  `hardware_profile_id` (and, per Section 4.2, per `country_code` combination) (see 4.3).
+- For the time-series aggregation itself — unlike the per-node storage-stats history (where
+  `docs/server-node-storage-stats-strategy.md` deliberately decides against an external time-series DB
+  per node) — a dedicated time-series/analytics store actually fits here, because this is *one* central
+  service rather than many per-node instances. The "GreptimeDB as a future central backend" idea
+  already noted in the storage-stats document fits better here than in the node-local case.
+- Access control:
+  - Raw data (including `telemetry_subject_id` mapping over time): project maintainers/operators of
+    the collector service only, admin-authenticated analogous to the existing
+    `IRONMESH_ADMIN_TOKEN`/RBAC model from `docs/security-architecture.md`.
+  - Aggregated, k-anonymous processed statistics: publicly viewable (e.g. a future "Fleet Reliability"
+    dashboard, including the country-level usage map from Section 4.2), since that is exactly the
+    community value this feature provides.
 
-### 5.4 Eigenständiger Dienst vs. bestehende Backend-Infrastruktur
+### 5.4 Standalone Service vs. Existing Backend Infrastructure
 
-Fazit: **neuer eigenständiger Dienst**, kein Andocken an `web-ui-backend` oder `server-admin`. Der
-`server-node` selbst bekommt lediglich einen neuen ausgehenden Client (ähnlich den bestehenden
-`RendezvousControlClient`-Mustern in `client-sdk`), der periodisch an den neuen Dienst sendet.
+Conclusion: a **new standalone service**, not docking onto `web-ui-backend` or `server-admin`. The
+`server-node` itself only gains a new outgoing client (similar to the existing
+`RendezvousControlClient` patterns in `client-sdk`) that periodically sends to the new service.
 
-## 6. Übertragungsfrequenz/Batching
+## 6. Transmission Frequency / Batching
 
-Angelehnt an die im Storage-Stats-Dokument etablierten Muster (Kombination aus periodischem Timer
-und ereignisgesteuerter, entkoppelter Aktualisierung, mit Debouncing):
+Following the patterns already established in the storage-stats document (a combination of a periodic
+timer and event-driven, debounced updates):
 
-- Kein Echtzeitversand einzelner Findings — das würde unnötig Netzwerk-/Batterie-/CPU-Last erzeugen
-  und widerspricht dem Grundsatz aus `docs/node-memory-footprint-reduction-plan.md` und dem
-  Storage-Stats-Dokument, Hintergrundarbeit ressourcenschonend zu takten.
-- Ein Batch fasst den aktuellen Stand des reduzierten `hardware_health_report`
-  (siehe Abschnitt 2) zu einem Zeitpunkt zusammen, keine Ereignis-für-Ereignis-Übertragung.
-- Vorschlag: fester periodischer Timer, analog zum bestehenden
-  `HARDWARE_HEALTH_REFRESH_INTERVAL_SECS` (aktuell 5 Minuten für die node-lokale Aktualisierung),
-  aber mit einem deutlich selteneren Sende-Intervall, z. B. alle 6–24 Stunden — die node-lokale
-  Erfassung bleibt häufig (für Admin-UI-Frische), der externe Versand ist bewusst seltener, da nur
-  Trends über Tage/Wochen relevant sind.
-- Kein zusätzliches sofortiges Senden bei kritischen Findings in der ersten Ausbaustufe (Konsistenz
-  mit dem konservativen "detect-only zuerst"-Ansatz aus `docs/data-scrub-auto-repair-strategy.md`);
-  ein optionaler beschleunigter Versand bei neuen `critical`-Findings kann eine spätere Ausbaustufe
-  sein.
-- Retry/Backoff bei Sendefehlern analog zum bestehenden Replikations-Repair-Muster
-  (`IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS` als Vorbild): fehlgeschlagene Batches werden verworfen
-  oder mit begrenzter Anzahl Versuche später erneut versucht, nie unbegrenzt aufgestaut (kein
-  unbeschränkt wachsender Sende-Puffer).
-- Deduplizierung: wenn sich seit dem letzten erfolgreichen Versand nichts Wesentliches geändert hat
-  (kein neues Finding, keine SMART-Werteänderung oberhalb einer Rausch-Schwelle), kann der Versand
-  übersprungen werden, um Grundlast zu reduzieren — Detailschwelle ist Implementierungsdetail.
+- No real-time transmission of individual findings — that would generate unnecessary network/
+  battery/CPU load and would contradict the principle from
+  `docs/node-memory-footprint-reduction-plan.md` and the storage-stats document of pacing background
+  work in a resource-conscious way.
+- A batch summarizes the current state of the reduced `hardware_health_report` (see Section 2) at a
+  point in time, not an event-by-event transmission.
+- Proposal: a fixed periodic timer, analogous to the existing `HARDWARE_HEALTH_REFRESH_INTERVAL_SECS`
+  (currently 5 minutes for the node-local refresh), but with a much less frequent send interval, e.g.
+  every 6–24 hours — the node-local collection stays frequent (for admin-UI freshness), while the
+  external transmission is deliberately rarer, since only trends over days/weeks matter.
+- No additional immediate send on critical findings in the first rollout stage (consistent with the
+  conservative "detect-only first" approach from `docs/data-scrub-auto-repair-strategy.md`); an
+  optional accelerated send on new `critical` findings could be a later expansion stage.
+- Retry/backoff on send failures, analogous to the existing replication-repair pattern
+  (`IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS` as a model): failed batches are dropped or retried a
+  limited number of times, never queued unboundedly (no unbounded growing send buffer).
+- Deduplication: if nothing material has changed since the last successful send (no new finding, no
+  SMART value change above a noise threshold), the send can be skipped to reduce baseline load — the
+  exact threshold is an implementation detail.
 
-## 7. Datenschema-Versionierung/Erweiterbarkeit
+## 7. Data Schema Versioning / Extensibility
 
-- Jeder Payload trägt ein Top-Level-Feld `schema_version: u32`, beginnend bei `1`.
-- Additive Evolution: neue Felder werden nur als optional hinzugefügt; bestehende Felder werden nicht
-  umbenannt oder in ihrer Bedeutung geändert (bei Bedeutungsänderung: neue `schema_version`).
-- Der Ingestion-Endpoint des zentralen Dienstes ist toleranz-first zu implementieren: unbekannte
-  zusätzliche Felder werden ignoriert statt den Request abzulehnen (erlaubt älteren Servern, mit
-  neueren Node-Versionen zu koexistieren, und umgekehrt).
-- Analog zum bestehenden `collectors`-Statusfeld im `hardware_health_report` trägt auch dieser Payload
-  pro Metrikgruppe einen `available: bool`/`collector_state`-Hinweis, damit der zentrale Dienst
-  fehlende Werte von "bewusst nicht unterstützt" unterscheiden kann, statt Nullwerte zu interpretieren.
-- Grobes Skizzenschema (Illustration, keine finale Spezifikation):
+- Every payload carries a top-level `schema_version: u32` field, starting at `1`.
+- Additive evolution: new fields are only ever added as optional; existing fields are not renamed or
+  have their meaning changed (a meaning change requires a new `schema_version`).
+- The central service's ingestion endpoint is implemented tolerance-first: unknown extra fields are
+  ignored rather than causing the request to be rejected (allows older servers to coexist with newer
+  node versions, and vice versa).
+- Analogous to the existing `collectors` status field in `hardware_health_report`, this payload also
+  carries an `available: bool`/`collector_state` hint per metric group, so the central service can
+  distinguish missing values from "deliberately unsupported" instead of interpreting nulls.
+- Rough sketch schema (illustration, not a final specification):
 
 ```jsonc
 {
@@ -384,7 +422,8 @@ und ereignisgesteuerter, entkoppelter Aktualisierung, mit Debouncing):
   "telemetry_subject_id": "hex-hmac...",
   "generated_at_unix": 1752912000,
   "ironmesh_version": "1.0.33",
-  "hardware_profile_id": "hp-...",   // wie im bestehenden hardware_health_report
+  "hardware_profile_id": "hp-...",   // as in the existing hardware_health_report
+  "country_code": "DE",              // derived server-side from source IP, see Section 4.2; optional
   "node_lifecycle": {
     "uptime_seconds": 431200,
     "cumulative_observed_uptime_seconds": 9871200,
@@ -392,7 +431,7 @@ und ereignisgesteuerter, entkoppelter Aktualisierung, mit Debouncing):
   },
   "storage_devices": [
     {
-      "component_instance_id": "ci-...", // bereits gehasht, siehe Hardware-Health-Doku
+      "component_instance_id": "ci-...", // already hashed, see hardware-health document
       "is_rotational": false,
       "interface_type": "nvme",
       "smart": {
@@ -404,54 +443,56 @@ und ereignisgesteuerter, entkoppelter Aktualisierung, mit Debouncing):
       }
     }
   ],
+  "memory_ecc": {
+    "available": true,
+    "correctable_error_count": 0,
+    "uncorrectable_error_count": 0
+  },
   "reliability_findings_summary": [
     { "finding_code": "chunk_hash_mismatch", "occurrence_count": 2 }
   ],
   "collectors": [
-    { "collector_id": "smartctl", "available": true }
+    { "collector_id": "smartctl", "available": true },
+    { "collector_id": "edac", "available": true }
   ]
 }
 ```
 
-- Migrationspfad: alte `schema_version`-Payloads bleiben im Rohdatenspeicher unverändert lesbar;
-  Aggregationsjobs müssen versionsbewusst normalisieren, bevor sie über mehrere `schema_version`-Werte
-  hinweg aggregieren.
+- Migration path: old `schema_version` payloads remain readable unchanged in raw storage; aggregation
+  jobs must normalize in a version-aware way before aggregating across multiple `schema_version`
+  values.
 
-## 8. Offene Fragen / nächste Schritte
+## 8. Open Questions / Next Steps
 
-- **Juristische Prüfung vor Rollout:** Ist "aktiv per Default + Opt-out" für diese Datenkategorie in
-  den relevanten Jurisdiktionen (insbesondere EU/DSGVO) rechtlich ausreichend, oder wird ein
-  bestätigungspflichtiger erster Schritt im Setup-Flow benötigt (siehe 4.4)? Sollte vor Implementierung
-  geklärt werden, nicht erst vor Release.
-- **Betrieb des zentralen Dienstes:** Wer hostet/betreibt `stats-collector-server` produktiv, mit
-  welchem Budget, welcher Domain, welchem Monitoring? Aktuell existiert dafür keine Infrastruktur im
-  Projekt (anders als z. B. für `rendezvous-server`, falls dort bereits ein gehosteter Dienst existiert
-  — zu verifizieren).
-- **Rotation von `telemetry_subject_id`:** Fixiertes Intervall (z. B. 180 Tage) vs. nie rotierend vs.
-  nutzergesteuert ("Reset-Button" in der Admin-UI)? Zielkonflikt zwischen Statistik-Kontinuität und
-  Datenschutz muss entschieden werden.
-- **Missbrauchsschutz ohne Identität:** Wie wird Spoofing/Spam am nicht-authentifizierten
-  Ingestion-Endpoint verhindert, ohne ein De-Anonymisierungsrisiko durch Auth-Token einzuführen?
-  Anonymes Ausstellungs-Token (Abschnitt 5.2) vs. reines IP-Rate-Limiting ist noch offen.
-- **Granularität von Temperatur-/SMART-Zeitreihen:** Sollten Rohwerte je Batch übertragen werden oder
-  bereits node-seitig auf Tagesaggregate (min/max/mean) reduziert werden, um sowohl Bandbreite zu
-  sparen als auch das Fingerprinting-Risiko einzelner Geräte über feingranulare Zeitreihen zu
-  reduzieren?
-- **RAM-ECC- und CPU-MCE-Erfassung:** Lohnt sich der Zusatzaufwand für EDAC-/MCE-Auslesen angesichts
-  der geringen Abdeckung auf Consumer-Hardware, oder wird das auf "Server-/Workstation-Board"-Nutzer
-  beschränkt priorisiert (Abschnitt 2.4)?
-- **Verhältnis zum bestehenden `/api/v1/auth/hardware/health`-Endpoint:** Soll der zu sendende Payload
-  strikt als abgeleitete, einseitige Projektion aus dem bestehenden `hardware_health_report` erzeugt
-  werden (ein Konverter, keine zweite unabhängige Erfassung), um Drift zwischen node-lokaler und
-  zentral gesendeter Sicht zu vermeiden? Empfehlung: ja, sollte vor Implementierung als Vorgabe
-  festgeschrieben werden.
-- **Admin-UI-Platzierung:** Eigene neue `server-admin`-Seite/Settings-Sektion vs. Erweiterung der
-  bestehenden `HardwarePage.tsx` — Entscheidung steht noch aus (Abschnitt 3.2 schlägt Erweiterung vor,
-  aber Umfang der Einstellungen könnte eine eigene Settings-Seite rechtfertigen, falls künftig weitere
-  Opt-out-Telemetrie-Kategorien dazukommen).
-- **Cluster- vs. Node-Granularität des Opt-outs:** Aktuell als Per-Node-Einstellung skizziert
-  (konsistent mit allen anderen Node-Env-Var-Togglen). Sollte stattdessen ein Cluster-weiter Default
-  über die Control-Plane verteilt werden können, damit ein Betreiber nicht jeden Node einzeln
-  umschalten muss? Deckt sich mit offenen Fragen zu Cluster-weiten Policy-Verteilungsmechanismen, die
-  in `docs/multi-node-strategy.md` bereits für andere Policies angedeutet, aber nicht abschließend
-  gelöst sind.
+Resolved based on project-owner feedback on the initial draft:
+
+- ~~Hosting of the central service~~ — assumed to be `creax.de`, port `44044` (see Section 5.2); exact
+  budget/monitoring setup for operating it is still to be worked out separately.
+- ~~RAM-ECC and CPU-MCE collection~~ — RAM ECC (via EDAC) is included in v1 at low effort, specifically
+  to gather real data on how valuable the signal is; CPU-MCE remains excluded due to unreliable
+  availability (see Section 2.4).
+- ~~Cluster- vs. node-granularity of the opt-out~~ — confirmed as a per-node setting for now, consistent
+  with all other node env-var toggles (see Section 3).
+
+Still open:
+
+- **Legal review before rollout:** is "enabled by default + opt-out", combined with the bootstrap
+  confirmation step from Section 4.4, legally sufficient in the relevant jurisdictions (especially
+  EU/GDPR)? Should be clarified before implementation, not just before release.
+- **Rotation of `telemetry_subject_id`:** fixed interval (e.g. 180 days) vs. never rotating vs.
+  user-controlled ("reset" button in the admin UI)? The trade-off between statistical continuity and
+  privacy still needs a decision.
+- **Abuse protection without identity:** how is spoofing/spam at the non-authenticated ingestion
+  endpoint prevented, without introducing a de-anonymization risk via an auth token? An anonymous
+  issuance token (Section 5.2) vs. pure IP rate limiting is still open.
+- **Granularity of temperature/SMART time series:** should raw values be transmitted per batch, or
+  already reduced node-side to daily aggregates (min/max/mean), to both save bandwidth and reduce the
+  fingerprinting risk of individual devices via fine-grained time series?
+- **Relationship to the existing `/api/v1/auth/hardware/health` endpoint:** should the payload to be
+  sent strictly be a derived, one-way projection from the existing `hardware_health_report` (a
+  converter, not a second independent collection), to avoid drift between the node-local and centrally
+  sent views? Recommendation: yes, this should be fixed as a requirement before implementation.
+- **Admin UI placement:** a new dedicated `server-admin` page/settings section vs. extending the
+  existing `HardwarePage.tsx` — still undecided (Section 3.2 proposes extending it, but the scope of
+  settings might justify a dedicated settings page if further opt-out telemetry categories are added
+  later).
