@@ -62,7 +62,9 @@ fn build_reqwest_client_from_pem_for_url_with_expected_server_identity(
     expected_server_identity: Option<ExpectedNodeServerIdentity>,
 ) -> Result<Client> {
     let builder = configure_reqwest_client_builder(Client::builder());
-    let builder = if let Some(expected_server_identity) = expected_server_identity {
+    let builder = if url.scheme() == "https"
+        && let Some(expected_server_identity) = expected_server_identity
+    {
         builder.use_preconfigured_tls(transport_sdk::build_tls_client_config(
             server_ca_pem,
             None,
@@ -108,7 +110,9 @@ pub(crate) fn build_blocking_reqwest_client_from_pem_for_url_with_expected_serve
     expected_server_identity: Option<ExpectedNodeServerIdentity>,
 ) -> Result<BlockingClient> {
     let builder = configure_blocking_reqwest_client_builder(BlockingClient::builder());
-    let builder = if let Some(expected_server_identity) = expected_server_identity {
+    let builder = if url.scheme() == "https"
+        && let Some(expected_server_identity) = expected_server_identity
+    {
         builder.use_preconfigured_tls(transport_sdk::build_tls_client_config(
             server_ca_pem,
             None,
@@ -435,12 +439,12 @@ fn expected_server_identity(
             node_id,
             cluster_id,
         })),
-        (None, None) => Ok(None),
+        // Older bootstrap payloads can describe direct endpoints without a
+        // node ID. Keep those usable with the CA-only verifier; identity
+        // binding is enabled as soon as the node ID is present.
+        (None, _) => Ok(None),
         (Some(_), None) => {
             bail!("identity-bound direct HTTPS target is missing its expected cluster_id")
-        }
-        (None, Some(_)) => {
-            bail!("identity-bound direct HTTPS target is missing its expected node_id")
         }
     }
 }

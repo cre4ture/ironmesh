@@ -1020,6 +1020,14 @@ fn generate_test_https_ca_and_server_material(
     bind_addr: SocketAddr,
     label: &str,
 ) -> (String, String, String, String) {
+    generate_test_https_ca_and_server_material_with_identity(bind_addr, label, None)
+}
+
+fn generate_test_https_ca_and_server_material_with_identity(
+    bind_addr: SocketAddr,
+    label: &str,
+    identity: Option<(NodeId, ClusterId)>,
+) -> (String, String, String, String) {
     let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.distinguished_name = rcgen::DistinguishedName::new();
@@ -1044,6 +1052,15 @@ fn generate_test_https_ca_and_server_material(
     server_params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(bind_addr.ip()));
+    if let Some((node_id, cluster_id)) = identity {
+        server_params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:node:{node_id}")).unwrap(),
+        ));
+        server_params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+                .unwrap(),
+        ));
+    }
     let server_key_pair = rcgen::KeyPair::generate().unwrap();
     let server_cert = server_params.signed_by(&server_key_pair, &issuer).unwrap();
 
@@ -6162,7 +6179,11 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
     let bind_addr = free_bind_addr();
     let public_url = format!("https://127.0.0.1:{}", bind_addr.port());
     let (public_ca_pem, _, server_cert_pem, server_key_pem) =
-        generate_test_https_ca_and_server_material(bind_addr, "bootstrap-remote-client-auth");
+        generate_test_https_ca_and_server_material_with_identity(
+            bind_addr,
+            "bootstrap-remote-client-auth",
+            Some((target.node_id, target.cluster_id)),
+        );
     source.network.public_ca_pem = Some(public_ca_pem.clone());
 
     {
