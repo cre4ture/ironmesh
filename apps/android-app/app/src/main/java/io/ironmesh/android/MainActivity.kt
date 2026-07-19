@@ -250,7 +250,6 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onOpenFiles = { openFilesAtIronmeshRoot(vm) },
                                     onOpenWebConsole = onOpenWebConsole,
-                                    onClearEnrollment = vm::clearDeviceEnrollment,
                                     onThemeAccentColorChange = vm::updateThemeAccentColor,
                                     onKeyChange = vm::updateKey,
                                     onPayloadChange = vm::updatePayload,

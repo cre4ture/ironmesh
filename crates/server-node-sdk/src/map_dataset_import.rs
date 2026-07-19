@@ -183,6 +183,11 @@ impl MapDatasetImportRuntime {
     }
 }
 
+pub(crate) async fn has_running_job(state: &ServerState) -> bool {
+    let runtime = state.storage.map_dataset_import.lock().await;
+    !runtime.status_view().can_start_new
+}
+
 impl MapDatasetImportJob {
     fn view(&self) -> AdminMapDatasetImportJobView {
         let current_part = current_part_spec(self).ok().flatten();
@@ -330,6 +335,9 @@ async fn start_import_job(
     state: &ServerState,
     request: StartAdminMapDatasetImportRequest,
 ) -> std::result::Result<StartAdminMapDatasetImportResponse, StatusCode> {
+    if natural_earth_import::is_running(state).await {
+        return Err(StatusCode::CONFLICT);
+    }
     let source_url = match extract_source_url(&request.source) {
         Ok(url) => url,
         Err(_) => return Err(StatusCode::BAD_REQUEST),
@@ -913,7 +921,7 @@ pub(crate) async fn register_put_outcome(state: &ServerState, key: &str, version
     }
 }
 
-async fn invalidate_cached_mbtiles_source(state: &ServerState, manifest_key: &str) {
+pub(crate) async fn invalidate_cached_mbtiles_source(state: &ServerState, manifest_key: &str) {
     let mut sources = state.storage.mbtiles_sources.write().await;
     sources.remove(manifest_key);
 }

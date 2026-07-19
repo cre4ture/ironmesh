@@ -74,20 +74,29 @@ An abbreviated example for a custom small globe profile is:
 source-layer schema used by the shared MapLibre gallery component; it does not
 alter the source data.
 
-## Import an MBTiles artifact
+## Use the map dataset import wizard
 
-The **Map dataset import** card first asks for a configured *variant artifact*
-(for example `natural-earth-globe — raster`). Paste an HTTP(S) URL to a single
-MBTiles file or a copied `wget -c ...` command, choose a part size, and start
-the job.
+Open **Server Admin → Gallery → Map dataset import wizard**. The wizard asks
+for a desired map outcome first and then adapts the remaining questions to that
+profile:
+
+1. choose **Natural Earth physical world map** or **An existing MBTiles
+   package**;
+2. confirm the fixed official Natural Earth source, or paste one HTTP(S) URL
+   (or a copied `wget -c ...` command) for an existing MBTiles package;
+3. confirm the fixed `natural-earth-globe` raster destination, or select the
+   configured variant artifact and part size for an MBTiles package;
+4. review the source and destination, then start the background job.
+
+The source file name is never a destination. The selected cluster
+configuration controls the logical file and manifest keys, so one profile can
+be replaced while other imported profiles remain available. The wizard shows
+the current or most recently completed job below the steps.
 
 The importer requires HTTP range requests. It streams the source directly into
 IronMesh chunks, checkpoints after at most 64 MiB of input, and resumes an
 unfinished job after the server node restarts. It publishes the generated
-split-file manifest only after all parts are complete. The source file name is
-not used as a destination: the selected cluster configuration controls the
-logical file and manifest keys. This makes it safe to replace one profile while
-leaving other imported profiles available.
+split-file manifest only after all parts are complete.
 
 The persisted source URL may contain credentials or signed-download tokens.
 Restrict the server-node state directory to administrators.
@@ -99,6 +108,27 @@ ready-made MBTiles package. Package the chosen Natural Earth layers into a
 worldwide raster MBTiles base and, if desired, a separate vector MBTiles
 overlay. Point the profile's manifest keys at those two artifacts and import
 them through the admin UI.
+
+### Automatic physical base map
+
+For the standard `natural-earth-globe` raster profile, choose **Natural Earth
+physical world map** in the wizard. The node downloads the fixed official
+Natural Earth 10m physical archive, renders ocean, land, lakes, rivers, and
+coastlines with the built-in colors, creates Web-Mercator PNG MBTiles, validates
+them, and publishes the configured manifest only after all generated artifact
+parts are stored.
+
+This automatic path has no administrator-provided URL or converter arguments.
+It requires `unzip`, `gdal_rasterize`, `gdalwarp`, `gdal_translate`, and
+`gdaladdo` on the server `PATH`. The Debian package installs `unzip` and
+`gdal-bin`; other deployments must provide the same tools. The existing manual
+import remains appropriate for a custom physical rendering, a labels overlay,
+or data from another provider.
+
+Expand **Conversion log** on the Natural Earth job to inspect each conversion
+phase, dependency check, and executed converter command. Failed commands show
+their exact invocation, exit status, and bounded captured output in both the
+job error and the log.
 
 For the `natural_earth` vector style, the overlay uses this compact source-layer
 contract:

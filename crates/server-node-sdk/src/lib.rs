@@ -126,6 +126,7 @@ mod hardware_health;
 mod listing;
 mod map_config;
 mod map_dataset_import;
+mod natural_earth_import;
 mod replication;
 mod s3_frontend;
 mod setup;
@@ -280,6 +281,7 @@ struct ServerStorageRuntime {
     upload_sessions_dirty: Arc<AtomicUsize>,
     upload_sessions_persist_notify: Arc<Notify>,
     map_dataset_import: Arc<Mutex<map_dataset_import::MapDatasetImportRuntime>>,
+    natural_earth_import: Arc<Mutex<natural_earth_import::NaturalEarthImportRuntime>>,
     storage_stats_history_retention_secs: u64,
     storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
     metadata_db_distribution_runtime: Arc<StdMutex<MetadataDbLogicalDistributionRuntime>>,
@@ -6877,6 +6879,9 @@ async fn run_inner(
             upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
             upload_sessions_persist_notify: Arc::new(Notify::new()),
             map_dataset_import: Arc::new(Mutex::new(map_dataset_import_runtime)),
+            natural_earth_import: Arc::new(Mutex::new(
+                natural_earth_import::NaturalEarthImportRuntime::default(),
+            )),
             storage_stats_history_retention_secs,
             storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
             metadata_db_distribution_runtime: Arc::new(StdMutex::new(
@@ -7196,6 +7201,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route(
             "/auth/maps/import",
             get(map_dataset_import::admin_status).post(map_dataset_import::start_admin_import),
+        )
+        .route(
+            "/auth/maps/import/natural-earth",
+            get(natural_earth_import::admin_status).post(natural_earth_import::start_admin_import),
         )
         .route(
             "/auth/storage/stats/metadata-db/logical",
