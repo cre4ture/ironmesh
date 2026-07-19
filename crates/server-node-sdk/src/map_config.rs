@@ -416,16 +416,15 @@ async fn load_or_initialize_configuration(state: &ServerState) -> Result<LoadedM
     // received an already-known custom document yet. The replica reconciler
     // will bring that object across; returning the safe default meanwhile is
     // preferable to creating a competing version.
-    if !loaded.stored {
-        if !state
+    if !loaded.stored
+        && !state
             .cluster
             .lock()
             .await
             .replica_nodes_for_subject(MAP_CONFIGURATION_STORAGE_KEY)
             .is_empty()
-        {
-            return Ok(loaded);
-        }
+    {
+        return Ok(loaded);
     }
 
     let payload = serde_json::to_vec_pretty(&loaded.configuration)
