@@ -689,8 +689,9 @@ test("server-admin gallery derives child folders from nested media entries", asy
   await expect(page.getByText("oppo-uli/", { exact: true }).first()).toBeVisible();
 });
 
-test("server-admin map import wizard starts the Natural Earth background job", async ({ page }) => {
+test("server-admin map import wizard starts the Natural Earth labels background job", async ({ page }) => {
   let naturalEarthStartRequests = 0;
+  let naturalEarthStartRequest: Record<string, unknown> | null = null;
   let naturalEarthJob: Record<string, unknown> | null = null;
 
   await installServerAdminMocks(page);
@@ -706,19 +707,37 @@ test("server-admin map import wizard starts the Natural Earth background job", a
     }
     if (route.request().method() === "POST") {
       naturalEarthStartRequests += 1;
+      naturalEarthStartRequest = JSON.parse(route.request().postData() ?? "{}");
       naturalEarthJob = {
         id: "natural-earth-job-1",
         state: "running",
-        phase: "Downloading Natural Earth physical data",
+        profile: "physical_with_labels",
+        phase: "Downloading Natural Earth populated places archive",
         source_url: "https://naciscdn.org/naturalearth/10m/physical/10m_physical.zip",
         logical_key: "sys/maps/natural-earth-globe.mbtiles",
         manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
         logical_size_bytes: 0,
+        artifacts: [
+          {
+            variant_id: "natural-earth-labels",
+            asset: "raster",
+            logical_key: "sys/maps/natural-earth-globe.mbtiles",
+            manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
+            logical_size_bytes: 0
+          },
+          {
+            variant_id: "natural-earth-labels",
+            asset: "vector",
+            logical_key: "sys/maps/natural-earth-labels.mbtiles",
+            manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json",
+            logical_size_bytes: 0
+          }
+        ],
         error: null,
         log_entries: [
           {
             timestamp_unix: 1_700_000_001,
-            message: "Phase: Downloading Natural Earth physical data"
+            message: "Phase: Downloading Natural Earth populated places archive"
           }
         ],
         started_at_unix: 1_700_000_000,
@@ -738,21 +757,32 @@ test("server-admin map import wizard starts the Natural Earth background job", a
   await page.getByText("Gallery", { exact: true }).click();
 
   await expect(page.getByText("Map dataset import wizard", { exact: true })).toBeVisible();
-  await page.getByRole("radio", { name: "Natural Earth physical world map" }).check();
+  await page.getByRole("radio", { name: "Natural Earth physical world map + labels" }).check();
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByText("Official Natural Earth source", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByText("Configured Natural Earth destination", { exact: true })).toBeVisible();
+  await expect(page.getByText("Configured Natural Earth destinations", { exact: true })).toBeVisible();
+  await expect(
+    page
+      .getByRole("alert", { name: "Configured Natural Earth destinations" })
+      .getByText("sys/maps/natural-earth-labels.mbtiles.manifest.json", { exact: true })
+  ).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByText("Review before starting the background job", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Start background import" }).click();
 
   await expect.poll(() => naturalEarthStartRequests).toBe(1);
-  await expect(page.getByText("Downloading Natural Earth physical data", { exact: true })).toBeVisible();
+  expect(naturalEarthStartRequest).toMatchObject({ profile: "physical_with_labels" });
+  await expect(
+    page.getByText("Downloading Natural Earth populated places archive", { exact: true })
+  ).toBeVisible();
   await expect(page.getByText("Natural Earth: running", { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByText("vector: sys/maps/natural-earth-labels.mbtiles.manifest.json", { exact: true })
+  ).toBeVisible();
   await page.getByText("Conversion log (1 entries)", { exact: true }).click();
   await expect(
-    page.getByText("Phase: Downloading Natural Earth physical data", { exact: true })
+    page.getByText("Phase: Downloading Natural Earth populated places archive", { exact: true })
   ).toBeVisible();
 });
 
@@ -1588,6 +1618,18 @@ async function installServerAdminMocks(
               style: "raster",
               enabled: true,
               raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
+            },
+            {
+              id: "natural-earth-labels",
+              label: "Natural Earth Globe + labels",
+              mode_label: "Labels",
+              description: "Natural Earth base map with country, city, and border labels.",
+              attribution: "Made with Natural Earth.",
+              kind: "hybrid",
+              style: "natural_earth",
+              enabled: false,
+              raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
+              vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
             }
           ]
         }
