@@ -459,6 +459,40 @@ fn host_dependency_report_marks_ready_and_missing_video_tools() {
             .contains("ffmpeg")
     );
 
+    let unzip_check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "natural-earth-unzip")
+        .unwrap();
+    assert_eq!(unzip_check.configured_path.as_deref(), Some("unzip"));
+    assert!(matches!(
+        &unzip_check.status,
+        HostDependencyStatus::Ready | HostDependencyStatus::Missing
+    ));
+
+    let gdal_check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "natural-earth-gdal")
+        .unwrap();
+    assert_eq!(
+        gdal_check.configured_path.as_deref(),
+        Some("gdal_rasterize, gdalwarp, gdal_translate, gdaladdo")
+    );
+    assert!(matches!(
+        &gdal_check.status,
+        HostDependencyStatus::Ready | HostDependencyStatus::Missing
+    ));
+    if gdal_check.status == HostDependencyStatus::Missing {
+        assert!(
+            gdal_check
+                .install_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gdal-bin")
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

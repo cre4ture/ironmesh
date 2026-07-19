@@ -8,6 +8,8 @@ pub(super) const VIDEO_THUMBNAIL_SEEK_FRACTION: f64 = 0.10;
 pub(super) const VIDEO_THUMBNAIL_SEEK_MIN_SECS: f64 = 10.0;
 pub(super) const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 120.0;
 pub(super) const VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS: f64 = 60.0;
+const NATURAL_EARTH_GDAL_COMMANDS: [&str; 4] =
+    ["gdal_rasterize", "gdalwarp", "gdal_translate", "gdaladdo"];
 
 #[derive(Clone)]
 pub(super) struct MediaToolPaths {
@@ -77,13 +79,23 @@ impl MediaToolPaths {
                     "Video metadata extraction",
                     &self.ffprobe,
                     "Video metadata extraction needs ffprobe on the server host.",
+                    Some("Install the `ffmpeg` package on the server host to provide both `ffprobe` and `ffmpeg`."),
                 ),
                 binary_dependency_check(
                     "video-thumbnails",
                     "Video thumbnail generation",
                     &self.ffmpeg,
                     "Video thumbnail generation needs ffmpeg on the server host.",
+                    Some("Install the `ffmpeg` package on the server host to provide both `ffprobe` and `ffmpeg`."),
                 ),
+                binary_dependency_check(
+                    "natural-earth-unzip",
+                    "Natural Earth archive extraction (unzip)",
+                    Path::new("unzip"),
+                    "Automatic Natural Earth map imports need unzip to extract the official source archive.",
+                    Some("On Debian or Ubuntu, install the `unzip` package on the server host."),
+                ),
+                natural_earth_gdal_dependency_check(),
             ],
         }
     }
@@ -148,6 +160,7 @@ fn binary_dependency_check(
     feature: &str,
     configured_path: &Path,
     feature_detail: &str,
+    missing_install_hint: Option<&str>,
 ) -> HostDependencyCheck {
     let configured_path_display = configured_path.display().to_string();
     let resolved_path = resolve_host_dependency_path(configured_path);
@@ -189,11 +202,53 @@ fn binary_dependency_check(
         detail,
         configured_path: Some(configured_path_display),
         resolved_path: resolved_path.map(|path| path.display().to_string()),
-        install_hint: if id.starts_with("video-") && status == HostDependencyStatus::Missing {
-            Some("Install the `ffmpeg` package on the server host to provide both `ffprobe` and `ffmpeg`.".to_string())
+        install_hint: (status == HostDependencyStatus::Missing)
+            .then(|| missing_install_hint.map(str::to_string))
+            .flatten(),
+    }
+}
+
+fn natural_earth_gdal_dependency_check() -> HostDependencyCheck {
+    let resolutions = NATURAL_EARTH_GDAL_COMMANDS
+        .iter()
+        .map(|command| (*command, resolve_host_dependency_path(Path::new(command))))
+        .collect::<Vec<_>>();
+    let resolved_commands = resolutions
+        .iter()
+        .filter_map(|(command, path)| {
+            path.as_ref()
+                .map(|path| format!("{command}: {}", path.display()))
+        })
+        .collect::<Vec<_>>();
+    let missing_commands = resolutions
+        .iter()
+        .filter(|(_, path)| path.is_none())
+        .map(|(command, _)| *command)
+        .collect::<Vec<_>>();
+    let status = if missing_commands.is_empty() {
+        HostDependencyStatus::Ready
+    } else {
+        HostDependencyStatus::Missing
+    };
+
+    HostDependencyCheck {
+        id: "natural-earth-gdal".to_string(),
+        feature: "Natural Earth map conversion (GDAL)".to_string(),
+        status: status.clone(),
+        summary: if missing_commands.is_empty() {
+            "All required GDAL map-conversion commands were resolved on PATH".to_string()
         } else {
-            None
+            format!(
+                "Required GDAL command(s) not found on PATH: {}",
+                missing_commands.join(", ")
+            )
         },
+        detail: "Automatic Natural Earth map imports need GDAL to rasterize source layers, project them to Web Mercator, and create MBTiles overviews.".to_string(),
+        configured_path: Some(NATURAL_EARTH_GDAL_COMMANDS.join(", ")),
+        resolved_path: (!resolved_commands.is_empty()).then(|| resolved_commands.join("; ")),
+        install_hint: (status == HostDependencyStatus::Missing).then(|| {
+            "On Debian or Ubuntu, install the `gdal-bin` package; it provides gdal_rasterize, gdalwarp, gdal_translate, and gdaladdo.".to_string()
+        }),
     }
 }
 

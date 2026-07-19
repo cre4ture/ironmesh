@@ -44,6 +44,8 @@ import type {
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
+  NaturalEarthImportJobView,
+  NaturalEarthImportStatusResponse,
   ProcessStatsCurrentResponse,
   ProcessStatsSample,
   RepairActivityStatusResponse,
@@ -288,6 +290,24 @@ export async function startAdminMapDatasetImport(
     method: "POST",
     adminTokenOverride,
     body: request
+  });
+}
+
+export async function getNaturalEarthMapImportStatus(
+  adminTokenOverride?: string
+): Promise<NaturalEarthImportStatusResponse> {
+  return fetchAdminJson<NaturalEarthImportStatusResponse>(
+    apiV1("/auth/maps/import/natural-earth"),
+    { adminTokenOverride }
+  );
+}
+
+export async function startNaturalEarthMapImport(
+  adminTokenOverride?: string
+): Promise<NaturalEarthImportJobView> {
+  return fetchAdminJson<NaturalEarthImportJobView>(apiV1("/auth/maps/import/natural-earth"), {
+    method: "POST",
+    adminTokenOverride
   });
 }
 

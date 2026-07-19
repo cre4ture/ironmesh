@@ -1,11 +1,10 @@
 import {
   getHostDependencyReport,
-  type HostDependencyCheck,
   type HostDependencyReport,
   type HostDependencyStatus
 } from "@ironmesh/api";
 import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
-import { Alert, Badge, Button, Card, Grid, Group, Stack, Text } from "@mantine/core";
+import { Alert, Badge, Button, Code, Grid, Group, Stack, Table, Text } from "@mantine/core";
 import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatUnixTs } from "../lib/format";
@@ -45,12 +44,12 @@ export function DependenciesPage() {
       {missingCount > 0 ? (
         <Alert color="yellow" title="Manual test blockers detected">
           {missingCount} required host dependenc{missingCount === 1 ? "y is" : "ies are"} missing on this node.
-          Fix the missing checks below before expecting server-side video thumbnail generation to work.
+          Fix the missing checks below before using the affected server-side feature.
         </Alert>
       ) : report ? (
         <Alert color={ironmeshPrimaryColor} title="Host dependency checks passed">
-          This node has the currently known runtime dependencies needed for built-in image processing and server-side
-          video metadata or thumbnail generation.
+          This node has the currently known runtime dependencies needed for built-in image processing, server-side video
+          processing, and automatic Natural Earth map conversion.
         </Alert>
       ) : null}
       {optionalCount > 0 ? (
@@ -61,9 +60,9 @@ export function DependenciesPage() {
       ) : null}
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
-          This page checks the host system for runtime dependencies that affect server-node features and reports whether
-          optional Cockpit host administration tooling is installed. Cockpit remains a separate, separately authenticated
-          interface for host-level operations; IronMesh does not restart services or the host itself.
+          This page checks host packages and commands required by server-node features. It also reports whether optional
+          Cockpit host-administration tooling is installed. Cockpit remains a separate, separately authenticated interface
+          for host-level operations; IronMesh does not restart services or the host itself.
         </Text>
         <Button variant="light" onClick={() => void refresh()} loading={loading}>
           Refresh
@@ -82,7 +81,7 @@ export function DependenciesPage() {
           <StatCard
             label="Required missing"
             value={loading && !report ? "loading..." : String(missingCount)}
-            hint={missingCount > 0 ? "Resolve before media tests" : "No blocking host gaps detected"}
+            hint={missingCount > 0 ? "Resolve before using affected features" : "No blocking host gaps detected"}
           />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
@@ -108,42 +107,58 @@ export function DependenciesPage() {
         </Grid.Col>
       </Grid>
 
-      <Grid>
-        {checks.map((check) => (
-          <Grid.Col key={check.id} span={{ base: 12, xl: 4 }}>
-            <DependencyCheckCard check={check} />
-          </Grid.Col>
-        ))}
-      </Grid>
+      <Table.ScrollContainer minWidth={920}>
+        <Table striped highlightOnHover withTableBorder withColumnBorders>
+          <Table.Thead>
+            <Table.Tr>
+              <Table.Th>Dependency</Table.Th>
+              <Table.Th>Status</Table.Th>
+              <Table.Th>Command</Table.Th>
+              <Table.Th>Resolved path</Table.Th>
+              <Table.Th>Install hint</Table.Th>
+            </Table.Tr>
+          </Table.Thead>
+          <Table.Tbody>
+            {checks.map((check) => (
+              <Table.Tr key={check.id}>
+                <Table.Td>
+                  <Text fw={600} size="sm">
+                    {check.feature}
+                  </Text>
+                  <Text c="dimmed" size="xs">
+                    {check.summary}
+                  </Text>
+                </Table.Td>
+                <Table.Td>
+                  <Badge variant="light" color={dependencyBadgeColor(check.status)}>
+                    {dependencyBadgeLabel(check.status)}
+                  </Badge>
+                </Table.Td>
+                <Table.Td>
+                  {check.configured_path ? <Code>{check.configured_path}</Code> : "built-in"}
+                </Table.Td>
+                <Table.Td>
+                  <Text size="xs" ff="monospace">
+                    {check.resolved_path || "not resolved"}
+                  </Text>
+                </Table.Td>
+                <Table.Td>
+                  {check.install_hint ? (
+                    <Text c={check.status === "missing" ? "red" : "dimmed"} size="xs">
+                      {check.install_hint}
+                    </Text>
+                  ) : (
+                    <Text c="dimmed" size="xs">
+                      —
+                    </Text>
+                  )}
+                </Table.Td>
+              </Table.Tr>
+            ))}
+          </Table.Tbody>
+        </Table>
+      </Table.ScrollContainer>
     </Stack>
-  );
-}
-
-function DependencyCheckCard({ check }: { check: HostDependencyCheck }) {
-  return (
-    <Card withBorder radius="md" padding="lg" h="100%">
-      <Stack gap="sm">
-        <Group justify="space-between" align="flex-start">
-          <Text fw={700}>{check.feature}</Text>
-          <Badge variant="light" color={dependencyBadgeColor(check.status)}>
-            {dependencyBadgeLabel(check.status)}
-          </Badge>
-        </Group>
-        <Text c="dimmed">{check.summary}</Text>
-        <Text size="sm">{check.detail}</Text>
-        <Text size="sm" ff="monospace">
-          Configured path: {check.configured_path || "n/a"}
-        </Text>
-        <Text size="sm" ff="monospace">
-          Resolved path: {check.resolved_path || "not resolved"}
-        </Text>
-        {check.install_hint ? (
-          <Alert color={check.status === "missing" ? "yellow" : "blue"} title="Install hint">
-            {check.install_hint}
-          </Alert>
-        ) : null}
-      </Stack>
-    </Card>
   );
 }
 

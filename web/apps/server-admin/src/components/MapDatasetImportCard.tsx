@@ -1,47 +1,40 @@
 import {
   getAdminGalleryMapConfiguration,
   getAdminMapDatasetImportStatus,
+  getNaturalEarthMapImportStatus,
   startAdminMapDatasetImport,
-  type AdminMapDatasetImportJobView
+  startNaturalEarthMapImport,
+  type AdminMapDatasetImportJobView,
+  type NaturalEarthImportJobView
 } from "@ironmesh/api";
 import { ironmeshPrimaryColor } from "@ironmesh/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
-  Anchor,
+  Accordion,
   Badge,
-  Button,
   Card,
   Code,
   Group,
-  NumberInput,
   Progress,
-  Select,
+  ScrollArea,
   Stack,
-  Text,
-  Textarea
+  Text
 } from "@mantine/core";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatBytes, formatRelativeUnixTs, formatUnixTs } from "../lib/format";
+import {
+  MapDatasetImportWizard,
+  type MapDatasetImportWizardTarget,
+  type MapImportProfile
+} from "./MapDatasetImportWizard";
 
 const DEFAULT_MAP_IMPORT_PART_SIZE_GIB = 10;
 const GIB_BYTES = 1024 ** 3;
 
-type MapImportTarget = {
-  key: string;
-  variantId: string;
-  asset: "raster" | "vector";
-  label: string;
-  manifestKey: string;
-  provider: MapDatasetProvider;
-};
-
-type MapDatasetProvider = {
-  label?: string;
-  homepageUrl?: string;
-  acquisitionHint: string;
-};
+type MapImportTarget = MapDatasetImportWizardTarget;
+type MapDatasetProvider = MapImportTarget["provider"];
 
 export function MapDatasetImportCard() {
   const queryClient = useQueryClient();
@@ -55,6 +48,10 @@ export function MapDatasetImportCard() {
   const [mapImportSource, setMapImportSource] = useState("");
   const [partSizeGiB, setPartSizeGiB] = useState<number>(DEFAULT_MAP_IMPORT_PART_SIZE_GIB);
   const [selectedTargetKey, setSelectedTargetKey] = useState<string | null>(null);
+  const [selectedImportProfile, setSelectedImportProfile] = useState<MapImportProfile | null>(
+    null
+  );
+  const [wizardStep, setWizardStep] = useState(0);
 
   const mapConfigurationQuery = useQuery({
     queryKey: ["gallery-page", "map-configuration", normalizedAdminTokenOverride],
@@ -68,6 +65,10 @@ export function MapDatasetImportCard() {
   );
   const importTargetSignature = importTargets.map((target) => target.key).join("\u0000");
   const selectedTarget = importTargets.find((target) => target.key === selectedTargetKey) ?? null;
+  const naturalEarthTarget =
+    importTargets.find(
+      (target) => target.variantId === "natural-earth-globe" && target.asset === "raster"
+    ) ?? null;
   useEffect(() => {
     if (!selectedTargetKey || !importTargets.some((target) => target.key === selectedTargetKey)) {
       setSelectedTargetKey(importTargets[0]?.key ?? null);
@@ -77,6 +78,13 @@ export function MapDatasetImportCard() {
   const mapImportStatusQuery = useQuery({
     queryKey: ["gallery-page", "map-import", normalizedAdminTokenOverride],
     queryFn: () => getAdminMapDatasetImportStatus(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectMapImport,
+    refetchInterval: (query) =>
+      query.state.data?.active_job?.state === "running" ? 2_000 : false
+  });
+  const naturalEarthImportStatusQuery = useQuery({
+    queryKey: ["gallery-page", "natural-earth-map-import", normalizedAdminTokenOverride],
+    queryFn: () => getNaturalEarthMapImportStatus(normalizedAdminTokenOverride || undefined),
     enabled: canInspectMapImport,
     refetchInterval: (query) =>
       query.state.data?.active_job?.state === "running" ? 2_000 : false
@@ -103,13 +111,32 @@ export function MapDatasetImportCard() {
       });
     }
   });
+  const startNaturalEarthImportMutation = useMutation({
+    mutationFn: () => startNaturalEarthMapImport(normalizedAdminTokenOverride || undefined),
+    onSuccess: async (job) => {
+      queryClient.setQueryData(
+        ["gallery-page", "natural-earth-map-import", normalizedAdminTokenOverride],
+        { active_job: job, can_start_new: false }
+      );
+      await queryClient.refetchQueries({
+        queryKey: ["gallery-page", "natural-earth-map-import", normalizedAdminTokenOverride],
+        exact: true
+      });
+    }
+  });
 
   const mapImportStatus = canInspectMapImport ? mapImportStatusQuery.data ?? null : null;
   const activeMapImport = mapImportStatus?.active_job ?? null;
+  const naturalEarthImportStatus = canInspectMapImport
+    ? naturalEarthImportStatusQuery.data ?? null
+    : null;
+  const naturalEarthJob = naturalEarthImportStatus?.active_job ?? null;
   const mapImportError = firstErrorMessage([
     mapImportStatusQuery.error,
+    naturalEarthImportStatusQuery.error,
     mapConfigurationQuery.error,
-    startMapImportMutation.error
+    startMapImportMutation.error,
+    startNaturalEarthImportMutation.error
   ]);
   const canStartMapImport =
     canInspectMapImport &&
@@ -118,6 +145,34 @@ export function MapDatasetImportCard() {
     mapImportSource.trim().length > 0 &&
     Number.isFinite(partSizeGiB) &&
     partSizeGiB > 0;
+  const canStartNaturalEarthImport =
+    canInspectMapImport &&
+    naturalEarthImportStatus?.can_start_new !== false &&
+    mapImportStatus?.can_start_new !== false;
+  const canStartSelectedImport =
+    selectedImportProfile === "natural-earth-physical"
+      ? canStartNaturalEarthImport && naturalEarthTarget !== null
+      : canStartMapImport;
+  const importControlsLocked =
+    mapImportStatus?.can_start_new === false ||
+    naturalEarthImportStatus?.can_start_new === false ||
+    startMapImportMutation.isPending ||
+    startNaturalEarthImportMutation.isPending;
+
+  function selectImportProfile(value: string) {
+    setSelectedImportProfile(value as MapImportProfile);
+    setWizardStep(0);
+  }
+
+  function startSelectedImport() {
+    if (selectedImportProfile === "natural-earth-physical") {
+      void startNaturalEarthImportMutation.mutateAsync();
+      return;
+    }
+    if (selectedImportProfile === "remote-mbtiles") {
+      void startMapImportMutation.mutateAsync();
+    }
+  }
 
   return (
     <>
@@ -131,102 +186,58 @@ export function MapDatasetImportCard() {
         <Stack gap="md">
           <Group justify="space-between" align="flex-start">
             <div>
-              <Text fw={600}>Map dataset import</Text>
+              <Text fw={600}>Map dataset import wizard</Text>
               <Text c="dimmed" size="sm" maw={860}>
-                Choose the configured map artifact, then paste its HTTP URL or a copied{" "}
-                <Code>wget -c ...</Code> command. The server node downloads that MBTiles file with
-                resumable range requests, ingests it directly into BerryKeep chunks, finalizes the
-                selected cluster artifact, and resumes automatically after server restarts.
+                Select the desired map outcome first. The wizard then asks only for the source and
+                destination information that profile requires before starting a background job.
               </Text>
             </div>
-            <MapDatasetImportStateBadge job={activeMapImport} />
+            {naturalEarthJob ? (
+              <NaturalEarthImportStateBadge job={naturalEarthJob} />
+            ) : (
+              <MapDatasetImportStateBadge job={activeMapImport} />
+            )}
           </Group>
 
-          <Alert color="blue" variant="light" title="Configured destination">
-            The source filename is no longer significant. This import writes the selected variant
-            asset to its manifest key from the replicated map configuration, so each map package
-            can be downloaded and enabled independently.
+          <Alert color="blue" variant="light" title="Background jobs publish atomically">
+            Each import writes only to the configured map artifact. The map view keeps using the
+            previously published data until the job has validated and published its manifest.
           </Alert>
 
-          <Select
-            label="Map variant artifact"
-            description="Disabled variants can be imported first and made visible later in the map variant configuration."
-            placeholder={mapConfigurationQuery.isLoading ? "Loading configured map artifacts…" : "No map artifact configured"}
-            value={selectedTargetKey}
-            data={importTargets.map((target) => ({
-              value: target.key,
-              label: `${target.label} — ${target.asset}`
-            }))}
-            onChange={setSelectedTargetKey}
-            disabled={mapImportStatus?.can_start_new === false || importTargets.length === 0}
-            searchable
-            nothingFoundMessage="No configured map artifact"
+          <MapDatasetImportWizard
+            profile={selectedImportProfile}
+            step={wizardStep}
+            source={mapImportSource}
+            partSizeGiB={partSizeGiB}
+            selectedTargetKey={selectedTargetKey}
+            targets={importTargets}
+            selectedTarget={selectedTarget}
+            naturalEarthTarget={naturalEarthTarget}
+            mapConfigurationLoading={mapConfigurationQuery.isLoading}
+            controlsLocked={importControlsLocked}
+            canStartImport={canStartSelectedImport}
+            startingImport={
+              startMapImportMutation.isPending || startNaturalEarthImportMutation.isPending
+            }
+            onProfileChange={selectImportProfile}
+            onSourceChange={setMapImportSource}
+            onPartSizeChange={setPartSizeGiB}
+            onTargetChange={setSelectedTargetKey}
+            onBack={() => setWizardStep((current) => Math.max(0, current - 1))}
+            onContinue={() => setWizardStep((current) => Math.min(3, current + 1))}
+            onStart={startSelectedImport}
           />
-          {selectedTarget ? (
-            <Stack gap={4}>
-              <Text size="xs" c="dimmed">
-                Target manifest: <Code>{selectedTarget.manifestKey}</Code>
-              </Text>
-              <Alert color="blue" variant="light" title="Find matching map data">
-                <Text size="sm">
-                  {selectedTarget.provider.acquisitionHint}{" "}
-                  {selectedTarget.provider.homepageUrl && selectedTarget.provider.label ? (
-                    <Anchor
-                      href={selectedTarget.provider.homepageUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Open {selectedTarget.provider.label}
-                    </Anchor>
-                  ) : null}
-                </Text>
+
+          <Stack gap="sm">
+            <Text fw={600}>Import jobs</Text>
+            {naturalEarthJob ? <NaturalEarthImportProgress job={naturalEarthJob} /> : null}
+            {activeMapImport ? <MapDatasetImportProgress job={activeMapImport} /> : null}
+            {!naturalEarthJob && !activeMapImport ? (
+              <Alert color="gray" variant="light" title="No map import job yet">
+                Select a map profile above to configure and start the first background job.
               </Alert>
-            </Stack>
-          ) : null}
-
-          <Textarea
-            label="MBTiles URL or pasted CLI command"
-            description="The source URL is persisted server-side for resumable retries and restart-safe continuation, but the admin UI only shows a redacted display form afterward."
-            placeholder="wget -c https://maps.example.org/natural-earth-globe.mbtiles"
-            minRows={3}
-            autosize
-            value={mapImportSource}
-            onChange={(event) => setMapImportSource(event.currentTarget.value)}
-            disabled={mapImportStatus?.can_start_new === false}
-          />
-
-          <Group align="flex-end">
-            <NumberInput
-              label="Part size"
-              description="Each finalized part object keeps its own BerryKeep object key under sys/maps/."
-              value={partSizeGiB}
-              min={1}
-              max={64}
-              step={1}
-              suffix=" GiB"
-              allowDecimal={false}
-              onChange={(value) =>
-                setPartSizeGiB(typeof value === "number" && Number.isFinite(value) ? value : 10)
-              }
-              w={220}
-              disabled={mapImportStatus?.can_start_new === false}
-            />
-            <Button
-              loading={startMapImportMutation.isPending}
-              disabled={!canStartMapImport}
-              onClick={() => void startMapImportMutation.mutateAsync()}
-            >
-              Start import
-            </Button>
-          </Group>
-
-          {activeMapImport ? (
-            <MapDatasetImportProgress job={activeMapImport} />
-          ) : (
-            <Alert color="gray" variant="light" title="No imported map dataset job yet">
-              This node has not started a persisted map dataset import yet.
-            </Alert>
-          )}
+            ) : null}
+          </Stack>
         </Stack>
       </Card>
     </>
@@ -255,6 +266,84 @@ function MapDatasetImportStateBadge({ job }: { job: AdminMapDatasetImportJobView
     >
       {job.state}
     </Badge>
+  );
+}
+
+function NaturalEarthImportStateBadge({ job }: { job: NaturalEarthImportJobView }) {
+  return (
+    <Badge
+      color={job.state === "ready" ? ironmeshPrimaryColor : job.state === "failed" ? "red" : "blue"}
+      variant="light"
+    >
+      Natural Earth: {job.state}
+    </Badge>
+  );
+}
+
+function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView }) {
+  return (
+    <Card withBorder radius="md" padding="md">
+      <Stack gap="sm">
+        <Group justify="space-between" align="center">
+          <Text fw={600}>Natural Earth physical world map</Text>
+          <NaturalEarthImportStateBadge job={job} />
+        </Group>
+        <Text size="sm">{job.phase}</Text>
+        <Group gap="xl" align="flex-start">
+          <ImportDetail label="Source">
+            <Text size="sm">Official Natural Earth 10m physical archive</Text>
+          </ImportDetail>
+          <ImportDetail label="Published artifact">
+            <Code>{job.manifest_key}</Code>
+          </ImportDetail>
+        </Group>
+        <Group gap="xl" align="flex-start">
+          <ImportDetail label="Started">
+            <Text size="sm">
+              {formatUnixTs(job.started_at_unix)} ({formatRelativeUnixTs(job.started_at_unix)})
+            </Text>
+          </ImportDetail>
+          <ImportDetail label="Updated">
+            <Text size="sm">
+              {formatUnixTs(job.updated_at_unix)} ({formatRelativeUnixTs(job.updated_at_unix)})
+            </Text>
+          </ImportDetail>
+          {job.logical_size_bytes > 0 ? (
+            <ImportDetail label="Published size">
+              <Text size="sm">{formatBytes(job.logical_size_bytes)}</Text>
+            </ImportDetail>
+          ) : null}
+        </Group>
+        {job.error ? (
+          <Alert color="red" variant="light" title="Import stopped with an error">
+            {job.error}
+          </Alert>
+        ) : null}
+        {job.log_entries.length > 0 ? (
+          <Accordion variant="contained">
+            <Accordion.Item value="natural-earth-import-log">
+              <Accordion.Control>
+                Conversion log ({job.log_entries.length} entries)
+              </Accordion.Control>
+              <Accordion.Panel>
+                <ScrollArea h={320} type="auto">
+                  <Stack gap="sm" pr="sm">
+                    {job.log_entries.map((entry, index) => (
+                      <div key={`${entry.timestamp_unix}-${index}`}>
+                        <Text size="xs" c="dimmed" mb={4}>
+                          {formatUnixTs(entry.timestamp_unix)}
+                        </Text>
+                        <Code block>{entry.message}</Code>
+                      </div>
+                    ))}
+                  </Stack>
+                </ScrollArea>
+              </Accordion.Panel>
+            </Accordion.Item>
+          </Accordion>
+        ) : null}
+      </Stack>
+    </Card>
   );
 }
 
