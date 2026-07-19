@@ -91,9 +91,17 @@ Follow-up design note:
 - The production relay path establishes TLS 1.3 with mutual certificate authentication *inside* the WebSocket tunnel before multiplexing HTTP bytes. The source validates the target node and cluster SANs; the target validates the source node/device and cluster SANs.
 - Enrolled-client and node data-plane relay tickets negotiate `inner_mtls`; these paths fail closed when the peer identity, cluster binding, certificate chain, or security mode is invalid, without a plaintext downgrade fallback.
 - Pre-enrollment bootstrap-claim relay is the deliberate legacy exception because the client does not have its certificate yet. Issue #120 tracks replacing that bootstrap path with a secure claim-specific design.
-- The rendezvous operator can observe control-plane metadata needed to broker a session, including authenticated endpoint identities, cluster scope, timing, and frame sizes. It cannot decrypt or alter protected application bytes without the inner TLS session failing.
+- The global rendezvous/relay has a hard data boundary: it can observe only outer metadata needed to broker a session, including authenticated endpoint identities, cluster scope, relay ticket or session id, timing, and frame or byte sizes. It forwards an encrypted inner TLS stream and has no access to application payloads, HTTP bytes, application credentials, or inner TLS private keys.
+- A global rendezvous may terminate its own external HTTPS or WSS connections, but it does not terminate, inspect, or participate in the inner TLS handshake. Altering an inner TLS record is detected by the endpoints and fails the session.
+- A global deployment must not expose the legacy pre-enrollment bootstrap-claim relay as a general application-data path, because that exception does not meet the inner-TLS boundary.
 - The relay tunnel therefore brokers opaque byte streams and does not need feature-specific knowledge of gallery, maps, replication, or other HTTP routes. Ironmesh carries serialized HTTP/1.1 request/response bytes through the encrypted tunnel; node-side and client-side authorization still happens at the actual Ironmesh endpoint.
 - `tests/system-tests/src/relay_security_e2e_test.rs` verifies a relay-only enrolled client against a real node and rendezvous service. It confirms that known HTTP, authorization, credential, and object payload bytes are absent from observed relay binary frames. It also modifies one post-handshake TLS application-data record and verifies that the client discards the affected session, reconnects with inner mTLS, and retries the unchanged request without exposing or committing modified application data.
+
+### 4.2.2 Global Rendezvous Option 1 Trust Selection
+- Option 1 has exactly one active registered P-256 CA for each cluster.
+- The verified `urn:ironmesh:cluster:<cluster_id>` SAN selects that exact CA. The verifier must not fall back to trying all registered CAs when the selected CA does not validate the certificate.
+- CA rotation is outside the Option 1 MVP. A request with an existing `cluster_id` and a different CA cannot replace the registered CA, including when the requester proves possession of that different CA.
+- The self-registration challenge and canonical proof requirements are defined in `docs/global-rendezvous-relay-e2e-plan.md`. The operational configuration contract is defined in `docs/global-rendezvous-operations.md`.
 
 ### 4.3 Human/Admin Authentication
 - Replace shared token with identity-backed auth:
