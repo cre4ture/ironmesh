@@ -1173,6 +1173,13 @@ struct GlobalRendezvousRegistrationCaptureState {
     challenge: transport_sdk::ClusterRegistrationChallengeResponse,
     challenge_request: Arc<Mutex<Option<transport_sdk::ClusterRegistrationChallengeRequest>>>,
     completion_request: Arc<Mutex<Option<transport_sdk::ClusterRegistrationCompleteRequest>>>,
+    completion_response: GlobalRendezvousRegistrationCompletionResponse,
+}
+
+#[derive(Clone, Copy)]
+enum GlobalRendezvousRegistrationCompletionResponse {
+    Record,
+    Empty,
 }
 
 async fn capture_global_rendezvous_registration_challenge(
@@ -1186,16 +1193,22 @@ async fn capture_global_rendezvous_registration_challenge(
 async fn capture_global_rendezvous_registration_completion(
     State(state): State<GlobalRendezvousRegistrationCaptureState>,
     Json(request): Json<transport_sdk::ClusterRegistrationCompleteRequest>,
-) -> Json<transport_sdk::ClusterRegistrationRecord> {
+) -> axum::response::Response {
     *state.completion_request.lock().await = Some(request.clone());
-    Json(transport_sdk::ClusterRegistrationRecord {
-        cluster_id: request.cluster_id,
-        cluster_ca_fingerprint_sha256: request.cluster_ca_fingerprint_sha256,
-        proof_algorithm: request.proof_algorithm,
-        created_at_unix: super::unix_ts(),
-        last_seen_at_unix: None,
-        suspension: transport_sdk::ClusterSuspendStatus::default(),
-    })
+    match state.completion_response {
+        GlobalRendezvousRegistrationCompletionResponse::Record => {
+            Json(transport_sdk::ClusterRegistrationRecord {
+                cluster_id: request.cluster_id,
+                cluster_ca_fingerprint_sha256: request.cluster_ca_fingerprint_sha256,
+                proof_algorithm: request.proof_algorithm,
+                created_at_unix: super::unix_ts(),
+                last_seen_at_unix: None,
+                suspension: transport_sdk::ClusterSuspendStatus::default(),
+            })
+            .into_response()
+        }
+        GlobalRendezvousRegistrationCompletionResponse::Empty => StatusCode::OK.into_response(),
+    }
 }
 
 fn spawn_global_rendezvous_registration_capture_server(
@@ -1309,6 +1322,91 @@ fn global_rendezvous_registration_rejects_insecure_urls_and_missing_material() {
     );
 }
 
+fn global_rendezvous_registration_test_config() -> ServerNodeConfig {
+    let mut config = test_cluster_config_without_internal_tls(
+        fresh_test_dir("global-rendezvous-registration-config"),
+        free_bind_addr(),
+    );
+    config.global_rendezvous_registration_enabled = true;
+    config.rendezvous_registration_enabled = true;
+    config.rendezvous_mtls_required = true;
+    config.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    config
+}
+
+#[test]
+fn global_rendezvous_registration_requires_normal_registration() {
+    let mut config = global_rendezvous_registration_test_config();
+    config.rendezvous_registration_enabled = false;
+
+    let error = super::validate_global_rendezvous_registration_config(&config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("normal rendezvous registration to be enabled")
+    );
+}
+
+#[test]
+fn global_rendezvous_registration_requires_explicit_rendezvous_url() {
+    let mut config = global_rendezvous_registration_test_config();
+    config.rendezvous_urls.clear();
+
+    let error = super::validate_global_rendezvous_registration_config(&config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("at least one explicit rendezvous URL")
+    );
+}
+
+#[test]
+fn global_rendezvous_registration_requires_rendezvous_mtls() {
+    let mut config = global_rendezvous_registration_test_config();
+    config.rendezvous_mtls_required = false;
+
+    let error = super::validate_global_rendezvous_registration_config(&config).unwrap_err();
+
+    assert!(error.to_string().contains("rendezvous mTLS to be enabled"));
+}
+
+#[test]
+fn global_rendezvous_registration_requires_internal_node_client_identity() {
+    let config = global_rendezvous_registration_test_config();
+
+    let error = super::validate_global_rendezvous_registration_config(&config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("node client identity from internal TLS")
+    );
+}
+
+#[test]
+fn global_rendezvous_registration_requires_readable_internal_node_client_identity() {
+    let mut config = global_rendezvous_registration_test_config();
+    let tls_dir = fresh_test_dir("global-rendezvous-registration-identity");
+    config.internal_tls = Some(super::InternalTlsConfig {
+        bind_addr: free_bind_addr(),
+        internal_url: None,
+        ca_cert_path: tls_dir.join("cluster-ca.pem"),
+        cert_path: tls_dir.join("missing-node.pem"),
+        key_path: tls_dir.join("missing-node.key"),
+        metadata_path: None,
+    });
+
+    let error = super::validate_global_rendezvous_registration_config(&config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("readable node client identity from internal TLS")
+    );
+}
+
 #[tokio::test]
 async fn global_rendezvous_registration_signs_canonical_proof_without_client_identity() {
     let root = std::env::temp_dir().join(format!(
@@ -1345,6 +1443,7 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         challenge: challenge.clone(),
         challenge_request: Arc::new(Mutex::new(None)),
         completion_request: Arc::new(Mutex::new(None)),
+        completion_response: GlobalRendezvousRegistrationCompletionResponse::Record,
     };
     let captured_client_certificate = Arc::new(Mutex::new(None));
     let server = spawn_global_rendezvous_registration_capture_server(
@@ -1420,6 +1519,76 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         Some(None),
         "initial global registration must not send a rendezvous client identity"
     );
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn global_rendezvous_registration_rejects_empty_completion_response() {
+    let root = std::env::temp_dir().join(format!(
+        "ironmesh-global-rendezvous-registration-empty-completion-{}",
+        Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bind_addr = listener.local_addr().unwrap();
+    let cluster_id = Uuid::now_v7();
+    let (cluster_ca_pem, cluster_ca_key_pem) = generate_test_internal_ca();
+    let (service_ca_pem, _, service_cert_pem, service_key_pem) =
+        generate_test_https_ca_and_server_material(bind_addr, "global-rendezvous");
+    let client_ca_cert_path = root.join("cluster-ca.pem");
+    let service_cert_path = root.join("service.pem");
+    let service_key_path = root.join("service.key");
+    std::fs::write(&client_ca_cert_path, &cluster_ca_pem).unwrap();
+    std::fs::write(&service_cert_path, service_cert_pem).unwrap();
+    std::fs::write(&service_key_path, service_key_pem).unwrap();
+
+    let challenge = transport_sdk::ClusterRegistrationChallengeResponse {
+        protocol_version: transport_sdk::CLUSTER_REGISTRATION_PROTOCOL_VERSION,
+        cluster_id,
+        cluster_ca_fingerprint_sha256: transport_sdk::cluster_ca_fingerprint_sha256(
+            &cluster_ca_pem,
+        )
+        .unwrap(),
+        proof_algorithm: transport_sdk::ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1,
+        challenge_id: Uuid::now_v7(),
+        challenge_nonce_b64u: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 16]),
+        expires_at_unix: super::unix_ts() + 60,
+    };
+    let state = GlobalRendezvousRegistrationCaptureState {
+        challenge,
+        challenge_request: Arc::new(Mutex::new(None)),
+        completion_request: Arc::new(Mutex::new(None)),
+        completion_response: GlobalRendezvousRegistrationCompletionResponse::Empty,
+    };
+    let server = spawn_global_rendezvous_registration_capture_server(
+        listener,
+        &client_ca_cert_path,
+        &service_cert_path,
+        &service_key_path,
+        state,
+        Arc::new(Mutex::new(None)),
+    );
+
+    let error = super::register_cluster_with_global_rendezvous_services(
+        cluster_id,
+        &[format!("https://{bind_addr}")],
+        Some(&cluster_ca_pem),
+        Some(&cluster_ca_key_pem),
+        Some(&service_ca_pem),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("successful global rendezvous registration response")
+    );
+    assert!(error.to_string().contains("was empty"));
 
     server.abort();
     let _ = server.await;

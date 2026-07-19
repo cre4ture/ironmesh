@@ -4849,6 +4849,39 @@ fn build_rendezvous_control_clients(
     Ok((Some(shared), endpoints))
 }
 
+fn validate_global_rendezvous_registration_config(config: &ServerNodeConfig) -> Result<()> {
+    if !config.global_rendezvous_registration_enabled {
+        return Ok(());
+    }
+
+    if !config.rendezvous_registration_enabled {
+        bail!(
+            "global rendezvous registration requires normal rendezvous registration to be enabled"
+        );
+    }
+    if config.rendezvous_urls.is_empty() {
+        bail!("global rendezvous registration requires at least one explicit rendezvous URL");
+    }
+    if !config.rendezvous_mtls_required {
+        bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
+    }
+
+    let internal_tls = config.internal_tls.as_ref().context(
+        "global rendezvous registration requires a node client identity from internal TLS",
+    )?;
+    let identity_pem = build_identity_pem_from_paths(
+        &internal_tls.cert_path,
+        &internal_tls.key_path,
+    )
+    .context(
+        "global rendezvous registration requires a readable node client identity from internal TLS",
+    )?;
+    reqwest::Identity::from_pem(&identity_pem).context(
+        "global rendezvous registration requires a valid node client identity from internal TLS",
+    )?;
+    Ok(())
+}
+
 struct GlobalRendezvousRegistrationClient {
     http: reqwest::Client,
     rendezvous_urls: Vec<reqwest::Url>,
@@ -4974,7 +5007,7 @@ async fn post_global_rendezvous_registration_json<Request, Response>(
     rendezvous_url: &reqwest::Url,
     endpoint_path: &str,
     request: &Request,
-) -> Result<Option<Response>>
+) -> Result<Response>
 where
     Request: Serialize,
     Response: DeserializeOwned,
@@ -5004,10 +5037,10 @@ where
     }
 
     if body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(None);
+        bail!("successful global rendezvous registration response from {request_url} was empty");
     }
 
-    serde_json::from_slice(&body).map(Some).with_context(|| {
+    serde_json::from_slice(&body).with_context(|| {
         format!(
             "failed decoding successful global rendezvous registration response from {request_url}"
         )
@@ -5061,8 +5094,7 @@ async fn register_cluster_with_global_rendezvous_services(
                 "/global/cluster-registration/challenge",
                 &registration.challenge_request,
             )
-            .await?
-            .context("global rendezvous registration challenge response was empty")?;
+            .await?;
         challenge.validate_at(unix_ts()).with_context(|| {
             format!("invalid global rendezvous registration challenge from {rendezvous_url}")
         })?;
@@ -5103,21 +5135,18 @@ async fn register_cluster_with_global_rendezvous_services(
             .validate_at(unix_ts())
             .context("failed validating global rendezvous registration completion proof")?;
 
-        if let Some(record) =
-            post_global_rendezvous_registration_json::<_, ClusterRegistrationRecord>(
-                &registration.http,
-                rendezvous_url,
-                "/global/cluster-registration/complete",
-                &completion,
-            )
-            .await?
-        {
-            validate_global_rendezvous_registration_record(
-                &record,
-                cluster_id,
-                &registration.cluster_ca_fingerprint_sha256,
-            )?;
-        }
+        let record = post_global_rendezvous_registration_json::<_, ClusterRegistrationRecord>(
+            &registration.http,
+            rendezvous_url,
+            "/global/cluster-registration/complete",
+            &completion,
+        )
+        .await?;
+        validate_global_rendezvous_registration_record(
+            &record,
+            cluster_id,
+            &registration.cluster_ca_fingerprint_sha256,
+        )?;
     }
 
     Ok(())
@@ -6355,6 +6384,7 @@ async fn run_inner(
 ) -> Result<()> {
     ensure_rustls_crypto_provider_installed();
     config.validate_public_listener_security()?;
+    validate_global_rendezvous_registration_config(&config)?;
 
     let public_tls_runtime = match config.public_tls.as_ref() {
         Some(public_tls) => Some(PublicTlsRuntime {
