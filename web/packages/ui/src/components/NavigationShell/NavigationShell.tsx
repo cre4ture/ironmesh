@@ -29,6 +29,7 @@ type NavigationShellProps<ItemId extends string = string> = {
   headerActions?: ReactNode;
   contentGap?: StackProps["gap"];
   navbarAriaLabel?: string;
+  showNavigation?: boolean;
 };
 
 export function NavigationShell<ItemId extends string = string>({
@@ -39,7 +40,8 @@ export function NavigationShell<ItemId extends string = string>({
   children,
   headerActions,
   contentGap = "lg",
-  navbarAriaLabel = "Primary navigation"
+  navbarAriaLabel = "Primary navigation",
+  showNavigation = true
 }: NavigationShellProps<ItemId>) {
   const [mobileOpened, mobileControls] = useDisclosure(false);
   const [desktopOpened, desktopControls] = useDisclosure(true);
@@ -52,7 +54,10 @@ export function NavigationShell<ItemId extends string = string>({
         navbar={{
           width: 280,
           breakpoint: "sm",
-          collapsed: { mobile: !mobileOpened, desktop: !desktopOpened }
+          collapsed: {
+            mobile: !showNavigation || !mobileOpened,
+            desktop: !showNavigation || !desktopOpened
+          }
         }}
         padding={{ base: "xs", sm: "md", lg: "lg" }}
       >
@@ -80,40 +85,42 @@ export function NavigationShell<ItemId extends string = string>({
           </Group>
         </AppShell.Header>
 
-        <AppShell.Navbar
-          aria-label={navbarAriaLabel}
-          className="shell-navbar"
-          p="sm"
-          style={{ display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden" }}
-        >
-          <AppShell.Section
-            grow
-            component={ScrollArea}
-            className="shell-navbar-scroll"
-            scrollbars="y"
-            type="auto"
-            style={{ flex: "1 1 auto", minHeight: 0 }}
+        {showNavigation ? (
+          <AppShell.Navbar
+            aria-label={navbarAriaLabel}
+            className="shell-navbar"
+            p="sm"
+            style={{ display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden" }}
           >
-            <Stack gap="xs">
-              {navigationItems.map((item) => {
-                const Icon = item.icon;
-                return (
-                  <NavLink
-                    key={item.id}
-                    active={item.id === activeItemId}
-                    label={item.label}
-                    description={item.description}
-                    leftSection={<Icon size={16} />}
-                    onClick={() => {
-                      onNavigate(item.id);
-                      mobileControls.close();
-                    }}
-                  />
-                );
-              })}
-            </Stack>
-          </AppShell.Section>
-        </AppShell.Navbar>
+            <AppShell.Section
+              grow
+              component={ScrollArea}
+              className="shell-navbar-scroll"
+              scrollbars="y"
+              type="auto"
+              style={{ flex: "1 1 auto", minHeight: 0 }}
+            >
+              <Stack gap="xs">
+                {navigationItems.map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <NavLink
+                      key={item.id}
+                      active={item.id === activeItemId}
+                      label={item.label}
+                      description={item.description}
+                      leftSection={<Icon size={16} />}
+                      onClick={() => {
+                        onNavigate(item.id);
+                        mobileControls.close();
+                      }}
+                    />
+                  );
+                })}
+              </Stack>
+            </AppShell.Section>
+          </AppShell.Navbar>
+        ) : null}
 
         <AppShell.Main className="shell-main">
           <Stack className="shell-content" gap={contentGap}>

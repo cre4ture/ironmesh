@@ -1,6 +1,6 @@
 import { getSetupStatus, isHttpErrorStatus } from "@ironmesh/api";
 import { ColorSchemeControl, ironmeshPrimaryColor, NavigationShell, PageHeader } from "@ironmesh/ui";
-import { Alert, Badge, Button, Center, Loader, Stack, Text } from "@mantine/core";
+import { Alert, Badge, Button, Center, Loader, Paper, Stack, Text, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { useEffect, useState } from "react";
 import { serverAdminRoutes } from "./routes";
@@ -16,12 +16,19 @@ export function ServerAdminShell() {
   const [activeRouteId, setActiveRouteId] = useState<(typeof serverAdminRoutes)[number]["id"]>(
     serverAdminRoutes[0].id
   );
-  const { sessionStatus } = useAdminAccess();
+  const { sessionStatus, sessionLoading } = useAdminAccess();
+  const runtimeAccessGranted =
+    surfaceMode === "runtime" &&
+    sessionStatus !== null &&
+    (!sessionStatus.login_required || sessionStatus.authenticated);
+  const runtimeAccessPending = surfaceMode === "runtime" && sessionLoading;
   const visibleRoutes =
     surfaceMode === "setup"
       ? serverAdminRoutes.filter((route) => route.id === "setup")
-      : serverAdminRoutes.filter((route) => route.id !== "setup");
-  const activeRoute = visibleRoutes.find((route) => route.id === activeRouteId) ?? visibleRoutes[0];
+      : runtimeAccessGranted
+        ? serverAdminRoutes.filter((route) => route.id !== "setup")
+        : [];
+  const activeRoute = visibleRoutes.find((route) => route.id === activeRouteId) ?? visibleRoutes[0] ?? null;
 
   useEffect(() => {
     let cancelled = false;
@@ -61,8 +68,9 @@ export function ServerAdminShell() {
       <NavigationShell
         surfaceLabel="Server Admin"
         navigationItems={visibleRoutes}
-        activeItemId={activeRoute.id}
+        activeItemId={activeRoute?.id ?? ""}
         onNavigate={setActiveRouteId}
+        showNavigation={surfaceMode === "setup" || runtimeAccessGranted}
         contentGap="xl"
         headerActions={
           <>
@@ -85,7 +93,7 @@ export function ServerAdminShell() {
           </>
         }
       >
-        {surfaceMode === "probing" ? (
+        {surfaceMode === "probing" || runtimeAccessPending ? (
           <>
             <PageHeader
               title="Detecting Node Mode"
@@ -98,15 +106,28 @@ export function ServerAdminShell() {
               </Stack>
             </Center>
           </>
+        ) : surfaceMode === "runtime" && !runtimeAccessGranted ? (
+          <Center mih="60vh">
+            <Paper withBorder shadow="sm" radius="md" p="xl" maw={560} w="100%">
+              <Stack align="center" gap="sm">
+                <Title order={2}>Admin login required</Title>
+                <Text c="dimmed" ta="center">
+                  Sign in with the local administrator password to view the server-admin pages and
+                  their contents.
+                </Text>
+                <Button onClick={accessControls.open}>Unlock server-admin</Button>
+              </Stack>
+            </Paper>
+          </Center>
         ) : (
           <>
-            <PageHeader title={activeRoute.label} description={activeRoute.description} />
+            {activeRoute ? <PageHeader title={activeRoute.label} description={activeRoute.description} /> : null}
             {surfaceError ? (
               <Alert color="yellow" title="Setup probe warning">
                 {surfaceError}
               </Alert>
             ) : null}
-            {activeRoute.element}
+            {activeRoute?.element}
           </>
         )}
       </NavigationShell>

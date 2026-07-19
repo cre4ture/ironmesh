@@ -13,6 +13,16 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.goto("/");
 
+  await expect(page.getByRole("heading", { name: "Admin login required" })).toBeVisible();
+  await expect(page.getByLabel("Primary navigation")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   const desktopSidebarToggle = page.getByRole("button", { name: "Toggle navigation sidebar" });
   const primaryNavigation = page.getByLabel("Primary navigation");
@@ -38,17 +48,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
   await expect(page.getByText(/UI build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-5-gmocked)")).toBeVisible();
-  await expect(page.getByText("0 discovered")).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
-  await expect(page.getByText(/live rendezvous registration details here\./i)).toBeVisible();
-
-  await page.getByRole("button", { name: "Admin Access" }).click();
-  await page.getByLabel("Admin password").fill("hunter2-harder");
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
-  await page.keyboard.press("Escape");
   // Storage stats require admin auth — verify chart content is visible after login
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Collected at (UTC)" })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Storage used (bytes)" })).toBeVisible();
@@ -679,6 +681,11 @@ test("server-admin gallery derives child folders from nested media entries", asy
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
 
@@ -1014,18 +1021,39 @@ test("server-admin runtime ignores auth-protected setup probes", async ({ page }
 
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
-  await expect(page.getByText("Setup probe warning", { exact: true })).toHaveCount(0);
-
-  await page.getByRole("button", { name: "Admin Access" }).click();
+  await expect(page.getByRole("heading", { name: "Admin login required" })).toBeVisible();
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
   await page.getByLabel("Admin password").fill("hunter2-harder");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
-  await expect(page.getByText("Setup probe warning", { exact: true })).toHaveCount(0);
   await page.keyboard.press("Escape");
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByText("Setup probe warning", { exact: true })).toHaveCount(0);
 
   await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Setup endpoint error", { exact: true })).toHaveCount(0);
+});
+
+test("server-admin hides runtime pages until admin login", async ({ page }) => {
+  const mockState = await installServerAdminMocks(page);
+
+  await page.goto("/");
+
+  await expect(page.getByRole("heading", { name: "Admin login required" })).toBeVisible();
+  await expect(page.getByLabel("Primary navigation")).toHaveCount(0);
+  await expect(page.getByText("Cluster health", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("0 discovered", { exact: true })).toHaveCount(0);
+  expect(mockState.requestedPaths()).not.toContain(apiV1("/health"));
+  expect(mockState.requestedPaths()).not.toContain(apiV1("/cluster/status"));
+  expect(mockState.requestedPaths()).not.toContain(apiV1("/auth/store/index"));
+
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByLabel("Primary navigation")).toBeVisible();
 });
 
 test("server-admin login ignores stale unauthenticated session probes", async ({ page }) => {
