@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod bootstrap_claim;
 pub mod candidates;
+pub mod cluster_registration;
 pub mod direct_quic;
 pub mod http_connector;
 pub mod identity;
@@ -32,6 +33,14 @@ pub use bootstrap_claim::{
     ClientBootstrapClaimTrust,
 };
 pub use candidates::{CandidateKind, ConnectionCandidate, rank_candidates};
+pub use cluster_registration::{
+    CLUSTER_REGISTRATION_PROTOCOL_VERSION, ClusterRegistrationChallengeRequest,
+    ClusterRegistrationChallengeResponse, ClusterRegistrationCompleteRequest,
+    ClusterRegistrationProofAlgorithm, ClusterRegistrationRecord,
+    ClusterRegistrationRegistryStatus, ClusterSuspendStatus,
+    canonical_cluster_registration_proof_message_v1, cluster_ca_fingerprint_sha256,
+    cluster_registration_proof_message_v1,
+};
 pub use direct_quic::{
     DEFAULT_DIRECT_QUIC_ALPN, DirectQuicAcceptedConnection, DirectQuicEndpoint,
     DirectQuicEndpointConfig, DirectQuicEndpointSnapshot, DirectQuicSession,
