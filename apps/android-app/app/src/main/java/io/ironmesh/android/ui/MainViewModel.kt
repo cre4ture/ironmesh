@@ -924,42 +924,6 @@ class MainViewModel(
         }
     }
 
-    fun clearDeviceEnrollment() {
-        uiState.value = uiState.value.copy(loading = true, status = "Clearing device credential...")
-        viewModelScope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    IronmeshPreferences.clearDeviceAuthState(getApplication())
-                }
-            }
-                .onSuccess {
-                    IronmeshPreferences.clearAppConnectionStatus(getApplication())
-                    stopConnectionRoutesMonitor()
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        deviceAuthState = DeviceAuthState(),
-                        appConnectionStatus = AppConnectionStatus(),
-                        bootstrapInput = "",
-                        deviceLabelInput = "",
-                        connectionRoutes = null,
-                        connectionRoutesLoading = false,
-                        connectionRoutesError = null,
-                        connectionRoutesLastLoadedUnixMs = 0L,
-                        selectedSection = MainSection.HOME,
-                        webUiUrl = "",
-                        status = "Cleared local device credential",
-                    )
-                    FolderSyncScheduler.reschedule(getApplication())
-                }
-                .onFailure { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        status = "Could not clear device credential: ${error.message}",
-                    )
-                }
-        }
-    }
-
     private fun execute(loadingMessage: String, action: suspend () -> String) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {

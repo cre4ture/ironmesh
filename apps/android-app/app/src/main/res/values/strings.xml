@@ -65,7 +65,6 @@
     <string name="settings_storage">Storage and files</string>
     <string name="settings_advanced">Advanced</string>
     <string name="rename_device_hint">Rename this device by updating its label and re-enrolling when needed.</string>
-    <string name="clear_device_identity">Clear device identity</string>
     <string name="open_files">Open Files</string>
     <string name="version">Version</string>
     <string name="theme_color_body">Choose the app accent color. Changes apply immediately and stay on this device.</string>
