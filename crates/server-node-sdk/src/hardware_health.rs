@@ -4,6 +4,7 @@ use std::fs;
 const HARDWARE_HEALTH_REFRESH_INTERVAL_SECS: u64 = 5 * 60;
 const HARDWARE_HEALTH_STATE_FILE: &str = "health/hardware-health-state.json";
 const HARDWARE_HEALTH_LOG_SCAN_LIMIT: usize = 250;
+const SMARTCTL_NOT_INSTALLED_ERROR_CODE: &str = "smartctl_not_installed";
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct HardwareHealthCurrentResponse {
@@ -948,6 +949,40 @@ async fn enrich_storage_with_smartctl(
         );
     }
 
+    match smartctl_is_available().await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                HardwareHealthCollectorStatus {
+                    collector_id: "smartctl".to_string(),
+                    label: "SMART / NVMe".to_string(),
+                    state: "unavailable".to_string(),
+                    available: false,
+                    last_collected_at_unix: Some(generated_at_unix),
+                    last_error_code: Some(SMARTCTL_NOT_INSTALLED_ERROR_CODE.to_string()),
+                    detail: "The smartctl executable is not installed or is not on the IronMesh process PATH. Install the smartmontools package, grant the IronMesh service access to physical block devices, then refresh."
+                        .to_string(),
+                },
+                Vec::new(),
+            );
+        }
+        Err(err) => {
+            let error_code = sanitize_error_code(&err.to_string());
+            return (
+                HardwareHealthCollectorStatus {
+                    collector_id: "smartctl".to_string(),
+                    label: "SMART / NVMe".to_string(),
+                    state: "unavailable".to_string(),
+                    available: false,
+                    last_collected_at_unix: Some(generated_at_unix),
+                    last_error_code: Some(error_code.clone()),
+                    detail: smartctl_unavailable_detail(Some(error_code.as_str())),
+                },
+                Vec::new(),
+            );
+        }
+    }
+
     let mut findings = Vec::new();
     let mut successful_devices = 0_usize;
     let mut last_error_code = None;
@@ -982,19 +1017,62 @@ async fn enrich_storage_with_smartctl(
             state: state.to_string(),
             available: successful_devices > 0,
             last_collected_at_unix: Some(generated_at_unix),
-            last_error_code,
+            last_error_code: last_error_code.clone(),
             detail: if successful_devices > 0 {
-                format!(
-                    "Collected SMART or NVMe lifecycle data from {successful_devices} of {} storage device{}.",
+                smartctl_collected_detail(
+                    successful_devices,
                     storage_targets.len(),
-                    if storage_targets.len() == 1 { "" } else { "s" }
+                    last_error_code.as_deref(),
                 )
             } else {
-                "SMART enrichment is unavailable on this node.".to_string()
+                smartctl_unavailable_detail(last_error_code.as_deref())
             },
         },
         findings,
     )
+}
+
+async fn smartctl_is_available() -> Result<bool> {
+    match tokio::process::Command::new("smartctl")
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).context("failed checking whether smartctl is available"),
+    }
+}
+
+fn smartctl_collected_detail(
+    successful_devices: usize,
+    total_devices: usize,
+    last_error_code: Option<&str>,
+) -> String {
+    let mut detail = format!(
+        "Collected SMART or NVMe lifecycle data from {successful_devices} of {total_devices} storage device{}.",
+        if total_devices == 1 { "" } else { "s" }
+    );
+    if let Some(error_code) = last_error_code {
+        detail.push_str(&format!(
+            " One or more remaining devices could not be read (error: {error_code})."
+        ));
+    }
+    detail
+}
+
+fn smartctl_unavailable_detail(last_error_code: Option<&str>) -> String {
+    match last_error_code {
+        Some(SMARTCTL_NOT_INSTALLED_ERROR_CODE) => "The smartctl executable is not installed or is not on the IronMesh process PATH. Install the smartmontools package, grant the IronMesh service access to physical block devices, then refresh."
+            .to_string(),
+        Some("permission_denied") => "The IronMesh process does not have permission to read the physical block devices. Grant the service device access, then refresh."
+            .to_string(),
+        Some(error_code) => format!(
+            "SMART or NVMe lifecycle data could not be read from any physical storage device (error: {error_code})."
+        ),
+        None => "SMART or NVMe lifecycle data could not be read from any physical storage device."
+            .to_string(),
+    }
 }
 
 async fn run_smartctl_snapshot(
@@ -1017,10 +1095,19 @@ async fn run_smartctl_snapshot(
     };
 
     if output.stdout.is_empty() {
-        return Ok(None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("smartctl produced no JSON output: {stderr}"));
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("failed parsing smartctl json for {device_path}"))?;
+
+    let exit_status = value
+        .pointer("/smartctl/exit_status")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if exit_status & 0b11 != 0 {
+        return Err(anyhow!(smartctl_failure_message(&value, exit_status)));
+    }
 
     let smart_passed = value
         .pointer("/smart_status/passed")
@@ -1168,6 +1255,24 @@ async fn run_smartctl_snapshot(
     }
 
     Ok(Some(SmartctlSnapshot { smart, findings }))
+}
+
+fn smartctl_failure_message(value: &serde_json::Value, exit_status: u64) -> String {
+    let message = value
+        .pointer("/smartctl/messages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|messages| {
+            messages.iter().find_map(|message| {
+                message
+                    .get("string")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|message| !message.is_empty())
+            })
+        });
+
+    message
+        .map(|message| format!("smartctl failed: {message}"))
+        .unwrap_or_else(|| format!("smartctl failed with exit status {exit_status}"))
 }
 
 fn storage_finding(
@@ -1917,6 +2022,35 @@ mod tests {
         );
         assert_eq!(sanitize_error_code("request timed out"), "timeout");
         assert_eq!(sanitize_error_code("database parse failed"), "parse_error");
+    }
+
+    #[test]
+    fn smartctl_status_details_explain_missing_tool_and_device_access() {
+        assert_eq!(
+            smartctl_unavailable_detail(Some(SMARTCTL_NOT_INSTALLED_ERROR_CODE)),
+            "The smartctl executable is not installed or is not on the IronMesh process PATH. Install the smartmontools package, grant the IronMesh service access to physical block devices, then refresh."
+        );
+        assert_eq!(
+            smartctl_unavailable_detail(Some("permission_denied")),
+            "The IronMesh process does not have permission to read the physical block devices. Grant the service device access, then refresh."
+        );
+    }
+
+    #[test]
+    fn smartctl_failure_message_uses_the_tool_diagnostic() {
+        let message = smartctl_failure_message(
+            &json!({
+                "smartctl": {
+                    "messages": [{ "string": "Smartctl open device failed: Permission denied" }]
+                }
+            }),
+            2,
+        );
+
+        assert_eq!(
+            message,
+            "smartctl failed: Smartctl open device failed: Permission denied"
+        );
     }
 
     #[test]

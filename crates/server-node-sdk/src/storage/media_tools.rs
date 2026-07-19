@@ -79,6 +79,7 @@ impl MediaToolPaths {
                     install_hint: None,
                 },
                 cockpit_dependency_check(),
+                smartctl_dependency_check(),
                 binary_dependency_check(
                     "video-metadata",
                     "Video metadata extraction",
@@ -104,6 +105,22 @@ impl MediaToolPaths {
             ],
         }
     }
+}
+
+fn smartctl_dependency_check() -> HostDependencyCheck {
+    smartctl_dependency_check_for_path(Path::new("smartctl"))
+}
+
+fn smartctl_dependency_check_for_path(configured_path: &Path) -> HostDependencyCheck {
+    binary_dependency_check(
+        "smartctl",
+        "SMART / NVMe hardware health",
+        configured_path,
+        "SMART and NVMe lifecycle collection needs smartctl on the server host. The IronMesh service also needs permission to read the physical block devices.",
+        Some(
+            "Install the `smartmontools` package to provide `smartctl` (Ubuntu/Debian: `sudo apt install smartmontools`). Then grant the IronMesh service access to the physical block devices.",
+        ),
+    )
 }
 
 fn cockpit_dependency_check() -> HostDependencyCheck {
@@ -343,6 +360,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smartctl_dependency_check_explains_the_package_and_device_access_requirement() {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing_path =
+            std::env::temp_dir().join(format!("ironmesh-missing-smartctl-{unique_suffix}"));
+        let check = smartctl_dependency_check_for_path(&missing_path);
+
+        assert_eq!(check.status, HostDependencyStatus::Missing);
+        assert_eq!(check.id, "smartctl");
+        let install_hint = check.install_hint.as_deref().unwrap_or_default();
+        assert!(install_hint.contains("smartmontools"));
+        assert!(install_hint.contains("physical block devices"));
     }
 }
 
