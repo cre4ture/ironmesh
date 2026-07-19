@@ -13,10 +13,13 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use transport_sdk::ClusterSuspendStatus;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
 const REGISTRY_FORMAT_VERSION: u32 = 1;
+const LEGACY_SUSPENSION_REASON: &str = "Suspended by a legacy registry caller";
+const LEGACY_SUSPENSION_MIGRATION_REASON: &str = "Suspension state migrated from a legacy registry";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The single active trust anchor for one globally registered IronMesh cluster.
@@ -32,6 +35,35 @@ pub struct ClusterCaRecord {
     pub last_seen_at_unix_secs: u64,
     pub registration_proof_fingerprint: String,
     pub suspended: bool,
+    #[serde(default)]
+    pub suspended_at_unix_secs: Option<u64>,
+    #[serde(default)]
+    pub suspension_reason: Option<String>,
+}
+
+impl ClusterCaRecord {
+    fn validate_suspension(&self) -> Result<()> {
+        match (
+            self.suspended,
+            self.suspended_at_unix_secs,
+            self.suspension_reason.as_deref(),
+        ) {
+            (false, None, None) => Ok(()),
+            (false, _, _) => bail!("active cluster record must not include suspension metadata"),
+            (true, Some(suspended_at_unix_secs), Some(reason)) => {
+                if suspended_at_unix_secs == 0 {
+                    bail!("suspended cluster record must include a non-zero suspension timestamp");
+                }
+                validate_suspension_reason(reason)
+            }
+            (true, _, None) => {
+                bail!("suspended cluster record must include a suspension reason");
+            }
+            (true, None, Some(_)) => {
+                bail!("suspended cluster record must include a non-zero suspension timestamp");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,6 +133,8 @@ impl ClusterCaRegistry {
             last_seen_at_unix_secs: now,
             registration_proof_fingerprint,
             suspended: false,
+            suspended_at_unix_secs: None,
+            suspension_reason: None,
         };
 
         let mut updated = clusters.clone();
@@ -110,12 +144,38 @@ impl ClusterCaRegistry {
         Ok(record)
     }
 
-    /// Suspends or re-enables a registered cluster without deleting its audit data.
-    pub fn set_suspended(&self, cluster_id: ClusterId, suspended: bool) -> Result<ClusterCaRecord> {
+    /// Suspends a registered cluster and persists the reason supplied by its caller.
+    pub fn suspend(&self, cluster_id: ClusterId, reason: String) -> Result<ClusterCaRecord> {
+        validate_suspension_reason(&reason)?;
+        let suspended_at_unix_secs = now_unix_secs()?;
         self.update_record(cluster_id, |record| {
-            record.suspended = suspended;
-            Ok(())
+            record.suspended = true;
+            record.suspended_at_unix_secs = Some(suspended_at_unix_secs);
+            record.suspension_reason = Some(reason);
+            record.validate_suspension()
         })
+    }
+
+    /// Resumes a registered cluster and removes its suspension audit metadata.
+    pub fn resume(&self, cluster_id: ClusterId) -> Result<ClusterCaRecord> {
+        self.update_record(cluster_id, |record| {
+            record.suspended = false;
+            record.suspended_at_unix_secs = None;
+            record.suspension_reason = None;
+            record.validate_suspension()
+        })
+    }
+
+    /// Suspends or re-enables a registered cluster without deleting its audit data.
+    ///
+    /// New callers should use [`Self::suspend`] so operator-provided audit data is
+    /// retained. This wrapper keeps the existing programmatic API compatible.
+    pub fn set_suspended(&self, cluster_id: ClusterId, suspended: bool) -> Result<ClusterCaRecord> {
+        if suspended {
+            self.suspend(cluster_id, LEGACY_SUSPENSION_REASON.to_string())
+        } else {
+            self.resume(cluster_id)
+        }
     }
 
     /// Returns every record, including suspended clusters, for a future admin handler.
@@ -213,20 +273,46 @@ fn load_registry(path: &Path) -> Result<BTreeMap<ClusterId, ClusterCaRecord>> {
         );
     }
 
-    for (cluster_id, record) in &registry.clusters {
+    let mut clusters = registry.clusters;
+    let mut migrated_legacy_suspension = false;
+    for (cluster_id, record) in &mut clusters {
         if record.cluster_id != *cluster_id {
             bail!("cluster CA registry key does not match record cluster_id");
         }
         if record.registration_proof_fingerprint.trim().is_empty() {
             bail!("cluster CA registry contains an empty registration proof fingerprint");
         }
+        if record.suspended
+            && record.suspended_at_unix_secs.is_none()
+            && record.suspension_reason.is_none()
+        {
+            record.suspended_at_unix_secs = Some(now_unix_secs()?);
+            record.suspension_reason = Some(LEGACY_SUSPENSION_MIGRATION_REASON.to_string());
+            migrated_legacy_suspension = true;
+        }
+        record.validate_suspension()?;
         let actual_fingerprint = cluster_ca_fingerprint(&record.ca_pem)?;
         if actual_fingerprint != record.ca_fingerprint {
             bail!("cluster CA registry contains a CA fingerprint mismatch");
         }
     }
 
-    Ok(registry.clusters)
+    if migrated_legacy_suspension {
+        persist_registry(path, &clusters)?;
+    }
+    Ok(clusters)
+}
+
+pub(crate) fn validate_suspension_reason(reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("cluster suspension reason must not be empty");
+    }
+    ClusterSuspendStatus {
+        suspended: true,
+        suspended_at_unix: Some(1),
+        reason: Some(reason.to_string()),
+    }
+    .validate()
 }
 
 fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>) -> Result<()> {
@@ -361,6 +447,35 @@ mod tests {
             .pem()
     }
 
+    fn write_legacy_registry(path: &Path, cluster_id: ClusterId, suspended: bool) {
+        let ca_pem = test_ca("legacy-cluster");
+        let ca_fingerprint =
+            cluster_ca_fingerprint(&ca_pem).expect("legacy test CA fingerprint should calculate");
+        let cluster_id = cluster_id.to_string();
+        let mut clusters = serde_json::Map::new();
+        clusters.insert(
+            cluster_id.clone(),
+            serde_json::json!({
+                "cluster_id": cluster_id,
+                "ca_pem": ca_pem,
+                "ca_fingerprint": ca_fingerprint,
+                "created_at_unix_secs": 1,
+                "last_seen_at_unix_secs": 1,
+                "registration_proof_fingerprint": "legacy-proof",
+                "suspended": suspended,
+            }),
+        );
+        fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "format_version": REGISTRY_FORMAT_VERSION,
+                "clusters": clusters,
+            }))
+            .expect("legacy registry JSON should serialize"),
+        )
+        .expect("legacy registry should write");
+    }
+
     #[test]
     fn registry_persists_and_reloads_records() {
         let path = test_registry_path("registry-restart");
@@ -415,12 +530,119 @@ mod tests {
             .register_or_update(cluster_id, test_ca("cluster-a"), "proof-a".to_string())
             .expect("registration should succeed");
         let suspended = registry
-            .set_suspended(cluster_id, true)
+            .suspend(cluster_id, "operator review".to_string())
             .expect("suspension should persist");
 
         assert!(suspended.suspended);
+        assert!(suspended.suspended_at_unix_secs.is_some());
+        assert_eq!(
+            suspended.suspension_reason.as_deref(),
+            Some("operator review")
+        );
         assert_eq!(registry.active_ca(cluster_id), None);
         assert!(registry.observe_access(cluster_id).is_err());
+        fs::remove_file(path).expect("test registry should be removable");
+    }
+
+    #[test]
+    fn suspension_audit_data_persists_and_is_cleared_when_resumed() {
+        let path = test_registry_path("suspension-audit");
+        let cluster_id = ClusterId::now_v7();
+        let registry = ClusterCaRegistry::open(&path).expect("registry should open");
+        registry
+            .register_or_update(cluster_id, test_ca("cluster-a"), "proof-a".to_string())
+            .expect("registration should succeed");
+        let suspended = registry
+            .suspend(cluster_id, "compromised credentials".to_string())
+            .expect("suspension should persist");
+        drop(registry);
+
+        let reloaded = ClusterCaRegistry::open(&path).expect("registry should reload");
+        assert_eq!(reloaded.registered_ca(cluster_id), Some(suspended));
+        let resumed = reloaded.resume(cluster_id).expect("resume should persist");
+        assert!(!resumed.suspended);
+        assert_eq!(resumed.suspended_at_unix_secs, None);
+        assert_eq!(resumed.suspension_reason, None);
+        drop(reloaded);
+
+        let reloaded = ClusterCaRegistry::open(&path).expect("resumed registry should reload");
+        assert_eq!(reloaded.registered_ca(cluster_id), Some(resumed));
+        fs::remove_file(path).expect("test registry should be removable");
+    }
+
+    #[test]
+    fn legacy_active_records_without_suspension_metadata_load() {
+        let path = test_registry_path("legacy-active");
+        let cluster_id = ClusterId::now_v7();
+        write_legacy_registry(&path, cluster_id, false);
+
+        let registry = ClusterCaRegistry::open(&path).expect("legacy active registry should load");
+        let record = registry
+            .registered_ca(cluster_id)
+            .expect("legacy record should be present");
+        assert_eq!(record.suspended_at_unix_secs, None);
+        assert_eq!(record.suspension_reason, None);
+        fs::remove_file(path).expect("test registry should be removable");
+    }
+
+    #[test]
+    fn legacy_suspended_records_without_suspension_metadata_are_migrated() {
+        let path = test_registry_path("legacy-suspended");
+        let cluster_id = ClusterId::now_v7();
+        write_legacy_registry(&path, cluster_id, true);
+
+        let registry =
+            ClusterCaRegistry::open(&path).expect("legacy suspended registry should migrate");
+        let record = registry
+            .registered_ca(cluster_id)
+            .expect("legacy suspended record should be present");
+        assert!(record.suspended);
+        assert!(record.suspended_at_unix_secs.is_some());
+        assert_ne!(record.suspended_at_unix_secs, Some(1));
+        assert_eq!(
+            record.suspension_reason.as_deref(),
+            Some(LEGACY_SUSPENSION_MIGRATION_REASON)
+        );
+        drop(registry);
+
+        let reloaded = ClusterCaRegistry::open(&path).expect("migrated registry should reload");
+        assert_eq!(reloaded.registered_ca(cluster_id), Some(record));
+        fs::remove_file(path).expect("test registry should be removable");
+    }
+
+    #[test]
+    fn suspended_records_with_partial_audit_metadata_are_rejected() {
+        let path = test_registry_path("partial-suspension-audit");
+        write_legacy_registry(&path, ClusterId::now_v7(), true);
+        let mut persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("legacy registry should be readable for mutation"),
+        )
+        .expect("legacy registry JSON should parse");
+        persisted["clusters"]
+            .as_object_mut()
+            .expect("clusters should be an object")
+            .values_mut()
+            .next()
+            .expect("legacy registry should have one record")
+            .as_object_mut()
+            .expect("record should be an object")
+            .insert(
+                "suspended_at_unix_secs".to_string(),
+                serde_json::Value::from(2),
+            );
+        fs::write(
+            &path,
+            serde_json::to_vec(&persisted).expect("partial registry JSON should serialize"),
+        )
+        .expect("partial registry should write");
+
+        let error = ClusterCaRegistry::open(&path)
+            .expect_err("suspended records require complete audit metadata");
+        assert!(
+            error
+                .to_string()
+                .contains("must include a suspension reason")
+        );
         fs::remove_file(path).expect("test registry should be removable");
     }
 }

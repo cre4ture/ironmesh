@@ -184,7 +184,8 @@ impl RendezvousServiceConfig {
                 .unwrap_or(false);
         let global_registry_path = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY");
         let global_admin_token = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN");
-        let global_rate_limit = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_RATE_LIMIT_PER_MINUTE");
+        let global_rate_limit =
+            lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE");
         let global_challenge_ttl = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS");
         let global_max_pending = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES");
         let global_settings_present = global_registration_enabled
@@ -328,7 +329,7 @@ fn build_global_mtls_config(
         .filter(|value| !value.trim().is_empty())
         .context("global rendezvous registration requires a non-empty IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN")?;
     let rate_limit_per_minute = parse_positive_env_u32(
-        "IRONMESH_RENDEZVOUS_GLOBAL_RATE_LIMIT_PER_MINUTE",
+        "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE",
         rate_limit_per_minute,
         10,
     )?;
@@ -776,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn from_lookup_builds_global_registration_config_with_safe_defaults() {
+    fn from_lookup_uses_the_exact_global_registration_rate_limit_env_name() {
         let registry_path = std::env::temp_dir().join(format!(
             "ironmesh-global-rendezvous-config-{}.json",
             uuid::Uuid::now_v7()
@@ -807,6 +808,14 @@ mod tests {
                 "IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN".to_string(),
                 "operator-secret".to_string(),
             ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE".to_string(),
+                "7".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_RATE_LIMIT_PER_MINUTE".to_string(),
+                "0".to_string(),
+            ),
         ]);
 
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
@@ -818,7 +827,7 @@ mod tests {
                 registration,
             } => {
                 assert_eq!(cluster_registry.path(), registry_path.as_path());
-                assert_eq!(registration.rate_limit_per_minute, 10);
+                assert_eq!(registration.rate_limit_per_minute, 7);
                 assert_eq!(
                     registration.challenge_ttl,
                     std::time::Duration::from_secs(300)
@@ -828,6 +837,33 @@ mod tests {
             }
             _ => panic!("global configuration must not use a static client CA"),
         }
+
+        let mut wrong_name_only = env;
+        wrong_name_only.remove("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE");
+        let config =
+            RendezvousServiceConfig::from_lookup(&cli, |key| wrong_name_only.get(key).cloned())
+                .expect("the obsolete rate limit variable must not be used as an alias");
+        let mtls = config.mtls.expect("global mode should configure TLS");
+        match mtls.client_ca {
+            RendezvousClientCa::Global { registration, .. } => {
+                assert_eq!(registration.rate_limit_per_minute, 10);
+            }
+            _ => panic!("global configuration must not use a static client CA"),
+        }
+    }
+
+    #[test]
+    fn global_registration_rate_limit_validation_names_the_public_contract() {
+        let error = parse_positive_env_u32(
+            "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE",
+            Some("0".to_string()),
+            10,
+        )
+        .expect_err("zero global registration rate limit must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE must be greater than zero"
+        );
     }
 
     #[test]

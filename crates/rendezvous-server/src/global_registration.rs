@@ -27,6 +27,7 @@ use transport_sdk::{
 use uuid::Uuid;
 use x509_parser::parse_x509_certificate;
 
+use crate::cluster_registry::validate_suspension_reason;
 use crate::{
     ClusterCaRecord, ClusterCaRegistry, GlobalClusterRegistrationConfig, MaybeObservedPeerAddr,
     RendezvousAppState,
@@ -184,8 +185,14 @@ impl GlobalRegistrationState {
         &self,
         cluster_id: ClusterId,
         suspended: bool,
+        reason: Option<String>,
     ) -> Result<ClusterRegistrationRecord> {
-        let record = self.registry.set_suspended(cluster_id, suspended)?;
+        let record = if suspended {
+            let reason = reason.context("suspending a cluster requires a reason")?;
+            self.registry.suspend(cluster_id, reason)?
+        } else {
+            self.registry.resume(cluster_id)?
+        };
         info!(
             cluster_id = %cluster_id,
             suspended,
@@ -280,6 +287,19 @@ enum RateLimitOperation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClusterSuspensionRequest {
     suspended: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl ClusterSuspensionRequest {
+    fn validate(&self) -> Result<()> {
+        match (self.suspended, self.reason.as_deref()) {
+            (true, Some(reason)) => validate_suspension_reason(reason),
+            (true, None) => bail!("suspending a cluster requires a reason"),
+            (false, None) => Ok(()),
+            (false, Some(_)) => bail!("resuming a cluster must not include a reason"),
+        }
+    }
 }
 
 pub(crate) async fn issue_challenge(
@@ -350,8 +370,9 @@ pub(crate) async fn set_cluster_suspension(
 ) -> ApiResult<Json<ClusterRegistrationRecord>> {
     let registration = global_registration(&state)?;
     require_operator(registration, &headers)?;
+    request.validate().map_err(bad_request)?;
     registration
-        .set_suspension(cluster_id, request.suspended)
+        .set_suspension(cluster_id, request.suspended, request.reason)
         .map(Json)
         .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))
 }
@@ -450,16 +471,10 @@ fn record_from_registry(record: &ClusterCaRecord) -> ClusterRegistrationRecord {
         proof_algorithm: ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1,
         created_at_unix: record.created_at_unix_secs,
         last_seen_at_unix: Some(record.last_seen_at_unix_secs),
-        // P2-C persists suspension as an active/inactive trust decision. Its latest
-        // persisted observation time is the stable audit timestamp available to P2-D.
-        suspension: if record.suspended {
-            ClusterSuspendStatus {
-                suspended: true,
-                suspended_at_unix: Some(record.last_seen_at_unix_secs),
-                reason: None,
-            }
-        } else {
-            ClusterSuspendStatus::default()
+        suspension: ClusterSuspendStatus {
+            suspended: record.suspended,
+            suspended_at_unix: record.suspended_at_unix_secs,
+            reason: record.suspension_reason.clone(),
         },
     }
 }
@@ -822,9 +837,32 @@ mod tests {
         assert_eq!(full.0, StatusCode::TOO_MANY_REQUESTS);
     }
 
+    #[test]
+    fn registry_records_preserve_suspension_audit_data_in_api_responses() {
+        let record = ClusterCaRecord {
+            cluster_id: ClusterId::now_v7(),
+            ca_pem: "unused in this conversion test".to_string(),
+            ca_fingerprint: "a".repeat(64),
+            created_at_unix_secs: 10,
+            last_seen_at_unix_secs: 20,
+            registration_proof_fingerprint: "proof".to_string(),
+            suspended: true,
+            suspended_at_unix_secs: Some(30),
+            suspension_reason: Some("credential compromise".to_string()),
+        };
+
+        let response = record_from_registry(&record);
+        assert_eq!(response.last_seen_at_unix, Some(20));
+        assert_eq!(response.suspension.suspended_at_unix, Some(30));
+        assert_eq!(
+            response.suspension.reason.as_deref(),
+            Some("credential compromise")
+        );
+    }
+
     #[tokio::test]
     async fn operator_auth_suspension_and_global_route_auth_boundaries_are_enforced() {
-        let (state, ca, _) = global_state(10);
+        let (state, ca, path) = global_state(10);
         let cluster_id = ClusterId::now_v7();
         let challenge = issue(&state, &ca, cluster_id, "203.0.113.30").await;
         let _ = complete_registration(
@@ -840,6 +878,19 @@ mod tests {
             .expect_err("registry status requires an operator token");
         assert_eq!(unauthorized.0, StatusCode::UNAUTHORIZED);
 
+        let unauthorized_suspension = set_cluster_suspension(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(cluster_id),
+            Json(ClusterSuspensionRequest {
+                suspended: true,
+                reason: Some("operator review".to_string()),
+            }),
+        )
+        .await
+        .expect_err("suspension requires an operator token");
+        assert_eq!(unauthorized_suspension.0, StatusCode::UNAUTHORIZED);
+
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -851,16 +902,76 @@ mod tests {
             .0;
         assert_eq!(status.records.len(), 1);
         assert_eq!(status.records[0].cluster_id, cluster_id);
+
+        let missing_reason = set_cluster_suspension(
+            State(state.clone()),
+            headers.clone(),
+            Path(cluster_id),
+            Json(ClusterSuspensionRequest {
+                suspended: true,
+                reason: None,
+            }),
+        )
+        .await
+        .expect_err("suspension without a reason must be rejected");
+        assert_eq!(missing_reason.0, StatusCode::BAD_REQUEST);
+
+        let resume_with_reason = set_cluster_suspension(
+            State(state.clone()),
+            headers.clone(),
+            Path(cluster_id),
+            Json(ClusterSuspensionRequest {
+                suspended: false,
+                reason: Some("not applicable".to_string()),
+            }),
+        )
+        .await
+        .expect_err("resume with a reason must be rejected");
+        assert_eq!(resume_with_reason.0, StatusCode::BAD_REQUEST);
+
+        let too_long_reason = set_cluster_suspension(
+            State(state.clone()),
+            headers.clone(),
+            Path(cluster_id),
+            Json(ClusterSuspensionRequest {
+                suspended: true,
+                reason: Some("x".repeat(1_025)),
+            }),
+        )
+        .await
+        .expect_err("suspension reason must use the protocol limit");
+        assert_eq!(too_long_reason.0, StatusCode::BAD_REQUEST);
+
         let suspended = set_cluster_suspension(
             State(state.clone()),
             headers.clone(),
             Path(cluster_id),
-            Json(ClusterSuspensionRequest { suspended: true }),
+            Json(ClusterSuspensionRequest {
+                suspended: true,
+                reason: Some("operator review".to_string()),
+            }),
         )
         .await
         .expect("operator should suspend cluster")
         .0;
         assert!(suspended.suspension.suspended);
+        assert!(suspended.suspension.suspended_at_unix.is_some());
+        assert_eq!(
+            suspended.suspension.reason.as_deref(),
+            Some("operator review")
+        );
+        let persisted = ClusterCaRegistry::open(&path)
+            .expect("suspended registry should reload")
+            .registered_ca(cluster_id)
+            .expect("suspended record should persist");
+        assert_eq!(
+            suspended.suspension.suspended_at_unix,
+            persisted.suspended_at_unix_secs
+        );
+        assert_eq!(
+            suspended.suspension.reason.as_deref(),
+            persisted.suspension_reason.as_deref()
+        );
         assert!(
             state
                 .global_registration
@@ -875,12 +986,23 @@ mod tests {
             State(state.clone()),
             headers,
             Path(cluster_id),
-            Json(ClusterSuspensionRequest { suspended: false }),
+            Json(ClusterSuspensionRequest {
+                suspended: false,
+                reason: None,
+            }),
         )
         .await
         .expect("operator should resume cluster")
         .0;
         assert!(!resumed.suspension.suspended);
+        assert_eq!(resumed.suspension.suspended_at_unix, None);
+        assert_eq!(resumed.suspension.reason, None);
+        let persisted = ClusterCaRegistry::open(&path)
+            .expect("resumed registry should reload")
+            .registered_ca(cluster_id)
+            .expect("resumed record should persist");
+        assert_eq!(persisted.suspended_at_unix_secs, None);
+        assert_eq!(persisted.suspension_reason, None);
 
         let router = build_router(state.clone());
         let control = router
