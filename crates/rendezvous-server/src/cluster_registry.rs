@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +7,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use common::ClusterId;
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
@@ -72,9 +74,45 @@ struct PersistedClusterCaRegistry {
     clusters: BTreeMap<ClusterId, ClusterCaRecord>,
 }
 
+/// The registry's pre-opened storage boundary.
+///
+/// All registry operations below are relative to this directory capability, so
+/// a configured registry filename cannot make a later write escape the
+/// canonical directory selected during service startup.
+#[derive(Debug)]
+struct RegistryStorage {
+    path: PathBuf,
+    directory: Dir,
+    file_name: PathBuf,
+}
+
+impl RegistryStorage {
+    fn open(path: PathBuf) -> Result<Self> {
+        let path = normalize_registry_path(path)?;
+        let parent = path
+            .parent()
+            .expect("normalized cluster CA registry path must have a parent");
+        let file_name = path
+            .file_name()
+            .expect("normalized cluster CA registry path must name a file");
+        let file_name = PathBuf::from(file_name);
+        let directory = Dir::open_ambient_dir(parent, ambient_authority()).with_context(|| {
+            format!(
+                "failed opening cluster CA registry directory {}",
+                parent.display()
+            )
+        })?;
+        Ok(Self {
+            path,
+            directory,
+            file_name,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct ClusterCaRegistryInner {
-    path: PathBuf,
+    storage: RegistryStorage,
     clusters: RwLock<BTreeMap<ClusterId, ClusterCaRecord>>,
 }
 
@@ -92,18 +130,18 @@ impl ClusterCaRegistry {
     /// Opens an existing registry, or creates an empty in-memory registry that
     /// is persisted on its first mutation.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = normalize_registry_path(path.into())?;
-        let clusters = load_registry(&path)?;
+        let storage = RegistryStorage::open(path.into())?;
+        let clusters = load_registry(&storage)?;
         Ok(Self {
             inner: Arc::new(ClusterCaRegistryInner {
-                path,
+                storage,
                 clusters: RwLock::new(clusters),
             }),
         })
     }
 
     pub fn path(&self) -> &Path {
-        &self.inner.path
+        &self.inner.storage.path
     }
 
     /// Registers a cluster CA or atomically replaces the existing active CA.
@@ -139,7 +177,7 @@ impl ClusterCaRegistry {
 
         let mut updated = clusters.clone();
         updated.insert(cluster_id, record.clone());
-        persist_registry(&self.inner.path, &updated)?;
+        persist_registry(&self.inner.storage, &updated)?;
         *clusters = updated;
         Ok(record)
     }
@@ -219,7 +257,7 @@ impl ClusterCaRegistry {
             .with_context(|| format!("cluster {cluster_id} is not registered"))?;
         update(record)?;
         let record = record.clone();
-        persist_registry(&self.inner.path, &updated)?;
+        persist_registry(&self.inner.storage, &updated)?;
         *clusters = updated;
         Ok(record)
     }
@@ -257,15 +295,26 @@ pub fn cluster_ca_fingerprint(ca_pem: &str) -> Result<String> {
     Ok(hex_digest(Sha256::digest(certificate.as_ref())))
 }
 
-fn load_registry(path: &Path) -> Result<BTreeMap<ClusterId, ClusterCaRecord>> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed reading cluster CA registry {}", path.display()))?;
-    let registry: PersistedClusterCaRegistry = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed parsing cluster CA registry {}", path.display()))?;
+fn load_registry(storage: &RegistryStorage) -> Result<BTreeMap<ClusterId, ClusterCaRecord>> {
+    let bytes = match storage.directory.read(&storage.file_name) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed reading cluster CA registry {}",
+                    storage.path.display()
+                )
+            });
+        }
+    };
+    let registry: PersistedClusterCaRegistry =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "failed parsing cluster CA registry {}",
+                storage.path.display()
+            )
+        })?;
     if registry.format_version != REGISTRY_FORMAT_VERSION {
         bail!(
             "unsupported cluster CA registry format version {}",
@@ -298,7 +347,7 @@ fn load_registry(path: &Path) -> Result<BTreeMap<ClusterId, ClusterCaRecord>> {
     }
 
     if migrated_legacy_suspension {
-        persist_registry(path, &clusters)?;
+        persist_registry(storage, &clusters)?;
     }
     Ok(clusters)
 }
@@ -315,29 +364,30 @@ pub(crate) fn validate_suspension_reason(reason: &str) -> Result<()> {
     .validate()
 }
 
-fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>) -> Result<()> {
+fn persist_registry(
+    storage: &RegistryStorage,
+    clusters: &BTreeMap<ClusterId, ClusterCaRecord>,
+) -> Result<()> {
     let serialized = serde_json::to_vec_pretty(&PersistedClusterCaRegistry {
         format_version: REGISTRY_FORMAT_VERSION,
         clusters: clusters.clone(),
     })
     .context("failed serializing cluster CA registry")?;
-    let parent = path
-        .parent()
-        .expect("normalized cluster CA registry path must have a parent");
     let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary_path = parent.join(format!(
+    let temporary_name = format!(
         ".ironmesh-cluster-ca-registry.{}.{}.tmp",
         std::process::id(),
         sequence
-    ));
-    let mut temporary = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary_path)
+    );
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut temporary = storage
+        .directory
+        .open_with(&temporary_name, &options)
         .with_context(|| {
             format!(
-                "failed creating temporary registry {}",
-                temporary_path.display()
+                "failed creating temporary registry for {}",
+                storage.path.display()
             )
         })?;
     temporary
@@ -351,12 +401,15 @@ fn persist_registry(path: &Path, clusters: &BTreeMap<ClusterId, ClusterCaRecord>
         .context("failed syncing temporary cluster CA registry")?;
     drop(temporary);
 
-    fs::rename(&temporary_path, path).with_context(|| {
-        format!(
-            "failed atomically replacing cluster CA registry {}",
-            path.display()
-        )
-    })?;
+    storage
+        .directory
+        .rename(&temporary_name, &storage.directory, &storage.file_name)
+        .with_context(|| {
+            format!(
+                "failed atomically replacing cluster CA registry {}",
+                storage.path.display()
+            )
+        })?;
     // The replacement file is fully synced before this atomic rename, so an
     // interrupted write cannot leave a partially written registry behind.
     Ok(())
