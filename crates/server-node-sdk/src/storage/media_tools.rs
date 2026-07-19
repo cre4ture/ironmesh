@@ -126,14 +126,21 @@ fn cockpit_dependency_check_for_candidates(candidates: &[PathBuf]) -> HostDepend
 }
 
 fn cockpit_ws_candidate_paths() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from("cockpit-ws")];
     #[cfg(unix)]
-    candidates.extend([
-        PathBuf::from("/usr/lib/cockpit/cockpit-ws"),
-        PathBuf::from("/usr/libexec/cockpit-ws"),
-        PathBuf::from("/usr/libexec/cockpit/cockpit-ws"),
-    ]);
-    candidates
+    {
+        let mut candidates = vec![PathBuf::from("cockpit-ws")];
+        candidates.extend([
+            PathBuf::from("/usr/lib/cockpit/cockpit-ws"),
+            PathBuf::from("/usr/libexec/cockpit-ws"),
+            PathBuf::from("/usr/libexec/cockpit/cockpit-ws"),
+        ]);
+        candidates
+    }
+
+    #[cfg(not(unix))]
+    {
+        vec![PathBuf::from("cockpit-ws")]
+    }
 }
 
 fn binary_dependency_check(
