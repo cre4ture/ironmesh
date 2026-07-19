@@ -5,7 +5,8 @@ import {
   startAdminMapDatasetImport,
   startNaturalEarthMapImport,
   type AdminMapDatasetImportJobView,
-  type NaturalEarthImportJobView
+  type NaturalEarthImportJobView,
+  type NaturalEarthImportProfile
 } from "@ironmesh/api";
 import { ironmeshPrimaryColor } from "@ironmesh/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -69,6 +70,14 @@ export function MapDatasetImportCard() {
     importTargets.find(
       (target) => target.variantId === "natural-earth-globe" && target.asset === "raster"
     ) ?? null;
+  const naturalEarthLabelsRasterTarget =
+    importTargets.find(
+      (target) => target.variantId === "natural-earth-labels" && target.asset === "raster"
+    ) ?? null;
+  const naturalEarthLabelsVectorTarget =
+    importTargets.find(
+      (target) => target.variantId === "natural-earth-labels" && target.asset === "vector"
+    ) ?? null;
   useEffect(() => {
     if (!selectedTargetKey || !importTargets.some((target) => target.key === selectedTargetKey)) {
       setSelectedTargetKey(importTargets[0]?.key ?? null);
@@ -112,7 +121,8 @@ export function MapDatasetImportCard() {
     }
   });
   const startNaturalEarthImportMutation = useMutation({
-    mutationFn: () => startNaturalEarthMapImport(normalizedAdminTokenOverride || undefined),
+    mutationFn: (profile: NaturalEarthImportProfile) =>
+      startNaturalEarthMapImport({ profile }, normalizedAdminTokenOverride || undefined),
     onSuccess: async (job) => {
       queryClient.setQueryData(
         ["gallery-page", "natural-earth-map-import", normalizedAdminTokenOverride],
@@ -152,6 +162,11 @@ export function MapDatasetImportCard() {
   const canStartSelectedImport =
     selectedImportProfile === "natural-earth-physical"
       ? canStartNaturalEarthImport && naturalEarthTarget !== null
+      : selectedImportProfile === "natural-earth-physical-with-labels"
+        ?
+          canStartNaturalEarthImport &&
+          naturalEarthLabelsRasterTarget !== null &&
+          naturalEarthLabelsVectorTarget !== null
       : canStartMapImport;
   const importControlsLocked =
     mapImportStatus?.can_start_new === false ||
@@ -166,7 +181,11 @@ export function MapDatasetImportCard() {
 
   function startSelectedImport() {
     if (selectedImportProfile === "natural-earth-physical") {
-      void startNaturalEarthImportMutation.mutateAsync();
+      void startNaturalEarthImportMutation.mutateAsync("physical");
+      return;
+    }
+    if (selectedImportProfile === "natural-earth-physical-with-labels") {
+      void startNaturalEarthImportMutation.mutateAsync("physical_with_labels");
       return;
     }
     if (selectedImportProfile === "remote-mbtiles") {
@@ -199,9 +218,10 @@ export function MapDatasetImportCard() {
             )}
           </Group>
 
-          <Alert color="blue" variant="light" title="Background jobs publish atomically">
-            Each import writes only to the configured map artifact. The map view keeps using the
-            previously published data until the job has validated and published its manifest.
+          <Alert color="blue" variant="light" title="Background jobs validate before publication">
+            Each import writes only to its configured map artifact or artifacts. A labels job
+            validates both outputs before it begins publication, and the map view keeps using the
+            previously published data until a replacement manifest is available.
           </Alert>
 
           <MapDatasetImportWizard
@@ -213,6 +233,8 @@ export function MapDatasetImportCard() {
             targets={importTargets}
             selectedTarget={selectedTarget}
             naturalEarthTarget={naturalEarthTarget}
+            naturalEarthLabelsRasterTarget={naturalEarthLabelsRasterTarget}
+            naturalEarthLabelsVectorTarget={naturalEarthLabelsVectorTarget}
             mapConfigurationLoading={mapConfigurationQuery.isLoading}
             controlsLocked={importControlsLocked}
             canStartImport={canStartSelectedImport}
@@ -281,20 +303,44 @@ function NaturalEarthImportStateBadge({ job }: { job: NaturalEarthImportJobView 
 }
 
 function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView }) {
+  const includesLabels = job.profile === "physical_with_labels";
+  const artifacts = job.artifacts ?? [];
   return (
     <Card withBorder radius="md" padding="md">
       <Stack gap="sm">
         <Group justify="space-between" align="center">
-          <Text fw={600}>Natural Earth physical world map</Text>
+          <Text fw={600}>
+            {includesLabels ? "Natural Earth physical world map + labels" : "Natural Earth physical world map"}
+          </Text>
           <NaturalEarthImportStateBadge job={job} />
         </Group>
         <Text size="sm">{job.phase}</Text>
         <Group gap="xl" align="flex-start">
           <ImportDetail label="Source">
-            <Text size="sm">Official Natural Earth 10m physical archive</Text>
+            <Text size="sm">
+              {includesLabels
+                ? "Official Natural Earth 10m physical and cultural archives"
+                : "Official Natural Earth 10m physical archive"}
+            </Text>
           </ImportDetail>
-          <ImportDetail label="Published artifact">
-            <Code>{job.manifest_key}</Code>
+          <ImportDetail label={artifacts.length > 1 ? "Published artifacts" : "Published artifact"}>
+            <Stack gap={4}>
+              {(artifacts.length > 0
+                ? artifacts
+                : [
+                    {
+                      manifest_key: job.manifest_key,
+                      asset: "raster",
+                      logical_size_bytes: job.logical_size_bytes
+                    }
+                  ]
+              ).map((artifact) => (
+                <Text key={artifact.manifest_key} size="sm">
+                  {artifact.asset}: <Code>{artifact.manifest_key}</Code>
+                  {artifact.logical_size_bytes > 0 ? ` (${formatBytes(artifact.logical_size_bytes)})` : ""}
+                </Text>
+              ))}
+            </Stack>
           </ImportDetail>
         </Group>
         <Group gap="xl" align="flex-start">

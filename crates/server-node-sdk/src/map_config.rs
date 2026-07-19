@@ -650,6 +650,26 @@ mod tests {
     }
 
     #[test]
+    fn labels_variant_exposes_both_automatic_import_targets() {
+        let configuration = default_configuration();
+        let raster = resolve_import_target(
+            &configuration,
+            "natural-earth-labels",
+            MapVariantAssetKind::Raster,
+        )
+        .expect("default Natural Earth labels raster target");
+        let vector = resolve_import_target(
+            &configuration,
+            "natural-earth-labels",
+            MapVariantAssetKind::Vector,
+        )
+        .expect("default Natural Earth labels vector target");
+
+        assert_eq!(raster.logical_key, "sys/maps/natural-earth-globe.mbtiles");
+        assert_eq!(vector.logical_key, "sys/maps/natural-earth-labels.mbtiles");
+    }
+
+    #[test]
     fn configuration_rejects_a_disabled_active_variant() {
         let mut configuration = default_configuration();
         configuration.variants[0].enabled = false;

@@ -45,6 +45,7 @@ import type {
   NodeDescriptor,
   NodeEnrollmentPackage,
   NaturalEarthImportJobView,
+  NaturalEarthImportProfile,
   NaturalEarthImportStatusResponse,
   ProcessStatsCurrentResponse,
   ProcessStatsSample,
@@ -303,11 +304,13 @@ export async function getNaturalEarthMapImportStatus(
 }
 
 export async function startNaturalEarthMapImport(
+  request: { profile: NaturalEarthImportProfile },
   adminTokenOverride?: string
 ): Promise<NaturalEarthImportJobView> {
   return fetchAdminJson<NaturalEarthImportJobView>(apiV1("/auth/maps/import/natural-earth"), {
     method: "POST",
-    adminTokenOverride
+    adminTokenOverride,
+    body: request
   });
 }
 

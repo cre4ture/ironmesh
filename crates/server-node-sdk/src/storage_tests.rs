@@ -477,7 +477,7 @@ fn host_dependency_report_marks_ready_and_missing_video_tools() {
         .unwrap();
     assert_eq!(
         gdal_check.configured_path.as_deref(),
-        Some("gdal_rasterize, gdalwarp, gdal_translate, gdaladdo")
+        Some("gdal_rasterize, gdalwarp, gdal_translate, gdaladdo, ogr2ogr")
     );
     assert!(matches!(
         &gdal_check.status,

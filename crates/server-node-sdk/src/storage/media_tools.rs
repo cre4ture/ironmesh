@@ -8,8 +8,13 @@ pub(super) const VIDEO_THUMBNAIL_SEEK_FRACTION: f64 = 0.10;
 pub(super) const VIDEO_THUMBNAIL_SEEK_MIN_SECS: f64 = 10.0;
 pub(super) const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 120.0;
 pub(super) const VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS: f64 = 60.0;
-const NATURAL_EARTH_GDAL_COMMANDS: [&str; 4] =
-    ["gdal_rasterize", "gdalwarp", "gdal_translate", "gdaladdo"];
+const NATURAL_EARTH_GDAL_COMMANDS: [&str; 5] = [
+    "gdal_rasterize",
+    "gdalwarp",
+    "gdal_translate",
+    "gdaladdo",
+    "ogr2ogr",
+];
 
 #[derive(Clone)]
 pub(super) struct MediaToolPaths {
@@ -243,11 +248,11 @@ fn natural_earth_gdal_dependency_check() -> HostDependencyCheck {
                 missing_commands.join(", ")
             )
         },
-        detail: "Automatic Natural Earth map imports need GDAL to rasterize source layers, project them to Web Mercator, and create MBTiles overviews.".to_string(),
+        detail: "Automatic Natural Earth map imports need GDAL to rasterize source layers, project them to Web Mercator, create MBTiles overviews, and generate the vector label overlay.".to_string(),
         configured_path: Some(NATURAL_EARTH_GDAL_COMMANDS.join(", ")),
         resolved_path: (!resolved_commands.is_empty()).then(|| resolved_commands.join("; ")),
         install_hint: (status == HostDependencyStatus::Missing).then(|| {
-            "On Debian or Ubuntu, install the `gdal-bin` package; it provides gdal_rasterize, gdalwarp, gdal_translate, and gdaladdo.".to_string()
+            "On Debian or Ubuntu, install the `gdal-bin` package; it provides gdal_rasterize, gdalwarp, gdal_translate, gdaladdo, and ogr2ogr.".to_string()
         }),
     }
 }
