@@ -16,7 +16,10 @@ import { type ReactNode } from "react";
 
 const MAP_IMPORT_WIZARD_STEPS = ["Import type", "Source", "Destination", "Review"];
 
-export type MapImportProfile = "natural-earth-physical" | "remote-mbtiles";
+export type MapImportProfile =
+  | "natural-earth-physical"
+  | "natural-earth-physical-with-labels"
+  | "remote-mbtiles";
 
 export type MapDatasetImportWizardTarget = {
   key: string;
@@ -40,6 +43,8 @@ type MapDatasetImportWizardProps = {
   targets: MapDatasetImportWizardTarget[];
   selectedTarget: MapDatasetImportWizardTarget | null;
   naturalEarthTarget: MapDatasetImportWizardTarget | null;
+  naturalEarthLabelsRasterTarget: MapDatasetImportWizardTarget | null;
+  naturalEarthLabelsVectorTarget: MapDatasetImportWizardTarget | null;
   mapConfigurationLoading: boolean;
   controlsLocked: boolean;
   canStartImport: boolean;
@@ -62,6 +67,8 @@ export function MapDatasetImportWizard({
   targets,
   selectedTarget,
   naturalEarthTarget,
+  naturalEarthLabelsRasterTarget,
+  naturalEarthLabelsVectorTarget,
   mapConfigurationLoading,
   controlsLocked,
   canStartImport,
@@ -74,11 +81,22 @@ export function MapDatasetImportWizard({
   onContinue,
   onStart
 }: MapDatasetImportWizardProps) {
-  const selectedWizardTarget = profile === "natural-earth-physical" ? naturalEarthTarget : selectedTarget;
+  const naturalEarthTargets =
+    profile === "natural-earth-physical"
+      ? [naturalEarthTarget].filter((target): target is MapDatasetImportWizardTarget => target !== null)
+      : profile === "natural-earth-physical-with-labels"
+        ? [naturalEarthLabelsRasterTarget, naturalEarthLabelsVectorTarget].filter(
+            (target): target is MapDatasetImportWizardTarget => target !== null
+          )
+        : [];
+  const hasNaturalEarthDestination =
+    profile === "natural-earth-physical"
+      ? naturalEarthTarget !== null
+      : naturalEarthLabelsRasterTarget !== null && naturalEarthLabelsVectorTarget !== null;
   const canContinue =
     (step === 0 && profile !== null) ||
-    (step === 1 && (profile === "natural-earth-physical" || source.trim().length > 0)) ||
-    (step === 2 && selectedWizardTarget !== null);
+    (step === 1 && (naturalEarthTargets.length > 0 || source.trim().length > 0)) ||
+    (step === 2 && (naturalEarthTargets.length > 0 ? hasNaturalEarthDestination : selectedTarget !== null));
 
   return (
     <>
@@ -110,6 +128,8 @@ export function MapDatasetImportWizard({
           selectedTargetKey={selectedTargetKey}
           selectedTarget={selectedTarget}
           naturalEarthTarget={naturalEarthTarget}
+          naturalEarthLabelsRasterTarget={naturalEarthLabelsRasterTarget}
+          naturalEarthLabelsVectorTarget={naturalEarthLabelsVectorTarget}
           mapConfigurationLoading={mapConfigurationLoading}
           partSizeGiB={partSizeGiB}
           controlsLocked={controlsLocked}
@@ -121,7 +141,8 @@ export function MapDatasetImportWizard({
         <MapReviewStep
           profile={profile}
           source={source}
-          target={selectedWizardTarget}
+          target={selectedTarget}
+          naturalEarthTargets={naturalEarthTargets}
           partSizeGiB={partSizeGiB}
         />
       ) : null}
@@ -164,6 +185,12 @@ function MapTypeStep({
           disabled={controlsLocked}
         />
         <Radio
+          value="natural-earth-physical-with-labels"
+          label="Natural Earth physical world map + labels"
+          description="Create the standard globe raster and its country, city, and border label overlay automatically."
+          disabled={controlsLocked}
+        />
+        <Radio
           value="remote-mbtiles"
           label="An existing MBTiles package"
           description="Download a compatible MBTiles file from an HTTP URL and publish it to one configured map artifact."
@@ -171,8 +198,9 @@ function MapTypeStep({
         />
       </Stack>
       <Alert color="blue" variant="light" mt="sm" title="Natural Earth source data">
-        Natural Earth publishes its source data in the public domain. The physical world-map profile
-        converts the official 10m data automatically.{" "}
+        Natural Earth publishes its source data in the public domain. Both Natural Earth profiles
+        convert the official 10m data automatically; the labels profile additionally builds a vector
+        overlay for the configured Labels map variant.{" "}
         <Anchor href="https://www.naturalearthdata.com/" target="_blank" rel="noreferrer">
           Open Natural Earth
         </Anchor>
@@ -190,12 +218,13 @@ function MapSourceStep({
   MapDatasetImportWizardProps,
   "profile" | "source" | "controlsLocked" | "onSourceChange"
 >) {
-  if (profile === "natural-earth-physical") {
+  if (profile === "natural-earth-physical" || profile === "natural-earth-physical-with-labels") {
     return (
       <Alert color="blue" variant="light" title="Official Natural Earth source">
-        The server downloads the fixed Natural Earth 10m physical archive, then renders land, ocean,
-        lakes, rivers, and coastlines. No URL or file needs to be supplied. GDAL and unzip must be
-        installed on this node.
+        {profile === "natural-earth-physical"
+          ? "The server downloads the fixed Natural Earth 10m physical archive, then renders land, ocean, lakes, rivers, and coastlines."
+          : "The server downloads the fixed Natural Earth physical, countries, populated-places, and country-boundaries archives, then builds the globe raster and its labels overlay."}{" "}
+        No URL or file needs to be supplied. GDAL and unzip must be installed on this node.
       </Alert>
     );
   }
@@ -220,6 +249,8 @@ function MapDestinationStep({
   selectedTargetKey,
   selectedTarget,
   naturalEarthTarget,
+  naturalEarthLabelsRasterTarget,
+  naturalEarthLabelsVectorTarget,
   mapConfigurationLoading,
   partSizeGiB,
   controlsLocked,
@@ -232,6 +263,8 @@ function MapDestinationStep({
   | "selectedTargetKey"
   | "selectedTarget"
   | "naturalEarthTarget"
+  | "naturalEarthLabelsRasterTarget"
+  | "naturalEarthLabelsVectorTarget"
   | "mapConfigurationLoading"
   | "partSizeGiB"
   | "controlsLocked"
@@ -249,6 +282,29 @@ function MapDestinationStep({
       <Alert color="red" title="Natural Earth destination is not configured">
         Add a raster artifact for the <Code>natural-earth-globe</Code> variant before starting this
         profile.
+      </Alert>
+    );
+  }
+
+  if (profile === "natural-earth-physical-with-labels") {
+    const labelTargets = [naturalEarthLabelsRasterTarget, naturalEarthLabelsVectorTarget].filter(
+      (target): target is MapDatasetImportWizardTarget => target !== null
+    );
+    return labelTargets.length === 2 ? (
+      <Alert color="blue" variant="light" title="Configured Natural Earth destinations">
+        The generated globe raster and label overlay will replace these configured artifacts:
+        <Stack gap={4} mt="xs">
+          {labelTargets.map((target) => (
+            <Text key={target.key} size="sm">
+              <Code>{target.label}</Code> — {target.asset} — <Code>{target.manifestKey}</Code>
+            </Text>
+          ))}
+        </Stack>
+      </Alert>
+    ) : (
+      <Alert color="red" title="Natural Earth label destinations are not configured">
+        Add both raster and vector artifacts for the <Code>natural-earth-labels</Code> variant before
+        starting this profile.
       </Alert>
     );
   }
@@ -315,11 +371,13 @@ function MapReviewStep({
   profile,
   source,
   target,
+  naturalEarthTargets,
   partSizeGiB
 }: {
   profile: MapImportProfile;
   source: string;
   target: MapDatasetImportWizardTarget | null;
+  naturalEarthTargets: MapDatasetImportWizardTarget[];
   partSizeGiB: number;
 }) {
   return (
@@ -330,6 +388,8 @@ function MapReviewStep({
             <Text size="sm">
               {profile === "natural-earth-physical"
                 ? "Natural Earth physical world map"
+                : profile === "natural-earth-physical-with-labels"
+                  ? "Natural Earth physical world map + labels"
                 : "Existing MBTiles package"}
             </Text>
           </WizardDetail>
@@ -337,10 +397,21 @@ function MapReviewStep({
             <Text size="sm">
               {profile === "natural-earth-physical"
                 ? "Official Natural Earth 10m physical archive"
+                : profile === "natural-earth-physical-with-labels"
+                  ? "Official Natural Earth 10m physical and cultural archives"
                 : source.trim()}
             </Text>
           </WizardDetail>
-          {target ? (
+          {naturalEarthTargets.length > 0 ? (
+            <WizardDetail label="Destinations">
+              {naturalEarthTargets.map((naturalEarthTarget) => (
+                <Text key={naturalEarthTarget.key} size="sm">
+                  {naturalEarthTarget.label} — {naturalEarthTarget.asset} —{" "}
+                  <Code>{naturalEarthTarget.manifestKey}</Code>
+                </Text>
+              ))}
+            </WizardDetail>
+          ) : target ? (
             <WizardDetail label="Destination">
               <Text size="sm">
                 {target.label} — {target.asset}

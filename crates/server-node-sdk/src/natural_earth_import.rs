@@ -8,6 +8,12 @@ use tokio::time::timeout;
 
 const NATURAL_EARTH_PHYSICAL_10M_URL: &str =
     "https://naciscdn.org/naturalearth/10m/physical/10m_physical.zip";
+const NATURAL_EARTH_COUNTRIES_10M_URL: &str =
+    "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_countries.zip";
+const NATURAL_EARTH_POPULATED_PLACES_10M_URL: &str =
+    "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places.zip";
+const NATURAL_EARTH_BOUNDARIES_10M_URL: &str =
+    "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_boundary_lines_land.zip";
 const NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_PART_BYTES: usize = 256 * 1024 * 1024;
@@ -23,6 +29,21 @@ const REQUIRED_MAP_IMPORT_COMMANDS: [(&str, &str); 5] = [
     ("gdal_translate", "--version"),
     ("gdaladdo", "--version"),
 ];
+const REQUIRED_LABEL_IMPORT_COMMANDS: [(&str, &str); 1] = [("ogr2ogr", "--version")];
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NaturalEarthImportProfile {
+    #[default]
+    Physical,
+    PhysicalWithLabels,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StartNaturalEarthImportRequest {
+    #[serde(default)]
+    profile: NaturalEarthImportProfile,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,14 +60,25 @@ pub(crate) struct NaturalEarthImportLogEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct NaturalEarthImportArtifactView {
+    pub(crate) variant_id: String,
+    pub(crate) asset: map_config::MapVariantAssetKind,
+    pub(crate) logical_key: String,
+    pub(crate) manifest_key: String,
+    pub(crate) logical_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct NaturalEarthImportJobView {
     pub(crate) id: String,
     pub(crate) state: NaturalEarthImportState,
+    pub(crate) profile: NaturalEarthImportProfile,
     pub(crate) phase: String,
     pub(crate) source_url: String,
     pub(crate) logical_key: String,
     pub(crate) manifest_key: String,
     pub(crate) logical_size_bytes: u64,
+    pub(crate) artifacts: Vec<NaturalEarthImportArtifactView>,
     pub(crate) error: Option<String>,
     pub(crate) log_entries: Vec<NaturalEarthImportLogEntry>,
     pub(crate) started_at_unix: u64,
@@ -95,6 +127,18 @@ struct PhysicalMapLayers<'a> {
     coastline: &'a Path,
 }
 
+struct NaturalEarthLabelLayers<'a> {
+    countries: &'a Path,
+    populated_places: &'a Path,
+    boundaries: &'a Path,
+}
+
+struct NaturalEarthSourceArchive {
+    url: &'static str,
+    archive_name: &'static str,
+    description: &'static str,
+}
+
 pub(crate) async fn is_running(state: &ServerState) -> bool {
     let runtime = state.storage.natural_earth_import.lock().await;
     matches!(
@@ -130,15 +174,27 @@ pub(crate) async fn admin_status(State(state): State<ServerState>, headers: Head
 pub(crate) async fn start_admin_import(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    request: Option<Json<StartNaturalEarthImportRequest>>,
 ) -> Response {
     let action = "auth/maps/import/natural-earth/run";
-    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    let profile = request
+        .map(|Json(request)| request.profile)
+        .unwrap_or_default();
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "profile": profile }),
+    )
+    .await
     {
         Ok(authz) => authz,
         Err(status) => return status.into_response(),
     };
 
-    let response = match start_import(&state).await {
+    let response = match start_import(&state, profile).await {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
         Err((status, error)) => {
             (status, Json(json!({ "error": error.to_string() }))).into_response()
@@ -164,6 +220,7 @@ pub(crate) async fn start_admin_import(
 
 async fn start_import(
     state: &ServerState,
+    profile: NaturalEarthImportProfile,
 ) -> std::result::Result<NaturalEarthImportJobView, (StatusCode, anyhow::Error)> {
     if map_dataset_import::has_running_job(state).await {
         return Err((
@@ -174,21 +231,49 @@ async fn start_import(
     let configuration = map_config::load_current_configuration(state)
         .await
         .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    let base_variant_id = match profile {
+        NaturalEarthImportProfile::Physical => "natural-earth-globe",
+        NaturalEarthImportProfile::PhysicalWithLabels => "natural-earth-labels",
+    };
     let target = map_config::resolve_import_target(
         &configuration.configuration,
-        "natural-earth-globe",
+        base_variant_id,
         map_config::MapVariantAssetKind::Raster,
     )
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let mut artifacts = vec![NaturalEarthImportArtifactView {
+        variant_id: target.variant_id.clone(),
+        asset: target.asset,
+        logical_key: target.logical_key.clone(),
+        manifest_key: target.manifest_key.clone(),
+        logical_size_bytes: 0,
+    }];
+    if profile == NaturalEarthImportProfile::PhysicalWithLabels {
+        let label_target = map_config::resolve_import_target(
+            &configuration.configuration,
+            "natural-earth-labels",
+            map_config::MapVariantAssetKind::Vector,
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        artifacts.push(NaturalEarthImportArtifactView {
+            variant_id: label_target.variant_id,
+            asset: label_target.asset,
+            logical_key: label_target.logical_key,
+            manifest_key: label_target.manifest_key,
+            logical_size_bytes: 0,
+        });
+    }
     let now = unix_ts();
     let job = NaturalEarthImportJobView {
         id: Uuid::now_v7().to_string(),
         state: NaturalEarthImportState::Running,
+        profile,
         phase: "Waiting for the Natural Earth conversion worker".to_string(),
         source_url: NATURAL_EARTH_PHYSICAL_10M_URL.to_string(),
         logical_key: target.logical_key,
         manifest_key: target.manifest_key,
         logical_size_bytes: 0,
+        artifacts,
         error: None,
         log_entries: vec![NaturalEarthImportLogEntry {
             timestamp_unix: now,
@@ -243,7 +328,7 @@ async fn start_import(
 
 async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Result<u64> {
     update_phase(state, "Checking GDAL and unzip dependencies").await;
-    ensure_import_commands_available(state).await?;
+    ensure_import_commands_available(state, job.profile).await?;
     let staging_dir = state
         .data_dir
         .join("state")
@@ -257,21 +342,16 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
     })?;
 
     let result = async {
-        let archive_path = staging_dir.join("natural-earth-physical.zip");
-        update_phase(state, "Downloading Natural Earth physical data").await;
-        download_natural_earth_archive(state, &archive_path).await?;
         let extracted_dir = staging_dir.join("source");
         fs::create_dir_all(&extracted_dir).await?;
-        update_phase(state, "Extracting Natural Earth source layers").await;
-        run_command(
+        download_and_extract_natural_earth_archive(
             state,
-            "unzip",
-            [
-                "-q".into(),
-                archive_path.as_os_str().to_owned(),
-                "-d".into(),
-                extracted_dir.as_os_str().to_owned(),
-            ],
+            NaturalEarthSourceArchive {
+                url: NATURAL_EARTH_PHYSICAL_10M_URL,
+                archive_name: "natural-earth-physical.zip",
+                description: "Natural Earth physical archive",
+            },
+            &extracted_dir,
             &staging_dir,
         )
         .await?;
@@ -308,8 +388,81 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
         .await?;
         update_phase(state, "Validating generated MBTiles").await;
         validate_generated_mbtiles(state, &artifact_path).await?;
-        update_phase(state, "Publishing the map artifact").await;
-        publish_generated_mbtiles(state, job, &artifact_path).await
+
+        let label_artifact_path = if job.profile == NaturalEarthImportProfile::PhysicalWithLabels {
+            let labels_source_dir = staging_dir.join("labels-source");
+            fs::create_dir_all(&labels_source_dir).await?;
+            for archive in [
+                NaturalEarthSourceArchive {
+                    url: NATURAL_EARTH_COUNTRIES_10M_URL,
+                    archive_name: "natural-earth-countries.zip",
+                    description: "Natural Earth countries archive",
+                },
+                NaturalEarthSourceArchive {
+                    url: NATURAL_EARTH_POPULATED_PLACES_10M_URL,
+                    archive_name: "natural-earth-populated-places.zip",
+                    description: "Natural Earth populated places archive",
+                },
+                NaturalEarthSourceArchive {
+                    url: NATURAL_EARTH_BOUNDARIES_10M_URL,
+                    archive_name: "natural-earth-boundaries.zip",
+                    description: "Natural Earth country boundaries archive",
+                },
+            ] {
+                download_and_extract_natural_earth_archive(
+                    state,
+                    archive,
+                    &labels_source_dir,
+                    &staging_dir,
+                )
+                .await?;
+            }
+            let countries = find_layer(&labels_source_dir, "ne_10m_admin_0_countries.shp")?;
+            let populated_places = find_layer(&labels_source_dir, "ne_10m_populated_places.shp")?;
+            let boundaries =
+                find_layer(&labels_source_dir, "ne_10m_admin_0_boundary_lines_land.shp")?;
+            let label_geopackage = staging_dir.join("natural-earth-labels.gpkg");
+            let label_mbtiles = staging_dir.join("natural-earth-labels.mbtiles");
+            update_phase(state, "Preparing Natural Earth country and place labels").await;
+            create_natural_earth_label_overlay(
+                state,
+                NaturalEarthLabelLayers {
+                    countries: &countries,
+                    populated_places: &populated_places,
+                    boundaries: &boundaries,
+                },
+                &label_geopackage,
+                &label_mbtiles,
+                &staging_dir,
+            )
+            .await?;
+            update_phase(state, "Validating generated label overlay").await;
+            validate_generated_label_mbtiles(state, &label_mbtiles).await?;
+            Some(label_mbtiles)
+        } else {
+            None
+        };
+
+        update_phase(state, "Publishing generated map artifact").await;
+        let base_artifact = required_job_artifact(job, map_config::MapVariantAssetKind::Raster)?;
+        let base_size =
+            publish_generated_mbtiles(state, job, base_artifact, &artifact_path).await?;
+        record_published_artifact(state, &base_artifact.manifest_key, base_size).await;
+
+        let label_size = if let Some(label_artifact_path) = label_artifact_path {
+            update_phase(state, "Publishing generated label overlay").await;
+            let label_artifact =
+                required_job_artifact(job, map_config::MapVariantAssetKind::Vector)?;
+            let size =
+                publish_generated_mbtiles(state, job, label_artifact, &label_artifact_path).await?;
+            record_published_artifact(state, &label_artifact.manifest_key, size).await;
+            size
+        } else {
+            0
+        };
+        base_size
+            .checked_add(label_size)
+            .context("published Natural Earth artifact size overflow")
     }
     .await;
     if let Err(error) = fs::remove_dir_all(&staging_dir).await {
@@ -357,7 +510,9 @@ async fn finish_job(
     let mut runtime = state.storage.natural_earth_import.lock().await;
     if let Some(job) = runtime.job.as_mut() {
         job.phase = phase.to_string();
-        job.logical_size_bytes = logical_size_bytes;
+        if !matches!(import_state, NaturalEarthImportState::Failed) || logical_size_bytes > 0 {
+            job.logical_size_bytes = logical_size_bytes;
+        }
         job.error = error;
         job.updated_at_unix = unix_ts();
         let completion_log = match &import_state {
@@ -375,8 +530,11 @@ async fn finish_job(
     }
 }
 
-async fn ensure_import_commands_available(state: &ServerState) -> Result<()> {
-    for (command, version_argument) in REQUIRED_MAP_IMPORT_COMMANDS {
+async fn ensure_import_commands_available(
+    state: &ServerState,
+    profile: NaturalEarthImportProfile,
+) -> Result<()> {
+    for (command, version_argument) in required_import_commands(profile) {
         let arguments = vec![version_argument.into()];
         let command_display = format_command(command, &arguments);
         append_import_log(
@@ -428,24 +586,44 @@ async fn ensure_import_commands_available(state: &ServerState) -> Result<()> {
     Ok(())
 }
 
-async fn download_natural_earth_archive(state: &ServerState, destination: &Path) -> Result<()> {
+fn required_import_commands(
+    profile: NaturalEarthImportProfile,
+) -> Vec<(&'static str, &'static str)> {
+    let mut commands = REQUIRED_MAP_IMPORT_COMMANDS.to_vec();
+    if profile == NaturalEarthImportProfile::PhysicalWithLabels {
+        commands.extend(REQUIRED_LABEL_IMPORT_COMMANDS);
+    }
+    commands
+}
+
+async fn download_and_extract_natural_earth_archive(
+    state: &ServerState,
+    archive: NaturalEarthSourceArchive,
+    destination_dir: &Path,
+    working_dir: &Path,
+) -> Result<()> {
+    let destination = working_dir.join(archive.archive_name);
+    update_phase(state, &format!("Downloading {}", archive.description)).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10 * 60))
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()
         .context("failed building Natural Earth download client")?;
     let mut response = client
-        .get(NATURAL_EARTH_PHYSICAL_10M_URL)
+        .get(archive.url)
         .send()
         .await
-        .context("failed downloading the Natural Earth physical archive")?
+        .with_context(|| format!("failed downloading the {}", archive.description))?
         .error_for_status()
-        .context("Natural Earth physical archive request was rejected")?;
+        .with_context(|| format!("{} request was rejected", archive.description))?;
     if response
         .content_length()
         .is_some_and(|size| size > NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES as u64)
     {
-        bail!("Natural Earth physical archive exceeds the configured download size limit")
+        bail!(
+            "{} exceeds the configured download size limit",
+            archive.description
+        )
     }
     let mut payload = Vec::with_capacity(
         response
@@ -461,25 +639,44 @@ async fn download_natural_earth_archive(state: &ServerState, destination: &Path)
         let next_size = payload
             .len()
             .checked_add(chunk.len())
-            .context("Natural Earth physical archive size overflow")?;
+            .with_context(|| format!("{} size overflow", archive.description))?;
         if next_size > NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES {
-            bail!("Natural Earth physical archive exceeds the configured download size limit")
+            bail!(
+                "{} exceeds the configured download size limit",
+                archive.description
+            )
         }
         payload.extend_from_slice(&chunk);
     }
     let downloaded_bytes = payload.len();
-    fs::write(destination, payload).await.with_context(|| {
+    fs::write(&destination, payload).await.with_context(|| {
         format!(
-            "failed writing Natural Earth archive {}",
+            "failed writing {} {}",
+            archive.description,
             destination.display()
         )
     })?;
     append_import_log(
         state,
-        format!("Downloaded Natural Earth archive ({downloaded_bytes} bytes)"),
+        format!(
+            "Downloaded {} ({downloaded_bytes} bytes)",
+            archive.description
+        ),
     )
     .await;
-    Ok(())
+    update_phase(state, &format!("Extracting {}", archive.description)).await;
+    run_command(
+        state,
+        "unzip",
+        [
+            "-q".into(),
+            destination.as_os_str().to_owned(),
+            "-d".into(),
+            destination_dir.as_os_str().to_owned(),
+        ],
+        working_dir,
+    )
+    .await
 }
 
 async fn rasterize_physical_map(
@@ -644,6 +841,113 @@ async fn project_and_create_mbtiles(
         working_dir,
     )
     .await
+}
+
+async fn create_natural_earth_label_overlay(
+    state: &ServerState,
+    layers: NaturalEarthLabelLayers<'_>,
+    geopackage: &Path,
+    artifact: &Path,
+    working_dir: &Path,
+) -> Result<()> {
+    run_command(
+        state,
+        "ogr2ogr",
+        country_label_geopackage_arguments(layers.countries, geopackage),
+        working_dir,
+    )
+    .await?;
+    run_command(
+        state,
+        "ogr2ogr",
+        populated_place_label_geopackage_arguments(layers.populated_places, geopackage),
+        working_dir,
+    )
+    .await?;
+    run_command(
+        state,
+        "ogr2ogr",
+        boundary_geopackage_arguments(layers.boundaries, geopackage),
+        working_dir,
+    )
+    .await?;
+    run_command(
+        state,
+        "ogr2ogr",
+        vector_mbtiles_arguments(geopackage, artifact),
+        working_dir,
+    )
+    .await
+}
+
+fn country_label_geopackage_arguments(
+    source: &Path,
+    destination: &Path,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-f".into(),
+        "GPKG".into(),
+        "-nln".into(),
+        "ne_places".into(),
+        "-nlt".into(),
+        "POINT".into(),
+        "-dialect".into(),
+        "SQLite".into(),
+        "-sql".into(),
+        "SELECT 'country' AS class, NAME AS name, NAME AS name_en, ST_PointOnSurface(geometry) AS geometry FROM ne_10m_admin_0_countries".into(),
+        destination.as_os_str().to_owned(),
+        source.as_os_str().to_owned(),
+    ]
+}
+
+fn populated_place_label_geopackage_arguments(
+    source: &Path,
+    destination: &Path,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-update".into(),
+        "-append".into(),
+        "-nln".into(),
+        "ne_places".into(),
+        "-nlt".into(),
+        "POINT".into(),
+        "-dialect".into(),
+        "SQLite".into(),
+        "-sql".into(),
+        "SELECT CASE WHEN SCALERANK <= 3 THEN 'city' WHEN SCALERANK <= 6 THEN 'town' ELSE 'village' END AS class, NAME AS name, COALESCE(NAMEASCII, NAME) AS name_en, geometry FROM ne_10m_populated_places".into(),
+        destination.as_os_str().to_owned(),
+        source.as_os_str().to_owned(),
+    ]
+}
+
+fn boundary_geopackage_arguments(source: &Path, destination: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "-update".into(),
+        "-append".into(),
+        "-nln".into(),
+        "ne_boundaries".into(),
+        destination.as_os_str().to_owned(),
+        source.as_os_str().to_owned(),
+    ]
+}
+
+fn vector_mbtiles_arguments(source: &Path, destination: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "-f".into(),
+        "MBTILES".into(),
+        "-dsco".into(),
+        "NAME=Natural Earth labels".into(),
+        "-dsco".into(),
+        "DESCRIPTION=Natural Earth countries, populated places, and borders".into(),
+        "-dsco".into(),
+        "TYPE=overlay".into(),
+        "-dsco".into(),
+        "MINZOOM=0".into(),
+        "-dsco".into(),
+        "MAXZOOM=8".into(),
+        destination.as_os_str().to_owned(),
+        source.as_os_str().to_owned(),
+    ]
 }
 
 async fn run_command(
@@ -812,9 +1116,111 @@ async fn validate_generated_mbtiles(state: &ServerState, path: &Path) -> Result<
     Ok(())
 }
 
+async fn validate_generated_label_mbtiles(state: &ServerState, path: &Path) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("failed opening generated Natural Earth label MBTiles artifact")?;
+        let tiles: i64 = connection
+            .query_row("select count(*) from tiles", [], |row| row.get(0))
+            .context("generated Natural Earth label artifact has no readable tiles table")?;
+        if tiles == 0 {
+            bail!("generated Natural Earth label artifact contains no tiles")
+        }
+        let format: Option<String> = connection
+            .query_row(
+                "select value from metadata where name = 'format' limit 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("generated Natural Earth label artifact has no readable metadata table")?;
+        if !matches!(format.as_deref(), Some(value) if value.eq_ignore_ascii_case("pbf")) {
+            bail!("generated Natural Earth label artifact must declare PBF vector tiles")
+        }
+        let metadata_json: Option<String> = connection
+            .query_row(
+                "select value from metadata where name = 'json' limit 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("generated Natural Earth label artifact has no vector metadata")?;
+        validate_natural_earth_label_metadata(metadata_json.as_deref())
+    })
+    .await
+    .context("generated Natural Earth label validation task failed")??;
+    append_import_log(
+        state,
+        "Generated Natural Earth label overlay validation completed successfully",
+    )
+    .await;
+    Ok(())
+}
+
+fn validate_natural_earth_label_metadata(metadata_json: Option<&str>) -> Result<()> {
+    let metadata_json =
+        metadata_json.context("generated Natural Earth label artifact has no json metadata")?;
+    let metadata: serde_json::Value = serde_json::from_str(metadata_json)
+        .context("generated Natural Earth label metadata is invalid JSON")?;
+    let vector_layers = metadata
+        .get("vector_layers")
+        .and_then(serde_json::Value::as_array)
+        .context("generated Natural Earth label metadata has no vector_layers array")?;
+    let layer_names = vector_layers
+        .iter()
+        .filter_map(|layer| layer.get("id").and_then(serde_json::Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    let missing_layers = ["ne_places", "ne_boundaries"]
+        .into_iter()
+        .filter(|layer| !layer_names.contains(layer))
+        .collect::<Vec<_>>();
+    if !missing_layers.is_empty() {
+        bail!(
+            "generated Natural Earth label artifact is missing required vector layer(s): {}",
+            missing_layers.join(", ")
+        )
+    }
+    Ok(())
+}
+
+fn required_job_artifact(
+    job: &NaturalEarthImportJobView,
+    asset: map_config::MapVariantAssetKind,
+) -> Result<&NaturalEarthImportArtifactView> {
+    job.artifacts
+        .iter()
+        .find(|artifact| artifact.asset == asset)
+        .with_context(|| format!("Natural Earth import job has no configured {asset:?} artifact"))
+}
+
+async fn record_published_artifact(
+    state: &ServerState,
+    manifest_key: &str,
+    logical_size_bytes: u64,
+) {
+    let mut runtime = state.storage.natural_earth_import.lock().await;
+    if let Some(job) = runtime.job.as_mut()
+        && matches!(job.state, NaturalEarthImportState::Running)
+    {
+        if let Some(artifact) = job
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.manifest_key == manifest_key)
+        {
+            artifact.logical_size_bytes = logical_size_bytes;
+        }
+        job.logical_size_bytes = job.artifacts.iter().fold(0_u64, |total, artifact| {
+            total.saturating_add(artifact.logical_size_bytes)
+        });
+        job.updated_at_unix = unix_ts();
+    }
+}
+
 async fn publish_generated_mbtiles(
     state: &ServerState,
     job: &NaturalEarthImportJobView,
+    artifact: &NaturalEarthImportArtifactView,
     artifact_path: &Path,
 ) -> Result<u64> {
     let payload = fs::read(artifact_path).await.with_context(|| {
@@ -833,7 +1239,7 @@ async fn publish_generated_mbtiles(
             u64::try_from(part_payload.len()).context("map artifact part size overflow")?;
         let key = format!(
             "{}.natural-earth-{}-part-{}",
-            job.logical_key,
+            artifact.logical_key,
             job.id,
             split_part_id(index)?
         );
@@ -853,8 +1259,8 @@ async fn publish_generated_mbtiles(
         manifest_version: 1,
         manifest_type: "split_file_manifest",
         logical_format: "mbtiles",
-        logical_key: job.logical_key.clone(),
-        manifest_key: job.manifest_key.clone(),
+        logical_key: artifact.logical_key.clone(),
+        manifest_key: artifact.manifest_key.clone(),
         storage_root: "sys/maps",
         logical_size_bytes: offset,
         last_part_size_bytes: parts.last().map(|part| part.size_bytes).unwrap_or_default(),
@@ -863,14 +1269,14 @@ async fn publish_generated_mbtiles(
     };
     put_system_object(
         state,
-        &job.manifest_key,
+        &artifact.manifest_key,
         Bytes::from(
             serde_json::to_vec_pretty(&manifest)
                 .context("failed serializing map artifact manifest")?,
         ),
     )
     .await?;
-    map_dataset_import::invalidate_cached_mbtiles_source(state, &job.manifest_key).await;
+    map_dataset_import::invalidate_cached_mbtiles_source(state, &artifact.manifest_key).await;
     append_import_log(
         state,
         format!("Published {parts_count} map artifact part(s) and manifest"),
@@ -928,5 +1334,62 @@ mod tests {
     #[test]
     fn command_display_names_the_exact_command() {
         assert_eq!(format_command("unzip", &["-v".into()]), "unzip -v");
+    }
+
+    #[test]
+    fn labels_profile_requires_ogr2ogr_but_the_raster_only_profile_does_not() {
+        assert!(
+            !required_import_commands(NaturalEarthImportProfile::Physical)
+                .iter()
+                .any(|(command, _)| *command == "ogr2ogr")
+        );
+        assert!(
+            required_import_commands(NaturalEarthImportProfile::PhysicalWithLabels)
+                .iter()
+                .any(|(command, argument)| *command == "ogr2ogr" && *argument == "--version")
+        );
+    }
+
+    #[test]
+    fn label_conversion_uses_the_viewer_source_layer_contract() {
+        let countries = Path::new("/tmp/ne_10m_admin_0_countries.shp");
+        let places = Path::new("/tmp/ne_10m_populated_places.shp");
+        let boundaries = Path::new("/tmp/ne_10m_admin_0_boundary_lines_land.shp");
+        let geopackage = Path::new("/tmp/natural-earth-labels.gpkg");
+        let artifact = Path::new("/tmp/natural-earth-labels.mbtiles");
+
+        let country_arguments = country_label_geopackage_arguments(countries, geopackage);
+        let place_arguments = populated_place_label_geopackage_arguments(places, geopackage);
+        let boundary_arguments = boundary_geopackage_arguments(boundaries, geopackage);
+        let mbtiles_command =
+            format_command("ogr2ogr", &vector_mbtiles_arguments(geopackage, artifact));
+
+        let country_sql = country_arguments[9].to_string_lossy();
+        let place_sql = place_arguments[9].to_string_lossy();
+        assert!(country_sql.contains("'country' AS class"));
+        assert!(country_sql.contains("ST_PointOnSurface(geometry)"));
+        assert!(place_sql.contains("'city'"));
+        assert!(place_sql.contains("'town'"));
+        assert!(place_sql.contains("'village'"));
+        assert_eq!(boundary_arguments[3].to_string_lossy(), "ne_boundaries");
+        assert!(mbtiles_command.contains("-f MBTILES"));
+        assert!(mbtiles_command.contains("MINZOOM=0"));
+        assert!(mbtiles_command.contains("MAXZOOM=8"));
+    }
+
+    #[test]
+    fn label_metadata_requires_places_and_boundaries_layers() {
+        assert!(
+            validate_natural_earth_label_metadata(Some(
+                r#"{"vector_layers":[{"id":"ne_places"},{"id":"ne_boundaries"}]}"#
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_natural_earth_label_metadata(Some(
+                r#"{"vector_layers":[{"id":"ne_places"}]}"#
+            ))
+            .is_err()
+        );
     }
 }

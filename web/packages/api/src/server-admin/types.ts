@@ -93,19 +93,31 @@ export type StartAdminMapDatasetImportResponse = {
 
 export type NaturalEarthImportState = "running" | "ready" | "failed";
 
+export type NaturalEarthImportProfile = "physical" | "physical_with_labels";
+
 export type NaturalEarthImportLogEntry = {
   timestamp_unix: number;
   message: string;
 };
 
+export type NaturalEarthImportArtifactView = {
+  variant_id: string;
+  asset: GalleryMapVariantAsset;
+  logical_key: string;
+  manifest_key: string;
+  logical_size_bytes: number;
+};
+
 export type NaturalEarthImportJobView = {
   id: string;
   state: NaturalEarthImportState;
+  profile: NaturalEarthImportProfile;
   phase: string;
   source_url: string;
   logical_key: string;
   manifest_key: string;
   logical_size_bytes: number;
+  artifacts: NaturalEarthImportArtifactView[];
   error?: string | null;
   log_entries: NaturalEarthImportLogEntry[];
   started_at_unix: number;

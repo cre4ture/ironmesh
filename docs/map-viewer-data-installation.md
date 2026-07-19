@@ -80,11 +80,12 @@ Open **Server Admin → Gallery → Map dataset import wizard**. The wizard asks
 for a desired map outcome first and then adapts the remaining questions to that
 profile:
 
-1. choose **Natural Earth physical world map** or **An existing MBTiles
-   package**;
+1. choose **Natural Earth physical world map**, **Natural Earth physical world
+   map + labels**, or **An existing MBTiles package**;
 2. confirm the fixed official Natural Earth source, or paste one HTTP(S) URL
    (or a copied `wget -c ...` command) for an existing MBTiles package;
-3. confirm the fixed `natural-earth-globe` raster destination, or select the
+3. confirm the fixed `natural-earth-globe` raster destination, the fixed
+   raster and vector destinations for the labels profile, or select the
    configured variant artifact and part size for an MBTiles package;
 4. review the source and destination, then start the background job.
 
@@ -122,8 +123,8 @@ This automatic path has no administrator-provided URL or converter arguments.
 It requires `unzip`, `gdal_rasterize`, `gdalwarp`, `gdal_translate`, and
 `gdaladdo` on the server `PATH`. The Debian package installs `unzip` and
 `gdal-bin`; other deployments must provide the same tools. The existing manual
-import remains appropriate for a custom physical rendering, a labels overlay,
-or data from another provider.
+import remains appropriate for a custom physical rendering or data from another
+provider.
 
 Expand **Conversion log** on the Natural Earth job to inspect each conversion
 phase, dependency check, and executed converter command. Failed commands show
@@ -138,10 +139,21 @@ contract:
 - `ne_boundaries` for borders;
 - `ne_roads` for optional road lines.
 
-The viewer tolerates absent optional source layers. A cities-and-borders overlay
-can therefore be installed first, with roads added later by replacing the same
-configured vector artifact. Natural Earth itself has only limited global road
-coverage; it is not a replacement for a detailed OpenStreetMap street map.
+Choose **Natural Earth physical world map + labels** in the wizard to generate
+the standard `natural-earth-labels` vector artifact automatically. In addition
+to the physical base archive, the node downloads the fixed official 10m
+countries, populated-places, and country-boundaries archives. It converts
+country polygons to label points, classifies populated places as cities, towns,
+or villages, then writes the `ne_places` and `ne_boundaries` layers to vector
+MBTiles. The raster base and vector overlay are both validated before either
+configured manifest is replaced.
+
+The labels profile also needs `ogr2ogr` from `gdal-bin`; its dependency check
+is visible on the Dependencies page and in the conversion log. The viewer
+tolerates the optional `ne_roads` layer, which is deliberately left out of the
+automatic profile because Natural Earth has only limited global road coverage.
+It can be added later by replacing the same configured vector artifact with a
+compatible custom package.
 
 ## Detailed street packages
 
