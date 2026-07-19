@@ -1,10 +1,9 @@
 # Global Rendezvous Relay and End-to-End Security Plan
 
-Status: Phase 1 is implemented on `main`. Phase 2 is in progress: P2-A and
-P2-B are present, and the P2-C registry/verifier foundation plus the versioned
-registration protocol are available on this branch's base. The registration
-API, node wiring, and Phase-2 end-to-end coverage are still landing in
-parallel; Phase 2 is not complete.
+Status: Phase 1 is implemented on `main`. Phase 2 is implemented by this
+branch and is pending review and merge. It adds the global registration API,
+server-node opt-in and auto-registration, and the Phase-2 end-to-end coverage;
+those capabilities become available on `main` when this branch is merged.
 
 ## Goal
 
@@ -171,11 +170,11 @@ Deliverables:
 
 ## Phase 2: Cluster tenancy for Option 1
 
-Phase 1 acceptance criteria are met on `main`; Phase 2 is now active but not
-complete. P2-A and P2-B are present. The P2-C persistent registry and dynamic
-verifier work, together with the versioned P2-D registration protocol, are the
-foundation for the remaining service API, node integration, and end-to-end
-tests. Those remaining parts must land before Phase 2 can be marked complete.
+Phase 1 acceptance criteria are met on `main`. This branch completes Phase 2:
+it integrates the P2-C registry and dynamic verifier, exposes the P2-D global
+registration and operator controls, adds node opt-in and auto-registration,
+and covers the full two-cluster lifecycle in P2-E. Review and merge remain
+required before this status applies to `main`.
 
 ### Tenant key and certificate binding
 
@@ -251,13 +250,14 @@ The service needs a reloadable custom client-certificate verifier that:
 - P2-A: Cluster SAN issuance and validation are present.
 - P2-B: In-memory rendezvous presence, discovery, relay, and wake state are
   cluster-keyed.
-- P2-C: The persistent cluster CA registry and dynamic verifier work are the
-  present foundation; integration completion remains gated on the items below.
-- P2-D: The versioned self-service challenge/proof protocol is present. The
-  service API, abuse-control wiring, operator suspend/list controls, and node
-  auto-registration are still in parallel development.
-- P2-E: Two-cluster isolation, restart persistence, and CA-registration system
-  tests remain required. Their absence means Phase 2 is not complete.
+- P2-C: The persistent cluster CA registry and dynamic verifier are integrated
+  into the global rendezvous service. Exactly one active CA is selected by the
+  verified cluster SAN, without an all-CA fallback.
+- P2-D: The versioned self-service challenge/proof API, registration rate
+  limiting, authenticated list/suspend/resume controls with suspension audit
+  data, and explicit server-node auto-registration opt-in are implemented.
+- P2-E: The system test covers HTTPS registration, two-cluster mTLS tenancy,
+  rejection of a bad CA, suspension, and restart persistence.
 
 ## Deferred work
 
@@ -275,8 +275,9 @@ Option 1 delivery.
 
 ## Delivery dependency
 
-The remaining Phase-2 API, node, and end-to-end test work can proceed in
-parallel, but must converge on the single-CA and cluster-SAN rules above. A
-merge must not enable global self-registration unless the persistent registry,
-dynamic verifier, service-side abuse controls, node opt-in, and isolation and
-restart tests are all present.
+The Phase-2 implementation on this branch meets the single-CA and cluster-SAN
+rules above. It may be merged only with the persistent registry, dynamic
+verifier, service-side abuse controls, node opt-in, and isolation and restart
+tests intact. Production enablement remains subject to the operations checklist
+and its service TLS, durable-storage, secret-management, monitoring, and backup
+requirements.

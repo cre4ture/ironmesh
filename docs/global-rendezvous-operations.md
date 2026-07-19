@@ -1,8 +1,8 @@
 # Global Rendezvous Operations Checklist
 
-Status: Phase-2 operating contract. The registration protocol and registry
-foundation do not by themselves mean that the global service API, server-node
-registration flow, or end-to-end tests are available on `main`.
+Status: Phase-2 operating contract. The global service API, server-node
+registration flow, and end-to-end coverage are implemented on this branch;
+they become available on `main` after review and merge.
 
 This checklist applies to an Internet-facing global rendezvous/relay operating
 with Option 1. Its security boundary is defined in
