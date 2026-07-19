@@ -7,56 +7,116 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		033FA480DF4A80E6F24261D9 /* IronmeshFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* IronmeshFileProviderConnectionService.swift */; };
 		082E983DBE4DD0A288B7E0B2 /* IronmeshMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */; };
+		08E716AF213E2FB823592D58 /* IronmeshFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* IronmeshFileProviderRuntimeSupport.swift */; };
 		09176176A1A35D7D95E20B12 /* IronmeshIosProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A36A32CA7808E8CC71993FEC /* IronmeshIosProjectTests.swift */; };
 		0BC42E8828E7FB463CEA0761 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 		0DBC3C31113B92CB3CFE0EFD /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
+		0E5FE19377CD8FDF125AAE42 /* IronmeshFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* IronmeshFileProviderItem.swift */; };
+		0F18AADE91E7CAB785BCB7F5 /* IronmeshFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* IronmeshFileProviderConnectionService.swift */; };
+		11B6ED71556A64B00280AC5E /* IronmeshFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* IronmeshFileProviderConnectionService.swift */; };
 		1596A1C38F950315CB507483 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 220FA7A03D50518BD537F1CB /* AVFoundation.framework */; };
+		1A8E87AEBF648C0E949F24EE /* IronmeshIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* IronmeshIdentifierPathCache.swift */; };
+		1E2E69BD1A65E53A91CB1EFE /* IronmeshSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* IronmeshSyncAnchorCodec.swift */; };
+		1EDB771D9C09AB528C3E97A7 /* IronmeshFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* IronmeshFileProviderMutationService.swift */; };
+		1F12A9A2FED5E58DE11EFDDD /* IronmeshIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* IronmeshIdentifierPathCache.swift */; };
 		1F289BAE99E359A43B97B771 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6DED46198314AD32D59D4EEE /* Network.framework */; };
 		1F30F9EE22B86F396DAEA0DF /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
+		21E9C2712F293E5C249D8C3E /* IronmeshFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* IronmeshFileProviderExtensionHost.swift */; };
+		27A5FFB82850B7BD3A74B1FA /* IronmeshFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* IronmeshFileProviderReadService.swift */; };
+		2E47B7E3A1EC24B17639E56D /* IronmeshFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* IronmeshFileProviderEnumerator.swift */; };
 		2F0BF924B0A6486D54FC974E /* IronmeshFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* IronmeshFileProviderSyncRuntime.swift */; };
+		3652E85986B596D16D33CB7D /* IronmeshFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* IronmeshFileProviderEnumerator.swift */; };
+		3812238F70057C449AA7B2B0 /* IronmeshFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* IronmeshFileProviderConflictService.swift */; };
+		3CE9B7BE02A592262B6F2A81 /* IronmeshFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* IronmeshFileProviderRuntimeSupport.swift */; };
 		3ECD32BAAD7E1074A209E6A9 /* IronmeshAppleProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7920A3DC35240252C623BC7 /* IronmeshAppleProjectTests.swift */; };
+		4197B1B83913504F532D511F /* IronmeshFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* IronmeshFileProviderReadService.swift */; };
+		435D0CA69066D5924C792779 /* IronmeshFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* IronmeshFileProviderService.swift */; };
 		43C79B50B668310E1E948E7A /* IronmeshIosFileProviderExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D65743C5EC88BC86B9CCD14F /* IronmeshIosFileProviderExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		442364943CDE6754986E4951 /* IronmeshFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* IronmeshFileProviderLookupService.swift */; };
 		4C9B2B93D3EF1DDA5309B64C /* IronmeshGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB0FEF4247443AA0C0D393D /* IronmeshGalleryModel.swift */; };
+		4F22E831A0BEF874230F1044 /* IronmeshFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* IronmeshFileProviderReadService.swift */; };
+		50D1573E018F1F112D40ED86 /* IronmeshFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* IronmeshFileProviderService.swift */; };
+		51BAF01273A3A345A54851B0 /* IronmeshFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* IronmeshFileProviderRuntimeSupport.swift */; };
+		52B068416C957652A221862F /* IronmeshFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* IronmeshFileProviderMutationService.swift */; };
 		5325406375A4DA8E66293157 /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
 		5392619423EF7380FFA0BA73 /* IronmeshBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */; };
 		5AA87421C5EE2962F1348EEC /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
 		5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */; };
+		5F9F92673599603F7B4FA94E /* IronmeshFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* IronmeshFileProviderService.swift */; };
 		61DE2DC4A82685AF6F6554D2 /* IronmeshGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB0FEF4247443AA0C0D393D /* IronmeshGalleryModel.swift */; };
 		6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */; };
 		63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
+		65453585D6DB3706C758A37C /* IronmeshIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* IronmeshIdentifierPathCache.swift */; };
+		67D608DE778EEB1DD66BA2CA /* IronmeshFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* IronmeshFileProviderConflictService.swift */; };
+		6960DA8C2DA00DDF7ED65525 /* IronmeshFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* IronmeshFileProviderExtensionReadHost.swift */; };
+		6BFE22DE8E310C164FEB9842 /* IronmeshFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* IronmeshFileProviderExtensionHost.swift */; };
+		6C13F572A208AD915911CB47 /* IronmeshFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* IronmeshFileProviderRuntimeSupport.swift */; };
 		6F3E03595FD2D97919630E3B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */; };
+		70997E3B270AA2CD91D71B3F /* IronmeshSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* IronmeshSyncAnchorCodec.swift */; };
+		70A038B8E6E1917924173FD8 /* IronmeshWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* IronmeshWorkingSetSignalCoordinator.swift */; };
 		71AE453247F18B2C6C8A3FD4 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 4CADBC90D590EDBD274936BB /* AppleFileProviderShared */; };
+		71CC3C788521C55110FEC7F2 /* IronmeshFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* IronmeshFileProviderLookupService.swift */; };
 		7338228AFCA582F92DE83DE8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 3B0EAA0A0E8449F387555CF7 /* AppleCore */; };
+		73AB93ED2F8EDD1659E92CB7 /* IronmeshFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* IronmeshFileProviderItem.swift */; };
+		764107B1DD7C2FF34E56FE6C /* IronmeshFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* IronmeshFileProviderMutationService.swift */; };
+		7C3AA36AE5D9679A105E1686 /* IronmeshWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* IronmeshWorkingSetSignalCoordinator.swift */; };
 		81832537D853D978072D3C62 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 27724ACE6FAA8F9BBB92D194 /* AppleFileProviderShared */; };
 		84B5410C166A55EF1D7143FB /* IronmeshFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* IronmeshFileProviderSyncRuntime.swift */; };
 		8BB7E92B717F247AC803FF2F /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 036A193B5DAC68469095CE5A /* AppleCore */; };
 		8E3B91407FEE58B371BDCA83 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */; };
+		9782220FB3499AA0A882D4BC /* IronmeshFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* IronmeshFileProviderLookupService.swift */; };
 		98957DAEF45FB9170691016A /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
 		9937DD5D5A6AEBD58A6F5689 /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
+		9AD8E45837318E90D1A18CAE /* IronmeshFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* IronmeshFileProviderExtensionReadHost.swift */; };
+		9B961AE315786144FC48A2A1 /* IronmeshFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* IronmeshFileProviderExtensionMutationHost.swift */; };
+		9E39367F085BA49D4281F19D /* IronmeshWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* IronmeshWorkingSetSignalCoordinator.swift */; };
+		A0B22A2A394BE923D17632AD /* IronmeshFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* IronmeshFileProviderExtensionReadHost.swift */; };
+		A62E2A94F79F4C586D00C090 /* IronmeshFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* IronmeshFileProviderExtensionMutationHost.swift */; };
+		A78C067EB050352B1D6E68C4 /* IronmeshFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* IronmeshFileProviderExtensionHost.swift */; };
+		A7DED56C1664CF0C39FA227C /* IronmeshFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* IronmeshFileProviderItem.swift */; };
 		A8F8240A7C3C6E6CA4DA5EA5 /* IronmeshSyncProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D5ABE42C4A88C9F432EAB30 /* IronmeshSyncProfilesView.swift */; };
+		AA84793D4F184A7BEA919B8D /* IronmeshFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* IronmeshFileProviderConflictService.swift */; };
+		AA8D440478B23CB57200B604 /* IronmeshFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* IronmeshFileProviderMutationService.swift */; };
+		AB76E22ACD480D5D494CCBF5 /* IronmeshSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* IronmeshSyncAnchorCodec.swift */; };
 		AB81FE36B1A8884EB22E1A2C /* IronmeshGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAE325C40BA870C788A02A49 /* IronmeshGalleryView.swift */; };
+		B02D3B50AA4DD0A74EA7EF64 /* IronmeshIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* IronmeshIdentifierPathCache.swift */; };
 		B1CEF3BBBCCA99EB5A2C2F17 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 648AE487A41AA72E53A73C09 /* AppleFileProviderShared */; };
 		B34CFEFE0F3CACD159AFC871 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = D4758290C2F46CB307E07F32 /* AppleCore */; };
 		B36DE238EE6B5D64A18A7FB8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 610C745899D565B8093E9493 /* AppleCore */; };
+		B3F11CA585F799C5462742AF /* IronmeshSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* IronmeshSyncAnchorCodec.swift */; };
+		B4332A6B3C4FF1837B6E1B5A /* IronmeshFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* IronmeshFileProviderReadService.swift */; };
+		B4ACE0699544E9E161E93BF7 /* IronmeshWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* IronmeshWorkingSetSignalCoordinator.swift */; };
+		B505F1987180B3B81BAFD838 /* IronmeshFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* IronmeshFileProviderConflictService.swift */; };
 		BBE371367C8853578B16C056 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6DED46198314AD32D59D4EEE /* Network.framework */; };
+		BC573F3331A869B6230804E1 /* IronmeshFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* IronmeshFileProviderExtensionReadHost.swift */; };
 		BD69388C688129F3E278CF1C /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = F0BA5FE65065A174670816F1 /* AppleFileProviderShared */; };
+		C6A90019EACA58A228F56027 /* IronmeshFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* IronmeshFileProviderService.swift */; };
 		C6AA101E4103A45EE21D1EE1 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 		C6EC8D0848B7E4A66A05D61B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = D3D93B20FE0A9294021D714C /* AppleFileProviderShared */; };
 		CBE7EAED3C09B6F2403AFD28 /* IronmeshIosFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7E9C7CA35FBD3948776E0AF /* IronmeshIosFileProviderExtension.swift */; };
 		CCEA254D25DFFA0674CEB1B8 /* IronmeshFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* IronmeshFileProviderSyncRuntime.swift */; };
+		CF3099C80F9D88009AC75FF0 /* IronmeshFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* IronmeshFileProviderEnumerator.swift */; };
+		D0C54EB6D904FBDA7DE798EF /* IronmeshFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* IronmeshFileProviderExtensionMutationHost.swift */; };
+		D32E29BA694DB69090891F2B /* IronmeshFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* IronmeshFileProviderLookupService.swift */; };
 		D54791C01A831B30E44701BF /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */; };
 		D769F254880D897FB1A0CDAA /* IronmeshFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* IronmeshFileProviderSyncRuntime.swift */; };
 		D802864A3D2DE7B7303E6279 /* IronmeshMacFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AF23604A81569FFBE88C99C /* IronmeshMacFileProviderExtension.swift */; };
 		D94B5BAD893A2D88F7DF51C8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 4FCEFD47F4EBD2FDE8D48497 /* AppleCore */; };
 		DD9F571E15ABD0C5B4D38F1D /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
+		DEF15D6D9BD692D36D445ACE /* IronmeshFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* IronmeshFileProviderItem.swift */; };
 		E139DE3EBC4A80CC22CED1D6 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
+		E2BB351D278368B67B1C40F0 /* IronmeshFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* IronmeshFileProviderExtensionHost.swift */; };
 		E5578688033BE7CDB458989B /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
 		E574A10C6D8F9A186FC35D3B /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
 		E6752CA7D26660DD296011E0 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 5EB1E57AE3FC7EA54C1477E3 /* AppleCore */; };
 		EA5CEAEDBC7AE459CDEF1C8B /* IronmeshBootstrapScannerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E936F23DD46DDF6D86D2F447 /* IronmeshBootstrapScannerSheet.swift */; };
+		EE180BC0B8517727ABFA2DA3 /* IronmeshFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* IronmeshFileProviderConnectionService.swift */; };
 		F02D4D63B27E99F45F6B05C9 /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
 		F13F3F0DA872B57AFD30EE67 /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
+		F3F4A05C300CBFB60793B650 /* IronmeshFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* IronmeshFileProviderEnumerator.swift */; };
+		F9BC2F0979CF91901D8F1CA3 /* IronmeshFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* IronmeshFileProviderExtensionMutationHost.swift */; };
 		FAF90D30003E3533BA646C07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 /* End PBXBuildFile section */
 
@@ -92,28 +152,43 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		1A9A6BE8EA898EC7D430B25C /* IronmeshFileProviderExtensionHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderExtensionHost.swift; sourceTree = "<group>"; };
 		220FA7A03D50518BD537F1CB /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 		244B38CABFC537484ED1F06D /* apple-file-provider */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "apple-file-provider"; path = .; sourceTree = SOURCE_ROOT; };
 		3AF23604A81569FFBE88C99C /* IronmeshMacFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshMacFileProviderExtension.swift; sourceTree = "<group>"; };
+		41445F644F4604684C2EF8C8 /* IronmeshFileProviderMutationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderMutationService.swift; sourceTree = "<group>"; };
 		490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+		5DCD2A1B89C7EC9FF09E436A /* IronmeshFileProviderConnectionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderConnectionService.swift; sourceTree = "<group>"; };
 		69448FBEB222C861B5CA9C1C /* IronmeshAppleProjectTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = IronmeshAppleProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		6C8998582382E6AF8D8680D1 /* IronmeshFileProviderService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderService.swift; sourceTree = "<group>"; };
+		6DD0D96D60F5C1E603B708FB /* IronmeshFileProviderConflictService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderConflictService.swift; sourceTree = "<group>"; };
 		6DED46198314AD32D59D4EEE /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosApp.swift; sourceTree = "<group>"; };
+		792F216BC5734E380B8D639B /* IronmeshSyncAnchorCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshSyncAnchorCodec.swift; sourceTree = "<group>"; };
 		7DA129FD959C0FD0D040070D /* IronmeshIosProjectTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = IronmeshIosProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		7DD73EE64ADF4D79132C4282 /* IronmeshAppleFFI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IronmeshAppleFFI-Bridging-Header.h"; sourceTree = "<group>"; };
 		8A1A4DEFA588B8859D393E5A /* IronmeshFileProviderSyncRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderSyncRuntime.swift; sourceTree = "<group>"; };
 		8F5701975DDED656D7A9B6A6 /* IronmeshMacFileProviderExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = IronmeshMacFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		987EDC104DA47B5CF20BED0D /* IronmeshMacApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IronmeshMacApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9C871EFA8FFA39346B9520B9 /* IronmeshFileProviderExtensionMutationHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderExtensionMutationHost.swift; sourceTree = "<group>"; };
 		9D5ABE42C4A88C9F432EAB30 /* IronmeshSyncProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshSyncProfilesView.swift; sourceTree = "<group>"; };
+		9DE242824A78C12FCE941041 /* IronmeshFileProviderReadService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderReadService.swift; sourceTree = "<group>"; };
+		9EAEDFCD6573C0E56F75AD1D /* IronmeshFileProviderEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderEnumerator.swift; sourceTree = "<group>"; };
 		A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshBrowserModel.swift; sourceTree = "<group>"; };
 		A36A32CA7808E8CC71993FEC /* IronmeshIosProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosProjectTests.swift; sourceTree = "<group>"; };
 		A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
+		A4A19B32096F78A0D540CACC /* IronmeshFileProviderRuntimeSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderRuntimeSupport.swift; sourceTree = "<group>"; };
+		A6C4CDC5E768B56A87C001C4 /* IronmeshFileProviderLookupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderLookupService.swift; sourceTree = "<group>"; };
 		A7E9C7CA35FBD3948776E0AF /* IronmeshIosFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosFileProviderExtension.swift; sourceTree = "<group>"; };
 		B88EA20710228EA5788F3224 /* IronmeshIosApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = IronmeshIosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshMacApp.swift; sourceTree = "<group>"; };
 		C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshRustFFIAdapter.swift; sourceTree = "<group>"; };
+		C3AC8A2D308A04A831319F14 /* IronmeshFileProviderExtensionReadHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderExtensionReadHost.swift; sourceTree = "<group>"; };
+		C7EA0BE16142BA4ABE0700C6 /* IronmeshWorkingSetSignalCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshWorkingSetSignalCoordinator.swift; sourceTree = "<group>"; };
 		CAE325C40BA870C788A02A49 /* IronmeshGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryView.swift; sourceTree = "<group>"; };
+		CC064A6A2AC06203AE0B3854 /* IronmeshIdentifierPathCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIdentifierPathCache.swift; sourceTree = "<group>"; };
 		D65743C5EC88BC86B9CCD14F /* IronmeshIosFileProviderExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = IronmeshIosFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		E669C9817685097A05F1EA4C /* IronmeshFileProviderItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderItem.swift; sourceTree = "<group>"; };
 		E936F23DD46DDF6D86D2F447 /* IronmeshBootstrapScannerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshBootstrapScannerSheet.swift; sourceTree = "<group>"; };
 		EBB0FEF4247443AA0C0D393D /* IronmeshGalleryModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshGalleryModel.swift; sourceTree = "<group>"; };
 		EC4454FA337C8FA97EBDD917 /* FileProvider.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FileProvider.framework; path = System/Library/Frameworks/FileProvider.framework; sourceTree = SDKROOT; };
@@ -267,8 +342,23 @@
 		96F7B3C14F1A91CD6DCE0635 /* AppleFileProviderRuntime */ = {
 			isa = PBXGroup;
 			children = (
+				6DD0D96D60F5C1E603B708FB /* IronmeshFileProviderConflictService.swift */,
+				5DCD2A1B89C7EC9FF09E436A /* IronmeshFileProviderConnectionService.swift */,
+				9EAEDFCD6573C0E56F75AD1D /* IronmeshFileProviderEnumerator.swift */,
+				1A9A6BE8EA898EC7D430B25C /* IronmeshFileProviderExtensionHost.swift */,
+				9C871EFA8FFA39346B9520B9 /* IronmeshFileProviderExtensionMutationHost.swift */,
+				C3AC8A2D308A04A831319F14 /* IronmeshFileProviderExtensionReadHost.swift */,
+				E669C9817685097A05F1EA4C /* IronmeshFileProviderItem.swift */,
+				A6C4CDC5E768B56A87C001C4 /* IronmeshFileProviderLookupService.swift */,
+				41445F644F4604684C2EF8C8 /* IronmeshFileProviderMutationService.swift */,
+				9DE242824A78C12FCE941041 /* IronmeshFileProviderReadService.swift */,
 				F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */,
+				A4A19B32096F78A0D540CACC /* IronmeshFileProviderRuntimeSupport.swift */,
+				6C8998582382E6AF8D8680D1 /* IronmeshFileProviderService.swift */,
 				8A1A4DEFA588B8859D393E5A /* IronmeshFileProviderSyncRuntime.swift */,
+				CC064A6A2AC06203AE0B3854 /* IronmeshIdentifierPathCache.swift */,
+				792F216BC5734E380B8D639B /* IronmeshSyncAnchorCodec.swift */,
+				C7EA0BE16142BA4ABE0700C6 /* IronmeshWorkingSetSignalCoordinator.swift */,
 			);
 			name = AppleFileProviderRuntime;
 			path = Sources/AppleFileProviderRuntime;
@@ -606,10 +696,25 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B505F1987180B3B81BAFD838 /* IronmeshFileProviderConflictService.swift in Sources */,
+				033FA480DF4A80E6F24261D9 /* IronmeshFileProviderConnectionService.swift in Sources */,
+				CF3099C80F9D88009AC75FF0 /* IronmeshFileProviderEnumerator.swift in Sources */,
+				A78C067EB050352B1D6E68C4 /* IronmeshFileProviderExtensionHost.swift in Sources */,
+				A62E2A94F79F4C586D00C090 /* IronmeshFileProviderExtensionMutationHost.swift in Sources */,
+				6960DA8C2DA00DDF7ED65525 /* IronmeshFileProviderExtensionReadHost.swift in Sources */,
+				0E5FE19377CD8FDF125AAE42 /* IronmeshFileProviderItem.swift in Sources */,
+				71CC3C788521C55110FEC7F2 /* IronmeshFileProviderLookupService.swift in Sources */,
+				764107B1DD7C2FF34E56FE6C /* IronmeshFileProviderMutationService.swift in Sources */,
+				27A5FFB82850B7BD3A74B1FA /* IronmeshFileProviderReadService.swift in Sources */,
 				98957DAEF45FB9170691016A /* IronmeshFileProviderRuntime.swift in Sources */,
+				3CE9B7BE02A592262B6F2A81 /* IronmeshFileProviderRuntimeSupport.swift in Sources */,
+				50D1573E018F1F112D40ED86 /* IronmeshFileProviderService.swift in Sources */,
 				CCEA254D25DFFA0674CEB1B8 /* IronmeshFileProviderSyncRuntime.swift in Sources */,
+				1A8E87AEBF648C0E949F24EE /* IronmeshIdentifierPathCache.swift in Sources */,
 				CBE7EAED3C09B6F2403AFD28 /* IronmeshIosFileProviderExtension.swift in Sources */,
 				5325406375A4DA8E66293157 /* IronmeshRustFFIAdapter.swift in Sources */,
+				AB76E22ACD480D5D494CCBF5 /* IronmeshSyncAnchorCodec.swift in Sources */,
+				70A038B8E6E1917924173FD8 /* IronmeshWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -626,11 +731,26 @@
 			buildActionMask = 2147483647;
 			files = (
 				5392619423EF7380FFA0BA73 /* IronmeshBrowserModel.swift in Sources */,
+				AA84793D4F184A7BEA919B8D /* IronmeshFileProviderConflictService.swift in Sources */,
+				11B6ED71556A64B00280AC5E /* IronmeshFileProviderConnectionService.swift in Sources */,
+				2E47B7E3A1EC24B17639E56D /* IronmeshFileProviderEnumerator.swift in Sources */,
+				21E9C2712F293E5C249D8C3E /* IronmeshFileProviderExtensionHost.swift in Sources */,
+				D0C54EB6D904FBDA7DE798EF /* IronmeshFileProviderExtensionMutationHost.swift in Sources */,
+				BC573F3331A869B6230804E1 /* IronmeshFileProviderExtensionReadHost.swift in Sources */,
+				73AB93ED2F8EDD1659E92CB7 /* IronmeshFileProviderItem.swift in Sources */,
+				442364943CDE6754986E4951 /* IronmeshFileProviderLookupService.swift in Sources */,
+				1EDB771D9C09AB528C3E97A7 /* IronmeshFileProviderMutationService.swift in Sources */,
+				4197B1B83913504F532D511F /* IronmeshFileProviderReadService.swift in Sources */,
 				F02D4D63B27E99F45F6B05C9 /* IronmeshFileProviderRuntime.swift in Sources */,
+				51BAF01273A3A345A54851B0 /* IronmeshFileProviderRuntimeSupport.swift in Sources */,
+				5F9F92673599603F7B4FA94E /* IronmeshFileProviderService.swift in Sources */,
 				84B5410C166A55EF1D7143FB /* IronmeshFileProviderSyncRuntime.swift in Sources */,
 				4C9B2B93D3EF1DDA5309B64C /* IronmeshGalleryModel.swift in Sources */,
+				65453585D6DB3706C758A37C /* IronmeshIdentifierPathCache.swift in Sources */,
 				082E983DBE4DD0A288B7E0B2 /* IronmeshMacApp.swift in Sources */,
 				F13F3F0DA872B57AFD30EE67 /* IronmeshRustFFIAdapter.swift in Sources */,
+				1E2E69BD1A65E53A91CB1EFE /* IronmeshSyncAnchorCodec.swift in Sources */,
+				B4ACE0699544E9E161E93BF7 /* IronmeshWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -648,13 +768,28 @@
 			files = (
 				EA5CEAEDBC7AE459CDEF1C8B /* IronmeshBootstrapScannerSheet.swift in Sources */,
 				5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */,
+				3812238F70057C449AA7B2B0 /* IronmeshFileProviderConflictService.swift in Sources */,
+				0F18AADE91E7CAB785BCB7F5 /* IronmeshFileProviderConnectionService.swift in Sources */,
+				3652E85986B596D16D33CB7D /* IronmeshFileProviderEnumerator.swift in Sources */,
+				6BFE22DE8E310C164FEB9842 /* IronmeshFileProviderExtensionHost.swift in Sources */,
+				9B961AE315786144FC48A2A1 /* IronmeshFileProviderExtensionMutationHost.swift in Sources */,
+				9AD8E45837318E90D1A18CAE /* IronmeshFileProviderExtensionReadHost.swift in Sources */,
+				DEF15D6D9BD692D36D445ACE /* IronmeshFileProviderItem.swift in Sources */,
+				9782220FB3499AA0A882D4BC /* IronmeshFileProviderLookupService.swift in Sources */,
+				52B068416C957652A221862F /* IronmeshFileProviderMutationService.swift in Sources */,
+				B4332A6B3C4FF1837B6E1B5A /* IronmeshFileProviderReadService.swift in Sources */,
 				1F30F9EE22B86F396DAEA0DF /* IronmeshFileProviderRuntime.swift in Sources */,
+				08E716AF213E2FB823592D58 /* IronmeshFileProviderRuntimeSupport.swift in Sources */,
+				C6A90019EACA58A228F56027 /* IronmeshFileProviderService.swift in Sources */,
 				D769F254880D897FB1A0CDAA /* IronmeshFileProviderSyncRuntime.swift in Sources */,
 				61DE2DC4A82685AF6F6554D2 /* IronmeshGalleryModel.swift in Sources */,
 				AB81FE36B1A8884EB22E1A2C /* IronmeshGalleryView.swift in Sources */,
+				B02D3B50AA4DD0A74EA7EF64 /* IronmeshIdentifierPathCache.swift in Sources */,
 				6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */,
 				E5578688033BE7CDB458989B /* IronmeshRustFFIAdapter.swift in Sources */,
+				B3F11CA585F799C5462742AF /* IronmeshSyncAnchorCodec.swift in Sources */,
 				A8F8240A7C3C6E6CA4DA5EA5 /* IronmeshSyncProfilesView.swift in Sources */,
+				9E39367F085BA49D4281F19D /* IronmeshWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -662,10 +797,25 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				67D608DE778EEB1DD66BA2CA /* IronmeshFileProviderConflictService.swift in Sources */,
+				EE180BC0B8517727ABFA2DA3 /* IronmeshFileProviderConnectionService.swift in Sources */,
+				F3F4A05C300CBFB60793B650 /* IronmeshFileProviderEnumerator.swift in Sources */,
+				E2BB351D278368B67B1C40F0 /* IronmeshFileProviderExtensionHost.swift in Sources */,
+				F9BC2F0979CF91901D8F1CA3 /* IronmeshFileProviderExtensionMutationHost.swift in Sources */,
+				A0B22A2A394BE923D17632AD /* IronmeshFileProviderExtensionReadHost.swift in Sources */,
+				A7DED56C1664CF0C39FA227C /* IronmeshFileProviderItem.swift in Sources */,
+				D32E29BA694DB69090891F2B /* IronmeshFileProviderLookupService.swift in Sources */,
+				AA8D440478B23CB57200B604 /* IronmeshFileProviderMutationService.swift in Sources */,
+				4F22E831A0BEF874230F1044 /* IronmeshFileProviderReadService.swift in Sources */,
 				9937DD5D5A6AEBD58A6F5689 /* IronmeshFileProviderRuntime.swift in Sources */,
+				6C13F572A208AD915911CB47 /* IronmeshFileProviderRuntimeSupport.swift in Sources */,
+				435D0CA69066D5924C792779 /* IronmeshFileProviderService.swift in Sources */,
 				2F0BF924B0A6486D54FC974E /* IronmeshFileProviderSyncRuntime.swift in Sources */,
+				1F12A9A2FED5E58DE11EFDDD /* IronmeshIdentifierPathCache.swift in Sources */,
 				D802864A3D2DE7B7303E6279 /* IronmeshMacFileProviderExtension.swift in Sources */,
 				5AA87421C5EE2962F1348EEC /* IronmeshRustFFIAdapter.swift in Sources */,
+				70997E3B270AA2CD91D71B3F /* IronmeshSyncAnchorCodec.swift in Sources */,
+				7C3AA36AE5D9679A105E1686 /* IronmeshWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

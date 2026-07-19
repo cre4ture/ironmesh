@@ -55,6 +55,34 @@ public enum AppleSyncConstraintEvaluator {
     }
 }
 
+public enum AppleSyncRecoverySignalPolicy {
+    public static func shouldSignal(
+        profile: AppleSyncProfile,
+        previous: AppleSyncEnvironmentSnapshot,
+        current: AppleSyncEnvironmentSnapshot
+    ) -> Bool {
+        !AppleSyncConstraintEvaluator.evaluate(
+            profile: profile,
+            environment: previous
+        ).isAllowed
+            && AppleSyncConstraintEvaluator.evaluate(
+                profile: profile,
+                environment: current
+            ).isAllowed
+    }
+}
+
+public enum AppleDeletionCapabilityPolicy {
+    public static func allowsDeletion(for kind: AppleFileProviderItemIdentifierKind) -> Bool {
+        switch kind {
+        case .file, .temporaryFile:
+            true
+        case .root, .directory:
+            false
+        }
+    }
+}
+
 public struct AppleProfilePathMapper: Equatable, Sendable {
     public let remotePrefix: String
 

@@ -37,11 +37,15 @@ separate Files domain backed by the shared enrolled device connection.
   disconnect/reconnect. The registered domain and OS-managed queued/materialized data remain intact.
 - Remote discovery is driven by File Provider enumeration and explicit working-set signals. A
   persistent generation journal translates full remote snapshots into restart-safe updates and
-  deletions without foreground polling.
+  deletions without foreground polling. Network/power recovery and a newly materialized conflict
+  copy emit best-effort working-set hints; they do not promise immediate remote push delivery.
 - Content is materialized on demand. Offline pinning remains the Files app's system-managed
   **Keep Downloaded** action; iOS has no provider-level per-profile eager-retention API.
 - File mutations carry File Provider's base version to a server-side preferred-head compare-and-swap.
-  Concurrent content edits are preserved under a deterministic visible conflict-copy name.
+  Concurrent content edits are preserved under a deterministic visible conflict-copy name. A
+  Directory deletion remains disabled until namespace-level snapshot CAS can protect concurrent
+  child mutations; directory items therefore do not advertise deletion in Files. The protocol
+  follow-up is tracked in [#148](https://github.com/cre4ture/ironmesh/issues/148).
 
 See [the multi-profile sync ADR](../../docs/ios-multi-profile-folder-sync-decision.md) for the
 architecture, platform compromises, guarantees, and known boundaries.

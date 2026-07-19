@@ -134,6 +134,7 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var syncProfiles: [AppleSyncProfile] = []
     @Published var registeredSyncProfileDomains: [String: AppleRegisteredFileProviderDomain] = [:]
     @Published var syncProfilesErrorMessage: String?
+    @Published private(set) var syncProfileOperationState = AppleSyncProfileOperationState()
     @Published var isBusy = false
     @Published var lastSuccessfulConnectionAt: Date?
     @Published var lastErrorMessage: String?
@@ -163,6 +164,10 @@ final class IronmeshBrowserModel: ObservableObject {
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
+
+    var isSyncProfileMutationInProgress: Bool {
+        syncProfileOperationState.isMutationInProgress
+    }
 
     init(
         userDefaults: UserDefaults = .standard,
@@ -485,6 +490,7 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
+    @discardableResult
     func configureSyncProfile(
         displayName: String,
         remotePrefix: String,
@@ -492,18 +498,18 @@ final class IronmeshBrowserModel: ObservableObject {
         allowsExpensiveNetwork: Bool,
         allowsConstrainedNetwork: Bool,
         defersInLowPowerMode: Bool
-    ) {
+    ) -> Bool {
         guard draft.connectionConfiguration != nil, !draft.requiresEnrollment else {
             let message = "Apply and enroll the shared device connection before adding a sync profile."
             syncProfilesErrorMessage = message
             statusText = message
-            return
+            return false
         }
         guard displayName.nilIfBlank != nil else {
             let message = "A sync profile needs a display name."
             syncProfilesErrorMessage = message
             statusText = message
-            return
+            return false
         }
 
         let profile = AppleSyncProfile(
@@ -519,17 +525,21 @@ final class IronmeshBrowserModel: ObservableObject {
             )
         )
 
+        guard beginSyncProfileMutation() else {
+            return false
+        }
+
         do {
             syncProfiles = try syncProfileStore.upsert(profile)
         } catch {
+            endSyncProfileMutation()
             syncProfilesErrorMessage = error.localizedDescription
             statusText = error.localizedDescription
-            return
+            return false
         }
 
-        beginOperation()
         Task {
-            defer { endOperation() }
+            defer { endSyncProfileMutation() }
             do {
                 try await syncProfileDomains.configure(profile)
                 try await refreshSyncProfileDomainsThrowing()
@@ -542,6 +552,7 @@ final class IronmeshBrowserModel: ObservableObject {
                 addAction("Sync profile registration failed", detail: error.localizedDescription)
             }
         }
+        return true
     }
 
     func pauseSyncProfile(_ profile: AppleSyncProfile) {
@@ -553,9 +564,11 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func removeSyncProfile(_ profile: AppleSyncProfile) {
-        beginOperation()
+        guard beginSyncProfileMutation() else {
+            return
+        }
         Task {
-            defer { endOperation() }
+            defer { endSyncProfileMutation() }
             do {
                 try await syncProfileDomains.remove(profile)
                 syncProfiles = try syncProfileStore.remove(profileID: profile.id)
@@ -605,9 +618,11 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     private func reconcileSyncProfileDomains() {
-        beginOperation()
+        guard beginSyncProfileMutation() else {
+            return
+        }
         Task {
-            defer { endOperation() }
+            defer { endSyncProfileMutation() }
             do {
                 let reconciliationErrors = await syncProfileDomains.reconcile(syncProfiles)
                 try await refreshSyncProfileDomainsThrowing()
@@ -624,9 +639,11 @@ final class IronmeshBrowserModel: ObservableObject {
         _ profile: AppleSyncProfile,
         lifecycle: AppleSyncProfileLifecycle
     ) {
-        beginOperation()
+        guard beginSyncProfileMutation() else {
+            return
+        }
         Task {
-            defer { endOperation() }
+            defer { endSyncProfileMutation() }
             do {
                 syncProfiles = try syncProfileStore.setLifecycle(
                     lifecycle,
@@ -669,6 +686,22 @@ final class IronmeshBrowserModel: ObservableObject {
 
     private func refreshSyncProfileDomainsThrowing() async throws {
         registeredSyncProfileDomains = try await syncProfileDomains.registeredProfiles(syncProfiles)
+    }
+
+    private func beginSyncProfileMutation() -> Bool {
+        guard syncProfileOperationState.beginMutation() else {
+            let message = "Wait for the current sync profile operation to finish."
+            syncProfilesErrorMessage = message
+            statusText = message
+            return false
+        }
+        beginOperation()
+        return true
+    }
+
+    private func endSyncProfileMutation() {
+        syncProfileOperationState.endMutation()
+        endOperation()
     }
 
     func resetToBundleDefaults() {

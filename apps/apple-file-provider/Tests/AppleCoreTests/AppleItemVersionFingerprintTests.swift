@@ -58,6 +58,53 @@ final class AppleItemVersionFingerprintTests: XCTestCase {
         )
     }
 
+    func testDeleteConflictUsesDeletionRejectedDisposition() {
+        let error = ironmeshDeletionRejectedError(
+            path: "documents/report.txt",
+            expectedRevision: "v1",
+            currentRevision: "v2"
+        )
+
+        XCTAssertEqual(error.domain, NSFileProviderErrorDomain)
+        XCTAssertEqual(error.code, NSFileProviderError.Code.deletionRejected.rawValue)
+        XCTAssertEqual(error.userInfo["IronmeshExpectedRevision"] as? String, "v1")
+        XCTAssertEqual(error.userInfo["IronmeshCurrentRevision"] as? String, "v2")
+    }
+
+    func testDirectoryDeleteIsNotAdvertisedAndUsesSnapshotCASReason() {
+        XCTAssertFalse(AppleDeletionCapabilityPolicy.allowsDeletion(for: .root))
+        XCTAssertFalse(AppleDeletionCapabilityPolicy.allowsDeletion(for: .directory))
+        XCTAssertTrue(AppleDeletionCapabilityPolicy.allowsDeletion(for: .file))
+        XCTAssertTrue(AppleDeletionCapabilityPolicy.allowsDeletion(for: .temporaryFile))
+
+        let error = ironmeshDeletionRejectedError(
+            path: "documents",
+            reason: "directory_snapshot_cas_required"
+        )
+        XCTAssertEqual(error.code, NSFileProviderError.Code.deletionRejected.rawValue)
+        XCTAssertEqual(
+            error.userInfo["IronmeshConflictReason"] as? String,
+            "directory_snapshot_cas_required"
+        )
+    }
+
+    func testConflictCopyErrorRequestsWorkingSetSignal() {
+        let conflictError = ironmeshConflictError(
+            originalPath: "documents/report.txt",
+            conflictCopyPath: "documents/report (IronMesh conflict abc).txt",
+            expectedRevision: "v1",
+            currentRevision: "v2"
+        )
+        let moveError = ironmeshRevisionConflictError(
+            path: "documents/report.txt",
+            expectedRevision: "v1",
+            currentRevision: "v2"
+        )
+
+        XCTAssertTrue(AppleWorkingSetSignalPolicy.shouldSignal(after: conflictError))
+        XCTAssertFalse(AppleWorkingSetSignalPolicy.shouldSignal(after: moveError))
+    }
+
     private func item(
         path: String,
         identifier: AppleFileProviderItemIdentifier

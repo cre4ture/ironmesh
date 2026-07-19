@@ -21,6 +21,7 @@ struct IronmeshFilesView: View {
                         HStack {
                             Button("Add profile") { showsNewProfile = true }
                                 .buttonStyle(.borderedProminent)
+                                .disabled(model.isSyncProfileMutationInProgress)
                             Button("Refresh status") { model.refreshSyncProfileDomains() }
                                 .buttonStyle(.bordered)
                             Button("Open Files") { showsFilesPicker = true }
@@ -41,6 +42,7 @@ struct IronmeshFilesView: View {
                         ) {
                             Button("Create first profile") { showsNewProfile = true }
                                 .buttonStyle(.borderedProminent)
+                                .disabled(model.isSyncProfileMutationInProgress)
                         }
                     } else {
                         ForEach(model.syncProfiles) { profile in
@@ -173,6 +175,7 @@ private struct IronmeshSyncProfileCard: View {
                 }
                 Button("Remove", role: .destructive) { model.removeSyncProfile(profile) }.buttonStyle(.bordered)
             }
+            .disabled(model.isSyncProfileMutationInProgress)
         }
     }
 
@@ -233,7 +236,7 @@ private struct IronmeshNewSyncProfileSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Add") {
-                        model.configureSyncProfile(
+                        let started = model.configureSyncProfile(
                             displayName: displayName,
                             remotePrefix: remotePrefix,
                             depth: depth,
@@ -241,9 +244,14 @@ private struct IronmeshNewSyncProfileSheet: View {
                             allowsConstrainedNetwork: allowsConstrainedNetwork,
                             defersInLowPowerMode: defersInLowPowerMode
                         )
-                        dismiss()
+                        if started {
+                            dismiss()
+                        }
                     }
-                    .disabled(displayName.nilIfBlank == nil)
+                    .disabled(
+                        displayName.nilIfBlank == nil
+                            || model.isSyncProfileMutationInProgress
+                    )
                 }
             }
         }

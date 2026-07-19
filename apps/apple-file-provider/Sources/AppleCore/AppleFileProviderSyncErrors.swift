@@ -45,6 +45,33 @@ public func ironmeshRevisionConflictError(
     )
 }
 
+public func ironmeshDeletionRejectedError(
+    path: String,
+    expectedRevision: String? = nil,
+    currentRevision: String? = nil,
+    reason: String = "remote_revision_changed"
+) -> NSError {
+    var userInfo: [String: Any] = [
+        NSLocalizedDescriptionKey:
+            "The remote item at \(path) could not be deleted safely. Files will restore its current version.",
+        "IronmeshConflictReason": reason,
+    ]
+    userInfo["IronmeshExpectedRevision"] = expectedRevision
+    userInfo["IronmeshCurrentRevision"] = currentRevision
+    return NSError(
+        domain: NSFileProviderErrorDomain,
+        code: NSFileProviderError.Code.deletionRejected.rawValue,
+        userInfo: userInfo
+    )
+}
+
+public enum AppleWorkingSetSignalPolicy {
+    public static func shouldSignal(after error: NSError) -> Bool {
+        error.domain == NSFileProviderErrorDomain
+            && error.userInfo["IronmeshConflictCopyPath"] as? String != nil
+    }
+}
+
 public enum ApplePostMoveRevisionPolicy {
     public static func expectedRevision(
         metadataRevision: String?,

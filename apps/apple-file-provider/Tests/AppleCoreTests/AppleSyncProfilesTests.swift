@@ -181,6 +181,45 @@ final class AppleSyncProfilesTests: XCTestCase {
         )
     }
 
+    func testRecoverySignalPolicyDetectsNetworkAndLowPowerUnblocking() {
+        let profile = AppleSyncProfile(id: "recover", displayName: "Recover")
+        let allowed = AppleSyncEnvironmentSnapshot(isConnected: true)
+
+        XCTAssertTrue(
+            AppleSyncRecoverySignalPolicy.shouldSignal(
+                profile: profile,
+                previous: AppleSyncEnvironmentSnapshot(isConnected: false),
+                current: allowed
+            )
+        )
+        XCTAssertTrue(
+            AppleSyncRecoverySignalPolicy.shouldSignal(
+                profile: profile,
+                previous: AppleSyncEnvironmentSnapshot(
+                    isConnected: true,
+                    isLowPowerModeEnabled: true
+                ),
+                current: allowed
+            )
+        )
+        XCTAssertFalse(
+            AppleSyncRecoverySignalPolicy.shouldSignal(
+                profile: profile,
+                previous: allowed,
+                current: allowed
+            )
+        )
+    }
+
+    func testProfileMutationStateSerializesAddAndRemove() {
+        var state = AppleSyncProfileOperationState()
+
+        XCTAssertTrue(state.beginMutation())
+        XCTAssertFalse(state.beginMutation())
+        state.endMutation()
+        XCTAssertTrue(state.beginMutation())
+    }
+
     func testConflictCopyNameIsDeterministicAndIncludesBaseVersion() {
         let first = AppleConflictCopyNaming.path(
             originalPath: "docs/readme.txt",

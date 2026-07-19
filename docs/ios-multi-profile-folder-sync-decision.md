@@ -33,7 +33,9 @@ domain disconnect/reconnect and rolls back the persisted lifecycle if that OS op
 Network and power restrictions are evaluated from `NWPathMonitor` and Low Power Mode before a
 connection is opened. Profiles may allow or defer expensive paths, constrained Low Data Mode paths,
 and Low Power Mode. A blocked operation returns a retryable File Provider `serverUnreachable` error;
-Files decides when to retry.
+when an environment transition makes that profile runnable again, the live extension signals its
+working-set enumerator so Files can retry queued work. This is an event-driven retry hint, not a
+guarantee of immediate execution.
 
 iOS exposes lazy materialization and eviction-on-remote-update, but no provider-level
 profile-wide “download eagerly and keep downloaded” policy. The provider therefore advertises
@@ -49,7 +51,8 @@ journal generation. Retained generations permit replay after an extension restar
 an anchor older than the retained journal returns `syncAnchorExpired`, causing Files to re-enumerate.
 
 There is no fixed foreground polling loop and no Android WorkManager port. Discovery occurs when
-Files enumerates, after an explicit app working-set signal, or during normal File Provider retries.
+Files enumerates, after an explicit app/recovery/conflict-copy working-set signal, or during normal
+File Provider retries.
 There is currently no APNs/push channel, so this design does not claim immediate unsolicited
 background discovery of a remote-only change.
 
@@ -66,12 +69,18 @@ check to close the race window. When a content PUT loses the race, it refreshes 
 user's bytes to a deterministic sibling named
 `<name> (IronMesh conflict <stable fingerprint>).<extension>`, and reports File Provider
 `cannotSynchronize` with the expected/current revisions and conflict path. Delete and rename races
-map to `cannotSynchronize` with the current revision and require a refresh before retry.
+are intentionally different: rename remains `cannotSynchronize`, while delete uses File Provider's
+`fileProviderErrorForRejectedDeletion` with the current item so Files restores the retained remote
+version.
 
-Synthetic directories do not have their own version head. Recursive delete receives CAS protection
-when a real directory marker supplies a revision; otherwise the extension's just-in-time child
-preflight is the strongest available guard. Adding a versioned namespace-generation token for every
-synthetic directory would be a server protocol change and remains outside this decision.
+Directory deletion is recursive in the current Rust client. A directory-marker revision cannot
+protect its children because normal child mutations do not atomically bump that marker. The
+extension therefore rejects directory deletion rather than issuing a subtree delete that could
+erase a child created after enumeration. Adding a versioned namespace/snapshot CAS token is a
+server protocol change tracked in
+[#148](https://github.com/cre4ture/ironmesh/issues/148). Until then, directory items deliberately
+omit File Provider's delete capability so Files does not present an operation the provider must
+reject.
 
 ## Consequences and boundaries
 
@@ -82,15 +91,16 @@ synthetic directory would be a server protocol change and remains outside this d
   does not maintain a second foreground queue.
 - Profile scopes may overlap. They are separate Files domains and can surface the same remote object;
   the UI should make this explicit rather than silently rejecting a valid configuration.
+- Profile mutations are serialized in the app so an in-flight add cannot be overtaken by remove,
+  pause, or resume.
 - Exact Android screens, WorkManager jobs, and multi-cluster credentials are intentionally not
   ported.
 
 ## Verification
 
-Unit and integration coverage exercises profile persistence across restart, pause/resume/remove,
-scope isolation, network/power deferral and recovery, journal replay/expiry/deletions, deterministic
-conflict names, duplicate legacy identifiers, domain reconciliation after missing registrations,
-and concurrent snapshot changes. Server-backed tests cover successful and stale compare-and-swap
-for PUT, DELETE, rename, and recursive marker deletion. Swift bridge tests prove that expected
-revisions reach the FFI boundary and that revision conflicts map to File Provider
-`cannotSynchronize` metadata.
+AppleCore unit tests exercise profile persistence/state transitions, scope mapping, recovery-signal
+policy, journal replay/expiry/deletions, deterministic conflict names, and mutation serialization.
+Server handler integration tests cover successful and stale compare-and-swap for PUT, DELETE,
+rename, and recursive marker deletion. Swift bridge tests cover expected-revision forwarding and
+File Provider error disposition; Xcode simulator builds validate that the app and extension compile
+and link. These tests do not claim end-to-end execution by the real Files daemon on a physical device.
