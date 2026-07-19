@@ -148,6 +148,12 @@ export function RepairPage() {
       await refresh();
     }
   });
+  const localScrubMutation = useMutation({
+    mutationFn: () => triggerDataScrub("local", normalizedAdminTokenOverride || undefined),
+    onSuccess: async () => {
+      await refresh();
+    }
+  });
   const manualRepairActionMutation = useMutation({
     mutationFn: ({ actionId, dryRun }: { actionId: string; dryRun: boolean }) =>
       runManualRepairAction(actionId, { dryRun }, normalizedAdminTokenOverride || undefined),
@@ -315,6 +321,7 @@ export function RepairPage() {
     scrubClusterQuery.isFetching;
   const error = firstErrorMessage([
     manualRepairActionMutation.error,
+    localScrubMutation.error,
     scrubMutation.error,
     repairMutation.error,
     repairActivityQuery.error,
@@ -363,6 +370,14 @@ export function RepairPage() {
               disabled={!canInspectRepair}
             >
               Run data scrub now
+            </Button>
+            <Button
+              variant="default"
+              onClick={() => void localScrubMutation.mutateAsync()}
+              loading={localScrubMutation.isPending}
+              disabled={!canInspectRepair}
+            >
+              Run data scrub on this node
             </Button>
             <Button variant="light" onClick={() => void refresh()} loading={loading}>
               Refresh

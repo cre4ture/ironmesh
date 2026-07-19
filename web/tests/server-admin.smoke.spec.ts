@@ -110,6 +110,10 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("under replicated", { exact: true })).toBeVisible();
   await expect(page.getByText("Live progress log", { exact: true })).toBeVisible();
   await expect(page.getByText("downloading replica chunk from source node")).toBeVisible();
+  await page.getByRole("button", { name: "Run data scrub on this node" }).click();
+  await expect
+    .poll(() => mockState.scrubTriggerScopes())
+    .toContain("local");
 
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
@@ -918,6 +922,7 @@ async function installServerAdminMocks(
   };
   const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
   const requestedPaths = new Set<string>();
+  const scrubTriggerScopes = new Set<string>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const metadataDbLogicalDistribution = {
@@ -1633,6 +1638,28 @@ async function installServerAdminMocks(
       });
     }
 
+    if (pathname === apiV1("/auth/scrub/run") && method === "POST") {
+      const scope = searchParams.get("scope") ?? "cluster";
+      scrubTriggerScopes.add(scope);
+      return json(route, {
+        scope,
+        nodes_contacted: scope === "local" ? 1 : 2,
+        failed_nodes: 0,
+        node_results: [
+          {
+            node_id: "node-alpha",
+            started: true,
+            active_run: {
+              run_id: "scrub-run-live-001",
+              trigger: "manual_request",
+              started_at_unix: 1_900_000_200
+            },
+            error: null
+          }
+        ]
+      });
+    }
+
     if (pathname === apiV1("/cluster/replication/plan") && method === "GET") {
       if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
         await route.fulfill({ status: 401 });
@@ -2205,6 +2232,7 @@ async function installServerAdminMocks(
 
   return {
     requestedPaths: () => Array.from(requestedPaths),
+    scrubTriggerScopes: () => Array.from(scrubTriggerScopes),
     restoredVersions: () => restoredVersions.slice()
   };
 }
