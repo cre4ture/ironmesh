@@ -165,6 +165,7 @@ export function HardwarePage() {
                           </Badge>
                         </Group>
                         <Text size="sm" c="dimmed">{collector.detail}</Text>
+                        <CollectorRemediation collector={collector} />
                         <Text size="sm">
                           Last collected: <Code>{formatUnixTs(collector.last_collected_at_unix)}</Code>
                         </Text>
@@ -391,6 +392,44 @@ function StorageDeviceCard({ device }: { device: HardwareStorageDevice }) {
       </Card>
     </Grid.Col>
   );
+}
+
+function CollectorRemediation({ collector }: { collector: HardwareHealthCollectorStatus }) {
+  if (collector.collector_id !== "smartctl" || collector.state === "ready") {
+    return null;
+  }
+
+  if (collector.last_error_code === "smartctl_not_installed") {
+    return (
+      <Alert color="yellow" variant="light" title="Enable SMART collection">
+        <Stack gap={6}>
+          <Text size="sm">
+            On Ubuntu or Debian, install the collector dependency:
+          </Text>
+          <Code block>sudo apt install smartmontools</Code>
+          <Text size="sm">
+            Then restart IronMesh (or wait for its next collection) and use Refresh. The service also
+            needs access to the physical block devices.
+          </Text>
+        </Stack>
+      </Alert>
+    );
+  }
+
+  if (collector.last_error_code === "permission_denied") {
+    return (
+      <Alert color="yellow" variant="light" title="Grant the IronMesh service device access">
+        <Text size="sm">
+          Run the service with least-privilege access to the physical block devices, then restart it
+          and use Refresh. For a systemd service this is commonly configured with a dedicated
+          service account and <Code>SupplementaryGroups=disk</Code>; do not add a broad interactive
+          user account to that group.
+        </Text>
+      </Alert>
+    );
+  }
+
+  return null;
 }
 
 function NetworkInterfaceCard({ iface }: { iface: HardwareNetworkInterface }) {

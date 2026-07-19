@@ -42,14 +42,14 @@ export function DependenciesPage() {
     <Stack gap="lg">
       {error ? <Alert color="red" title="Failed to load host dependency status">{error}</Alert> : null}
       {missingCount > 0 ? (
-        <Alert color="yellow" title="Manual test blockers detected">
-          {missingCount} required host dependenc{missingCount === 1 ? "y is" : "ies are"} missing on this node.
-          Fix the missing checks below before using the affected server-side feature.
+        <Alert color="yellow" title="Host feature dependencies missing">
+          {missingCount} host feature dependenc{missingCount === 1 ? "y is" : "ies are"} missing on this node.
+          Resolve the missing checks below before relying on their affected server features.
         </Alert>
       ) : report ? (
         <Alert color={ironmeshPrimaryColor} title="Host dependency checks passed">
-          This node has the currently known runtime dependencies needed for built-in image processing, server-side video
-          processing, and automatic Natural Earth map conversion.
+          This node has the currently known runtime dependencies for media processing, SMART/NVMe hardware health, and
+          automatic Natural Earth map conversion.
         </Alert>
       ) : null}
       {optionalCount > 0 ? (
@@ -60,9 +60,10 @@ export function DependenciesPage() {
       ) : null}
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
-          This page checks host packages and commands required by server-node features. It also reports whether optional
-          Cockpit host-administration tooling is installed. Cockpit remains a separate, separately authenticated interface
-          for host-level operations; IronMesh does not restart services or the host itself.
+          This page checks host packages and commands required by server-node features, including <Code>smartctl</Code>
+          for SMART/NVMe hardware health and the Natural Earth map-import tools. It also reports whether optional Cockpit
+          host-administration tooling is installed. Cockpit remains a separate, separately authenticated interface for
+          host-level operations; IronMesh does not restart services or the host itself.
         </Text>
         <Button variant="light" onClick={() => void refresh()} loading={loading}>
           Refresh
@@ -79,7 +80,7 @@ export function DependenciesPage() {
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
           <StatCard
-            label="Required missing"
+            label="Feature dependencies missing"
             value={loading && !report ? "loading..." : String(missingCount)}
             hint={missingCount > 0 ? "Resolve before using affected features" : "No blocking host gaps detected"}
           />
