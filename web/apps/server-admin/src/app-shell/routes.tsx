@@ -69,7 +69,7 @@ export const serverAdminRoutes = [
   {
     id: "client-connections",
     label: "Connections",
-    description: "Inspect currently active client HTTP requests and accepted transport sessions with live cursor paging from the node runtime.",
+    description: "Inspect active client traffic, rendezvous registrations, and the advertised connection paths to other server nodes.",
     icon: IconPlugConnected,
     element: <ClientConnectionsPage />
   },

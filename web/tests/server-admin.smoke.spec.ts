@@ -171,6 +171,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("columnheader", { name: "Transport" })).toBeVisible();
   await expect(page.getByText("via relay-alpha.local:9443", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous registration state", { exact: true })).toBeVisible();
+  await expect(page.getByText("Server node connections", { exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "node-beta", exact: true })).toBeVisible();
+  await expect(page.getByText("rendezvous relay", { exact: true })).toBeVisible();
   await expect(page.getByText("Software version: 1.0.31", { exact: true })).toBeVisible();
   await expect(page.getByText("Software version: 1.0.30", { exact: true })).toBeVisible();
 

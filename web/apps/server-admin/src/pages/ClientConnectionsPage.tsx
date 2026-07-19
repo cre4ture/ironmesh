@@ -1,11 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   getClientConnections,
+  getClusterNodes,
+  getClusterSummary,
   getRendezvousConfig,
   type ClientConnectionCursor,
   type ClientConnectionEntry,
   type ClientConnectionSummary,
-  type ClientConnectionTransport
+  type ClientConnectionTransport,
+  type NodeDescriptor
 } from "@ironmesh/api";
 import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
 import {
@@ -27,6 +30,7 @@ import { formatRelativeUnixTs, formatUnixTs } from "../lib/format";
 
 const CLIENT_CONNECTION_POLL_INTERVAL_MS = 3_000;
 const RENDEZVOUS_REGISTRATION_POLL_INTERVAL_MS = 5_000;
+const SERVER_NODE_CONNECTION_POLL_INTERVAL_MS = 3_000;
 const RELATIVE_TIME_REFRESH_INTERVAL_MS = 1_000;
 const LIMIT_OPTIONS = ["25", "50", "100", "200"].map((value) => ({
   value,
@@ -97,10 +101,25 @@ export function ClientConnectionsPage() {
     enabled: canInspectConnections,
     refetchInterval: RENDEZVOUS_REGISTRATION_POLL_INTERVAL_MS
   });
+  const clusterSummaryQuery = useQuery({
+    queryKey: ["cluster-summary", normalizedAdminTokenOverride],
+    queryFn: () => getClusterSummary(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectConnections,
+    refetchInterval: SERVER_NODE_CONNECTION_POLL_INTERVAL_MS
+  });
+  const serverNodesQuery = useQuery({
+    queryKey: ["cluster-nodes", normalizedAdminTokenOverride],
+    queryFn: () => getClusterNodes(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectConnections,
+    refetchInterval: SERVER_NODE_CONNECTION_POLL_INTERVAL_MS
+  });
 
   const summary = canInspectConnections ? connectionsQuery.data?.summary ?? EMPTY_SUMMARY : EMPTY_SUMMARY;
   const entries = canInspectConnections ? connectionsQuery.data?.entries ?? [] : [];
   const nextCursor = connectionsQuery.data?.next_cursor ?? null;
+  const peerNodes = (clusterSummaryQuery.data ? serverNodesQuery.data ?? [] : [])
+    .filter((node) => node.node_id !== clusterSummaryQuery.data?.local_node_id)
+    .sort((left, right) => left.node_id.localeCompare(right.node_id));
 
   function handleOlderPage() {
     if (!nextCursor || connectionsQuery.isFetching) {
@@ -149,10 +168,15 @@ export function ClientConnectionsPage() {
             : String(rendezvousConfigQuery.error)}
         </Alert>
       ) : null}
+      {clusterSummaryQuery.error || serverNodesQuery.error ? (
+        <Alert color="red" title="Server node connection state unavailable">
+          {describeQueryError(clusterSummaryQuery.error ?? serverNodesQuery.error)}
+        </Alert>
+      ) : null}
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={820}>
-          Inspect the live device traffic this node is currently handling. HTTP entries cover active
-          authenticated client requests, while direct and relay entries represent accepted transport
+          Inspect live device traffic and the paths advertised by other server nodes. HTTP entries cover
+          active authenticated client requests, while direct and relay entries represent accepted transport
           sessions that remain open across multiple operations.
         </Text>
         <Button
@@ -160,10 +184,17 @@ export function ClientConnectionsPage() {
           onClick={() => {
             void Promise.all([
               connectionsQuery.refetch(),
-              rendezvousConfigQuery.refetch()
+              rendezvousConfigQuery.refetch(),
+              clusterSummaryQuery.refetch(),
+              serverNodesQuery.refetch()
             ]);
           }}
-          loading={connectionsQuery.isFetching || rendezvousConfigQuery.isFetching}
+          loading={
+            connectionsQuery.isFetching ||
+            rendezvousConfigQuery.isFetching ||
+            clusterSummaryQuery.isFetching ||
+            serverNodesQuery.isFetching
+          }
         >
           Refresh
         </Button>
@@ -196,6 +227,61 @@ export function ClientConnectionsPage() {
           />
         </Card>
       ) : null}
+
+      <Card withBorder radius="md" padding="lg">
+        <Group justify="space-between" align="center" mb="md">
+          <Stack gap={4}>
+            <Text fw={700}>Server node connections</Text>
+            <Text size="xs" c="dimmed">
+              Live cluster membership, heartbeats, and advertised peer routes for the other server nodes.
+            </Text>
+          </Stack>
+          <Badge variant="light">{peerNodes.length} peers</Badge>
+        </Group>
+
+        {serverNodesQuery.isLoading || clusterSummaryQuery.isLoading ? (
+          <Text c="dimmed">Loading server node connection state...</Text>
+        ) : peerNodes.length === 0 ? (
+          <Text c="dimmed">No other server nodes are currently discovered.</Text>
+        ) : (
+          <Table striped highlightOnHover withTableBorder>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Server Node</Table.Th>
+                <Table.Th>Status</Table.Th>
+                <Table.Th>Last Heartbeat</Table.Th>
+                <Table.Th>Connection Path</Table.Th>
+                <Table.Th>Peer Endpoints</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {peerNodes.map((node) => (
+                <Table.Tr key={node.node_id}>
+                  <Table.Td>
+                    <Text size="sm" fw={600} ff="monospace">
+                      {node.node_id}
+                    </Text>
+                  </Table.Td>
+                  <Table.Td>
+                    <Badge color={node.status === "online" ? "green" : "gray"} variant="light">
+                      {node.status}
+                    </Badge>
+                  </Table.Td>
+                  <Table.Td>
+                    <TimestampCell unixTs={node.last_heartbeat_unix} nowMs={nowMs} />
+                  </Table.Td>
+                  <Table.Td>
+                    <ServerNodeConnectionPath node={node} />
+                  </Table.Td>
+                  <Table.Td>
+                    <ServerNodeEndpoints node={node} />
+                  </Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+        )}
+      </Card>
 
       <Card withBorder radius="md" padding="lg">
         <Group justify="space-between" align="center" mb="md">
@@ -318,6 +404,39 @@ function TimestampCell({
   );
 }
 
+function ServerNodeConnectionPath({ node }: { node: NodeDescriptor }) {
+  const path = describeServerNodeConnectionPath(node);
+
+  return (
+    <Stack gap={2}>
+      <Badge color={path.color} variant="light">
+        {path.label}
+      </Badge>
+      <Text size="xs" c="dimmed">
+        {path.detail}
+      </Text>
+    </Stack>
+  );
+}
+
+function ServerNodeEndpoints({ node }: { node: NodeDescriptor }) {
+  const endpoints = peerEndpoints(node);
+
+  if (endpoints.length === 0) {
+    return <Text size="sm" c="dimmed">No direct peer endpoint advertised</Text>;
+  }
+
+  return (
+    <Stack gap={2}>
+      {endpoints.map((endpoint) => (
+        <Text key={endpoint} size="xs" ff="monospace">
+          {endpoint}
+        </Text>
+      ))}
+    </Stack>
+  );
+}
+
 function TransportCell({ entry }: { entry: ClientConnectionEntry }) {
   const detail = describeTransportDetail(entry);
 
@@ -365,6 +484,57 @@ function describeTransportDetail(entry: ClientConnectionEntry): string | null {
     return "via unknown relay";
   }
   return `via ${summarizeUrl(entry.rendezvous_url)}`;
+}
+
+function describeServerNodeConnectionPath(node: NodeDescriptor): {
+  label: string;
+  color: string;
+  detail: string;
+} {
+  if (node.reachability.relay_required) {
+    return {
+      label: "rendezvous relay",
+      color: "grape",
+      detail: "This node requires a relay path."
+    };
+  }
+
+  if (peerEndpoints(node).length > 0) {
+    return {
+      label: "direct preferred",
+      color: ironmeshPrimaryColor,
+      detail: "A direct peer endpoint is advertised."
+    };
+  }
+
+  if (node.capabilities.relay_tunnel) {
+    return {
+      label: "relay available",
+      color: "blue",
+      detail: "No direct peer endpoint is advertised."
+    };
+  }
+
+  return {
+    label: "not configured",
+    color: "gray",
+    detail: "No usable peer route is advertised."
+  };
+}
+
+function peerEndpoints(node: NodeDescriptor): string[] {
+  const endpoints = [
+    node.reachability.peer_api_url,
+    ...(node.reachability.peer_direct_urls ?? [])
+  ]
+    .filter((endpoint): endpoint is string => Boolean(endpoint?.trim()))
+    .map((endpoint) => endpoint.trim());
+
+  return [...new Set(endpoints)];
+}
+
+function describeQueryError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function describeDevice(entry: ClientConnectionEntry): string {
