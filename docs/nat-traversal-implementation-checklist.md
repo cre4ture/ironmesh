@@ -312,6 +312,8 @@ Global rendezvous service:
   self-registration attempts accepted per minute.
 - `IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS`: lifetime of a registration
   challenge before a proof must be rejected.
+- `IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES`: bound on outstanding
+  in-memory registration challenges.
 
 Server node:
 

@@ -39,6 +39,9 @@ encrypted inner TLS stream, not application payloads or inner TLS termination.
 - [ ] `IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS` sets proof challenge
   lifetime. Set an explicit short operational value and reject expired or
   reused challenges.
+- [ ] `IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES` bounds in-memory
+  outstanding registration challenges. Set an explicit conservative value and
+  alert when the service rejects registrations because the bound is exhausted.
 - [ ] `IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED` is the server-node
   opt-in. Enable it only on nodes intended to self-register and only after the
   service-side gate is enabled.
