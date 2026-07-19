@@ -286,11 +286,11 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
 
 async fn update_phase(state: &ServerState, phase: &str) {
     let mut runtime = state.storage.natural_earth_import.lock().await;
-    if let Some(job) = runtime.job.as_mut() {
-        if matches!(job.state, NaturalEarthImportState::Running) {
-            job.phase = phase.to_string();
-            job.updated_at_unix = unix_ts();
-        }
+    if let Some(job) = runtime.job.as_mut()
+        && matches!(job.state, NaturalEarthImportState::Running)
+    {
+        job.phase = phase.to_string();
+        job.updated_at_unix = unix_ts();
     }
 }
 
