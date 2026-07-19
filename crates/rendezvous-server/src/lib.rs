@@ -1,4 +1,5 @@
 mod auth;
+mod cluster_registry;
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -39,6 +40,9 @@ use crate::auth::{
     ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
 
+pub use crate::auth::GlobalClusterClientCertVerifier;
+pub use crate::cluster_registry::{ClusterCaRecord, ClusterCaRegistry, cluster_ca_fingerprint};
+
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
@@ -63,6 +67,24 @@ pub enum RendezvousClientCa {
 pub struct RendezvousMtlsConfig {
     pub client_ca: RendezvousClientCa,
     pub server_identity: RendezvousServerTlsIdentity,
+}
+
+/// TLS material for a global Option-1 rendezvous service.
+///
+/// This is intentionally separate from `RendezvousMtlsConfig`: existing
+/// standalone services continue using their static CA configuration until the
+/// global registration and challenge handlers wire this path into the app.
+#[derive(Debug, Clone)]
+pub struct GlobalRendezvousMtlsConfig {
+    pub cluster_registry: ClusterCaRegistry,
+    pub server_identity: RendezvousServerTlsIdentity,
+}
+
+impl GlobalRendezvousMtlsConfig {
+    /// Builds optional-client-auth TLS configuration backed by the live registry.
+    pub fn build_rustls_config(&self) -> Result<axum_server::tls_rustls::RustlsConfig> {
+        auth::build_global_mtls_rustls_config(self)
+    }
 }
 
 #[derive(Debug, Clone)]
