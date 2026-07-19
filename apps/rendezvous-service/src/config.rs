@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use common::{ClusterId, NodeId};
 pub use rendezvous_server::{
-    RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig, RendezvousServerTlsIdentity,
+    ClusterCaRegistry, GlobalClusterRegistrationConfig, RendezvousClientCa, RendezvousMtlsConfig,
+    RendezvousServerConfig, RendezvousServerTlsIdentity,
 };
 
 use crate::failover::{
@@ -171,16 +172,52 @@ impl RendezvousServiceConfig {
         let client_ca_cert_path = lookup_env("IRONMESH_RENDEZVOUS_CLIENT_CA_CERT");
         let cert_path = lookup_env("IRONMESH_RENDEZVOUS_TLS_CERT");
         let key_path = lookup_env("IRONMESH_RENDEZVOUS_TLS_KEY");
-        let mtls = build_mtls_config(
-            client_ca_cert_path,
-            cert_path,
-            key_path,
-            failover_package.as_ref(),
-        )?;
-
         let allow_insecure_http = lookup_env("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP")
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
+        let global_registration_enabled =
+            lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED")
+                .map(|value| {
+                    parse_bool_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED", &value)
+                })
+                .transpose()?
+                .unwrap_or(false);
+        let global_registry_path = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY");
+        let global_admin_token = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN");
+        let global_rate_limit = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_RATE_LIMIT_PER_MINUTE");
+        let global_challenge_ttl = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS");
+        let global_max_pending = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES");
+        let global_settings_present = global_registration_enabled
+            || global_registry_path.is_some()
+            || global_admin_token.is_some()
+            || global_rate_limit.is_some()
+            || global_challenge_ttl.is_some()
+            || global_max_pending.is_some();
+
+        let mtls = if global_settings_present {
+            build_global_mtls_config(
+                global_registration_enabled,
+                global_registry_path,
+                global_admin_token,
+                global_rate_limit,
+                global_challenge_ttl,
+                global_max_pending,
+                client_ca_cert_path,
+                cert_path,
+                key_path,
+                failover_package.as_ref(),
+                allow_insecure_http,
+                &public_url,
+                &relay_public_urls,
+            )?
+        } else {
+            build_mtls_config(
+                client_ca_cert_path,
+                cert_path,
+                key_path,
+                failover_package.as_ref(),
+            )?
+        };
 
         let config = Self {
             bind_addr,
@@ -203,6 +240,27 @@ impl RendezvousServiceConfig {
     }
 
     pub fn validate_startup_security(&self) -> Result<()> {
+        if let Some(RendezvousMtlsConfig {
+            client_ca: RendezvousClientCa::Global { .. },
+            ..
+        }) = self.mtls.as_ref()
+        {
+            if self.allow_insecure_http {
+                bail!(
+                    "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP cannot be enabled for global rendezvous registration"
+                );
+            }
+            if self.failover_package.is_some() {
+                bail!("global rendezvous registration cannot use a failover package");
+            }
+            if !is_https_url(&self.public_url)
+                || self.relay_public_urls.iter().any(|url| !is_https_url(url))
+            {
+                bail!("global rendezvous registration requires HTTPS public and relay URLs");
+            }
+            return Ok(());
+        }
+
         if self.mtls.is_some() || self.allow_insecure_http {
             return Ok(());
         }
@@ -221,6 +279,144 @@ impl RendezvousServiceConfig {
             mtls: self.mtls.clone(),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_global_mtls_config(
+    enabled: bool,
+    registry_path: Option<String>,
+    admin_token: Option<String>,
+    rate_limit_per_minute: Option<String>,
+    challenge_ttl_secs: Option<String>,
+    max_pending_challenges: Option<String>,
+    client_ca_cert_path: Option<String>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    failover_package: Option<&DecryptedRendezvousFailoverPackage>,
+    allow_insecure_http: bool,
+    public_url: &str,
+    relay_public_urls: &[String],
+) -> Result<Option<RendezvousMtlsConfig>> {
+    if !enabled {
+        bail!(
+            "global rendezvous settings require IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=true"
+        );
+    }
+    if client_ca_cert_path.is_some() {
+        bail!(
+            "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT cannot be combined with global rendezvous registration"
+        );
+    }
+    if failover_package.is_some() {
+        bail!("global rendezvous registration cannot use a failover package");
+    }
+    if allow_insecure_http {
+        bail!(
+            "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP cannot be enabled for global rendezvous registration"
+        );
+    }
+    if !is_https_url(public_url) || relay_public_urls.iter().any(|url| !is_https_url(url)) {
+        bail!("global rendezvous registration requires HTTPS public and relay URLs");
+    }
+
+    let registry_path = registry_path
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "global rendezvous registration requires IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY",
+        )?;
+    let admin_token = admin_token
+        .filter(|value| !value.trim().is_empty())
+        .context("global rendezvous registration requires a non-empty IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN")?;
+    let rate_limit_per_minute = parse_positive_env_u32(
+        "IRONMESH_RENDEZVOUS_GLOBAL_RATE_LIMIT_PER_MINUTE",
+        rate_limit_per_minute,
+        10,
+    )?;
+    let challenge_ttl_secs = parse_positive_env_u64(
+        "IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS",
+        challenge_ttl_secs,
+        300,
+    )?;
+    let max_pending_challenges = parse_positive_env_usize(
+        "IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES",
+        max_pending_challenges,
+        1_024,
+    )?;
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => (cert_path, key_path),
+        _ => bail!(
+            "global rendezvous registration requires IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY"
+        ),
+    };
+
+    Ok(Some(RendezvousMtlsConfig {
+        client_ca: RendezvousClientCa::Global {
+            cluster_registry: ClusterCaRegistry::open(PathBuf::from(registry_path))?,
+            registration: GlobalClusterRegistrationConfig {
+                admin_token,
+                rate_limit_per_minute,
+                challenge_ttl: std::time::Duration::from_secs(challenge_ttl_secs),
+                max_pending_challenges,
+            },
+        },
+        server_identity: RendezvousServerTlsIdentity::Files {
+            cert_path: PathBuf::from(cert_path),
+            key_path: PathBuf::from(key_path),
+        },
+    }))
+}
+
+fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
+    match value.trim() {
+        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+        _ => bail!("invalid {name}; expected true or false"),
+    }
+}
+
+fn parse_positive_env_u32(name: &str, value: Option<String>, default: u32) -> Result<u32> {
+    let value = value
+        .map(|value| value.parse().with_context(|| format!("invalid {name}")))
+        .transpose()?
+        .unwrap_or(default);
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn parse_positive_env_u64(name: &str, value: Option<String>, default: u64) -> Result<u64> {
+    let value = value
+        .map(|value| value.parse().with_context(|| format!("invalid {name}")))
+        .transpose()?
+        .unwrap_or(default);
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn parse_positive_env_usize(name: &str, value: Option<String>, default: usize) -> Result<usize> {
+    let value = value
+        .map(|value| value.parse().with_context(|| format!("invalid {name}")))
+        .transpose()?
+        .unwrap_or(default);
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn is_https_url(value: &str) -> bool {
+    value
+        .trim()
+        .parse::<axum::http::Uri>()
+        .ok()
+        .is_some_and(|uri| {
+            uri.scheme_str()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+                && uri.authority().is_some()
+        })
 }
 
 fn build_mtls_config(
@@ -409,6 +605,9 @@ mod tests {
             RendezvousClientCa::File { .. } => {
                 panic!("failover package should produce inline client CA material");
             }
+            RendezvousClientCa::Global { .. } => {
+                panic!("failover package must not configure global client trust");
+            }
         }
         match mtls.server_identity {
             RendezvousServerTlsIdentity::InlinePem { cert_pem, key_pem } => {
@@ -542,6 +741,9 @@ mod tests {
             RendezvousClientCa::InlinePem { .. } => {
                 panic!("legacy failover packages should fall back to file-based client CA");
             }
+            RendezvousClientCa::Global { .. } => {
+                panic!("legacy failover package must not configure global client trust");
+            }
         }
 
         let _ = std::fs::remove_dir_all(dir);
@@ -571,5 +773,113 @@ mod tests {
                 "https://peer-b.example/".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn from_lookup_builds_global_registration_config_with_safe_defaults() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "ironmesh-global-rendezvous-config-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let cli = RendezvousServiceCliConfig::default();
+        let env = HashMap::from([
+            (
+                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "https://rendezvous.example".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_TLS_CERT".to_string(),
+                "/tmp/rendezvous.pem".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_TLS_KEY".to_string(),
+                "/tmp/rendezvous.key".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY".to_string(),
+                registry_path.display().to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN".to_string(),
+                "operator-secret".to_string(),
+            ),
+        ]);
+
+        let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect("global registration config should load");
+        let mtls = config.mtls.expect("global mode should configure TLS");
+        match mtls.client_ca {
+            RendezvousClientCa::Global {
+                cluster_registry,
+                registration,
+            } => {
+                assert_eq!(cluster_registry.path(), registry_path.as_path());
+                assert_eq!(registration.rate_limit_per_minute, 10);
+                assert_eq!(
+                    registration.challenge_ttl,
+                    std::time::Duration::from_secs(300)
+                );
+                assert_eq!(registration.max_pending_challenges, 1_024);
+                assert_eq!(registration.admin_token, "operator-secret");
+            }
+            _ => panic!("global configuration must not use a static client CA"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_rejects_insecure_or_static_ca_global_registration() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "ironmesh-global-rendezvous-config-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let cli = RendezvousServiceCliConfig::default();
+        let base = [
+            (
+                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "https://rendezvous.example".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_TLS_CERT".to_string(),
+                "/tmp/rendezvous.pem".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_TLS_KEY".to_string(),
+                "/tmp/rendezvous.key".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY".to_string(),
+                registry_path.display().to_string(),
+            ),
+            (
+                "IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN".to_string(),
+                "operator-secret".to_string(),
+            ),
+        ];
+
+        let mut insecure = HashMap::from(base.clone());
+        insecure.insert(
+            "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+            "true".to_string(),
+        );
+        let error = RendezvousServiceConfig::from_lookup(&cli, |key| insecure.get(key).cloned())
+            .expect_err("global registration must reject insecure HTTP override");
+        assert!(error.to_string().contains("ALLOW_INSECURE_HTTP"));
+
+        let mut static_ca = HashMap::from(base);
+        static_ca.insert(
+            "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
+            "/tmp/client-ca.pem".to_string(),
+        );
+        let error = RendezvousServiceConfig::from_lookup(&cli, |key| static_ca.get(key).cloned())
+            .expect_err("global registration must reject a static client CA");
+        assert!(error.to_string().contains("CLIENT_CA_CERT"));
     }
 }

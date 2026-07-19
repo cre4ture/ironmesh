@@ -317,6 +317,9 @@ pub(crate) fn build_mtls_rustls_config(
                     .context("failed adding rendezvous client CA certificate to trust store")?;
             }
         }
+        RendezvousClientCa::Global { .. } => {
+            bail!("global rendezvous mTLS must use the dynamic cluster registry verifier");
+        }
     }
 
     let (cert_chain, key) = load_server_tls_identity(&mtls.server_identity)?;

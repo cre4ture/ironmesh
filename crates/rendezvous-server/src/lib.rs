@@ -1,5 +1,6 @@
 mod auth;
 mod cluster_registry;
+mod global_registration;
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -39,6 +40,7 @@ use crate::auth::{
     authenticated_peer_cluster, build_mtls_rustls_config, ensure_authenticated_peer_cluster,
     ensure_authenticated_peer_identity, require_any_authenticated_peer,
 };
+use crate::global_registration::GlobalRegistrationState;
 
 pub use crate::auth::GlobalClusterClientCertVerifier;
 pub use crate::cluster_registry::{ClusterCaRecord, ClusterCaRegistry, cluster_ca_fingerprint};
@@ -59,14 +61,67 @@ pub enum RendezvousServerTlsIdentity {
 
 #[derive(Debug, Clone)]
 pub enum RendezvousClientCa {
-    File { cert_path: PathBuf },
-    InlinePem { cert_pem: String },
+    File {
+        cert_path: PathBuf,
+    },
+    InlinePem {
+        cert_pem: String,
+    },
+    /// Dynamic Option-1 client trust selected from a persistent cluster registry.
+    ///
+    /// This is deliberately a distinct variant rather than an empty static CA:
+    /// global services never fall back to a trust-all or bundled-root verifier.
+    Global {
+        cluster_registry: ClusterCaRegistry,
+        registration: GlobalClusterRegistrationConfig,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct RendezvousMtlsConfig {
     pub client_ca: RendezvousClientCa,
     pub server_identity: RendezvousServerTlsIdentity,
+}
+
+/// Operational limits and operator credentials for self-service global registration.
+#[derive(Clone)]
+pub struct GlobalClusterRegistrationConfig {
+    pub admin_token: String,
+    pub rate_limit_per_minute: u32,
+    pub challenge_ttl: Duration,
+    pub max_pending_challenges: usize,
+}
+
+impl std::fmt::Debug for GlobalClusterRegistrationConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GlobalClusterRegistrationConfig")
+            .field("admin_token", &"[REDACTED]")
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("challenge_ttl", &self.challenge_ttl)
+            .field("max_pending_challenges", &self.max_pending_challenges)
+            .finish()
+    }
+}
+
+impl GlobalClusterRegistrationConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.admin_token.trim().is_empty() {
+            anyhow::bail!("global rendezvous registration requires a non-empty admin token");
+        }
+        if self.rate_limit_per_minute == 0 {
+            anyhow::bail!("global rendezvous registration rate limit must be greater than zero");
+        }
+        if self.challenge_ttl.as_secs() == 0 {
+            anyhow::bail!("global rendezvous registration challenge TTL must be greater than zero");
+        }
+        if self.max_pending_challenges == 0 {
+            anyhow::bail!(
+                "global rendezvous registration challenge store capacity must be greater than zero"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// TLS material for a global Option-1 rendezvous service.
@@ -87,6 +142,35 @@ impl GlobalRendezvousMtlsConfig {
     }
 }
 
+impl RendezvousMtlsConfig {
+    /// Returns the dynamic TLS configuration only for the explicit global mode.
+    pub fn global_mtls_config(&self) -> Option<GlobalRendezvousMtlsConfig> {
+        let RendezvousClientCa::Global {
+            cluster_registry, ..
+        } = &self.client_ca
+        else {
+            return None;
+        };
+        Some(GlobalRendezvousMtlsConfig {
+            cluster_registry: cluster_registry.clone(),
+            server_identity: self.server_identity.clone(),
+        })
+    }
+
+    fn global_registration_config(
+        &self,
+    ) -> Option<(&ClusterCaRegistry, &GlobalClusterRegistrationConfig)> {
+        let RendezvousClientCa::Global {
+            cluster_registry,
+            registration,
+        } = &self.client_ca
+        else {
+            return None;
+        };
+        Some((cluster_registry, registration))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RendezvousServerConfig {
     pub bind_addr: SocketAddr,
@@ -102,15 +186,26 @@ pub struct RendezvousAppState {
     pub presence: PresenceRegistry,
     pub relay_tunnel: RelayTunnelBroker,
     pub mesh_peers: Option<RendezvousControlClient>,
+    pub(crate) global_registration: Option<GlobalRegistrationState>,
 }
 
 impl RendezvousAppState {
     pub fn new(config: RendezvousServerConfig) -> Result<Self> {
+        let global_registration = config
+            .mtls
+            .as_ref()
+            .and_then(RendezvousMtlsConfig::global_registration_config)
+            .map(|(registry, registration)| {
+                registration.validate()?;
+                GlobalRegistrationState::new(registry.clone(), registration.clone())
+            })
+            .transpose()?;
         Ok(Self {
             mesh_peers: build_mesh_probe_client(&config)?,
             config,
             presence: PresenceRegistry::new(),
             relay_tunnel: RelayTunnelBroker::new(),
+            global_registration,
         })
     }
 }
@@ -128,7 +223,7 @@ pub fn build_router(state: RendezvousAppState) -> Router {
         .route("/relay/tunnel/ws", get(relay_tunnel_ws))
         .route("/relay/wake/ws", get(relay_wake_ws));
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/control/mesh", get(mesh_status))
         .route("/control/discovery", get(discovery))
@@ -136,8 +231,30 @@ pub fn build_router(state: RendezvousAppState) -> Router {
         .route("/control/presence/register", post(register_presence))
         .route("/control/relay/ticket", post(issue_relay_ticket))
         .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
-        .merge(relay_router)
-        .with_state(state)
+        .merge(relay_router);
+
+    let router = if state.global_registration.is_some() {
+        router
+            .route(
+                "/global/cluster-registration/challenge",
+                post(global_registration::issue_challenge),
+            )
+            .route(
+                "/global/cluster-registration/complete",
+                post(global_registration::complete_registration),
+            )
+            .route(
+                "/global/cluster-registration/clusters",
+                get(global_registration::list_clusters),
+            )
+            .route(
+                "/global/cluster-registration/clusters/{cluster_id}/suspension",
+                post(global_registration::set_cluster_suspension),
+            )
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 pub async fn serve(state: RendezvousAppState) -> Result<()> {
@@ -146,7 +263,11 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
     spawn_mesh_probe_task(state.mesh_peers.clone());
 
     if let Some(mtls) = state.config.mtls.as_ref() {
-        let tls_config = build_mtls_rustls_config(mtls)?;
+        let tls_config = if let Some(global) = mtls.global_mtls_config() {
+            global.build_rustls_config()?
+        } else {
+            build_mtls_rustls_config(mtls)?
+        };
         axum_server::bind(bind_addr)
             .acceptor(MtlsAuthenticatedPeerAcceptor::new(tls_config))
             .serve(app.into_make_service())
@@ -370,6 +491,7 @@ fn rendezvous_mesh_server_ca_pem(mtls: Option<&RendezvousMtlsConfig>) -> Result<
                 .with_context(|| format!("failed reading {}", cert_path.display()))?,
         )),
         RendezvousClientCa::InlinePem { cert_pem } => Ok(Some(cert_pem.clone())),
+        RendezvousClientCa::Global { .. } => Ok(None),
     }
 }
 
@@ -685,10 +807,19 @@ async fn relay_tunnel_ws(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
     websocket: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    websocket.on_upgrade(move |socket| async move {
+) -> std::result::Result<impl axum::response::IntoResponse, (StatusCode, String)> {
+    ensure_relay_websocket_authenticated(&state, &authenticated_peer)
+        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    Ok(websocket.on_upgrade(move |socket| async move {
         serve_relay_tunnel_websocket(state, authenticated_peer, socket).await;
-    })
+    }))
+}
+
+pub(crate) fn ensure_relay_websocket_authenticated(
+    state: &RendezvousAppState,
+    authenticated_peer: &MaybeAuthenticatedPeer,
+) -> anyhow::Result<()> {
+    require_any_authenticated_peer(state.config.mtls.is_some(), authenticated_peer)
 }
 
 async fn serve_relay_tunnel_websocket(
@@ -1074,10 +1205,12 @@ async fn relay_wake_ws(
     State(state): State<RendezvousAppState>,
     authenticated_peer: MaybeAuthenticatedPeer,
     websocket: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    websocket.on_upgrade(move |socket| async move {
+) -> std::result::Result<impl axum::response::IntoResponse, (StatusCode, String)> {
+    ensure_relay_websocket_authenticated(&state, &authenticated_peer)
+        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+    Ok(websocket.on_upgrade(move |socket| async move {
         serve_relay_wake_websocket(state, authenticated_peer, socket).await;
-    })
+    }))
 }
 
 async fn serve_relay_wake_websocket(
