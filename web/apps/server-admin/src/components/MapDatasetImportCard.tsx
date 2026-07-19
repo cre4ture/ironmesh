@@ -201,7 +201,7 @@ export function MapDatasetImportCard() {
                   disabled={!canStartNaturalEarthImport}
                   onClick={() => void startNaturalEarthImportMutation.mutateAsync()}
                 >
-                  Download and convert Natural Earth
+                  Start Natural Earth conversion
                 </Button>
               </Group>
               {naturalEarthJob?.logical_size_bytes ? (
