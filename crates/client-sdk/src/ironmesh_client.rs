@@ -1973,6 +1973,8 @@ struct PathMutationRequest {
     from_path: String,
     to_path: String,
     overwrite: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2614,8 +2616,18 @@ impl IronMeshClient {
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
+        self.put_with_expected_revision(key, data, None).await
+    }
+
+    pub async fn put_with_expected_revision(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<StorageObjectMeta> {
         let key = key.into();
-        let url = self.store_key_url(&key)?;
+        let mut url = self.store_key_url(&key)?;
+        append_optional_query(&mut url, "expected_revision", expected_revision);
 
         let response = self
             .execute_buffered_request(Method::PUT, url, Vec::new(), Some(data.to_vec()))
@@ -2667,6 +2679,17 @@ impl IronMeshClient {
         to_path: impl Into<String>,
         overwrite: bool,
     ) -> Result<()> {
+        self.rename_path_with_expected_revision(from_path, to_path, overwrite, None)
+            .await
+    }
+
+    pub async fn rename_path_with_expected_revision(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
         let from_path = from_path.into();
         let to_path = to_path.into();
         let url = self.store_rename_url()?;
@@ -2674,6 +2697,7 @@ impl IronMeshClient {
             from_path: from_path.clone(),
             to_path: to_path.clone(),
             overwrite,
+            expected_revision: expected_revision.map(str::to_string),
         })
         .context("failed to encode rename request")?;
 
@@ -2710,6 +2734,7 @@ impl IronMeshClient {
             from_path: from_path.clone(),
             to_path: to_path.clone(),
             overwrite,
+            expected_revision: None,
         })
         .context("failed to encode copy request")?;
 
@@ -2785,9 +2810,18 @@ impl IronMeshClient {
     }
 
     pub async fn delete_path(&self, key: impl AsRef<str>) -> Result<()> {
+        self.delete_path_with_expected_revision(key, None).await
+    }
+
+    pub async fn delete_path_with_expected_revision(
+        &self,
+        key: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
         let key = key.as_ref();
         let mut url = self.store_delete_url()?;
         url.query_pairs_mut().append_pair("key", key);
+        append_optional_query(&mut url, "expected_revision", expected_revision);
         if key.ends_with('/') {
             url.query_pairs_mut().append_pair("recursive", "true");
         }

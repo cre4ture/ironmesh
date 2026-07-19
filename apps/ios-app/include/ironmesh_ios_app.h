@@ -87,6 +87,20 @@ int ironmesh_ios_facade_put_bytes(void *handle,
                                   char **out_json,
                                   char **out_error);
 
+int ironmesh_ios_facade_put_bytes_with_expected_revision(void *handle,
+                                                         const char *key,
+                                                         const uint8_t *data,
+                                                         uintptr_t len,
+                                                         const char *expected_revision,
+                                                         char **out_json,
+                                                         char **out_error);
+
+int ironmesh_ios_facade_delete_path_with_expected_revision(void *handle,
+                                                           const char *key,
+                                                           const char *expected_revision,
+                                                           char **out_json,
+                                                           char **out_error);
+
 int ironmesh_ios_facade_enroll_with_bootstrap(const char *connection_input,
                                               const char *device_id_override,
                                               const char *device_label_override,
@@ -100,6 +114,13 @@ int ironmesh_ios_facade_move_path(void *handle,
                                   const char *to_path,
                                   int overwrite,
                                   char **out_error);
+
+int ironmesh_ios_facade_move_path_with_expected_revision(void *handle,
+                                                         const char *from_path,
+                                                         const char *to_path,
+                                                         int overwrite,
+                                                         const char *expected_revision,
+                                                         char **out_error);
 
 int ironmesh_ios_facade_start_web_ui(const char *connection_input,
                                      const char *server_ca_pem,

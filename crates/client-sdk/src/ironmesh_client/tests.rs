@@ -238,6 +238,72 @@ fn versions_url_builder_builds_expected_path() {
 }
 
 #[tokio::test]
+async fn expected_revision_is_sent_separately_for_put_delete_and_recursive_delete() {
+    async fn put(
+        axum::extract::Query(query): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >,
+    ) -> axum::http::StatusCode {
+        if query.get("expected_revision").map(String::as_str) == Some("version-7")
+            && !query.contains_key("parent")
+        {
+            axum::http::StatusCode::CREATED
+        } else {
+            axum::http::StatusCode::BAD_REQUEST
+        }
+    }
+
+    async fn delete(
+        axum::extract::Query(query): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >,
+    ) -> axum::http::StatusCode {
+        let is_recursive = query.get("recursive").map(String::as_str) == Some("true");
+        let valid_revision = if is_recursive {
+            !query.contains_key("expected_revision")
+        } else {
+            query.get("expected_revision").map(String::as_str) == Some("version-7")
+        };
+        if valid_revision && !query.contains_key("parent") {
+            axum::http::StatusCode::CREATED
+        } else {
+            axum::http::StatusCode::BAD_REQUEST
+        }
+    }
+
+    let app = axum::Router::new()
+        .route("/api/v1/store/delete", axum::routing::post(delete))
+        .route("/api/v1/store/{key}", axum::routing::put(put));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener should have addr");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service()).await;
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+    client
+        .put_with_expected_revision(
+            "docs/readme.txt",
+            bytes::Bytes::from_static(b"updated"),
+            Some("version-7"),
+        )
+        .await
+        .expect("expected revision PUT should be accepted");
+    client
+        .delete_path_with_expected_revision("docs/readme.txt", Some("version-7"))
+        .await
+        .expect("expected revision delete should be accepted");
+    client
+        .delete_path_with_expected_revision("docs/", None)
+        .await
+        .expect("recursive delete should not send a parent or expected revision");
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn list_versions_parses_version_graph_summary() {
     async fn versions(
         axum::extract::Path(key): axum::extract::Path<String>,

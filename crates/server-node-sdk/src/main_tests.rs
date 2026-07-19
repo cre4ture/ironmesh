@@ -10369,6 +10369,7 @@ async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBacken
         Query(super::PutObjectQuery {
             state: None,
             parent: Vec::new(),
+            expected_revision: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -11553,6 +11554,240 @@ run_on_main_metadata_backends!(
     autonomous_post_write_replication_pushes_to_missing_remote_nodes_turso
 );
 
+async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let key = "expected-revision-cas.txt".to_string();
+
+    let original_revision = {
+        let mut store = lock_store(&state, "tests.expected_revision.original").await;
+        store
+            .put_object_versioned(
+                &key,
+                bytes::Bytes::from_static(b"original"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+            .version_id
+    };
+    let current_revision = {
+        let mut store = lock_store(&state, "tests.expected_revision.concurrent").await;
+        store
+            .put_object_versioned(
+                &key,
+                bytes::Bytes::from_static(b"concurrent"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+            .version_id
+    };
+
+    let stale_put = super::put_object(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(key.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(original_revision.clone()),
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"stale-local"),
+    )
+    .await
+    .into_response();
+    assert_eq!(stale_put.status(), StatusCode::CONFLICT);
+
+    let stale_delete = super::delete_object(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(key.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(original_revision),
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(stale_delete.status(), StatusCode::CONFLICT);
+
+    {
+        let store = lock_store(&state, "tests.expected_revision.unchanged").await;
+        let current = store
+            .get_object(&key, None, None, super::storage::ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(current.as_ref(), b"concurrent");
+    }
+
+    let accepted_put = super::put_object(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(key.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(current_revision),
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"accepted-local"),
+    )
+    .await
+    .into_response();
+    assert_eq!(accepted_put.status(), StatusCode::CREATED);
+
+    let accepted_revision = {
+        let store = lock_store(&state, "tests.expected_revision.accepted").await;
+        store
+            .list_versions(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .preferred_head_version_id
+            .unwrap()
+    };
+    let accepted_delete = super::delete_object(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path(key.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(accepted_revision),
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(accepted_delete.status(), StatusCode::CREATED);
+
+    let rename_key = "expected-revision-rename.txt";
+    let rename_revision = {
+        let mut store = lock_store(&state, "tests.expected_revision.rename").await;
+        store
+            .put_object_versioned(
+                rename_key,
+                bytes::Bytes::from_static(b"rename-me"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+            .version_id
+    };
+    let stale_rename = super::rename_object_path(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::PathMutationRequest {
+            from_path: rename_key.to_string(),
+            to_path: "renamed-stale.txt".to_string(),
+            overwrite: false,
+            expected_revision: Some("stale-revision".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(stale_rename.status(), StatusCode::CONFLICT);
+
+    let accepted_rename = super::rename_object_path(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(super::PathMutationRequest {
+            from_path: rename_key.to_string(),
+            to_path: "renamed-current.txt".to_string(),
+            overwrite: false,
+            expected_revision: Some(rename_revision),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(accepted_rename.status(), StatusCode::NO_CONTENT);
+
+    let (stale_directory_revision, current_directory_revision) = {
+        let mut store = lock_store(&state, "tests.expected_revision.directory").await;
+        let stale = store
+            .put_object_versioned(
+                "cas-directory/",
+                bytes::Bytes::from_static(b"marker-v1"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+            .version_id;
+        store
+            .put_object_versioned(
+                "cas-directory/child.txt",
+                bytes::Bytes::from_static(b"child"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let current = store
+            .put_object_versioned(
+                "cas-directory/",
+                bytes::Bytes::from_static(b"marker-v2"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+            .version_id;
+        (stale, current)
+    };
+    let stale_recursive_delete = super::delete_object(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path("cas-directory/".to_string()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(stale_directory_revision),
+            version_id: None,
+            internal_replication: false,
+            recursive: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(stale_recursive_delete.status(), StatusCode::CONFLICT);
+
+    let accepted_recursive_delete = super::delete_object(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::extract::Path("cas-directory/".to_string()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(current_directory_revision),
+            version_id: None,
+            internal_replication: false,
+            recursive: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(accepted_recursive_delete.status(), StatusCode::CREATED);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl,
+    expected_revision_compare_and_swap_rejects_stale_put_and_delete,
+    expected_revision_compare_and_swap_rejects_stale_put_and_delete_turso
+);
+
 async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     backend: MainTestBackend,
 ) {
@@ -11576,6 +11811,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     let query = axum::extract::Query(super::PutObjectQuery {
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
+        expected_revision: None,
         version_id: None,
         internal_replication: false,
         recursive: false,
@@ -11632,6 +11868,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
     let query = axum::extract::Query(super::PutObjectQuery {
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
+        expected_revision: None,
         version_id: None,
         internal_replication: false,
         recursive: true,
@@ -11688,6 +11925,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
     let query = axum::extract::Query(super::PutObjectQuery {
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
+        expected_revision: None,
         version_id: Some("repl-tomb-docs-marker".to_string()),
         internal_replication: true,
         recursive: false,

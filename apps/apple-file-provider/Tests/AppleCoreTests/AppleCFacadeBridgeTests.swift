@@ -82,7 +82,8 @@ final class AppleCFacadeBridgeTests: XCTestCase {
           "item_id": "file:object:obj-123",
           "object_id": "obj-123",
           "version_graph": {
-            "preferred_head_version_id": "version-10"
+            "preferred_head_version_id": "version-10",
+            "head_version_ids": ["version-10"]
           }
         }
         """
@@ -96,22 +97,25 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(metadata?.identifier.serialized, "file:object:obj-123")
         XCTAssertEqual(metadata?.revisionHint, "version-9")
 
-        let upload = try bridge.upload(path: "docs/readme.txt", data: Data("hello".utf8), expectedRevision: nil)
+        let upload = try bridge.upload(path: "docs/readme.txt", data: Data("hello".utf8), expectedRevision: "version-9")
         XCTAssertTrue(upload.accepted)
         XCTAssertEqual(upload.resultingIdentifier, "file:object:obj-123")
         XCTAssertEqual(upload.resultingRevision, "version-10")
+        XCTAssertEqual(ffi.lastPutExpectedRevision, "version-9")
 
         let bytes = try bridge.download(path: "docs/readme.txt", revisionHint: nil)
         XCTAssertEqual(String(decoding: bytes, as: UTF8.self), "hello")
 
-        let move = try bridge.move(from: "docs/readme.txt", to: "docs/guide.txt", expectedRevision: nil)
+        let move = try bridge.move(from: "docs/readme.txt", to: "docs/guide.txt", expectedRevision: "version-10")
         XCTAssertTrue(move.accepted)
         XCTAssertEqual(ffi.lastMoveFromPath, "docs/readme.txt")
         XCTAssertEqual(ffi.lastMoveToPath, "docs/guide.txt")
+        XCTAssertEqual(ffi.lastMoveExpectedRevision, "version-10")
 
-        let delete = try bridge.delete(path: "docs/guide.txt", expectedRevision: nil)
+        let delete = try bridge.delete(path: "docs/guide.txt", expectedRevision: "version-10")
         XCTAssertTrue(delete.accepted)
         XCTAssertEqual(ffi.lastDeletePath, "docs/guide.txt")
+        XCTAssertEqual(ffi.lastDeleteExpectedRevision, "version-10")
     }
 
     func testDeletePreservesDirectoryMarkerForRecursiveDeletes() throws {
@@ -123,6 +127,30 @@ final class AppleCFacadeBridgeTests: XCTestCase {
 
         XCTAssertTrue(delete.accepted)
         XCTAssertEqual(ffi.lastDeletePath, "docs/archive/")
+    }
+
+    func testUploadReportsDivergentHeadsForVisibleConflictRecovery() throws {
+        let ffi = MockFFI()
+        ffi.putResponseJSON = """
+        {
+          "item_id": "file:object:obj-123",
+          "version_graph": {
+            "preferred_head_version_id": "local-head",
+            "head_version_ids": ["remote-head", "local-head"]
+          }
+        }
+        """
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+
+        let result = try bridge.upload(
+            path: "docs/readme.txt",
+            data: Data("local".utf8),
+            expectedRevision: "base-head"
+        )
+
+        XCTAssertEqual(result.conflictingRevision, "local-head,remote-head")
+        XCTAssertEqual(ffi.lastPutExpectedRevision, "base-head")
     }
 
     func testMkdirReturnsNonAcceptedPlaceholderUntilDirectoryCreationExists() throws {
@@ -213,8 +241,11 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var lastListPrefix: String?
     var lastListDepth: Int?
     var lastDeletePath: String?
+    var lastDeleteExpectedRevision: String?
+    var lastPutExpectedRevision: String?
     var lastMoveFromPath: String?
     var lastMoveToPath: String?
+    var lastMoveExpectedRevision: String?
     var lastStoreIndexPrefix: String?
     var lastStoreIndexOffset: Int?
     var lastStoreIndexLimit: Int?
@@ -308,23 +339,42 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         return relativeResponseData
     }
 
-    func putBytes(handle: AppleRustHandle, key: String, data: Data) throws -> String {
+    func putBytes(
+        handle: AppleRustHandle,
+        key: String,
+        data: Data,
+        expectedRevision: String?
+    ) throws -> String {
         _ = handle
         _ = key
         _ = data
+        lastPutExpectedRevision = expectedRevision
         return putResponseJSON
     }
 
-    func deletePath(handle: AppleRustHandle, key: String) throws {
+    func deletePath(
+        handle: AppleRustHandle,
+        key: String,
+        expectedRevision: String?
+    ) throws -> String {
         _ = handle
         lastDeletePath = key
+        lastDeleteExpectedRevision = expectedRevision
+        return #"{"version_graph":null}"#
     }
 
-    func movePath(handle: AppleRustHandle, fromPath: String, toPath: String, overwrite: Bool) throws {
+    func movePath(
+        handle: AppleRustHandle,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool,
+        expectedRevision: String?
+    ) throws {
         _ = handle
         _ = overwrite
         lastMoveFromPath = fromPath
         lastMoveToPath = toPath
+        lastMoveExpectedRevision = expectedRevision
     }
 
     func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String {

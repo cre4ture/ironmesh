@@ -61,17 +61,20 @@ public struct AppleMutationResult: Sendable, Codable, Equatable {
     public var message: String?
     public var resultingIdentifier: String?
     public var resultingRevision: String?
+    public var conflictingRevision: String?
 
     public init(
         accepted: Bool,
         message: String? = nil,
         resultingIdentifier: String? = nil,
-        resultingRevision: String? = nil
+        resultingRevision: String? = nil,
+        conflictingRevision: String? = nil
     ) {
         self.accepted = accepted
         self.message = message?.nilIfBlank
         self.resultingIdentifier = resultingIdentifier?.nilIfBlank
         self.resultingRevision = resultingRevision?.nilIfBlank
+        self.conflictingRevision = conflictingRevision?.nilIfBlank
     }
 }
 

@@ -192,20 +192,28 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return data
     }
 
-    func putBytes(handle: AppleRustHandle, key: String, data: Data) throws -> String {
+    func putBytes(
+        handle: AppleRustHandle,
+        key: String,
+        data: Data,
+        expectedRevision: String?
+    ) throws -> String {
         var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = withOptionalCString(key) { keyPointer in
-            return data.withUnsafeBytes { rawBuffer in
-                let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress
-                return ironmesh_ios_facade_put_bytes(
-                    handle,
-                    keyPointer,
-                    baseAddress,
-                    numericCast(data.count),
-                    &jsonPointer,
-                    &errorPointer
-                )
+            withOptionalCString(expectedRevision) { revisionPointer in
+                data.withUnsafeBytes { rawBuffer in
+                    let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress
+                    return ironmesh_ios_facade_put_bytes_with_expected_revision(
+                        handle,
+                        keyPointer,
+                        baseAddress,
+                        numericCast(data.count),
+                        revisionPointer,
+                        &jsonPointer,
+                        &errorPointer
+                    )
+                }
             }
         }
 
@@ -216,26 +224,52 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(jsonPointer)
     }
 
-    func deletePath(handle: AppleRustHandle, key: String) throws {
+    func deletePath(
+        handle: AppleRustHandle,
+        key: String,
+        expectedRevision: String?
+    ) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = withOptionalCString(key) { keyPointer in
-            ironmesh_ios_facade_delete_path(handle, keyPointer, &errorPointer)
+            withOptionalCString(expectedRevision) { revisionPointer in
+                ironmesh_ios_facade_delete_path_with_expected_revision(
+                    handle,
+                    keyPointer,
+                    revisionPointer,
+                    &jsonPointer,
+                    &errorPointer
+                )
+            }
         }
 
         try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no delete JSON.")
+        }
+        return consumeString(jsonPointer)
     }
 
-    func movePath(handle: AppleRustHandle, fromPath: String, toPath: String, overwrite: Bool) throws {
+    func movePath(
+        handle: AppleRustHandle,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool,
+        expectedRevision: String?
+    ) throws {
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = withOptionalCString(fromPath) { sourcePointer in
             withOptionalCString(toPath) { destinationPointer in
-                ironmesh_ios_facade_move_path(
-                    handle,
-                    sourcePointer,
-                    destinationPointer,
-                    overwrite ? 1 : 0,
-                    &errorPointer
-                )
+                withOptionalCString(expectedRevision) { revisionPointer in
+                    ironmesh_ios_facade_move_path_with_expected_revision(
+                        handle,
+                        sourcePointer,
+                        destinationPointer,
+                        overwrite ? 1 : 0,
+                        revisionPointer,
+                        &errorPointer
+                    )
+                }
             }
         }
 

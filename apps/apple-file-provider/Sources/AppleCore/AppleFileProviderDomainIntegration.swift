@@ -4,10 +4,16 @@ import Foundation
 public struct AppleRegisteredFileProviderDomain: Equatable, Sendable {
     public let identifier: String
     public let displayName: String
+    public let isDisconnected: Bool
 
-    public init(identifier: String, displayName: String) {
+    public init(
+        identifier: String,
+        displayName: String,
+        isDisconnected: Bool = false
+    ) {
         self.identifier = identifier
         self.displayName = displayName
+        self.isDisconnected = isDisconnected
     }
 }
 
@@ -74,6 +80,10 @@ public struct AppleFileProviderDomainRegistrationResult: Equatable, Sendable {
 
 public protocol AppleFileProviderDomainManaging: Sendable {
     func add(identifier: String, displayName: String) async throws
+    func remove(identifier: String, displayName: String) async throws
+    func disconnect(identifier: String, displayName: String, reason: String) async throws
+    func reconnect(identifier: String, displayName: String) async throws
+    func signalChanges(identifier: String, displayName: String) async throws
     func domains() async throws -> [AppleRegisteredFileProviderDomain]
 }
 
@@ -81,13 +91,84 @@ public struct AppleLiveFileProviderDomainManager: AppleFileProviderDomainManagin
     public init() {}
 
     public func add(identifier: String, displayName: String) async throws {
-        let domain = NSFileProviderDomain(
-            identifier: NSFileProviderDomainIdentifier(rawValue: identifier),
-            displayName: displayName
-        )
+        let domain = domain(identifier: identifier, displayName: displayName)
         let _: Void = try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<Void, any Error>) in
             NSFileProviderManager.add(domain) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+    }
+
+    public func remove(identifier: String, displayName: String) async throws {
+        let domain = domain(identifier: identifier, displayName: displayName)
+        let _: Void = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            NSFileProviderManager.remove(domain) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+    }
+
+    public func disconnect(
+        identifier: String,
+        displayName: String,
+        reason: String
+    ) async throws {
+        #if os(macOS)
+        let manager = try manager(identifier: identifier, displayName: displayName)
+        let _: Void = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            manager.disconnect(reason: reason, options: []) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+        #else
+        // iOS does not expose NSFileProviderManager.disconnect. The shared profile lifecycle is
+        // read before every extension operation, so persisting `.paused` is the authoritative
+        // iOS gate. Keep the domain registered to preserve materialized and queued user data.
+        _ = identifier
+        _ = displayName
+        _ = reason
+        #endif
+    }
+
+    public func reconnect(identifier: String, displayName: String) async throws {
+        #if os(macOS)
+        let manager = try manager(identifier: identifier, displayName: displayName)
+        let _: Void = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            manager.reconnect { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+        #else
+        _ = identifier
+        _ = displayName
+        #endif
+    }
+
+    public func signalChanges(identifier: String, displayName: String) async throws {
+        let manager = try manager(identifier: identifier, displayName: displayName)
+        let _: Void = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            manager.signalEnumerator(for: .workingSet) { error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
@@ -107,13 +188,45 @@ public struct AppleLiveFileProviderDomainManager: AppleFileProviderDomainManagin
                 }
 
                 let registeredDomains = domains.map {
-                    AppleRegisteredFileProviderDomain(
+                    #if os(macOS)
+                    let isDisconnected = $0.isDisconnected
+                    #else
+                    let isDisconnected = false
+                    #endif
+                    return AppleRegisteredFileProviderDomain(
                         identifier: $0.identifier.rawValue,
-                        displayName: $0.displayName
+                        displayName: $0.displayName,
+                        isDisconnected: isDisconnected
                     )
                 }
                 continuation.resume(returning: registeredDomains)
             }
+        }
+    }
+
+    private func domain(identifier: String, displayName: String) -> NSFileProviderDomain {
+        NSFileProviderDomain(
+            identifier: NSFileProviderDomainIdentifier(rawValue: identifier),
+            displayName: displayName
+        )
+    }
+
+    private func manager(identifier: String, displayName: String) throws -> NSFileProviderManager {
+        let domain = domain(identifier: identifier, displayName: displayName)
+        guard let manager = NSFileProviderManager(for: domain) else {
+            throw AppleFileProviderDomainManagementError.managerUnavailable(identifier)
+        }
+        return manager
+    }
+}
+
+public enum AppleFileProviderDomainManagementError: LocalizedError, Equatable {
+    case managerUnavailable(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .managerUnavailable(let identifier):
+            return "File Provider manager for domain '\(identifier)' is unavailable."
         }
     }
 }

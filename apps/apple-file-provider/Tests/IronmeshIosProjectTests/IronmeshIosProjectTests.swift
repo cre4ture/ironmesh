@@ -1,8 +1,21 @@
 import AppleCore
 import AppleFileProviderShared
+@preconcurrency import FileProvider
 import XCTest
 
 final class IronmeshIosProjectTests: XCTestCase {
+    func testRevisionConflictMapsToCannotSynchronizeWithCurrentRevision() {
+        let error = ironmeshRevisionConflictError(
+            path: "docs/readme.txt",
+            expectedRevision: "version-1",
+            currentRevision: "version-2"
+        )
+
+        XCTAssertEqual(error.domain, NSFileProviderErrorDomain)
+        XCTAssertEqual(error.code, NSFileProviderError.Code.cannotSynchronize.rawValue)
+        XCTAssertEqual(error.userInfo["IronmeshCurrentRevision"] as? String, "version-2")
+    }
+
     func testSharedPackageTypesAreAvailableToTheXcodeProject() {
         let configuration = AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080")
         let item = AppleFileProviderItem.file(
@@ -158,22 +171,150 @@ final class IronmeshIosProjectTests: XCTestCase {
             )
         )
     }
+
+    func testSyncProfileDomainConfigureIsIdempotent() async throws {
+        let profile = AppleSyncProfile(id: "documents", displayName: "Documents")
+        let manager = MockFileProviderDomainManager(
+            domainsToReturn: [
+                AppleRegisteredFileProviderDomain(
+                    identifier: profile.domainIdentifier,
+                    displayName: profile.displayName
+                )
+            ]
+        )
+        let coordinator = AppleSyncProfileDomainCoordinator(manager: manager)
+
+        try await coordinator.configure(profile)
+
+        let adds = await manager.recordedAdds()
+        XCTAssertTrue(adds.isEmpty)
+    }
+
+    func testSyncProfileDomainPauseResumeSignalAndRemove() async throws {
+        let profile = AppleSyncProfile(id: "photos", displayName: "Photos")
+        let manager = MockFileProviderDomainManager(
+            domainsToReturn: [
+                AppleRegisteredFileProviderDomain(
+                    identifier: profile.domainIdentifier,
+                    displayName: profile.displayName
+                )
+            ]
+        )
+        let coordinator = AppleSyncProfileDomainCoordinator(manager: manager)
+
+        try await coordinator.pause(profile)
+        try await coordinator.resume(profile)
+        try await coordinator.remove(profile)
+
+        let operations = await manager.recordedLifecycleOperations()
+        XCTAssertEqual(
+            operations,
+            [
+                "disconnect:\(profile.domainIdentifier)",
+                "reconnect:\(profile.domainIdentifier)",
+                "signal:\(profile.domainIdentifier)",
+                "remove:\(profile.domainIdentifier)",
+            ]
+        )
+    }
+
+    func testSyncProfileResumeRecreatesMissingDomainAsActive() async throws {
+        let pausedProfile = AppleSyncProfile(
+            id: "missing-paused",
+            displayName: "Missing paused",
+            lifecycle: .paused
+        )
+        let manager = MockFileProviderDomainManager()
+        let coordinator = AppleSyncProfileDomainCoordinator(manager: manager)
+
+        try await coordinator.resume(pausedProfile)
+
+        let adds = await manager.recordedAdds()
+        XCTAssertEqual(
+            adds,
+            [
+                AppleRegisteredFileProviderDomain(
+                    identifier: pausedProfile.domainIdentifier,
+                    displayName: pausedProfile.displayName
+                )
+            ]
+        )
+        let operations = await manager.recordedLifecycleOperations()
+        XCTAssertTrue(operations.isEmpty)
+    }
+
+    func testSyncProfileRemoveMissingDomainIsIdempotent() async throws {
+        let profile = AppleSyncProfile(id: "already-removed", displayName: "Already removed")
+        let manager = MockFileProviderDomainManager()
+        let coordinator = AppleSyncProfileDomainCoordinator(manager: manager)
+
+        try await coordinator.remove(profile)
+
+        let operations = await manager.recordedLifecycleOperations()
+        XCTAssertTrue(operations.isEmpty)
+    }
+
+    func testRegisteredProfilesDeduplicatesLegacyDomainsDeterministically() async throws {
+        let profile = AppleSyncProfile(id: "duplicate", displayName: "Duplicate")
+        let manager = MockFileProviderDomainManager(
+            domainsToReturn: [
+                AppleRegisteredFileProviderDomain(
+                    identifier: profile.domainIdentifier,
+                    displayName: "Zulu",
+                    isDisconnected: false
+                ),
+                AppleRegisteredFileProviderDomain(
+                    identifier: profile.domainIdentifier,
+                    displayName: "Alpha",
+                    isDisconnected: false
+                ),
+            ]
+        )
+        let coordinator = AppleSyncProfileDomainCoordinator(manager: manager)
+
+        let registered = try await coordinator.registeredProfiles([profile])
+
+        XCTAssertEqual(registered[profile.domainIdentifier]?.displayName, "Alpha")
+    }
+
+    func testSyncProfileReconcileContinuesAfterOneProfileFails() async {
+        let broken = AppleSyncProfile(id: "broken", displayName: "Broken")
+        let healthy = AppleSyncProfile(id: "healthy", displayName: "Healthy")
+        let manager = MockFileProviderDomainManager(
+            failingAddIdentifiers: [broken.domainIdentifier]
+        )
+        let coordinator = AppleSyncProfileDomainCoordinator(manager: manager)
+
+        let errors = await coordinator.reconcile([broken, healthy])
+
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertTrue(errors[0].contains("Broken"))
+        let addedIdentifiers = await manager.recordedAdds().map(\.identifier)
+        XCTAssertEqual(addedIdentifiers, [
+            broken.domainIdentifier,
+            healthy.domainIdentifier,
+        ])
+    }
 }
 
 private actor MockFileProviderDomainManager: AppleFileProviderDomainManaging {
     private var domainsToReturn: [AppleRegisteredFileProviderDomain]
     private let postAddDomains: [AppleRegisteredFileProviderDomain]?
     private let addError: Error?
+    private let failingAddIdentifiers: Set<String>
     private var addRequests: [AppleRegisteredFileProviderDomain] = []
+    private var lifecycleOperations: [String] = []
 
     init(
         domainsToReturn: [AppleRegisteredFileProviderDomain] = [],
         addError: Error? = nil,
-        postAddDomains: [AppleRegisteredFileProviderDomain]? = nil
+        postAddDomains: [AppleRegisteredFileProviderDomain]? = nil,
+        failingAddIdentifiers: Set<String> = []
     ) {
         self.domainsToReturn = domainsToReturn
         self.addError = addError
         self.postAddDomains = postAddDomains
+        self.failingAddIdentifiers = failingAddIdentifiers
     }
 
     func add(identifier: String, displayName: String) async throws {
@@ -182,6 +323,9 @@ private actor MockFileProviderDomainManager: AppleFileProviderDomainManaging {
             displayName: displayName
         )
         addRequests.append(domain)
+        if failingAddIdentifiers.contains(identifier) {
+            throw MockDomainError("Configured add failure for \(identifier).")
+        }
         if let postAddDomains {
             domainsToReturn = postAddDomains
         } else if addError == nil {
@@ -197,8 +341,34 @@ private actor MockFileProviderDomainManager: AppleFileProviderDomainManaging {
         domainsToReturn
     }
 
+    func remove(identifier: String, displayName: String) async throws {
+        _ = displayName
+        lifecycleOperations.append("remove:\(identifier)")
+        domainsToReturn.removeAll { $0.identifier == identifier }
+    }
+
+    func disconnect(identifier: String, displayName: String, reason: String) async throws {
+        _ = displayName
+        _ = reason
+        lifecycleOperations.append("disconnect:\(identifier)")
+    }
+
+    func reconnect(identifier: String, displayName: String) async throws {
+        _ = displayName
+        lifecycleOperations.append("reconnect:\(identifier)")
+    }
+
+    func signalChanges(identifier: String, displayName: String) async throws {
+        _ = displayName
+        lifecycleOperations.append("signal:\(identifier)")
+    }
+
     func recordedAdds() -> [AppleRegisteredFileProviderDomain] {
         addRequests
+    }
+
+    func recordedLifecycleOperations() -> [String] {
+        lifecycleOperations
     }
 }
 

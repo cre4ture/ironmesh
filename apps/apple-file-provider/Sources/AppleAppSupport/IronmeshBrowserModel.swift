@@ -131,6 +131,10 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var currentItems: [AppleBridgeItem] = []
     @Published var statusText: String
     @Published var domainState: IronmeshDomainRegistrationState = .unchecked
+    @Published var syncProfiles: [AppleSyncProfile] = []
+    @Published var registeredSyncProfileDomains: [String: AppleRegisteredFileProviderDomain] = [:]
+    @Published var syncProfilesErrorMessage: String?
+    @Published private(set) var syncProfileOperationState = AppleSyncProfileOperationState()
     @Published var isBusy = false
     @Published var lastSuccessfulConnectionAt: Date?
     @Published var lastErrorMessage: String?
@@ -149,6 +153,8 @@ final class IronmeshBrowserModel: ObservableObject {
     private let settingsStore: AppleConnectionSettingsStore
     private let enroller: AppleBootstrapEnroller
     private let fileProviderDomains: AppleFileProviderDomainCoordinator
+    private let syncProfileDomains: AppleSyncProfileDomainCoordinator
+    private let syncProfileStore: AppleSyncProfileStore
     private let userDefaults: UserDefaults
     private let draftStorageKey = AppleConnectionSettingsStore.defaultLegacyDraftStateKey
     private let onboardingStorageKey = "IronmeshIosApp.hasCompletedOnboarding"
@@ -159,21 +165,29 @@ final class IronmeshBrowserModel: ObservableObject {
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
 
+    var isSyncProfileMutationInProgress: Bool {
+        syncProfileOperationState.isMutationInProgress
+    }
+
     init(
         userDefaults: UserDefaults = .standard,
         settingsStore: AppleConnectionSettingsStore? = nil,
         enroller: AppleBootstrapEnroller = IronmeshRustFFIAdapter(connectionName: "ios app shell"),
         fileProviderDomains: AppleFileProviderDomainCoordinator = AppleFileProviderDomainCoordinator(),
+        syncProfileDomains: AppleSyncProfileDomainCoordinator = AppleSyncProfileDomainCoordinator(),
+        syncProfileStore: AppleSyncProfileStore? = nil,
         remoteSession: IronmeshRemoteSession = IronmeshRemoteSession()
     ) {
         self.userDefaults = userDefaults
         self.enroller = enroller
         self.remoteSession = remoteSession
         self.fileProviderDomains = fileProviderDomains
+        self.syncProfileDomains = syncProfileDomains
         let bundleConfiguration = IronmeshBundleConfiguration(bundle: .main)
         let defaults = IronmeshConnectionDraft(bundleConfiguration: bundleConfiguration)
         bundleDefaults = defaults
         self.settingsStore = settingsStore ?? bundleConfiguration.makeSettingsStore()
+        self.syncProfileStore = syncProfileStore ?? bundleConfiguration.makeProfileStore()
 
         let storedDraft: IronmeshConnectionDraft? = if let storedData = userDefaults.data(
             forKey: draftStorageKey
@@ -211,6 +225,11 @@ final class IronmeshBrowserModel: ObservableObject {
         hasCompletedOnboarding = userDefaults.object(forKey: onboardingStorageKey) as? Bool ?? false
         lastErrorMessage = settingsLoadError?.localizedDescription
         statusText = settingsLoadError?.localizedDescription ?? initialDraft.setupSummary
+        do {
+            syncProfiles = try self.syncProfileStore.load()
+        } catch {
+            syncProfilesErrorMessage = error.localizedDescription
+        }
     }
 
     var shouldShowOnboarding: Bool {
@@ -273,7 +292,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     var filesIntegrationNote: String {
-        "The current iOS slice shares connection state with the File Provider extension and registers a Files domain. It does not run a background sync agent or local mirror yet."
+        "Each profile is a native Files domain backed by the shared enrolled device connection. iOS queues local work, materializes files on demand, and requests remote changes through persistent File Provider anchors without a foreground polling loop."
     }
 
     var orderedConnectionEndpoints: [IronmeshConnectionEndpointStatus] {
@@ -301,6 +320,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
         didActivate = true
         refreshDomainState()
+        reconcileSyncProfileDomains()
 
         if draft.requiresEnrollment {
             hasCompletedOnboarding = false
@@ -468,6 +488,220 @@ final class IronmeshBrowserModel: ObservableObject {
                 expectedIdentifier: expectedIdentifier
             )
         }
+    }
+
+    @discardableResult
+    func configureSyncProfile(
+        displayName: String,
+        remotePrefix: String,
+        depth: Int,
+        allowsExpensiveNetwork: Bool,
+        allowsConstrainedNetwork: Bool,
+        defersInLowPowerMode: Bool
+    ) -> Bool {
+        guard draft.connectionConfiguration != nil, !draft.requiresEnrollment else {
+            let message = "Apply and enroll the shared device connection before adding a sync profile."
+            syncProfilesErrorMessage = message
+            statusText = message
+            return false
+        }
+        guard displayName.nilIfBlank != nil else {
+            let message = "A sync profile needs a display name."
+            syncProfilesErrorMessage = message
+            statusText = message
+            return false
+        }
+
+        let profile = AppleSyncProfile(
+            displayName: displayName,
+            remotePrefix: remotePrefix,
+            depth: depth,
+            networkPolicy: AppleSyncProfileNetworkPolicy(
+                allowsExpensiveNetwork: allowsExpensiveNetwork,
+                allowsConstrainedNetwork: allowsConstrainedNetwork
+            ),
+            powerPolicy: AppleSyncProfilePowerPolicy(
+                defersInLowPowerMode: defersInLowPowerMode
+            )
+        )
+
+        guard beginSyncProfileMutation() else {
+            return false
+        }
+
+        do {
+            syncProfiles = try syncProfileStore.upsert(profile)
+        } catch {
+            endSyncProfileMutation()
+            syncProfilesErrorMessage = error.localizedDescription
+            statusText = error.localizedDescription
+            return false
+        }
+
+        Task {
+            defer { endSyncProfileMutation() }
+            do {
+                try await syncProfileDomains.configure(profile)
+                try await refreshSyncProfileDomainsThrowing()
+                syncProfilesErrorMessage = nil
+                statusText = "Added Files sync profile \(profile.displayName)."
+                addAction("Added sync profile", detail: "\(profile.displayName): \(profile.scopeSummary)")
+            } catch {
+                syncProfilesErrorMessage = error.localizedDescription
+                statusText = error.localizedDescription
+                addAction("Sync profile registration failed", detail: error.localizedDescription)
+            }
+        }
+        return true
+    }
+
+    func pauseSyncProfile(_ profile: AppleSyncProfile) {
+        updateSyncProfileLifecycle(profile, lifecycle: .paused)
+    }
+
+    func resumeSyncProfile(_ profile: AppleSyncProfile) {
+        updateSyncProfileLifecycle(profile, lifecycle: .active)
+    }
+
+    func removeSyncProfile(_ profile: AppleSyncProfile) {
+        guard beginSyncProfileMutation() else {
+            return
+        }
+        Task {
+            defer { endSyncProfileMutation() }
+            do {
+                try await syncProfileDomains.remove(profile)
+                syncProfiles = try syncProfileStore.remove(profileID: profile.id)
+                registeredSyncProfileDomains.removeValue(forKey: profile.domainIdentifier)
+                syncProfilesErrorMessage = nil
+                statusText = "Removed Files sync profile \(profile.displayName)."
+                addAction("Removed sync profile", detail: profile.displayName)
+            } catch {
+                syncProfilesErrorMessage = error.localizedDescription
+                statusText = error.localizedDescription
+                addAction("Sync profile removal failed", detail: error.localizedDescription)
+            }
+        }
+    }
+
+    func requestSyncProfileRefresh(_ profile: AppleSyncProfile) {
+        beginOperation()
+        Task {
+            defer { endOperation() }
+            do {
+                try await syncProfileDomains.signalChanges(profile)
+                syncProfilesErrorMessage = nil
+                statusText = "Asked Files to discover remote changes for \(profile.displayName)."
+                addAction("Requested remote discovery", detail: profile.displayName)
+            } catch {
+                syncProfilesErrorMessage = error.localizedDescription
+                statusText = error.localizedDescription
+            }
+        }
+    }
+
+    func refreshSyncProfileDomains() {
+        beginOperation()
+        Task {
+            defer { endOperation() }
+            do {
+                try await refreshSyncProfileDomainsThrowing()
+                syncProfilesErrorMessage = nil
+            } catch {
+                syncProfilesErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func registeredDomain(for profile: AppleSyncProfile) -> AppleRegisteredFileProviderDomain? {
+        registeredSyncProfileDomains[profile.domainIdentifier]
+    }
+
+    private func reconcileSyncProfileDomains() {
+        guard beginSyncProfileMutation() else {
+            return
+        }
+        Task {
+            defer { endSyncProfileMutation() }
+            do {
+                let reconciliationErrors = await syncProfileDomains.reconcile(syncProfiles)
+                try await refreshSyncProfileDomainsThrowing()
+                syncProfilesErrorMessage = reconciliationErrors.isEmpty
+                    ? nil
+                    : reconciliationErrors.joined(separator: "\n")
+            } catch {
+                syncProfilesErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func updateSyncProfileLifecycle(
+        _ profile: AppleSyncProfile,
+        lifecycle: AppleSyncProfileLifecycle
+    ) {
+        guard beginSyncProfileMutation() else {
+            return
+        }
+        Task {
+            defer { endSyncProfileMutation() }
+            do {
+                syncProfiles = try syncProfileStore.setLifecycle(
+                    lifecycle,
+                    profileID: profile.id
+                )
+                var updatedProfile = profile
+                updatedProfile.lifecycle = lifecycle
+                do {
+                    if lifecycle == .paused {
+                        try await syncProfileDomains.pause(updatedProfile)
+                    } else {
+                        try await syncProfileDomains.resume(updatedProfile)
+                    }
+                } catch {
+                    // On macOS the domain-level disconnect/reconnect can fail. Restore the
+                    // persisted gate so app and extension still agree on the lifecycle.
+                    #if os(macOS)
+                    syncProfiles = try syncProfileStore.setLifecycle(
+                        profile.lifecycle,
+                        profileID: profile.id
+                    )
+                    #endif
+                    throw error
+                }
+                try await refreshSyncProfileDomainsThrowing()
+                syncProfilesErrorMessage = nil
+                statusText = lifecycle == .paused
+                    ? "Paused \(profile.displayName). Existing downloaded files remain available."
+                    : "Resumed \(profile.displayName). Files will retry queued work."
+                addAction(
+                    lifecycle == .paused ? "Paused sync profile" : "Resumed sync profile",
+                    detail: profile.displayName
+                )
+            } catch {
+                syncProfilesErrorMessage = error.localizedDescription
+                statusText = error.localizedDescription
+            }
+        }
+    }
+
+    private func refreshSyncProfileDomainsThrowing() async throws {
+        registeredSyncProfileDomains = try await syncProfileDomains.registeredProfiles(syncProfiles)
+    }
+
+    private func beginSyncProfileMutation() -> Bool {
+        guard syncProfileOperationState.beginMutation() else {
+            let message = "Wait for the current sync profile operation to finish."
+            syncProfilesErrorMessage = message
+            statusText = message
+            return false
+        }
+        beginOperation()
+        return true
+    }
+
+    private func endSyncProfileMutation() {
+        syncProfileOperationState.endMutation()
+        endOperation()
     }
 
     func resetToBundleDefaults() {

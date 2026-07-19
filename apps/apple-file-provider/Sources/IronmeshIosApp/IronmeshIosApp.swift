@@ -428,149 +428,7 @@ private enum IronmeshLibrarySection {
     case photos
 }
 
-private struct IronmeshFilesView: View {
-    @EnvironmentObject private var model: IronmeshBrowserModel
-    @State private var showsFilesPicker = false
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 18) {
-                    IronmeshHeroCard(
-                        title: model.domainState.title,
-                        body: model.domainState.detail,
-                        tone: model.domainState.isRegistered ? .good : .warning
-                    ) {
-                        HStack {
-                            if !model.domainState.isRegistered {
-                                Button("Register domain") {
-                                    model.registerDomain()
-                                }
-                                .buttonStyle(.borderedProminent)
-                            }
-
-                            Button(model.domainState.isRegistered ? "Refresh status" : "Check domain") {
-                                model.refreshDomainState()
-                            }
-                            .buttonStyle(.bordered)
-
-                            Button("Open Files") {
-                                showsFilesPicker = true
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-
-                    IronmeshCard(title: "Files & domain integration", subtitle: "This slice registers the File Provider domain and shares connection state with the extension.") {
-                        IronmeshKeyValueRow(label: "Display name", value: model.draft.domainDisplayName)
-                        IronmeshKeyValueRow(label: "Identifier", value: model.draft.domainIdentifier)
-                        Text(model.filesIntegrationNote)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    IronmeshCard(title: "Connection diagnostics", subtitle: "App-side visibility into the current route.") {
-                        IronmeshKeyValueRow(label: "Connection role", value: model.connectionDiagnostics?.connectionName ?? "ios app shell")
-                        IronmeshKeyValueRow(label: "Status", value: model.statusText)
-                        IronmeshKeyValueRow(label: "Connection target", value: model.draft.normalizedConnectionInput ?? "Not configured")
-                        IronmeshKeyValueRow(label: "Last route success", value: unixMillisecondsTimestamp(model.connectionDiagnostics?.lastSuccessUnixMs))
-                        IronmeshKeyValueRow(label: "Last library success", value: timestamp(model.lastSuccessfulConnectionAt))
-                        IronmeshKeyValueRow(label: "Last root refresh", value: timestamp(model.lastLibraryRefreshAt))
-                        if let lastErrorMessage = model.lastErrorMessage {
-                            IronmeshKeyValueRow(label: "Last error", value: lastErrorMessage)
-                        }
-                        HStack {
-                            Button("Refresh diagnostics") {
-                                model.refreshConnectionDiagnostics()
-                            }
-                            .buttonStyle(.borderedProminent)
-
-                            Button("Open Web UI") {
-                                model.openWebUI()
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        NavigationLink {
-                            IronmeshConnectionPathsView()
-                        } label: {
-                            Label("Inspect connection paths", systemImage: "point.3.connected.trianglepath.dotted")
-                        }
-                        .buttonStyle(.bordered)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        if model.orderedConnectionEndpoints.isEmpty {
-                            Text("No route attempts recorded yet.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(Array(model.orderedConnectionEndpoints.prefix(3))) { endpoint in
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
-                                        Text(endpoint.locator)
-                                            .font(.headline)
-                                        Spacer()
-                                        Text(endpoint.active ? "Active" : "Standby")
-                                            .font(.caption)
-                                            .foregroundStyle(endpoint.active ? .green : .secondary)
-                                    }
-                                    IronmeshKeyValueRow(label: "Path", value: endpoint.pathKind)
-                                    IronmeshKeyValueRow(label: "Base URL", value: endpoint.requestBaseUrl)
-                                    IronmeshKeyValueRow(label: "Failures", value: "\(endpoint.consecutiveFailures) consecutive, \(endpoint.totalFailures) total")
-                                    IronmeshKeyValueRow(label: "Successes", value: "\(endpoint.totalSuccesses)")
-                                    if let lastError = endpoint.lastError {
-                                        IronmeshKeyValueRow(label: "Last error", value: lastError)
-                                    }
-                                }
-                                .padding(.vertical, 4)
-                            }
-                        }
-
-                        if !model.recentConnectionAttempts.isEmpty {
-                            Divider()
-                            ForEach(Array(model.recentConnectionAttempts.prefix(4))) { attempt in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("\(attempt.method) \(attempt.outcome)")
-                                        .font(.headline)
-                                    Text(attempt.url)
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                    Text(unixMillisecondsTimestamp(attempt.startedUnixMs))
-                                        .font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.tertiary)
-                                    if let error = attempt.error {
-                                        Text(error)
-                                            .font(.caption)
-                                            .foregroundStyle(.red)
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 2)
-                            }
-                        }
-                    }
-
-                    if !model.items.isEmpty {
-                        IronmeshCard(title: "Root snapshot", subtitle: "Latest items visible at the top of the remote tree.") {
-                            ForEach(model.items.prefix(5), id: \.identifier.serialized) { item in
-                                IronmeshBrowserRow(item: item)
-                            }
-                        }
-                    }
-                }
-                .padding(16)
-            }
-            .background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("Sync")
-        }
-        .sheet(isPresented: $showsFilesPicker) {
-            IronmeshFilesHandoffPicker { url in
-                model.noteFilesSelection(url)
-            }
-        }
-    }
-}
-
-private struct IronmeshConnectionPathsView: View {
+struct IronmeshConnectionPathsView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
 
     var body: some View {
@@ -978,7 +836,7 @@ private struct IronmeshFileInspectorView: View {
     }
 }
 
-private struct IronmeshCard<Content: View>: View {
+struct IronmeshCard<Content: View>: View {
     let title: String
     var subtitle: String?
     @ViewBuilder var content: Content
@@ -1005,7 +863,7 @@ private struct IronmeshCard<Content: View>: View {
     }
 }
 
-private struct IronmeshHeroCard<Content: View>: View {
+struct IronmeshHeroCard<Content: View>: View {
     let title: String
     let message: String
     var tone: IronmeshHeroTone = .neutral
@@ -1066,7 +924,7 @@ private struct IronmeshMetricTile: View {
     }
 }
 
-private struct IronmeshBrowserRow: View {
+struct IronmeshBrowserRow: View {
     let item: AppleBridgeItem
 
     var body: some View {
@@ -1099,7 +957,7 @@ private struct IronmeshBrowserRow: View {
     }
 }
 
-private struct IronmeshKeyValueRow: View {
+struct IronmeshKeyValueRow: View {
     let label: String
     let value: String
 
@@ -1167,7 +1025,7 @@ private struct IronmeshInlineNote: View {
     }
 }
 
-private struct IronmeshFilesHandoffPicker: UIViewControllerRepresentable {
+struct IronmeshFilesHandoffPicker: UIViewControllerRepresentable {
     let onPick: (URL) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -1398,7 +1256,7 @@ private struct IronmeshLiveScanner: UIViewControllerRepresentable {
 }
 #endif
 
-private enum IronmeshHeroTone {
+enum IronmeshHeroTone {
     case neutral
     case good
     case warning

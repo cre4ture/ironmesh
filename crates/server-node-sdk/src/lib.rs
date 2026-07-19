@@ -12011,6 +12011,8 @@ struct PutObjectQuery {
     state: Option<String>,
     #[serde(default)]
     parent: Vec<String>,
+    #[serde(default)]
+    expected_revision: Option<String>,
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
@@ -12024,6 +12026,8 @@ struct DeleteObjectByQuery {
     state: Option<String>,
     #[serde(default)]
     parent: Vec<String>,
+    #[serde(default)]
+    expected_revision: Option<String>,
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
@@ -12037,6 +12041,8 @@ struct PathMutationRequest {
     to_path: String,
     #[serde(default)]
     overwrite: bool,
+    #[serde(default)]
+    expected_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12298,6 +12304,7 @@ async fn delete_object_by_query_response(
         PutObjectQuery {
             state: query.state,
             parent: query.parent,
+            expected_revision: query.expected_revision,
             version_id: query.version_id,
             internal_replication: query.internal_replication,
             recursive: query.recursive,
@@ -12378,6 +12385,22 @@ async fn rename_object_path_response(
     let mut store = lock_store(state, "store_path.rename").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_started = Instant::now();
+    if let Some(expected_revision) = request.expected_revision.as_deref() {
+        let current_revision = match store.list_versions(&request.from_path).await {
+            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    path = %request.from_path,
+                    "failed resolving preferred revision before rename"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if current_revision.as_deref() != Some(expected_revision) {
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     match store
         .rename_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
@@ -12811,6 +12834,22 @@ async fn put_object_response(
     let total_size_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let mut store = lock_store(state, "store_object.put").await;
+    if let Some(expected_revision) = query.expected_revision.as_deref() {
+        let current_revision = match store.list_versions(&key).await {
+            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    path = %key,
+                    "failed resolving preferred revision before put"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if current_revision.as_deref() != Some(expected_revision) {
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     match store
         .put_object_versioned(
             &key,
@@ -13565,6 +13604,22 @@ async fn delete_object_response(
     }
 
     let mut store = lock_store(state, "store_object.tombstone").await;
+    if let Some(expected_revision) = query.expected_revision.as_deref() {
+        let current_revision = match store.list_versions(&key).await {
+            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    path = %key,
+                    "failed resolving preferred revision before delete"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+        };
+        if current_revision.as_deref() != Some(expected_revision) {
+            return StatusCode::CONFLICT;
+        }
+    }
     let delete_result = if recursive {
         store
             .tombstone_subtree(

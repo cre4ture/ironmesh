@@ -40,8 +40,20 @@ impl ClientNode {
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
+        self.put_with_expected_revision(key, data, None).await
+    }
+
+    pub async fn put_with_expected_revision(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<StorageObjectMeta> {
         let key = key.into();
-        let meta = self.client.put(key.clone(), data.clone()).await?;
+        let meta = self
+            .client
+            .put_with_expected_revision(key.clone(), data.clone(), expected_revision)
+            .await?;
 
         self.cache.write().await.insert(key.clone(), data.clone());
         Ok(meta)
@@ -111,10 +123,26 @@ impl ClientNode {
         to_path: impl Into<String>,
         overwrite: bool,
     ) -> Result<()> {
+        self.rename_path_with_expected_revision(from_path, to_path, overwrite, None)
+            .await
+    }
+
+    pub async fn rename_path_with_expected_revision(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
         let from_path = from_path.into();
         let to_path = to_path.into();
         self.client
-            .rename_path(from_path.clone(), to_path.clone(), overwrite)
+            .rename_path_with_expected_revision(
+                from_path.clone(),
+                to_path.clone(),
+                overwrite,
+                expected_revision,
+            )
             .await?;
 
         let mut cache = self.cache.write().await;
@@ -175,8 +203,18 @@ impl ClientNode {
     }
 
     pub async fn delete_path(&self, key: impl Into<String>) -> Result<()> {
+        self.delete_path_with_expected_revision(key, None).await
+    }
+
+    pub async fn delete_path_with_expected_revision(
+        &self,
+        key: impl Into<String>,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
         let key = key.into();
-        self.client.delete_path(&key).await?;
+        self.client
+            .delete_path_with_expected_revision(&key, expected_revision)
+            .await?;
         self.cache.write().await.remove(&key);
         Ok(())
     }

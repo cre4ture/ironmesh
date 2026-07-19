@@ -30,9 +30,24 @@ public protocol AppleManualCBridgeFFI: Sendable {
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data
     func fetchRelativeBytes(handle: AppleRustHandle, path: String) throws -> Data
-    func putBytes(handle: AppleRustHandle, key: String, data: Data) throws -> String
-    func deletePath(handle: AppleRustHandle, key: String) throws
-    func movePath(handle: AppleRustHandle, fromPath: String, toPath: String, overwrite: Bool) throws
+    func putBytes(
+        handle: AppleRustHandle,
+        key: String,
+        data: Data,
+        expectedRevision: String?
+    ) throws -> String
+    func deletePath(
+        handle: AppleRustHandle,
+        key: String,
+        expectedRevision: String?
+    ) throws -> String
+    func movePath(
+        handle: AppleRustHandle,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool,
+        expectedRevision: String?
+    ) throws
     func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String
     func connectionRouteSnapshotJSON(handle: AppleRustHandle, refresh: Bool) throws -> String
     func startWebUI(
@@ -148,14 +163,21 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     }
 
     public func upload(path: String, data: Data, expectedRevision: String?) throws -> AppleMutationResult {
-        _ = expectedRevision
         return try withHandle { handle in
-            let responseJSON = try ffi.putBytes(handle: handle, key: normalizedPath(path), data: data)
+            let responseJSON = try ffi.putBytes(
+                handle: handle,
+                key: normalizedPath(path),
+                data: data,
+                expectedRevision: expectedRevision
+            )
             let response = try decode(RustApplePutResponse.self, from: responseJSON)
             return AppleMutationResult(
                 accepted: true,
                 resultingIdentifier: response.itemID,
-                resultingRevision: response.versionGraph?.preferredHeadVersionID
+                resultingRevision: response.versionGraph?.preferredHeadVersionID,
+                conflictingRevision: response.versionGraph?.conflictingRevision(
+                    expectedRevision: expectedRevision
+                )
             )
         }
     }
@@ -174,20 +196,35 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     }
 
     public func delete(path: String, expectedRevision: String?) throws -> AppleMutationResult {
-        _ = expectedRevision
         return try withHandle { handle in
             let normalized = normalizedDeleteKey(path)
-            try ffi.deletePath(handle: handle, key: normalized)
-            return AppleMutationResult(accepted: true)
+            let responseJSON = try ffi.deletePath(
+                handle: handle,
+                key: normalized,
+                expectedRevision: expectedRevision
+            )
+            let response = try decode(RustAppleDeleteResponse.self, from: responseJSON)
+            return AppleMutationResult(
+                accepted: true,
+                resultingRevision: response.versionGraph?.preferredHeadVersionID,
+                conflictingRevision: response.versionGraph?.conflictingRevision(
+                    expectedRevision: expectedRevision
+                )
+            )
         }
     }
 
     public func move(from: String, to: String, expectedRevision: String?) throws -> AppleMutationResult {
-        _ = expectedRevision
         return try withHandle { handle in
             let source = normalizedPath(from)
             let destination = normalizedPath(to)
-            try ffi.movePath(handle: handle, fromPath: source, toPath: destination, overwrite: false)
+            try ffi.movePath(
+                handle: handle,
+                fromPath: source,
+                toPath: destination,
+                overwrite: false,
+                expectedRevision: expectedRevision
+            )
             return AppleMutationResult(
                 accepted: true,
                 resultingIdentifier: inferredIdentifier(for: destination, objectID: nil).serialized
@@ -373,11 +410,28 @@ private struct RustApplePutResponse: Decodable {
     }
 }
 
+private struct RustAppleDeleteResponse: Decodable {
+    var versionGraph: RustAppleVersionGraph?
+
+    enum CodingKeys: String, CodingKey {
+        case versionGraph = "version_graph"
+    }
+}
+
 private struct RustAppleVersionGraph: Decodable {
     var preferredHeadVersionID: String?
+    var headVersionIDs: [String]?
 
     enum CodingKeys: String, CodingKey {
         case preferredHeadVersionID = "preferred_head_version_id"
+        case headVersionIDs = "head_version_ids"
+    }
+
+    func conflictingRevision(expectedRevision: String?) -> String? {
+        guard expectedRevision != nil, let headVersionIDs, headVersionIDs.count > 1 else {
+            return nil
+        }
+        return headVersionIDs.sorted().joined(separator: ",")
     }
 }
 

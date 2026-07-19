@@ -88,6 +88,12 @@ pub struct ApplePutResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppleDeleteResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_graph: Option<VersionGraphSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppleEnrollmentResponse {
     #[serde(flatten)]
     pub enrollment: BootstrapEnrollmentResult,
@@ -314,8 +320,18 @@ impl IosStorageApp {
     }
 
     pub fn put(&self, key: impl Into<String>, data: Vec<u8>) -> Result<ApplePutResponse> {
+        self.put_with_expected_revision(key, data, None)
+    }
+
+    pub fn put_with_expected_revision(
+        &self,
+        key: impl Into<String>,
+        data: Vec<u8>,
+        expected_revision: Option<&str>,
+    ) -> Result<ApplePutResponse> {
         let key = key.into();
-        self.runtime.block_on(self.put_async(key, data))
+        self.runtime
+            .block_on(self.put_async(key, data, expected_revision))
     }
 
     pub fn fetch(&self, key: impl AsRef<str>) -> Result<Vec<u8>> {
@@ -360,10 +376,25 @@ impl IosStorageApp {
         to_path: impl Into<String>,
         overwrite: bool,
     ) -> Result<()> {
+        self.move_path_with_expected_revision(from_path, to_path, overwrite, None)
+    }
+
+    pub fn move_path_with_expected_revision(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
         let from_path = from_path.into();
         let to_path = to_path.into();
         self.runtime
-            .block_on(self.client.rename_path(from_path, to_path, overwrite))
+            .block_on(self.client.rename_path_with_expected_revision(
+                from_path,
+                to_path,
+                overwrite,
+                expected_revision,
+            ))
     }
 
     pub fn web_gui_html(&self) -> String {
@@ -399,8 +430,16 @@ impl IosStorageApp {
         )
     }
 
-    async fn put_async(&self, key: String, data: Vec<u8>) -> Result<ApplePutResponse> {
-        let meta = self.client.put(key.clone(), Bytes::from(data)).await?;
+    async fn put_async(
+        &self,
+        key: String,
+        data: Vec<u8>,
+        expected_revision: Option<&str>,
+    ) -> Result<ApplePutResponse> {
+        let meta = self
+            .client
+            .put_with_expected_revision(key.clone(), Bytes::from(data), expected_revision)
+            .await?;
         let version_graph = self.client.list_versions(&key).await?;
         let object_id = version_graph.as_ref().map(|graph| graph.object_id.clone());
         let item_id = apple_item_id_for_file(&key, object_id.as_deref());
@@ -672,8 +711,19 @@ fn fetch_relative_bytes(handle: *mut c_void, path: impl AsRef<str>) -> Result<Ve
 
 #[allow(unsafe_code)]
 fn put_json(handle: *mut c_void, key: impl Into<String>, data: Vec<u8>) -> Result<String> {
+    put_with_expected_revision_json(handle, key, data, None)
+}
+
+#[allow(unsafe_code)]
+fn put_with_expected_revision_json(
+    handle: *mut c_void,
+    key: impl Into<String>,
+    data: Vec<u8>,
+    expected_revision: Option<&str>,
+) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
-    serde_json::to_string(&app.put(key, data)?).context("failed to serialize Apple put response")
+    serde_json::to_string(&app.put_with_expected_revision(key, data, expected_revision)?)
+        .context("failed to serialize Apple put response")
 }
 
 #[allow(unsafe_code)]
@@ -683,14 +733,43 @@ fn delete_path(handle: *mut c_void, key: impl AsRef<str>) -> Result<()> {
 }
 
 #[allow(unsafe_code)]
+fn delete_with_expected_revision_json(
+    handle: *mut c_void,
+    key: impl Into<String>,
+    expected_revision: Option<&str>,
+) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    let key = key.into();
+    app.runtime.block_on(async {
+        app.client
+            .delete_path_with_expected_revision(key.clone(), expected_revision)
+            .await?;
+        let version_graph = app.client.list_versions(&key).await?;
+        serde_json::to_string(&AppleDeleteResponse { version_graph })
+            .context("failed to serialize Apple delete response")
+    })
+}
+
+#[allow(unsafe_code)]
 fn move_path(
     handle: *mut c_void,
     from_path: impl Into<String>,
     to_path: impl Into<String>,
     overwrite: bool,
 ) -> Result<()> {
+    move_path_with_expected_revision(handle, from_path, to_path, overwrite, None)
+}
+
+#[allow(unsafe_code)]
+fn move_path_with_expected_revision(
+    handle: *mut c_void,
+    from_path: impl Into<String>,
+    to_path: impl Into<String>,
+    overwrite: bool,
+    expected_revision: Option<&str>,
+) -> Result<()> {
     let app = unsafe { handle_to_app(handle)? };
-    app.move_path(from_path, to_path, overwrite)
+    app.move_path_with_expected_revision(from_path, to_path, overwrite, expected_revision)
 }
 
 #[allow(unsafe_code)]
@@ -973,6 +1052,45 @@ pub extern "C" fn ironmesh_ios_facade_put_bytes(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_put_bytes_with_expected_revision(
+    handle: *mut c_void,
+    key: *const c_char,
+    data: *const u8,
+    len: usize,
+    expected_revision: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let key = required_c_string(key, "key")?;
+        let payload = raw_bytes_to_vec(data, len)?;
+        let expected_revision = optional_c_string(expected_revision)?;
+        put_with_expected_revision_json(handle, key, payload, expected_revision.as_deref())
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_delete_path_with_expected_revision(
+    handle: *mut c_void,
+    key: *const c_char,
+    expected_revision: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let key = required_c_string(key, "key")?;
+        let expected_revision = optional_c_string(expected_revision)?;
+        delete_with_expected_revision_json(handle, key, expected_revision.as_deref())
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_enroll_with_bootstrap(
     connection_input: *const c_char,
     device_id_override: *const c_char,
@@ -1023,6 +1141,29 @@ pub extern "C" fn ironmesh_ios_facade_move_path(
             required_c_string(from_path, "from_path")?,
             required_c_string(to_path, "to_path")?,
             overwrite != 0,
+        )
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_move_path_with_expected_revision(
+    handle: *mut c_void,
+    from_path: *const c_char,
+    to_path: *const c_char,
+    overwrite: c_int,
+    expected_revision: *const c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_error(out_error);
+    run_ffi_unit_result(out_error, || {
+        let expected_revision = optional_c_string(expected_revision)?;
+        move_path_with_expected_revision(
+            handle,
+            required_c_string(from_path, "from_path")?,
+            required_c_string(to_path, "to_path")?,
+            overwrite != 0,
+            expected_revision.as_deref(),
         )
     })
 }
