@@ -16,9 +16,10 @@ use super::{
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
     MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
     RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
-    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample,
-    StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, decompress_snapshot_json, metadata_db_logical_summary_query,
+    metadata_db_logical_table_specs,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -1718,6 +1719,62 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
+    async fn load_storage_locations(&self) -> Result<Vec<StorageLocationRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT content_kind, content_hash, path_id, size_bytes, state
+                 FROM storage_locations",
+                (),
+            )
+            .await?;
+        let mut locations = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let kind = row_string(&row, 0, "storage_locations.content_kind")?;
+            let state = row_string(&row, 4, "storage_locations.state")?;
+            locations.push(StorageLocationRecord {
+                kind: StorageContentKind::from_str(&kind)?,
+                hash: row_string(&row, 1, "storage_locations.content_hash")?,
+                path_id: row_string(&row, 2, "storage_locations.path_id")?,
+                size_bytes: row_u64(&row, 3, "storage_locations.size_bytes")?,
+                state: StorageLocationState::from_str(&state)?,
+            });
+        }
+        Ok(locations)
+    }
+
+    async fn persist_storage_location(&self, location: &StorageLocationRecord) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO storage_locations
+                     (content_kind, content_hash, path_id, size_bytes, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(content_kind, content_hash) DO UPDATE SET
+                     path_id = excluded.path_id,
+                     size_bytes = excluded.size_bytes,
+                     state = excluded.state",
+                (
+                    location.kind.as_str(),
+                    location.hash.as_str(),
+                    location.path_id.as_str(),
+                    i64::try_from(location.size_bytes).context("storage location size overflow")?,
+                    location.state.as_str(),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_storage_location(&self, kind: StorageContentKind, hash: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM storage_locations WHERE content_kind = ?1 AND content_hash = ?2",
+                (kind.as_str(), hash),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>> {
         let mut rows = self
             .connection
@@ -2179,6 +2236,15 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS storage_stats_history (
                 collected_at_unix INTEGER NOT NULL,
                 sample_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS storage_locations (
+                content_kind TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                path_id TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (content_kind, content_hash)
             );
 
             CREATE TABLE IF NOT EXISTS repair_attempts (

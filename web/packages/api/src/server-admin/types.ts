@@ -686,6 +686,46 @@ export type StorageStatsSample = {
   media_cache_bytes: number;
   latest_snapshot_logical_bytes: number;
   latest_snapshot_unique_chunk_bytes: number;
+  storage_paths?: StoragePathStats[];
+};
+
+export type StoragePathState = "active" | "draining" | "disabled";
+
+export type StoragePathConfig = {
+  id: string;
+  path: string;
+  state: StoragePathState;
+  weight: number;
+  reserve_bytes: number;
+};
+
+export type StoragePoolConfig = {
+  version: number;
+  paths: StoragePathConfig[];
+};
+
+export type StoragePathStats = {
+  id: string;
+  path: string;
+  state: StoragePathState;
+  available: boolean;
+  capacity_bytes?: number | null;
+  free_bytes?: number | null;
+  chunk_store_bytes: number;
+  manifest_store_bytes: number;
+  last_error?: string | null;
+};
+
+export type StoragePoolStatusResponse = {
+  config_path: string;
+  config: StoragePoolConfig;
+  paths: StoragePathStats[];
+};
+
+export type StoragePoolRebalanceReport = {
+  moved_chunks: number;
+  moved_manifests: number;
+  skipped_invalid_entries: number;
 };
 
 export type StorageStatsCurrentResponse = {

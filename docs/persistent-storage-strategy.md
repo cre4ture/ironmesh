@@ -37,6 +37,10 @@ The node uses an on-disk **content-addressed object store** with immutable snaps
 - Each chunk is hashed with `BLAKE3`.
 - Chunk file path is derived from the hash (`chunks/<prefix>/<hash>`).
 - If a chunk hash already exists, the chunk is reused (dedup) instead of written again.
+- A node can place chunks and manifests on multiple local storage paths while
+  retaining the metadata database under the node data directory. See
+  `docs/multi-storage-paths-strategy.md` for configuration, migration, and
+  rebalancing semantics.
 
 ### 2) Object manifests
 

@@ -19,10 +19,10 @@ The first rollout should prioritize:
 
 ## Current Storage Layout
 
-The node currently stores data in separate on-disk areas:
+The node stores data in separate on-disk areas:
 
-- `chunks/` for content-addressed chunk payloads,
-- `manifests/` for object manifests,
+- one or more local storage-pool paths for content-addressed chunk payloads
+  (`chunks/`) and object manifests (`manifests/`),
 - `state/metadata.sqlite` or `state/metadata.turso.db` for metadata DB state,
 - `state/media_cache/` for generated media metadata and thumbnails.
 
@@ -32,6 +32,13 @@ database file size. The implementation should report at least:
 - `metadata_db_bytes`,
 - `manifest_store_bytes`,
 - `media_cache_bytes`.
+
+For a storage pool, the current sample additionally carries per-path capacity,
+free-space, availability, and chunk/manifest byte counts. The node capacity
+used for cluster advertisements is the aggregate of distinct active/draining
+filesystems; shared underlying volumes are counted only once on Unix.
+Configuration and operational details are documented in
+`docs/multi-storage-paths-strategy.md`.
 
 ## Recommended Model
 

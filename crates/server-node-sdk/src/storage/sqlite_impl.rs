@@ -19,9 +19,10 @@ use super::{
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
     MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord,
     RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
-    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample,
-    StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    compress_snapshot_json, decompress_snapshot_json, metadata_db_logical_summary_query,
+    metadata_db_logical_table_specs,
 };
 
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
@@ -2041,6 +2042,73 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn load_storage_locations(&self) -> Result<Vec<StorageLocationRecord>> {
+        self.read(|db| {
+            let mut statement = db.prepare(
+                "SELECT content_kind, content_hash, path_id, size_bytes, state
+                 FROM storage_locations",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut locations = Vec::new();
+            for row in rows {
+                let (kind, hash, path_id, size_bytes, state) = row?;
+                locations.push(StorageLocationRecord {
+                    kind: StorageContentKind::from_str(&kind)?,
+                    hash,
+                    path_id,
+                    size_bytes,
+                    state: StorageLocationState::from_str(&state)?,
+                });
+            }
+            Ok(locations)
+        })
+        .await
+    }
+
+    async fn persist_storage_location(&self, location: &StorageLocationRecord) -> Result<()> {
+        let location = location.clone();
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO storage_locations
+                     (content_kind, content_hash, path_id, size_bytes, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(content_kind, content_hash) DO UPDATE SET
+                     path_id = excluded.path_id,
+                     size_bytes = excluded.size_bytes,
+                     state = excluded.state",
+                params![
+                    location.kind.as_str(),
+                    location.hash,
+                    location.path_id,
+                    location.size_bytes,
+                    location.state.as_str(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_storage_location(&self, kind: StorageContentKind, hash: &str) -> Result<()> {
+        let hash = hash.to_string();
+        self.write(move |db| {
+            db.execute(
+                "DELETE FROM storage_locations WHERE content_kind = ?1 AND content_hash = ?2",
+                params![kind.as_str(), hash],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>> {
         let hash = hash.to_string();
         let payload = self
@@ -2486,6 +2554,15 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS storage_stats_history (
             collected_at_unix INTEGER NOT NULL,
             sample_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS storage_locations (
+            content_kind TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            path_id TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (content_kind, content_hash)
         );
 
         CREATE TABLE IF NOT EXISTS repair_attempts (

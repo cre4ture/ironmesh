@@ -1,9 +1,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::{
-    ChunkRef, CurrentState, MetadataStore, TOMBSTONE_MANIFEST_HASH, chunk_path_for_hash, hash_hex,
+    ChunkRef, CurrentState, MetadataStore, StorageContentKind, StoragePool,
+    TOMBSTONE_MANIFEST_HASH, hash_hex,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -67,8 +68,7 @@ pub struct DataScrubReport {
 #[derive(Clone)]
 pub(crate) struct DataScrubber {
     pub(super) current_state: CurrentState,
-    pub(super) manifests_dir: PathBuf,
-    pub(super) chunks_dir: PathBuf,
+    pub(super) storage_pool: StoragePool,
     pub(super) metadata_store: Arc<dyn MetadataStore>,
     #[cfg(test)]
     pub(super) run_test_hook: Option<DataScrubRunTestHook>,
@@ -244,14 +244,12 @@ impl VerifiedChunkCache {
 impl DataScrubber {
     pub(super) fn new(
         current_state: CurrentState,
-        manifests_dir: PathBuf,
-        chunks_dir: PathBuf,
+        storage_pool: StoragePool,
         metadata_store: Arc<dyn MetadataStore>,
     ) -> Self {
         Self {
             current_state,
-            manifests_dir,
-            chunks_dir,
+            storage_pool,
             metadata_store,
             #[cfg(test)]
             run_test_hook: None,
@@ -432,7 +430,23 @@ impl DataScrubber {
         chunk_hash_buffer: &mut [u8],
         output: &mut DataScrubRunOutput,
     ) {
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = match self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)
+        {
+            Ok(path) => path,
+            Err(err) => {
+                self.push_issue(
+                    output,
+                    contexts,
+                    DataScrubIssueKind::ManifestMissing,
+                    Some(manifest_hash.to_string()),
+                    None,
+                    format!("manifest location unavailable: {err}"),
+                );
+                return;
+            }
+        };
         let payload = match self.read_with_bounded_retry(&manifest_path).await {
             Ok(payload) => payload,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -621,7 +635,10 @@ impl DataScrubber {
         chunk_hash_buffer: &mut [u8],
     ) -> VerifiedChunkState {
         report.chunks_scanned = report.chunks_scanned.saturating_add(1);
-        let chunk_path = match chunk_path_for_hash(&self.chunks_dir, &chunk.hash) {
+        let chunk_path = match self
+            .storage_pool
+            .content_path(StorageContentKind::Chunk, &chunk.hash)
+        {
             Ok(p) => p,
             Err(err) => {
                 return VerifiedChunkState::ReadError(format!(

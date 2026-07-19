@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
@@ -93,6 +93,10 @@ const GC_MANIFEST_LOAD_BATCH_SIZE: usize = 500;
 /// used only for the dashboard's memory-attribution estimate.
 const CURRENT_OBJECT_CACHE_ENTRY_ESTIMATED_BYTES: u64 = 300;
 const SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS: u64 = 2 * 60 * 60;
+const STORAGE_POOL_CONFIG_ENV: &str = "IRONMESH_STORAGE_CONFIG";
+const STORAGE_POOL_CONFIG_FILE: &str = "storage-pool.json";
+const STORAGE_POOL_PATH_MARKER_FILE: &str = ".ironmesh-storage-path.json";
+const STORAGE_POOL_CONFIG_VERSION: u32 = 1;
 
 fn manifest_hash_looks_safe_filename(manifest_hash: &str) -> bool {
     manifest_hash.len() == blake3::OUT_LEN * 2
@@ -108,6 +112,791 @@ fn manifest_path_from_hash(
         bail!("invalid manifest hash: {manifest_hash}");
     }
     Ok(manifests_dir.join(format!("{manifest_hash}.json")))
+}
+
+/// Node-local configuration for the directories that hold immutable payload data.
+///
+/// The metadata database, TLS material, and setup state continue to live below the
+/// node data directory. Only chunks and manifests are pooled. Keeping this config
+/// local is intentional: a node enrollment package must never prescribe host paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoragePoolConfig {
+    pub version: u32,
+    pub paths: Vec<StoragePathConfig>,
+}
+
+impl StoragePoolConfig {
+    fn legacy(root_dir: &Path) -> Self {
+        Self {
+            version: STORAGE_POOL_CONFIG_VERSION,
+            paths: vec![StoragePathConfig {
+                id: "legacy-primary".to_string(),
+                path: root_dir.to_path_buf(),
+                state: StoragePathState::Active,
+                weight: 1,
+                reserve_bytes: 0,
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoragePathConfig {
+    pub id: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub state: StoragePathState,
+    #[serde(default = "default_storage_path_weight")]
+    pub weight: u32,
+    #[serde(default)]
+    pub reserve_bytes: u64,
+}
+
+fn default_storage_path_weight() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePathState {
+    #[default]
+    Active,
+    Draining,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoragePathStats {
+    pub id: String,
+    pub path: String,
+    pub state: StoragePathState,
+    pub available: bool,
+    pub capacity_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    pub chunk_store_bytes: u64,
+    pub manifest_store_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoragePoolRebalanceReport {
+    pub moved_chunks: usize,
+    pub moved_manifests: usize,
+    pub skipped_invalid_entries: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageContentKind {
+    Chunk,
+    Manifest,
+}
+
+impl StorageContentKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Chunk => "chunk",
+            Self::Manifest => "manifest",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "chunk" => Ok(Self::Chunk),
+            "manifest" => Ok(Self::Manifest),
+            other => bail!("invalid storage content kind: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageLocationState {
+    Pending,
+    Available,
+}
+
+impl StorageLocationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Available => "available",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "available" => Ok(Self::Available),
+            other => bail!("invalid storage location state: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageLocationRecord {
+    kind: StorageContentKind,
+    hash: String,
+    path_id: String,
+    size_bytes: u64,
+    state: StorageLocationState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StoragePathMarker {
+    version: u32,
+    path_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StoragePathRuntime {
+    config: StoragePathConfig,
+    chunks_dir: PathBuf,
+    manifests_dir: PathBuf,
+    available: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct StoragePool {
+    config_path: PathBuf,
+    paths: Vec<StoragePathRuntime>,
+    chunk_locations: Arc<RwLock<HashMap<String, String>>>,
+    manifest_locations: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl StoragePool {
+    async fn load(root_dir: &Path, node_id: Option<NodeId>) -> Result<Self> {
+        fs::create_dir_all(root_dir).await?;
+        let config_path = std::env::var_os(STORAGE_POOL_CONFIG_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root_dir.join("state").join(STORAGE_POOL_CONFIG_FILE));
+        let config = match fs::read(&config_path).await {
+            Ok(payload) => {
+                serde_json::from_slice::<StoragePoolConfig>(&payload).with_context(|| {
+                    format!("invalid storage pool config {}", config_path.display())
+                })?
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                StoragePoolConfig::legacy(root_dir)
+            }
+            Err(err) => return Err(err.into()),
+        };
+        Self::from_config(config_path, config, node_id).await
+    }
+
+    #[cfg(test)]
+    async fn from_test_config(config_path: PathBuf, config: StoragePoolConfig) -> Result<Self> {
+        Self::from_config(config_path, config, None).await
+    }
+
+    async fn from_config(
+        config_path: PathBuf,
+        config: StoragePoolConfig,
+        node_id: Option<NodeId>,
+    ) -> Result<Self> {
+        if config.version != STORAGE_POOL_CONFIG_VERSION {
+            bail!(
+                "unsupported storage pool config version: {} (expected {})",
+                config.version,
+                STORAGE_POOL_CONFIG_VERSION
+            );
+        }
+        if config.paths.is_empty() {
+            bail!("storage pool config must contain at least one path");
+        }
+
+        let mut ids = HashSet::new();
+        let mut comparison_paths = Vec::<PathBuf>::new();
+        let mut paths = Vec::with_capacity(config.paths.len());
+        for path_config in config.paths {
+            validate_storage_path_config(&path_config)?;
+            if !ids.insert(path_config.id.clone()) {
+                bail!(
+                    "storage pool config contains duplicate path id {}",
+                    path_config.id
+                );
+            }
+
+            let exists = fs::try_exists(&path_config.path).await?;
+            let comparison_path = if exists {
+                std::fs::canonicalize(&path_config.path).with_context(|| {
+                    format!(
+                        "failed resolving storage path {}",
+                        path_config.path.display()
+                    )
+                })?
+            } else if path_config.path.is_absolute() {
+                path_config.path.clone()
+            } else {
+                std::env::current_dir()
+                    .context("failed resolving relative storage path")?
+                    .join(&path_config.path)
+            };
+            if comparison_paths.iter().any(|existing| {
+                comparison_path.starts_with(existing) || existing.starts_with(&comparison_path)
+            }) {
+                bail!(
+                    "storage paths must not overlap: {}",
+                    comparison_path.display()
+                );
+            }
+            comparison_paths.push(comparison_path);
+
+            if !exists {
+                paths.push(StoragePathRuntime {
+                    chunks_dir: path_config.path.join("chunks"),
+                    manifests_dir: path_config.path.join("manifests"),
+                    config: path_config,
+                    available: false,
+                    last_error: Some(
+                        "configured path does not exist or is not mounted".to_string(),
+                    ),
+                });
+                continue;
+            }
+
+            let chunks_dir = path_config.path.join("chunks");
+            let manifests_dir = path_config.path.join("manifests");
+            fs::create_dir_all(&chunks_dir).await?;
+            fs::create_dir_all(&manifests_dir).await?;
+            ensure_storage_path_marker(&path_config, node_id).await?;
+            paths.push(StoragePathRuntime {
+                config: path_config,
+                chunks_dir,
+                manifests_dir,
+                available: true,
+                last_error: None,
+            });
+        }
+
+        if !paths
+            .iter()
+            .any(|path| path.available && matches!(path.config.state, StoragePathState::Active))
+        {
+            bail!("storage pool has no available active path");
+        }
+
+        Ok(Self {
+            config_path,
+            paths,
+            chunk_locations: Arc::new(RwLock::new(HashMap::new())),
+            manifest_locations: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    fn config(&self) -> StoragePoolConfig {
+        StoragePoolConfig {
+            version: STORAGE_POOL_CONFIG_VERSION,
+            paths: self.paths.iter().map(|path| path.config.clone()).collect(),
+        }
+    }
+
+    fn load_locations(&self, locations: impl IntoIterator<Item = StorageLocationRecord>) {
+        let mut chunks = self
+            .chunk_locations
+            .write()
+            .expect("storage chunk location map lock should not be poisoned");
+        let mut manifests = self
+            .manifest_locations
+            .write()
+            .expect("storage manifest location map lock should not be poisoned");
+        for location in locations {
+            if location.state != StorageLocationState::Available
+                || self.path(&location.path_id).is_none()
+            {
+                continue;
+            }
+            match location.kind {
+                StorageContentKind::Chunk => {
+                    chunks.insert(location.hash, location.path_id);
+                }
+                StorageContentKind::Manifest => {
+                    manifests.insert(location.hash, location.path_id);
+                }
+            }
+        }
+    }
+
+    fn note_location(&self, location: &StorageLocationRecord) {
+        if location.state != StorageLocationState::Available {
+            return;
+        }
+        let locations = match location.kind {
+            StorageContentKind::Chunk => &self.chunk_locations,
+            StorageContentKind::Manifest => &self.manifest_locations,
+        };
+        locations
+            .write()
+            .expect("storage location map lock should not be poisoned")
+            .insert(location.hash.clone(), location.path_id.clone());
+    }
+
+    /// Removes an in-memory location only when `content_path` is the currently
+    /// indexed copy. A rebalancing crash can temporarily leave an old source
+    /// copy next to its already indexed target; garbage collection must not
+    /// discard the target's location while removing that stale source.
+    fn forget_location_at_path(
+        &self,
+        kind: StorageContentKind,
+        hash: &str,
+        content_path: &Path,
+    ) -> bool {
+        let locations = match kind {
+            StorageContentKind::Chunk => &self.chunk_locations,
+            StorageContentKind::Manifest => &self.manifest_locations,
+        };
+        let mut locations = locations
+            .write()
+            .expect("storage location map lock should not be poisoned");
+        let Some(path_id) = locations.get(hash) else {
+            return false;
+        };
+        let Some(path) = self.path(path_id) else {
+            return false;
+        };
+        let Ok(indexed_path) = content_path_in_runtime(path, kind, hash) else {
+            return false;
+        };
+        if indexed_path != content_path {
+            return false;
+        }
+        locations.remove(hash);
+        true
+    }
+
+    fn content_path(&self, kind: StorageContentKind, hash: &str) -> Result<PathBuf> {
+        let configured_path_id = match kind {
+            StorageContentKind::Chunk => self
+                .chunk_locations
+                .read()
+                .expect("storage chunk location map lock should not be poisoned")
+                .get(hash)
+                .cloned(),
+            StorageContentKind::Manifest => self
+                .manifest_locations
+                .read()
+                .expect("storage manifest location map lock should not be poisoned")
+                .get(hash)
+                .cloned(),
+        };
+        let path = configured_path_id
+            .as_deref()
+            .and_then(|id| self.path(id))
+            .or_else(|| self.legacy_read_path())
+            .context("storage pool has no readable path")?;
+        content_path_in_runtime(path, kind, hash)
+    }
+
+    fn content_path_in(
+        &self,
+        path_id: &str,
+        kind: StorageContentKind,
+        hash: &str,
+    ) -> Result<PathBuf> {
+        let path = self
+            .path(path_id)
+            .with_context(|| format!("unknown storage path id {path_id}"))?;
+        content_path_in_runtime(path, kind, hash)
+    }
+
+    fn legacy_read_path(&self) -> Option<&StoragePathRuntime> {
+        self.paths
+            .iter()
+            .find(|path| path.available && path.config.id == "legacy-primary")
+            .or_else(|| self.paths.iter().find(|path| path.available))
+    }
+
+    fn path(&self, id: &str) -> Option<&StoragePathRuntime> {
+        self.paths.iter().find(|path| path.config.id == id)
+    }
+
+    async fn select_write_path(
+        &self,
+        hash: &str,
+        expected_size_bytes: u64,
+    ) -> Result<&StoragePathRuntime> {
+        let mut selected: Option<(&StoragePathRuntime, u128)> = None;
+        for path in &self.paths {
+            if !path.available || !matches!(path.config.state, StoragePathState::Active) {
+                continue;
+            }
+            let free_bytes = match fs2::available_space(&path.config.path) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(path_id = %path.config.id, error = %err, "storage path is not writable");
+                    continue;
+                }
+            };
+            let usable = free_bytes.saturating_sub(path.config.reserve_bytes);
+            if usable < expected_size_bytes {
+                continue;
+            }
+            // A capacity-aware weighted rendezvous score. The hash makes ties stable,
+            // while usable bytes and weight guide new chunks towards larger paths.
+            let mut score_material = Vec::with_capacity(hash.len() + path.config.id.len() + 1);
+            score_material.extend_from_slice(hash.as_bytes());
+            score_material.push(0);
+            score_material.extend_from_slice(path.config.id.as_bytes());
+            let hash_score = u64::from_be_bytes(
+                blake3::hash(&score_material).as_bytes()[..8]
+                    .try_into()
+                    .expect("blake3 prefix has eight bytes"),
+            ) as u128;
+            let score = usable as u128 * u128::from(path.config.weight) + (hash_score >> 16);
+            if selected.is_none_or(|(_, current)| score > current) {
+                selected = Some((path, score));
+            }
+        }
+        selected
+            .map(|(path, _)| path)
+            .context("storage pool has no active path with sufficient free space")
+    }
+
+    fn path_stats_roots(&self) -> impl Iterator<Item = &StoragePathRuntime> {
+        self.paths.iter()
+    }
+
+    async fn stats(&self) -> Vec<StoragePathStats> {
+        let mut stats = Vec::with_capacity(self.paths.len());
+        for path in &self.paths {
+            let (capacity_bytes, free_bytes, last_error) = if path.available {
+                match (
+                    fs2::total_space(&path.config.path),
+                    fs2::available_space(&path.config.path),
+                ) {
+                    (Ok(capacity), Ok(free)) => (Some(capacity), Some(free.min(capacity)), None),
+                    (Err(err), _) | (_, Err(err)) => (None, None, Some(err.to_string())),
+                }
+            } else {
+                (None, None, path.last_error.clone())
+            };
+            stats.push(StoragePathStats {
+                id: path.config.id.clone(),
+                path: path.config.path.display().to_string(),
+                state: path.config.state,
+                available: path.available,
+                capacity_bytes,
+                free_bytes,
+                chunk_store_bytes: if path.available {
+                    directory_size_bytes(&path.chunks_dir).await.unwrap_or(0)
+                } else {
+                    0
+                },
+                manifest_store_bytes: if path.available {
+                    directory_size_bytes(&path.manifests_dir).await.unwrap_or(0)
+                } else {
+                    0
+                },
+                last_error: last_error.or_else(|| path.last_error.clone()),
+            });
+        }
+        stats
+    }
+
+    fn aggregate_capacity(&self) -> Result<(u64, u64)> {
+        let mut capacity = 0u64;
+        let mut free = 0u64;
+        #[cfg(unix)]
+        let mut seen_volumes = HashSet::new();
+        for path in &self.paths {
+            if !path.available || matches!(path.config.state, StoragePathState::Disabled) {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let volume = std::fs::metadata(&path.config.path)?.dev();
+                if !seen_volumes.insert(volume) {
+                    continue;
+                }
+            }
+            let path_capacity = fs2::total_space(&path.config.path)?;
+            let path_free = fs2::available_space(&path.config.path)?.min(path_capacity);
+            capacity = capacity.saturating_add(path_capacity);
+            free = free.saturating_add(path_free);
+        }
+        Ok((capacity, free))
+    }
+}
+
+fn validate_storage_path_config(path: &StoragePathConfig) -> Result<()> {
+    if path.id.is_empty()
+        || !path
+            .id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        bail!("storage path id must contain only ASCII letters, digits, '-' and '_'");
+    }
+    if path.weight == 0 {
+        bail!("storage path {} must have a non-zero weight", path.id);
+    }
+    if path.path.as_os_str().is_empty() {
+        bail!("storage path {} has an empty path", path.id);
+    }
+    Ok(())
+}
+
+async fn ensure_storage_path_marker(
+    config: &StoragePathConfig,
+    node_id: Option<NodeId>,
+) -> Result<()> {
+    let marker_path = config.path.join(STORAGE_POOL_PATH_MARKER_FILE);
+    let expected = StoragePathMarker {
+        version: STORAGE_POOL_CONFIG_VERSION,
+        path_id: config.id.clone(),
+        node_id: node_id.map(|id| id.to_string()),
+    };
+    match fs::read(&marker_path).await {
+        Ok(payload) => {
+            let marker =
+                serde_json::from_slice::<StoragePathMarker>(&payload).with_context(|| {
+                    format!("invalid storage path marker {}", marker_path.display())
+                })?;
+            if marker != expected {
+                bail!(
+                    "storage path marker mismatch for {}; keep the configured path id stable and do not share a path between nodes",
+                    config.path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            write_atomic(&marker_path, &serde_json::to_vec_pretty(&expected)?).await?;
+        }
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+fn content_path_in_runtime(
+    path: &StoragePathRuntime,
+    kind: StorageContentKind,
+    hash: &str,
+) -> Result<PathBuf> {
+    match kind {
+        StorageContentKind::Chunk => chunk_path_for_hash(&path.chunks_dir, hash),
+        StorageContentKind::Manifest => manifest_path_from_hash(&path.manifests_dir, hash),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StorageContentPersistOutcome {
+    stored: bool,
+    replaced_existing_path: bool,
+}
+
+async fn persist_storage_content(
+    storage_pool: &StoragePool,
+    metadata_store: &dyn MetadataStore,
+    kind: StorageContentKind,
+    hash: &str,
+    payload: &[u8],
+) -> Result<StorageContentPersistOutcome> {
+    let existing_path = storage_pool.content_path(kind, hash)?;
+    let mut replaced_existing_path = false;
+    match fs::read(&existing_path).await {
+        Ok(existing_payload) if hash_hex(&existing_payload) == hash => {
+            return Ok(StorageContentPersistOutcome {
+                stored: false,
+                replaced_existing_path: false,
+            });
+        }
+        Ok(_) => {
+            replaced_existing_path = true;
+        }
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            replaced_existing_path = true;
+        }
+        Err(_) => {}
+    }
+
+    let target = storage_pool
+        .select_write_path(hash, payload.len() as u64)
+        .await?;
+    let location = StorageLocationRecord {
+        kind,
+        hash: hash.to_string(),
+        path_id: target.config.id.clone(),
+        size_bytes: payload.len() as u64,
+        state: StorageLocationState::Pending,
+    };
+    metadata_store.persist_storage_location(&location).await?;
+    let target_path = content_path_in_runtime(target, kind, hash)?;
+    if let Err(err) = write_atomic_overwrite(&target_path, payload).await {
+        let _ = metadata_store.delete_storage_location(kind, hash).await;
+        return Err(err);
+    }
+    let available_location = StorageLocationRecord {
+        state: StorageLocationState::Available,
+        ..location
+    };
+    metadata_store
+        .persist_storage_location(&available_location)
+        .await?;
+    storage_pool.note_location(&available_location);
+    Ok(StorageContentPersistOutcome {
+        stored: true,
+        replaced_existing_path,
+    })
+}
+
+async fn recover_pending_storage_locations(
+    storage_pool: &StoragePool,
+    metadata_store: &dyn MetadataStore,
+    locations: &[StorageLocationRecord],
+) -> Result<()> {
+    for location in locations {
+        if location.state != StorageLocationState::Pending {
+            continue;
+        }
+        let path =
+            match storage_pool.content_path_in(&location.path_id, location.kind, &location.hash) {
+                Ok(path) => path,
+                Err(err) => {
+                    warn!(
+                        content_kind = location.kind.as_str(),
+                        content_hash = %location.hash,
+                        path_id = %location.path_id,
+                        error = %err,
+                        "discarding pending storage location for an unavailable path"
+                    );
+                    metadata_store
+                        .delete_storage_location(location.kind, &location.hash)
+                        .await?;
+                    continue;
+                }
+            };
+        let valid =
+            match kind_payload_hash_matches(&path, &location.hash, location.size_bytes).await {
+                Ok(valid) => valid,
+                Err(err) => {
+                    warn!(
+                        content_kind = location.kind.as_str(),
+                        content_hash = %location.hash,
+                        path = %path.display(),
+                        error = %err,
+                        "failed validating pending storage location"
+                    );
+                    false
+                }
+            };
+        if valid {
+            let available = StorageLocationRecord {
+                state: StorageLocationState::Available,
+                ..location.clone()
+            };
+            metadata_store.persist_storage_location(&available).await?;
+            storage_pool.note_location(&available);
+        } else {
+            metadata_store
+                .delete_storage_location(location.kind, &location.hash)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn kind_payload_hash_matches(path: &Path, hash: &str, expected_size: u64) -> Result<bool> {
+    let payload = match fs::read(path).await {
+        Ok(payload) => payload,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(payload.len() as u64 == expected_size && hash_hex(&payload) == hash)
+}
+
+async fn storage_pool_chunk_bytes(storage_pool: &StoragePool) -> Result<u64> {
+    let mut total = 0u64;
+    for path in storage_pool.path_stats_roots() {
+        if path.available {
+            total = total.saturating_add(directory_size_bytes(&path.chunks_dir).await?);
+        }
+    }
+    Ok(total)
+}
+
+async fn storage_pool_manifest_bytes(storage_pool: &StoragePool) -> Result<u64> {
+    let mut total = 0u64;
+    for path in storage_pool.path_stats_roots() {
+        if path.available {
+            total = total.saturating_add(directory_size_bytes(&path.manifests_dir).await?);
+        }
+    }
+    Ok(total)
+}
+
+async fn collect_storage_content_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = match fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    Ok(files)
+}
+
+async fn relocate_storage_content(
+    storage_pool: &StoragePool,
+    metadata_store: &dyn MetadataStore,
+    kind: StorageContentKind,
+    hash: &str,
+    source_path: &Path,
+) -> Result<bool> {
+    let payload = fs::read(source_path)
+        .await
+        .with_context(|| format!("failed reading storage content {}", source_path.display()))?;
+    if hash_hex(&payload) != hash {
+        bail!("storage content hash mismatch while rebalancing {hash}");
+    }
+    let target = storage_pool
+        .select_write_path(hash, payload.len() as u64)
+        .await?;
+    let target_path = content_path_in_runtime(target, kind, hash)?;
+    if target_path == source_path {
+        return Ok(false);
+    }
+    let pending = StorageLocationRecord {
+        kind,
+        hash: hash.to_string(),
+        path_id: target.config.id.clone(),
+        size_bytes: payload.len() as u64,
+        state: StorageLocationState::Pending,
+    };
+    metadata_store.persist_storage_location(&pending).await?;
+    if let Err(err) = write_atomic_overwrite(&target_path, &payload).await {
+        let _ = metadata_store.delete_storage_location(kind, hash).await;
+        return Err(err);
+    }
+    let available = StorageLocationRecord {
+        state: StorageLocationState::Available,
+        ..pending
+    };
+    metadata_store.persist_storage_location(&available).await?;
+    storage_pool.note_location(&available);
+    fs::remove_file(source_path).await.with_context(|| {
+        format!(
+            "failed removing drained storage content {}",
+            source_path.display()
+        )
+    })?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +1197,8 @@ pub struct StorageStatsSample {
     pub media_cache_bytes: u64,
     pub latest_snapshot_logical_bytes: u64,
     pub latest_snapshot_unique_chunk_bytes: u64,
+    #[serde(default)]
+    pub storage_paths: Vec<StoragePathStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1044,6 +1835,10 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["sample_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "storage_locations",
+        tracked_columns: &["content_kind", "content_hash", "path_id", "state"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "repair_attempts",
         tracked_columns: &["subject"],
     },
@@ -1179,8 +1974,7 @@ pub(super) fn metadata_db_logical_summary_query(spec: MetadataDbLogicalTableSpec
 
 pub struct PersistentStore {
     root_dir: PathBuf,
-    chunks_dir: PathBuf,
-    manifests_dir: PathBuf,
+    storage_pool: StoragePool,
     metadata_backend_kind: MetadataBackendKind,
     metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
@@ -1199,7 +1993,7 @@ pub struct PersistentStore {
 
 #[derive(Clone)]
 pub(crate) struct ChunkIngestor {
-    chunks_dir: PathBuf,
+    storage_pool: StoragePool,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
 }
@@ -1207,8 +2001,7 @@ pub(crate) struct ChunkIngestor {
 #[derive(Clone)]
 pub(crate) struct StorageStatsCollector {
     root_dir: PathBuf,
-    chunks_dir: PathBuf,
-    manifests_dir: PathBuf,
+    storage_pool: StoragePool,
     metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
     metadata_store: Arc<dyn MetadataStore>,
@@ -1224,7 +2017,7 @@ pub(crate) struct MetadataDbDistributionLoader {
 #[derive(Clone)]
 pub(crate) struct StoreIndexInspector {
     current_state: CurrentState,
-    manifests_dir: PathBuf,
+    storage_pool: StoragePool,
     metadata_store: Arc<dyn MetadataStore>,
 }
 
@@ -1241,8 +2034,7 @@ pub(crate) struct ClusterNodesPersister {
 #[derive(Clone)]
 pub(crate) struct ReplicationSubjectInspector {
     current_state: CurrentState,
-    manifests_dir: PathBuf,
-    chunks_dir: PathBuf,
+    storage_pool: StoragePool,
     metadata_store: Arc<dyn MetadataStore>,
 }
 
@@ -1390,6 +2182,9 @@ trait MetadataStore: Send + Sync {
     async fn vacuum_metadata_store(&self) -> Result<bool>;
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>>;
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()>;
+    async fn load_storage_locations(&self) -> Result<Vec<StorageLocationRecord>>;
+    async fn persist_storage_location(&self, location: &StorageLocationRecord) -> Result<()>;
+    async fn delete_storage_location(&self, kind: StorageContentKind, hash: &str) -> Result<()>;
     async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>>;
     async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()>;
     async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()>;
@@ -1447,12 +2242,12 @@ trait MetadataStore: Send + Sync {
 
 impl ChunkIngestor {
     fn new(
-        chunks_dir: PathBuf,
+        storage_pool: StoragePool,
         metadata_store: Arc<dyn MetadataStore>,
         storage_stats_lock: Arc<AsyncMutex<()>>,
     ) -> Self {
         Self {
-            chunks_dir,
+            storage_pool,
             metadata_store,
             storage_stats_lock,
         }
@@ -1464,30 +2259,20 @@ impl ChunkIngestor {
             bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
         }
 
-        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash)?;
-        let mut replaced_existing_path = false;
-        if fs::try_exists(&chunk_path).await? {
-            match fs::read(&chunk_path).await {
-                Ok(existing_payload) if hash_hex(&existing_payload) == hash => {
-                    return Ok(false);
-                }
-                Ok(_) | Err(_) => {
-                    replaced_existing_path = true;
-                }
-            }
-        }
-
-        if let Some(parent) = chunk_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        write_atomic_overwrite(&chunk_path, payload).await?;
-        if replaced_existing_path {
+        let outcome = persist_storage_content(
+            &self.storage_pool,
+            self.metadata_store.as_ref(),
+            StorageContentKind::Chunk,
+            hash,
+            payload,
+        )
+        .await?;
+        if outcome.replaced_existing_path {
             self.reconcile_chunk_store_bytes_state().await?;
-        } else {
+        } else if outcome.stored {
             self.note_chunk_store_delta(payload.len() as i64).await?;
         }
-        Ok(true)
+        Ok(outcome.stored)
     }
 
     pub(crate) async fn ingest_chunk_auto(&self, payload: &[u8]) -> Result<(String, bool)> {
@@ -1502,8 +2287,11 @@ impl ChunkIngestor {
     ) -> Result<Vec<Option<UploadChunkRef>>> {
         let mut available = Vec::with_capacity(chunk_refs.len());
         for chunk_ref in chunk_refs {
-            let entry = match validate_local_chunk_integrity(
-                &self.chunks_dir,
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk_ref.hash)?;
+            let entry = match validate_chunk_path_integrity(
+                &chunk_path,
                 &chunk_ref.hash,
                 chunk_ref.size_bytes,
             )
@@ -1521,7 +2309,7 @@ impl ChunkIngestor {
 
     async fn reconcile_chunk_store_bytes_state(&self) -> Result<StorageStatsState> {
         let state = StorageStatsState {
-            chunk_store_bytes: directory_size_bytes(&self.chunks_dir).await?,
+            chunk_store_bytes: storage_pool_chunk_bytes(&self.storage_pool).await?,
             last_reconciled_unix: unix_ts(),
         };
         self.metadata_store
@@ -1558,8 +2346,7 @@ impl ChunkIngestor {
 impl StorageStatsCollector {
     fn new(
         root_dir: PathBuf,
-        chunks_dir: PathBuf,
-        manifests_dir: PathBuf,
+        storage_pool: StoragePool,
         metadata_db_path: PathBuf,
         media_thumbnails_dir: PathBuf,
         metadata_store: Arc<dyn MetadataStore>,
@@ -1567,8 +2354,7 @@ impl StorageStatsCollector {
     ) -> Self {
         Self {
             root_dir,
-            chunks_dir,
-            manifests_dir,
+            storage_pool,
             metadata_db_path,
             media_thumbnails_dir,
             metadata_store,
@@ -1609,7 +2395,9 @@ impl StorageStatsCollector {
             return Ok(None);
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -1623,7 +2411,7 @@ impl StorageStatsCollector {
     async fn reconcile_chunk_store_bytes_state(&self) -> Result<StorageStatsState> {
         let _guard = self.storage_stats_lock.lock().await;
         let state = StorageStatsState {
-            chunk_store_bytes: directory_size_bytes(&self.chunks_dir).await?,
+            chunk_store_bytes: storage_pool_chunk_bytes(&self.storage_pool).await?,
             last_reconciled_unix: unix_ts(),
         };
         self.persist_storage_stats_state(&state).await?;
@@ -1658,7 +2446,7 @@ impl StorageStatsCollector {
     pub(crate) async fn collect_storage_stats_sample(&self) -> Result<StorageStatsSample> {
         let metadata_db_bytes = file_size_bytes(&self.metadata_db_path).await?;
         let chunk_store_bytes = self.current_chunk_store_bytes(None).await?;
-        let manifest_store_bytes = directory_size_bytes(&self.manifests_dir).await?;
+        let manifest_store_bytes = storage_pool_manifest_bytes(&self.storage_pool).await?;
         let media_cache_root = self
             .media_thumbnails_dir
             .parent()
@@ -1721,6 +2509,7 @@ impl StorageStatsCollector {
             media_cache_bytes,
             latest_snapshot_logical_bytes,
             latest_snapshot_unique_chunk_bytes,
+            storage_paths: self.storage_pool.stats().await,
         })
     }
 
@@ -1746,12 +2535,12 @@ impl StorageStatsCollector {
 impl StoreIndexInspector {
     fn new(
         current_state: CurrentState,
-        manifests_dir: PathBuf,
+        storage_pool: StoragePool,
         metadata_store: Arc<dyn MetadataStore>,
     ) -> Self {
         Self {
             current_state,
-            manifests_dir,
+            storage_pool,
             metadata_store,
         }
     }
@@ -1769,7 +2558,9 @@ impl StoreIndexInspector {
             return Ok(None);
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -2037,14 +2828,12 @@ impl ClusterNodesPersister {
 impl ReplicationSubjectInspector {
     fn new(
         current_state: CurrentState,
-        manifests_dir: PathBuf,
-        chunks_dir: PathBuf,
+        storage_pool: StoragePool,
         metadata_store: Arc<dyn MetadataStore>,
     ) -> Self {
         Self {
             current_state,
-            manifests_dir,
-            chunks_dir,
+            storage_pool,
             metadata_store,
         }
     }
@@ -2129,7 +2918,9 @@ impl ReplicationSubjectInspector {
         };
 
         for chunk in &manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)?;
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)?;
             let metadata = match fs::metadata(&chunk_path).await {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -2148,7 +2939,9 @@ impl ReplicationSubjectInspector {
             return Ok(None);
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -2261,17 +3054,22 @@ impl PersistentStore {
         root_dir: impl Into<PathBuf>,
         backend: MetadataBackendKind,
     ) -> Result<Self> {
+        Self::init_with_metadata_backend_for_node(root_dir, backend, None).await
+    }
+
+    pub async fn init_with_metadata_backend_for_node(
+        root_dir: impl Into<PathBuf>,
+        backend: MetadataBackendKind,
+        node_id: Option<NodeId>,
+    ) -> Result<Self> {
         let root_dir = root_dir.into();
-        let chunks_dir = root_dir.join("chunks");
-        let manifests_dir = root_dir.join("manifests");
         let state_dir = root_dir.join("state");
         let media_cache_dir = state_dir.join("media_cache");
         let media_thumbnails_dir = media_cache_dir.join("thumbnails");
 
-        fs::create_dir_all(&chunks_dir).await?;
-        fs::create_dir_all(&manifests_dir).await?;
         fs::create_dir_all(&state_dir).await?;
         fs::create_dir_all(&media_thumbnails_dir).await?;
+        let storage_pool = StoragePool::load(&root_dir, node_id).await?;
 
         let (metadata_db_path, metadata_store): (PathBuf, Arc<dyn MetadataStore>) = match backend {
             MetadataBackendKind::Sqlite => (
@@ -2287,6 +3085,14 @@ impl PersistentStore {
                 )
             }
         };
+        let storage_locations = metadata_store.load_storage_locations().await?;
+        storage_pool.load_locations(storage_locations.iter().cloned());
+        recover_pending_storage_locations(
+            &storage_pool,
+            metadata_store.as_ref(),
+            &storage_locations,
+        )
+        .await?;
         let current_objects_cache =
             std::sync::Mutex::new(RangeChunkCache::new(current_objects_cache_capacity()));
         let snapshot_batch = metadata_store.load_snapshot_batch_state().await?;
@@ -2296,15 +3102,14 @@ impl PersistentStore {
             media_cache_build_config.total_permits as usize,
         ));
         let chunk_ingestor = ChunkIngestor::new(
-            chunks_dir.clone(),
+            storage_pool.clone(),
             metadata_store.clone(),
             storage_stats_lock.clone(),
         );
 
         Ok(Self {
             root_dir,
-            chunks_dir,
-            manifests_dir,
+            storage_pool,
             metadata_backend_kind: backend,
             metadata_db_path,
             media_thumbnails_dir,
@@ -2326,10 +3131,99 @@ impl PersistentStore {
         self.chunk_ingestor.clone()
     }
 
+    pub fn storage_pool_config(&self) -> StoragePoolConfig {
+        self.storage_pool.config()
+    }
+
+    pub fn storage_pool_config_path(&self) -> String {
+        self.storage_pool.config_path().display().to_string()
+    }
+
+    pub fn storage_pool_capacity(&self) -> Result<(u64, u64)> {
+        self.storage_pool.aggregate_capacity()
+    }
+
+    pub async fn storage_pool_paths(&self) -> Vec<StoragePathStats> {
+        self.storage_pool.stats().await
+    }
+
+    pub async fn rebalance_storage_pool(&self) -> Result<StoragePoolRebalanceReport> {
+        let draining_paths = self
+            .storage_pool
+            .path_stats_roots()
+            .filter(|path| {
+                path.available && matches!(path.config.state, StoragePathState::Draining)
+            })
+            .map(|path| (path.chunks_dir.clone(), path.manifests_dir.clone()))
+            .collect::<Vec<_>>();
+        let mut report = StoragePoolRebalanceReport {
+            moved_chunks: 0,
+            moved_manifests: 0,
+            skipped_invalid_entries: 0,
+        };
+
+        for (chunks_dir, manifests_dir) in draining_paths {
+            for chunk_path in collect_storage_content_files(&chunks_dir).await? {
+                let Some(hash) = chunk_path.file_name().and_then(|name| name.to_str()) else {
+                    report.skipped_invalid_entries += 1;
+                    continue;
+                };
+                if chunk_path_for_hash(Path::new("chunks"), hash).is_err() {
+                    report.skipped_invalid_entries += 1;
+                    continue;
+                }
+                if relocate_storage_content(
+                    &self.storage_pool,
+                    self.metadata_store.as_ref(),
+                    StorageContentKind::Chunk,
+                    hash,
+                    &chunk_path,
+                )
+                .await?
+                {
+                    report.moved_chunks += 1;
+                }
+            }
+            for manifest_path in collect_storage_content_files(&manifests_dir).await? {
+                if manifest_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("json")
+                {
+                    report.skipped_invalid_entries += 1;
+                    continue;
+                }
+                let Some(hash) = manifest_path.file_stem().and_then(|name| name.to_str()) else {
+                    report.skipped_invalid_entries += 1;
+                    continue;
+                };
+                if !manifest_hash_looks_safe_filename(hash) {
+                    report.skipped_invalid_entries += 1;
+                    continue;
+                }
+                if relocate_storage_content(
+                    &self.storage_pool,
+                    self.metadata_store.as_ref(),
+                    StorageContentKind::Manifest,
+                    hash,
+                    &manifest_path,
+                )
+                .await?
+                {
+                    report.moved_manifests += 1;
+                }
+            }
+        }
+
+        if report.moved_chunks > 0 {
+            self.reconcile_chunk_store_bytes_state().await?;
+        }
+        Ok(report)
+    }
+
     pub(crate) fn media_cache_worker(&self) -> MediaCacheWorker {
         MediaCacheWorker::new(
-            self.manifests_dir.clone(),
-            self.chunks_dir.clone(),
+            self.storage_pool.clone(),
             self.media_thumbnails_dir.clone(),
             self.media_cache_build_permits.clone(),
             self.media_cache_build_config.clone(),
@@ -2389,7 +3283,7 @@ impl PersistentStore {
     pub(crate) async fn store_index_inspector(&self) -> Result<StoreIndexInspector> {
         Ok(StoreIndexInspector::new(
             self.metadata_store.load_current_state().await?,
-            self.manifests_dir.clone(),
+            self.storage_pool.clone(),
             self.metadata_store.clone(),
         ))
     }
@@ -2397,8 +3291,7 @@ impl PersistentStore {
     pub(crate) fn storage_stats_collector(&self) -> StorageStatsCollector {
         StorageStatsCollector::new(
             self.root_dir.clone(),
-            self.chunks_dir.clone(),
-            self.manifests_dir.clone(),
+            self.storage_pool.clone(),
             self.metadata_db_path.clone(),
             self.media_thumbnails_dir.clone(),
             self.metadata_store.clone(),
@@ -2425,8 +3318,7 @@ impl PersistentStore {
     pub(crate) async fn data_scrubber(&self) -> Result<DataScrubber> {
         let scrubber = DataScrubber::new(
             self.metadata_store.load_current_state().await?,
-            self.manifests_dir.clone(),
-            self.chunks_dir.clone(),
+            self.storage_pool.clone(),
             self.metadata_store.clone(),
         );
         #[cfg(test)]
@@ -2447,8 +3339,7 @@ impl PersistentStore {
     ) -> Result<ReplicationSubjectInspector> {
         Ok(ReplicationSubjectInspector::new(
             self.metadata_store.load_current_state().await?,
-            self.manifests_dir.clone(),
-            self.chunks_dir.clone(),
+            self.storage_pool.clone(),
             self.metadata_store.clone(),
         ))
     }
@@ -2766,13 +3657,16 @@ impl PersistentStore {
 
     #[cfg(test)]
     pub fn manifest_path_for_test(&self, manifest_hash: &str) -> PathBuf {
-        manifest_path_from_hash(&self.manifests_dir, manifest_hash)
+        self.storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)
             .expect("test manifest hash should be a safe filename")
     }
 
     #[cfg(test)]
     pub fn chunk_path_for_test(&self, chunk_hash: &str) -> PathBuf {
-        chunk_path_for_hash(&self.chunks_dir, chunk_hash).unwrap()
+        self.storage_pool
+            .content_path(StorageContentKind::Chunk, chunk_hash)
+            .unwrap()
     }
 
     pub async fn object_count(&self) -> Result<usize> {
@@ -3116,19 +4010,25 @@ impl PersistentStore {
         let mut chunk_refs = Vec::new();
         let mut new_chunks = 0usize;
         let mut dedup_reused_chunks = 0usize;
+        let mut chunk_bytes_delta = 0i64;
+        let mut reconcile_chunk_stats = false;
 
         for chunk in payload.chunks(CHUNK_SIZE) {
             let hash = hash_hex(chunk);
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &hash)?;
-
-            if fs::try_exists(&chunk_path).await? {
-                dedup_reused_chunks += 1;
-            } else {
-                if let Some(parent) = chunk_path.parent() {
-                    fs::create_dir_all(parent).await?;
-                }
-                write_atomic(&chunk_path, chunk).await?;
+            let outcome = persist_storage_content(
+                &self.storage_pool,
+                self.metadata_store.as_ref(),
+                StorageContentKind::Chunk,
+                &hash,
+                chunk,
+            )
+            .await?;
+            if outcome.stored {
                 new_chunks += 1;
+                chunk_bytes_delta = chunk_bytes_delta.saturating_add(chunk.len() as i64);
+                reconcile_chunk_stats |= outcome.replaced_existing_path;
+            } else {
+                dedup_reused_chunks += 1;
             }
 
             chunk_refs.push(ChunkRef {
@@ -3145,10 +4045,18 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash.as_str())?;
-
-        if !fs::try_exists(&manifest_path).await? {
-            write_atomic(&manifest_path, &manifest_bytes).await?;
+        persist_storage_content(
+            &self.storage_pool,
+            self.metadata_store.as_ref(),
+            StorageContentKind::Manifest,
+            &manifest_hash,
+            &manifest_bytes,
+        )
+        .await?;
+        if reconcile_chunk_stats {
+            self.reconcile_chunk_store_bytes_state().await?;
+        } else if chunk_bytes_delta > 0 {
+            self.note_chunk_store_delta(chunk_bytes_delta).await?;
         }
 
         self.finalize_put_from_manifest_hash(
@@ -3186,9 +4094,10 @@ impl PersistentStore {
 
         let chunk_validation_started_at = Instant::now();
         for chunk in chunk_refs {
-            match validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes)
-                .await?
-            {
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)?;
+            match validate_chunk_path_integrity(&chunk_path, &chunk.hash, chunk.size_bytes).await? {
                 LocalChunkIntegrity::Valid => {}
                 LocalChunkIntegrity::Missing => {
                     bail!(
@@ -3230,13 +4139,17 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash.as_str())?;
         let manifest_build_ms = manifest_build_started_at.elapsed().as_millis();
 
         let manifest_store_started_at = Instant::now();
-        if !fs::try_exists(&manifest_path).await? {
-            write_atomic(&manifest_path, &manifest_bytes).await?;
-        }
+        persist_storage_content(
+            &self.storage_pool,
+            self.metadata_store.as_ref(),
+            StorageContentKind::Manifest,
+            &manifest_hash,
+            &manifest_bytes,
+        )
+        .await?;
         let manifest_store_ms = manifest_store_started_at.elapsed().as_millis();
 
         let finalize_started_at = Instant::now();
@@ -4202,7 +5115,9 @@ impl PersistentStore {
             }));
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash.as_str())?;
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash.as_str())?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -4331,7 +5246,9 @@ impl PersistentStore {
     }
 
     pub async fn read_chunk_payload(&self, hash: &str) -> Result<Option<Bytes>> {
-        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash)?;
+        let chunk_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Chunk, hash)?;
         if !fs::try_exists(&chunk_path).await? {
             return Ok(None);
         }
@@ -4542,7 +5459,9 @@ impl PersistentStore {
         }
 
         for chunk in &manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)?;
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)?;
             if !fs::try_exists(&chunk_path).await? {
                 bail!("manifest references missing chunk hash={}", chunk.hash);
             }
@@ -4558,15 +5477,14 @@ impl PersistentStore {
             }
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
-        let manifest_needs_write = match fs::read(&manifest_path).await {
-            Ok(existing_payload) => existing_payload != manifest_payload,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => true,
-        };
-        if manifest_needs_write {
-            write_atomic_overwrite(&manifest_path, manifest_payload).await?;
-        }
+        persist_storage_content(
+            &self.storage_pool,
+            self.metadata_store.as_ref(),
+            StorageContentKind::Manifest,
+            manifest_hash,
+            manifest_payload,
+        )
+        .await?;
         self.mark_manifest_locally_owned(manifest_hash).await?;
 
         let object_id = self
@@ -4649,12 +5567,15 @@ impl PersistentStore {
             let parsed_manifest: ObjectManifest = serde_json::from_slice(&manifest.manifest_bytes)
                 .context("invalid metadata manifest payload")?;
 
-            let manifest_path =
-                manifest_path_from_hash(&self.manifests_dir, manifest.manifest_hash.as_str())?;
-            if !fs::try_exists(&manifest_path).await? {
-                write_atomic(&manifest_path, &manifest.manifest_bytes).await?;
-                changed = true;
-            }
+            let manifest_write = persist_storage_content(
+                &self.storage_pool,
+                self.metadata_store.as_ref(),
+                StorageContentKind::Manifest,
+                &manifest.manifest_hash,
+                &manifest.manifest_bytes,
+            )
+            .await?;
+            changed |= manifest_write.stored;
             self.persist_manifest_summary(&manifest.manifest_hash, &parsed_manifest)
                 .await?;
         }
@@ -4812,7 +5733,9 @@ impl PersistentStore {
             }
 
             for chunk in &manifest.chunks {
-                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)?;
+                let chunk_path = self
+                    .storage_pool
+                    .content_path(StorageContentKind::Chunk, &chunk.hash)?;
                 if !fs::try_exists(&chunk_path).await? {
                     bail!("manifest references missing chunk hash={}", chunk.hash);
                 }
@@ -4828,16 +5751,14 @@ impl PersistentStore {
                 }
             }
 
-            let manifest_path =
-                manifest_path_from_hash(&self.manifests_dir, bundle.manifest_hash.as_str())?;
-            let manifest_needs_write = match fs::read(&manifest_path).await {
-                Ok(existing_payload) => existing_payload != bundle.manifest_bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                Err(_) => true,
-            };
-            if manifest_needs_write {
-                write_atomic_overwrite(&manifest_path, &bundle.manifest_bytes).await?;
-            }
+            persist_storage_content(
+                &self.storage_pool,
+                self.metadata_store.as_ref(),
+                StorageContentKind::Manifest,
+                &bundle.manifest_hash,
+                &bundle.manifest_bytes,
+            )
+            .await?;
             self.mark_manifest_locally_owned(&bundle.manifest_hash)
                 .await?;
         }
@@ -5077,7 +5998,9 @@ impl PersistentStore {
             return Ok(None);
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -5093,7 +6016,9 @@ impl PersistentStore {
             return Ok(None);
         }
 
-        let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -5102,7 +6027,14 @@ impl PersistentStore {
 
     async fn local_chunk_matches_ref(&self, chunk: &ChunkRef) -> Result<bool> {
         Ok(matches!(
-            validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes).await?,
+            validate_chunk_path_integrity(
+                &self
+                    .storage_pool
+                    .content_path(StorageContentKind::Chunk, &chunk.hash)?,
+                &chunk.hash,
+                chunk.size_bytes,
+            )
+            .await?,
             LocalChunkIntegrity::Valid
         ))
     }
@@ -5128,8 +6060,14 @@ impl PersistentStore {
 
         for chunk in &manifest.chunks {
             if !matches!(
-                validate_local_chunk_integrity(&self.chunks_dir, &chunk.hash, chunk.size_bytes)
-                    .await?,
+                validate_chunk_path_integrity(
+                    &self
+                        .storage_pool
+                        .content_path(StorageContentKind::Chunk, &chunk.hash)?,
+                    &chunk.hash,
+                    chunk.size_bytes,
+                )
+                .await?,
                 LocalChunkIntegrity::Valid
             ) {
                 return Ok(false);
@@ -5147,11 +6085,14 @@ impl PersistentStore {
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let cloned_manifest_hash = hash_hex(&manifest_bytes);
-        let manifest_path =
-            manifest_path_from_hash(&self.manifests_dir, cloned_manifest_hash.as_str())?;
-        if !fs::try_exists(&manifest_path).await? {
-            write_atomic(&manifest_path, &manifest_bytes).await?;
-        }
+        persist_storage_content(
+            &self.storage_pool,
+            self.metadata_store.as_ref(),
+            StorageContentKind::Manifest,
+            &cloned_manifest_hash,
+            &manifest_bytes,
+        )
+        .await?;
         self.mark_manifest_locally_owned(&cloned_manifest_hash)
             .await?;
 
@@ -5175,7 +6116,9 @@ impl PersistentStore {
         let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
 
         for chunk in manifest.chunks {
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)
                 .map_err(StoreReadError::Internal)?;
             if !fs::try_exists(&chunk_path)
                 .await
@@ -5312,7 +6255,9 @@ impl PersistentStore {
                 break;
             }
 
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)
                 .map_err(StoreReadError::Internal)?;
             if !fs::try_exists(&chunk_path)
                 .await
@@ -5406,7 +6351,9 @@ impl PersistentStore {
                 break;
             }
 
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)
                 .map_err(StoreReadError::Internal)?;
             let metadata = fs::metadata(&chunk_path).await.map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
@@ -5502,7 +6449,9 @@ impl PersistentStore {
                 break;
             }
 
-            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash)
+            let chunk_path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)
                 .map_err(StoreReadError::Internal)?;
             let is_missing = match fs::metadata(&chunk_path).await {
                 Ok(metadata) if metadata.len() == chunk.size_bytes as u64 => !self
@@ -6174,7 +7123,7 @@ impl PersistentStore {
 
     async fn reconcile_chunk_store_bytes_state(&self) -> Result<StorageStatsState> {
         let state = StorageStatsState {
-            chunk_store_bytes: directory_size_bytes(&self.chunks_dir).await?,
+            chunk_store_bytes: storage_pool_chunk_bytes(&self.storage_pool).await?,
             last_reconciled_unix: unix_ts(),
         };
         self.persist_storage_stats_state(&state).await?;
@@ -6228,7 +7177,7 @@ impl PersistentStore {
         let now = unix_ts();
         let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
         let owned_referenced_manifests = self.collect_owned_referenced_manifest_hashes().await?;
-        let manifest_hashes = self.list_manifest_hashes().await?;
+        let manifest_paths = self.list_manifest_paths().await?;
         let cached_chunk_records = self.metadata_store.list_cached_chunk_records().await?;
         let tracked_cached_chunks = cached_chunk_records.len();
         let cached_chunk_hashes = cached_chunk_records
@@ -6240,13 +7189,16 @@ impl PersistentStore {
         let mut skipped_recent_manifests = 0usize;
         let mut deleted_manifests = 0usize;
 
-        for manifest_hash in &manifest_hashes {
+        for manifest_path in &manifest_paths {
+            let Some(manifest_hash) = manifest_path.file_stem().and_then(|name| name.to_str())
+            else {
+                continue;
+            };
             if referenced_manifests.contains(manifest_hash) {
                 continue;
             }
 
-            let manifest_path = manifest_path_from_hash(&self.manifests_dir, manifest_hash)?;
-            let metadata = match fs::metadata(&manifest_path).await {
+            let metadata = match fs::metadata(manifest_path).await {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
             };
@@ -6256,7 +7208,7 @@ impl PersistentStore {
                 .map(|d| now.saturating_sub(d.as_secs()))
                 .unwrap_or(0);
             if age_secs < retention_secs {
-                retained_manifests.insert(manifest_hash.clone());
+                retained_manifests.insert(manifest_hash.to_string());
                 skipped_recent_manifests += 1;
                 continue;
             }
@@ -6265,11 +7217,21 @@ impl PersistentStore {
                 continue;
             }
 
-            if fs::try_exists(&manifest_path).await? {
-                fs::remove_file(&manifest_path).await?;
-                self.metadata_store
-                    .delete_locally_owned_manifest(manifest_hash)
-                    .await?;
+            if fs::try_exists(manifest_path).await? {
+                fs::remove_file(manifest_path).await?;
+                let removed_indexed_location = self.storage_pool.forget_location_at_path(
+                    StorageContentKind::Manifest,
+                    manifest_hash,
+                    manifest_path,
+                );
+                if removed_indexed_location {
+                    self.metadata_store
+                        .delete_storage_location(StorageContentKind::Manifest, manifest_hash)
+                        .await?;
+                    self.metadata_store
+                        .delete_locally_owned_manifest(manifest_hash)
+                        .await?;
+                }
                 deleted_manifests += 1;
             }
         }
@@ -6331,9 +7293,19 @@ impl PersistentStore {
 
             let chunk_size_bytes = metadata.len();
             fs::remove_file(&chunk_path).await?;
+            let removed_indexed_location = self.storage_pool.forget_location_at_path(
+                StorageContentKind::Chunk,
+                &chunk_hash,
+                &chunk_path,
+            );
+            if removed_indexed_location {
+                self.metadata_store
+                    .delete_storage_location(StorageContentKind::Chunk, &chunk_hash)
+                    .await?;
+            }
             self.note_chunk_store_delta(-(chunk_size_bytes as i64))
                 .await?;
-            if cached_chunk_hashes.contains(&chunk_hash) {
+            if removed_indexed_location && cached_chunk_hashes.contains(&chunk_hash) {
                 self.metadata_store
                     .delete_cached_chunk_record(&chunk_hash)
                     .await?;
@@ -6353,7 +7325,9 @@ impl PersistentStore {
                     continue;
                 }
 
-                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &record.hash)?;
+                let chunk_path = self
+                    .storage_pool
+                    .content_path(StorageContentKind::Chunk, &record.hash)?;
                 if !fs::try_exists(&chunk_path).await? {
                     self.metadata_store
                         .delete_cached_chunk_record(&record.hash)
@@ -7723,32 +8697,45 @@ impl PersistentStore {
         Ok(referenced)
     }
 
-    /// Lists manifest hashes present in the manifest store without parsing their
+    /// Lists manifest files present in the manifest store without parsing their
     /// content, so GC's orphan scan doesn't have to hold every manifest's bytes in
     /// memory just to enumerate hashes.
-    async fn list_manifest_hashes(&self) -> Result<Vec<String>> {
-        let mut hashes = Vec::<String>::new();
-        let mut entries = fs::read_dir(&self.manifests_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+    async fn list_manifest_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::<PathBuf>::new();
+        for storage_path in self.storage_pool.path_stats_roots() {
+            if !storage_path.available {
                 continue;
             }
-
-            let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
+            let mut entries = match fs::read_dir(&storage_path.manifests_dir).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
             };
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
 
-            hashes.push(file_stem.to_string());
+                let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if manifest_hash_looks_safe_filename(file_stem) {
+                    paths.push(path);
+                }
+            }
         }
 
-        Ok(hashes)
+        Ok(paths)
     }
 
     async fn collect_chunk_file_paths(&self) -> Result<Vec<PathBuf>> {
         let mut files = Vec::<PathBuf>::new();
-        let mut dirs = vec![self.chunks_dir.clone()];
+        let mut dirs = self
+            .storage_pool
+            .path_stats_roots()
+            .filter(|path| path.available)
+            .map(|path| path.chunks_dir.clone())
+            .collect::<Vec<_>>();
 
         while let Some(dir) = dirs.pop() {
             let mut entries = match fs::read_dir(&dir).await {
@@ -8223,12 +9210,11 @@ enum LocalChunkIntegrity {
     HashMismatch { actual_hash: String },
 }
 
-async fn validate_local_chunk_integrity(
-    chunks_dir: &Path,
+async fn validate_chunk_path_integrity(
+    chunk_path: &Path,
     hash: &str,
     expected_size_bytes: usize,
 ) -> Result<LocalChunkIntegrity> {
-    let chunk_path = chunk_path_for_hash(chunks_dir, hash)?;
     let payload = match fs::read(&chunk_path).await {
         Ok(payload) => payload,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {

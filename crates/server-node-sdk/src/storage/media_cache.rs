@@ -25,7 +25,7 @@ use super::media_tools::{
     VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS,
 };
 use super::{
-    MetadataStore, ObjectManifest, TOMBSTONE_MANIFEST_HASH, chunk_path_for_hash,
+    MetadataStore, ObjectManifest, StorageContentKind, StoragePool, TOMBSTONE_MANIFEST_HASH,
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
@@ -235,8 +235,7 @@ impl From<CachedMediaMetadata> for DerivedMediaCacheArtifact {
 
 #[derive(Clone)]
 pub(crate) struct MediaCacheWorker {
-    pub(super) manifests_dir: PathBuf,
-    pub(super) chunks_dir: PathBuf,
+    pub(super) storage_pool: StoragePool,
     pub(super) media_thumbnails_dir: PathBuf,
     pub(super) media_cache_build_permits: Arc<Semaphore>,
     pub(super) media_cache_build_config: MediaCacheBuildConfig,
@@ -246,8 +245,7 @@ pub(crate) struct MediaCacheWorker {
 
 impl MediaCacheWorker {
     pub(super) fn new(
-        manifests_dir: PathBuf,
-        chunks_dir: PathBuf,
+        storage_pool: StoragePool,
         media_thumbnails_dir: PathBuf,
         media_cache_build_permits: Arc<Semaphore>,
         media_cache_build_config: MediaCacheBuildConfig,
@@ -255,8 +253,7 @@ impl MediaCacheWorker {
         media_tools: MediaToolPaths,
     ) -> Self {
         Self {
-            manifests_dir,
-            chunks_dir,
+            storage_pool,
             media_thumbnails_dir,
             media_cache_build_permits,
             media_cache_build_config,
@@ -288,7 +285,7 @@ impl MediaCacheWorker {
             return Ok(None);
         };
 
-        if !manifest_chunks_are_locally_complete(&manifest, &self.chunks_dir).await? {
+        if !manifest_chunks_are_locally_complete(&manifest, &self.storage_pool).await? {
             return Ok(None);
         }
 
@@ -301,9 +298,12 @@ impl MediaCacheWorker {
             return Ok(Some(fs::read(&thumbnail_path).await?));
         }
 
-        let sniff_bytes =
-            read_object_prefix_from_manifest(&manifest, &self.chunks_dir, MEDIA_FORMAT_SNIFF_BYTES)
-                .await?;
+        let sniff_bytes = read_object_prefix_from_manifest(
+            &manifest,
+            &self.storage_pool,
+            MEDIA_FORMAT_SNIFF_BYTES,
+        )
+        .await?;
         let format = match image::guess_format(&sniff_bytes) {
             Ok(format) => format,
             Err(_) => return Ok(None),
@@ -328,11 +328,11 @@ impl MediaCacheWorker {
             .expect("media cache build semaphore should remain open");
 
         let manifest_owned = manifest.clone();
-        let chunks_dir = self.chunks_dir.clone();
+        let storage_pool = self.storage_pool.clone();
         let image_limits = self.media_cache_build_config.image_limits().clone();
         let rendered = match task::spawn_blocking(move || {
             let _build_permit = build_permit;
-            render_image_thumbnail_payload(&manifest_owned, &chunks_dir, profile, &image_limits)
+            render_image_thumbnail_payload(&manifest_owned, &storage_pool, profile, &image_limits)
         })
         .await
         {
@@ -525,7 +525,9 @@ impl MediaCacheWorker {
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
         if !fs::try_exists(&manifest_path).await? {
             return Ok(None);
         }
@@ -554,7 +556,7 @@ impl MediaCacheWorker {
     ) -> DerivedMediaCacheArtifact {
         let generated_at_unix = unix_ts();
 
-        match manifest_chunks_are_locally_complete(manifest, &self.chunks_dir).await {
+        match manifest_chunks_are_locally_complete(manifest, &self.storage_pool).await {
             Ok(true) => {}
             Ok(false) => {
                 return incomplete_media_cache_artifact(
@@ -578,7 +580,7 @@ impl MediaCacheWorker {
 
         let sniff_bytes = match read_object_prefix_from_manifest(
             manifest,
-            &self.chunks_dir,
+            &self.storage_pool,
             MEDIA_FORMAT_SNIFF_BYTES,
         )
         .await
@@ -623,7 +625,7 @@ impl MediaCacheWorker {
                 .expect("media cache build semaphore should remain open");
 
             let manifest_owned = manifest.clone();
-            let chunks_dir = self.chunks_dir.clone();
+            let storage_pool = self.storage_pool.clone();
             let manifest_hash_owned = manifest_hash.to_string();
             let content_fingerprint_owned = content_fingerprint.to_string();
             let image_limits = self.media_cache_build_config.image_limits().clone();
@@ -634,7 +636,7 @@ impl MediaCacheWorker {
                     &manifest_hash_owned,
                     &content_fingerprint_owned,
                     &manifest_owned,
-                    &chunks_dir,
+                    &storage_pool,
                     include_thumbnail,
                     &image_limits,
                 )
@@ -674,7 +676,7 @@ impl MediaCacheWorker {
             content_fingerprint,
             manifest.total_size_bytes,
             manifest,
-            &self.chunks_dir,
+            &self.storage_pool,
             &self.media_tools,
             include_thumbnail,
         )
@@ -919,10 +921,10 @@ pub(super) async fn persist_media_cache_record_with_payload(
 
 async fn manifest_chunks_are_locally_complete(
     manifest: &ObjectManifest,
-    chunks_dir: &Path,
+    storage_pool: &StoragePool,
 ) -> Result<bool> {
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
+        let chunk_path = storage_pool.content_path(StorageContentKind::Chunk, &chunk.hash)?;
         let metadata = match fs::metadata(&chunk_path).await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -938,7 +940,7 @@ async fn manifest_chunks_are_locally_complete(
 
 async fn read_object_prefix_from_manifest(
     manifest: &ObjectManifest,
-    chunks_dir: &Path,
+    storage_pool: &StoragePool,
     max_bytes: usize,
 ) -> Result<Vec<u8>> {
     let target_len = std::cmp::min(manifest.total_size_bytes, max_bytes);
@@ -949,7 +951,7 @@ async fn read_object_prefix_from_manifest(
             break;
         }
 
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
+        let chunk_path = storage_pool.content_path(StorageContentKind::Chunk, &chunk.hash)?;
         let payload = fs::read(&chunk_path)
             .await
             .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
@@ -979,11 +981,11 @@ async fn read_object_prefix_from_manifest(
 
 async fn collect_local_chunk_paths(
     manifest: &ObjectManifest,
-    chunks_dir: &Path,
+    storage_pool: &StoragePool,
 ) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::with_capacity(manifest.chunks.len());
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
+        let chunk_path = storage_pool.content_path(StorageContentKind::Chunk, &chunk.hash)?;
         let metadata = fs::metadata(&chunk_path)
             .await
             .with_context(|| format!("missing chunk {}", chunk.hash))?;
@@ -1001,10 +1003,9 @@ async fn collect_local_chunk_paths(
 }
 
 /// Holds the chunk hashes and precomputed byte offsets for a virtual video file.
-/// Paths are reconstructed from `chunks_dir` + hash at read time rather than
-/// stored, so the read path is always rooted in the trusted chunks directory.
+/// Paths are resolved from the in-memory storage-location index at read time.
 struct ChunkVideoIndex {
-    chunks_dir: PathBuf,
+    storage_pool: StoragePool,
     hashes: Vec<String>,
     /// Byte offset of each chunk's first byte in the virtual file.
     offsets: Vec<u64>,
@@ -1012,7 +1013,7 @@ struct ChunkVideoIndex {
 }
 
 impl ChunkVideoIndex {
-    fn new(chunks_dir: PathBuf, manifest: &ObjectManifest) -> Self {
+    fn new(storage_pool: StoragePool, manifest: &ObjectManifest) -> Self {
         let mut offsets = Vec::with_capacity(manifest.chunks.len());
         let mut offset = 0u64;
         for chunk in &manifest.chunks {
@@ -1021,7 +1022,7 @@ impl ChunkVideoIndex {
         }
         let hashes = manifest.chunks.iter().map(|c| c.hash.clone()).collect();
         Self {
-            chunks_dir,
+            storage_pool,
             hashes,
             offsets,
             total_size: offset,
@@ -1046,7 +1047,9 @@ impl ChunkVideoIndex {
             }
             let read_from = start.saturating_sub(chunk_start) as usize;
             let read_to = (end.min(chunk_end) - chunk_start) as usize;
-            let path = chunk_path_for_hash(&self.chunks_dir, &self.hashes[i])?;
+            let path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &self.hashes[i])?;
             let data = fs::read(&path).await?;
             result.extend_from_slice(&data[read_from..=read_to]);
         }
@@ -1168,14 +1171,14 @@ async fn derive_video_media_cache(
     content_fingerprint: &str,
     source_size_bytes: usize,
     manifest: &ObjectManifest,
-    chunks_dir: &Path,
+    storage_pool: &StoragePool,
     media_tools: &MediaToolPaths,
     include_thumbnail: bool,
 ) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
     // Validate all chunks are present and have the expected size.
-    collect_local_chunk_paths(manifest, chunks_dir).await?;
-    let chunk_index = Arc::new(ChunkVideoIndex::new(chunks_dir.to_path_buf(), manifest));
+    collect_local_chunk_paths(manifest, storage_pool).await?;
+    let chunk_index = Arc::new(ChunkVideoIndex::new(storage_pool.clone(), manifest));
 
     let temp_dir = std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir)
@@ -1373,11 +1376,11 @@ fn build_image_media_cache_blocking(
     manifest_hash: &str,
     content_fingerprint: &str,
     manifest: &ObjectManifest,
-    chunks_dir: &Path,
+    storage_pool: &StoragePool,
     include_thumbnail: bool,
     image_limits: &MediaCacheImageLimits,
 ) -> Result<DerivedMediaCacheArtifact> {
-    let payload = read_object_by_manifest_blocking(manifest, chunks_dir)?;
+    let payload = read_object_by_manifest_blocking(manifest, storage_pool)?;
     derive_image_media_cache(
         manifest_hash,
         content_fingerprint,
@@ -1390,12 +1393,12 @@ fn build_image_media_cache_blocking(
 
 fn read_object_by_manifest_blocking(
     manifest: &ObjectManifest,
-    chunks_dir: &Path,
+    storage_pool: &StoragePool,
 ) -> Result<Vec<u8>> {
     let mut assembled = Vec::new();
 
     for chunk in &manifest.chunks {
-        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash)?;
+        let chunk_path = storage_pool.content_path(StorageContentKind::Chunk, &chunk.hash)?;
         let payload = std::fs::read(&chunk_path)
             .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
 
@@ -1637,11 +1640,11 @@ fn render_thumbnail(
 
 fn render_image_thumbnail_payload(
     manifest: &ObjectManifest,
-    chunks_dir: &Path,
+    storage_pool: &StoragePool,
     profile: ThumbnailProfileSpec,
     image_limits: &MediaCacheImageLimits,
 ) -> Result<Option<Vec<u8>>> {
-    let payload = read_object_by_manifest_blocking(manifest, chunks_dir)?;
+    let payload = read_object_by_manifest_blocking(manifest, storage_pool)?;
     let format = image::guess_format(&payload).context("unsupported media format")?;
     let (width, height) = image_dimensions(&payload, format)?;
     if let Some(error) = validate_image_decode_limits(width, height, image_limits) {

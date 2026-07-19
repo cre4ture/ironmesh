@@ -510,6 +510,252 @@ macro_rules! run_on_all_metadata_backends {
     };
 }
 
+async fn write_storage_pool_config(root: &Path, config: &StoragePoolConfig) {
+    fs::create_dir_all(root.join("state")).await.unwrap();
+    fs::write(
+        root.join("state").join("storage-pool.json"),
+        serde_json::to_vec_pretty(config).unwrap(),
+    )
+    .await
+    .unwrap();
+}
+
+fn storage_path(id: &str, path: PathBuf, state: StoragePathState) -> StoragePathConfig {
+    StoragePathConfig {
+        id: id.to_string(),
+        path,
+        state,
+        weight: 1,
+        reserve_bytes: 0,
+    }
+}
+
+#[tokio::test]
+async fn storage_pool_rejects_overlapping_paths() {
+    let root = test_store_dir("storage-pool-overlap");
+    let first = root.join("first");
+    let nested = first.join("nested");
+    fs::create_dir_all(&first).await.unwrap();
+    let config = StoragePoolConfig {
+        version: STORAGE_POOL_CONFIG_VERSION,
+        paths: vec![
+            storage_path("first", first, StoragePathState::Active),
+            storage_path("nested", nested, StoragePathState::Active),
+        ],
+    };
+
+    let error = match StoragePool::from_test_config(root.join("storage-pool.json"), config).await {
+        Ok(_) => panic!("overlapping storage paths must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("must not overlap"));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+async fn storage_pool_legacy_mode_remains_readable_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("storage-pool-legacy").await;
+    let payload = Bytes::from_static(b"legacy storage pool data");
+    let hash = hash_hex(&payload);
+    store
+        .put_object_versioned("legacy.txt", payload.clone(), PutOptions::default())
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .chunk_path_for_test(&hash)
+            .starts_with(root.join("chunks"))
+    );
+    assert_eq!(store.storage_pool_config().paths.len(), 1);
+    assert_eq!(store.storage_pool_config().paths[0].id, "legacy-primary");
+
+    drop(store);
+    let store = backend.open_store(root.clone()).await;
+    let read = store
+        .get_object("legacy.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(read, payload);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    storage_pool_legacy_mode_remains_readable_impl,
+    storage_pool_legacy_mode_remains_readable,
+    storage_pool_legacy_mode_remains_readable_turso
+);
+
+async fn storage_pool_distributes_restarts_and_rebalances_impl(backend: StorageTestBackend) {
+    let root = test_store_dir(&format!("storage-pool-multipath-{}", backend.suffix()));
+    let first = root.join("first-disk");
+    let second = root.join("second-disk");
+    fs::create_dir_all(&first).await.unwrap();
+    fs::create_dir_all(&second).await.unwrap();
+    let mut config = StoragePoolConfig {
+        version: STORAGE_POOL_CONFIG_VERSION,
+        paths: vec![
+            storage_path("first", first.clone(), StoragePathState::Active),
+            storage_path("second", second.clone(), StoragePathState::Active),
+        ],
+    };
+    write_storage_pool_config(&root, &config).await;
+
+    let mut store = backend.open_store(root.clone()).await;
+    let mut payloads_by_path = HashMap::new();
+    for candidate in 0u16..1024 {
+        let payload = format!("storage-pool-payload-{candidate}").into_bytes();
+        let hash = hash_hex(&payload);
+        let selected = store
+            .storage_pool
+            .select_write_path(&hash, payload.len() as u64)
+            .await
+            .unwrap()
+            .config
+            .id
+            .clone();
+        payloads_by_path.entry(selected).or_insert((hash, payload));
+        if payloads_by_path.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        payloads_by_path.len(),
+        2,
+        "both storage paths must be selectable"
+    );
+
+    let mut objects = Vec::new();
+    for path_id in ["first", "second"] {
+        let (hash, payload) = payloads_by_path.remove(path_id).unwrap();
+        let key = format!("pool/{path_id}.bin");
+        store
+            .put_object_versioned(&key, Bytes::from(payload.clone()), PutOptions::default())
+            .await
+            .unwrap();
+        let expected_root = if path_id == "first" { &first } else { &second };
+        assert!(store.chunk_path_for_test(&hash).starts_with(expected_root));
+        objects.push((key, payload));
+    }
+
+    let initial_stats = store.storage_pool_paths().await;
+    assert_eq!(initial_stats.len(), 2);
+    assert!(initial_stats.iter().all(|path| path.available));
+    assert!(initial_stats.iter().any(|path| path.chunk_store_bytes > 0));
+
+    drop(store);
+    let store = backend.open_store(root.clone()).await;
+    for (key, payload) in &objects {
+        let read = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(&read[..], payload.as_slice());
+    }
+
+    drop(store);
+    config.paths[1].state = StoragePathState::Draining;
+    write_storage_pool_config(&root, &config).await;
+    let store = backend.open_store(root.clone()).await;
+    let report = store.rebalance_storage_pool().await.unwrap();
+    assert!(report.moved_chunks >= 1);
+
+    let rebalanced_stats = store.storage_pool_paths().await;
+    let drained = rebalanced_stats
+        .iter()
+        .find(|path| path.id == "second")
+        .unwrap();
+    assert_eq!(drained.state, StoragePathState::Draining);
+    assert_eq!(drained.chunk_store_bytes, 0);
+    assert_eq!(drained.manifest_store_bytes, 0);
+    for (key, payload) in &objects {
+        let read = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(&read[..], payload.as_slice());
+    }
+
+    drop(store);
+    let store = backend.open_store(root.clone()).await;
+    for (key, payload) in &objects {
+        let read = store
+            .get_object(key, None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(&read[..], payload.as_slice());
+    }
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    storage_pool_distributes_restarts_and_rebalances_impl,
+    storage_pool_distributes_restarts_and_rebalances,
+    storage_pool_distributes_restarts_and_rebalances_turso
+);
+
+async fn storage_pool_recovers_pending_location_after_restart_impl(backend: StorageTestBackend) {
+    let root = test_store_dir(&format!("storage-pool-pending-{}", backend.suffix()));
+    let data_path = root.join("data-disk");
+    fs::create_dir_all(&data_path).await.unwrap();
+    write_storage_pool_config(
+        &root,
+        &StoragePoolConfig {
+            version: STORAGE_POOL_CONFIG_VERSION,
+            paths: vec![storage_path("data", data_path, StoragePathState::Active)],
+        },
+    )
+    .await;
+
+    let store = backend.open_store(root.clone()).await;
+    let payload = b"pending storage location";
+    let hash = hash_hex(payload);
+    let target = store
+        .storage_pool
+        .select_write_path(&hash, payload.len() as u64)
+        .await
+        .unwrap();
+    let target_path = content_path_in_runtime(target, StorageContentKind::Chunk, &hash).unwrap();
+    write_atomic(&target_path, payload).await.unwrap();
+    store
+        .metadata_store
+        .persist_storage_location(&StorageLocationRecord {
+            kind: StorageContentKind::Chunk,
+            hash: hash.clone(),
+            path_id: target.config.id.clone(),
+            size_bytes: payload.len() as u64,
+            state: StorageLocationState::Pending,
+        })
+        .await
+        .unwrap();
+
+    drop(store);
+    let store = backend.open_store(root.clone()).await;
+    assert_eq!(
+        store.read_chunk_payload(&hash).await.unwrap().as_deref(),
+        Some(payload.as_slice())
+    );
+    let locations = store.metadata_store.load_storage_locations().await.unwrap();
+    assert!(locations.iter().any(|location| {
+        location.kind == StorageContentKind::Chunk
+            && location.hash == hash
+            && location.state == StorageLocationState::Available
+    }));
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    storage_pool_recovers_pending_location_after_restart_impl,
+    storage_pool_recovers_pending_location_after_restart,
+    storage_pool_recovers_pending_location_after_restart_turso
+);
+
 async fn load_admin_audit_event_from_metadata_db(
     backend: StorageTestBackend,
     metadata_db_path: &Path,
@@ -924,7 +1170,7 @@ async fn cleanup_unreferenced_dry_run_reports_without_deleting_impl(backend: Sto
 
     let orphan_chunk_payload = b"orphan-chunk";
     let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
-    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash).unwrap();
+    let orphan_chunk_path = store.chunk_path_for_test(&orphan_chunk_hash);
     fs::create_dir_all(orphan_chunk_path.parent().unwrap())
         .await
         .unwrap();
@@ -942,9 +1188,7 @@ async fn cleanup_unreferenced_dry_run_reports_without_deleting_impl(backend: Sto
     };
     let orphan_manifest_bytes = serde_json::to_vec_pretty(&orphan_manifest).unwrap();
     let orphan_manifest_hash = hash_hex(&orphan_manifest_bytes);
-    let orphan_manifest_path = store
-        .manifests_dir
-        .join(format!("{orphan_manifest_hash}.json"));
+    let orphan_manifest_path = store.manifest_path_for_test(&orphan_manifest_hash);
     fs::write(&orphan_manifest_path, orphan_manifest_bytes)
         .await
         .unwrap();
@@ -979,7 +1223,7 @@ async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: St
 
     let orphan_chunk_payload = b"orphan-chunk-delete";
     let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
-    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash).unwrap();
+    let orphan_chunk_path = store.chunk_path_for_test(&orphan_chunk_hash);
     fs::create_dir_all(orphan_chunk_path.parent().unwrap())
         .await
         .unwrap();
@@ -997,9 +1241,7 @@ async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: St
     };
     let orphan_manifest_bytes = serde_json::to_vec_pretty(&orphan_manifest).unwrap();
     let orphan_manifest_hash = hash_hex(&orphan_manifest_bytes);
-    let orphan_manifest_path = store
-        .manifests_dir
-        .join(format!("{orphan_manifest_hash}.json"));
+    let orphan_manifest_path = store.manifest_path_for_test(&orphan_manifest_hash);
     fs::write(&orphan_manifest_path, orphan_manifest_bytes)
         .await
         .unwrap();
@@ -1087,7 +1329,7 @@ async fn cleanup_unreferenced_ignores_tombstone_manifest_markers_impl(backend: S
 
     let orphan_chunk_payload = b"orphan-after-tombstone";
     let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
-    let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash).unwrap();
+    let orphan_chunk_path = store.chunk_path_for_test(&orphan_chunk_hash);
     fs::create_dir_all(orphan_chunk_path.parent().unwrap())
         .await
         .unwrap();
@@ -5935,7 +6177,7 @@ async fn metadata_only_cached_chunks_are_evicted_by_cleanup_impl(backend: Storag
             .is_empty()
     );
 
-    let first_chunk_path = chunk_path_for_hash(&target.chunks_dir, &first_chunk.hash).unwrap();
+    let first_chunk_path = target.chunk_path_for_test(&first_chunk.hash);
     assert!(!fs::try_exists(&first_chunk_path).await.unwrap());
 
     let metadata_subjects = target.list_metadata_subjects().await.unwrap();
@@ -6022,7 +6264,7 @@ async fn put_object_from_chunks_rejects_corrupt_chunk_payload_impl(backend: Stor
         .first()
         .cloned()
         .expect("sample payload should produce at least one chunk");
-    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash).unwrap();
+    let corrupt_path = store.chunk_path_for_test(&corrupt_chunk.hash);
     let mut corrupt_payload = fs::read(&corrupt_path).await.unwrap();
     corrupt_payload[0] ^= 0xff;
     fs::write(&corrupt_path, &corrupt_payload).await.unwrap();
@@ -6290,6 +6532,7 @@ async fn storage_stats_history_prune_drops_older_samples_impl(backend: StorageTe
         media_cache_bytes: 40,
         latest_snapshot_logical_bytes: 50,
         latest_snapshot_unique_chunk_bytes: 60,
+        storage_paths: Vec::new(),
     };
     let newer = StorageStatsSample {
         collected_at_unix: 2_000,
@@ -6302,6 +6545,7 @@ async fn storage_stats_history_prune_drops_older_samples_impl(backend: StorageTe
         media_cache_bytes: 41,
         latest_snapshot_logical_bytes: 51,
         latest_snapshot_unique_chunk_bytes: 61,
+        storage_paths: Vec::new(),
     };
 
     store.persist_storage_stats_sample(&older).await.unwrap();
@@ -6352,6 +6596,7 @@ async fn storage_stats_history_since_filters_samples_impl(backend: StorageTestBa
         media_cache_bytes: 40,
         latest_snapshot_logical_bytes: 50,
         latest_snapshot_unique_chunk_bytes: 60,
+        storage_paths: Vec::new(),
     };
     let middle = StorageStatsSample {
         collected_at_unix: 2_000,
@@ -6364,6 +6609,7 @@ async fn storage_stats_history_since_filters_samples_impl(backend: StorageTestBa
         media_cache_bytes: 41,
         latest_snapshot_logical_bytes: 51,
         latest_snapshot_unique_chunk_bytes: 61,
+        storage_paths: Vec::new(),
     };
     let newest = StorageStatsSample {
         collected_at_unix: 3_000,
@@ -6376,6 +6622,7 @@ async fn storage_stats_history_since_filters_samples_impl(backend: StorageTestBa
         media_cache_bytes: 42,
         latest_snapshot_logical_bytes: 52,
         latest_snapshot_unique_chunk_bytes: 62,
+        storage_paths: Vec::new(),
     };
 
     store.persist_storage_stats_sample(&oldest).await.unwrap();
@@ -6923,8 +7170,8 @@ async fn data_scrub_detects_missing_and_corrupt_chunks_impl(backend: StorageTest
 
     let corrupt_chunk = &manifest.chunks[0];
     let missing_chunk = &manifest.chunks[1];
-    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash).unwrap();
-    let missing_path = chunk_path_for_hash(&store.chunks_dir, &missing_chunk.hash).unwrap();
+    let corrupt_path = store.chunk_path_for_test(&corrupt_chunk.hash);
+    let missing_path = store.chunk_path_for_test(&missing_chunk.hash);
 
     fs::write(&corrupt_path, vec![0u8; corrupt_chunk.size_bytes])
         .await

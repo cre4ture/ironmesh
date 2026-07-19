@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getMetadataDbLogicalDistributionStatus,
+  getStoragePoolStatus,
   getStorageStatsCurrent,
   getStorageStatsHistory,
+  rebalanceStoragePool,
   startMetadataDbLogicalDistribution,
   type MetadataDbLogicalDistribution,
   type MetadataDbLogicalDistributionStatusResponse,
@@ -137,6 +139,11 @@ export function MetadataPage() {
     queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(historyRange), normalizedAdminTokenOverride || undefined),
     enabled: canInspectDbDistribution
   });
+  const storagePoolQuery = useQuery({
+    queryKey: ["metadata-page", "storage-pool", normalizedAdminTokenOverride],
+    queryFn: () => getStoragePoolStatus(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectDbDistribution
+  });
   const dbDistributionStatusQuery = useQuery({
     queryKey: [
       "metadata-page",
@@ -170,6 +177,21 @@ export function MetadataPage() {
       });
     }
   });
+  const rebalanceStoragePoolMutation = useMutation({
+    mutationFn: () => rebalanceStoragePool(normalizedAdminTokenOverride || undefined),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.refetchQueries({
+          queryKey: ["metadata-page", "storage-pool", normalizedAdminTokenOverride],
+          exact: true
+        }),
+        queryClient.refetchQueries({
+          queryKey: ["metadata-page", "storage-stats-current", normalizedAdminTokenOverride],
+          exact: true
+        })
+      ]);
+    }
+  });
 
   const refresh = useCallback(async () => {
     const queryKeys: ReadonlyArray<readonly unknown[]> = [
@@ -180,7 +202,7 @@ export function MetadataPage() {
             "metadata-page",
             "metadata-db-logical-distribution-status",
             normalizedAdminTokenOverride
-          ]]
+          ], ["metadata-page", "storage-pool", normalizedAdminTokenOverride]]
         : [])
     ];
 
@@ -195,6 +217,7 @@ export function MetadataPage() {
   }, [canInspectDbDistribution, historyRange, normalizedAdminTokenOverride, queryClient]);
 
   const currentResponse = currentQuery.data ?? null;
+  const storagePool = storagePoolQuery.data ?? null;
   const currentSample = currentResponse?.sample ?? null;
   const history = historyQuery.data ?? EMPTY_STORAGE_HISTORY;
   const historyChronological = useMemo(() => [...history].reverse(), [history]);
@@ -271,8 +294,9 @@ export function MetadataPage() {
   const loading =
     currentQuery.isFetching ||
     historyQuery.isFetching ||
+    storagePoolQuery.isFetching ||
     startDbDistributionMutation.isPending;
-  const error = firstErrorMessage([currentQuery.error, historyQuery.error]);
+  const error = firstErrorMessage([currentQuery.error, historyQuery.error, storagePoolQuery.error]);
   const dbDistributionError = canInspectDbDistribution
     ? firstErrorMessage([
         startDbDistributionMutation.error,
@@ -395,6 +419,80 @@ export function MetadataPage() {
           />
         </Grid.Col>
       </Grid>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between" align="flex-start">
+            <Stack gap={4}>
+              <Text fw={700}>Storage Pool</Text>
+              <Text size="sm" c="dimmed" maw={820}>
+                Chunks and immutable manifests are placed across these node-local paths. The
+                metadata database remains in the node data directory. Edit the configuration file
+                and restart the node to add, disable, or drain a path.
+              </Text>
+              <Text size="xs" c="dimmed">
+                Configuration: <Code>{storagePool?.config_path ?? "loading…"}</Code>
+              </Text>
+            </Stack>
+            {storagePool?.paths.some((path) => path.state === "draining") ? (
+              <Button
+                variant="light"
+                onClick={() => void rebalanceStoragePoolMutation.mutateAsync()}
+                loading={rebalanceStoragePoolMutation.isPending}
+              >
+                Rebalance draining paths
+              </Button>
+            ) : null}
+          </Group>
+
+          {rebalanceStoragePoolMutation.error ? (
+            <Alert color="red" title="Storage-pool rebalance failed">
+              {rebalanceStoragePoolMutation.error.message}
+            </Alert>
+          ) : null}
+
+          {storagePool ? (
+            <ScrollArea type="auto">
+              <Table striped highlightOnHover withTableBorder>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Path</Table.Th>
+                    <Table.Th>State</Table.Th>
+                    <Table.Th>Capacity</Table.Th>
+                    <Table.Th>Free</Table.Th>
+                    <Table.Th>Chunks</Table.Th>
+                    <Table.Th>Manifests</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {storagePool.paths.map((path) => (
+                    <Table.Tr key={path.id}>
+                      <Table.Td>
+                        <Stack gap={1}>
+                          <Text size="sm" fw={600}>{path.id}</Text>
+                          <Code>{path.path}</Code>
+                          {path.last_error ? <Text size="xs" c="red">{path.last_error}</Text> : null}
+                        </Stack>
+                      </Table.Td>
+                      <Table.Td>
+                        <Badge color={path.available ? path.state === "active" ? "green" : "yellow" : "red"} variant="light">
+                          {path.available ? path.state : "unavailable"}
+                        </Badge>
+                      </Table.Td>
+                      <Table.Td>{formatBytes(path.capacity_bytes)}</Table.Td>
+                      <Table.Td>{formatBytes(path.free_bytes)}</Table.Td>
+                      <Table.Td>{formatBytes(path.chunk_store_bytes)}</Table.Td>
+                      <Table.Td>{formatBytes(path.manifest_store_bytes)}</Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </ScrollArea>
+          ) : (
+            <Text size="sm" c="dimmed">Loading storage-pool status…</Text>
+          )}
+        </Stack>
+      </Card>
 
       <Card withBorder radius="md" padding="lg">
         <Stack gap="md">

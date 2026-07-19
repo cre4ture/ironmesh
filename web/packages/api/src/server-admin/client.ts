@@ -57,6 +57,8 @@ import type {
   StartAdminMapDatasetImportResponse,
   StorageStatsCurrentResponse,
   StorageStatsSample,
+  StoragePoolRebalanceReport,
+  StoragePoolStatusResponse,
   StoreListRequestOptions,
   StoreListView,
   SetupStatus,
@@ -753,6 +755,23 @@ export async function getStorageStatsHistory(
     `${apiV1("/storage/stats/history")}?${query.toString()}`,
     { adminTokenOverride }
   );
+}
+
+export async function getStoragePoolStatus(
+  adminTokenOverride?: string
+): Promise<StoragePoolStatusResponse> {
+  return fetchAdminJson<StoragePoolStatusResponse>(apiV1("/auth/storage/pool"), {
+    adminTokenOverride
+  });
+}
+
+export async function rebalanceStoragePool(
+  adminTokenOverride?: string
+): Promise<StoragePoolRebalanceReport> {
+  return fetchAdminJson<StoragePoolRebalanceReport>(apiV1("/auth/storage/pool/rebalance"), {
+    method: "POST",
+    adminTokenOverride
+  });
 }
 
 export async function getProcessStatsCurrent(

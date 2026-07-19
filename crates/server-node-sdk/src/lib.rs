@@ -229,8 +229,8 @@ use storage::{
     ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult, PersistentStore,
     PreferredHeadReason, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
     ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
-    StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
+    S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult, StoragePathStats,
+    StoragePoolConfig, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
     VersionConsistencyState, grid_thumbnail_profile, media_cache_retry_due,
     metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
     thumbnail_profile_from_query,
@@ -6155,9 +6155,10 @@ async fn run_inner(
     let mut cluster = ClusterService::new(config.node_id, policy, config.heartbeat_timeout_secs);
 
     let store = new_store_rwlock(
-        PersistentStore::init_with_metadata_backend(
+        PersistentStore::init_with_metadata_backend_for_node(
             config.data_dir.clone(),
             config.metadata_backend(),
+            Some(config.node_id),
         )
         .await?,
     );
@@ -6851,6 +6852,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             get(metadata_db_logical_distribution_status)
                 .post(start_metadata_db_logical_distribution),
         )
+        .route("/auth/storage/pool", get(storage_pool_status))
+        .route("/auth/storage/pool/rebalance", post(rebalance_storage_pool))
         .route("/auth/versions/{key}", get(list_versions_admin))
         .route(
             "/auth/versions/{key}/restore/{version_id}",
@@ -7417,14 +7420,6 @@ async fn run_server_listeners(
     Ok(())
 }
 
-fn storage_stats_for_path(path: &FsPath) -> Result<(u64, u64)> {
-    let capacity_bytes = fs2::total_space(path)
-        .with_context(|| format!("failed to read capacity for {}", path.display()))?;
-    let free_bytes = fs2::available_space(path)
-        .with_context(|| format!("failed to read free space for {}", path.display()))?;
-    Ok((capacity_bytes, free_bytes.min(capacity_bytes)))
-}
-
 fn summarize_storage_stats(sample: &StorageStatsSample) -> NodeStorageStatsSummary {
     NodeStorageStatsSummary {
         collected_at_unix: sample.collected_at_unix,
@@ -7441,13 +7436,17 @@ fn summarize_storage_stats(sample: &StorageStatsSample) -> NodeStorageStatsSumma
 }
 
 async fn refresh_local_node_storage(state: &ServerState) {
-    let (capacity_bytes, free_bytes) = match storage_stats_for_path(&state.data_dir) {
+    let pool_capacity = {
+        let store = read_store(state, "storage_pool.capacity").await;
+        store.storage_pool_capacity()
+    };
+    let (capacity_bytes, free_bytes) = match pool_capacity {
         Ok(stats) => stats,
         Err(err) => {
             warn!(
                 path = %state.data_dir.display(),
                 error = %err,
-                "failed to refresh local node storage stats"
+                "failed to refresh local storage pool capacity"
             );
             return;
         }
@@ -16620,6 +16619,13 @@ struct StorageStatsCurrentResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct StoragePoolStatusResponse {
+    config_path: String,
+    config: StoragePoolConfig,
+    paths: Vec<StoragePathStats>,
+}
+
+#[derive(Debug, Serialize)]
 struct MetadataDbLogicalDistributionStatusResponse {
     state: MetadataDbLogicalDistributionActivityState,
     backend: MetadataBackendKind,
@@ -22932,6 +22938,67 @@ async fn storage_stats_current(
         }),
     )
         .into_response()
+}
+
+async fn storage_pool_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "storage_pool_read",
+        false,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let response = {
+        let store = read_store(&state, "storage_pool.status").await;
+        StoragePoolStatusResponse {
+            config_path: store.storage_pool_config_path(),
+            config: store.storage_pool_config(),
+            paths: store.storage_pool_paths().await,
+        }
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn rebalance_storage_pool(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        "storage_pool_rebalance",
+        true,
+        true,
+        json!({}),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let result = {
+        let store = lock_store(&state, "storage_pool.rebalance").await;
+        store.rebalance_storage_pool().await
+    };
+    match result {
+        Ok(report) => {
+            refresh_local_node_storage(&state).await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "storage pool rebalance failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn storage_stats_history(
