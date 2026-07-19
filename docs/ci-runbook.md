@@ -34,9 +34,17 @@ cargo fmt --all -- --check
 cargo +stable check --workspace
 cargo +stable clippy --workspace --all-targets -- -D warnings
 cargo +stable test --workspace
-cargo +stable llvm-cov --workspace --all-features --summary-only \
-	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(background-launcher|config-app|folder-agent|os-integration)/|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/client-sdk/src/content_addressed_client_cache.rs|crates/desktop-client-config/src/lib.rs|crates/desktop-status/|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_(conflicts|runtime|startup|state|ui)\.rs|crates/web-ui-backend/' \
-	--fail-under-lines 70
+cargo +stable llvm-cov \
+	-p client-sdk \
+	-p sync-core \
+	-p transport-sdk \
+	-p rendezvous-server \
+	-p server-node-sdk \
+	--lib \
+	--all-features \
+	--summary-only \
+	--ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
+	--fail-under-lines 68
 cd web && pnpm test:e2e:client-ui
 cd web && pnpm test:e2e:server-admin
 cd web && pnpm test:e2e:server-admin-rust
@@ -47,7 +55,7 @@ cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
 Pass or fail rule:
 
 - Each command must exit `0`.
-- `coverage` must stay at or above the `--fail-under-lines 70` floor.
+- `coverage` must stay at or above the `--fail-under-lines 68` floor.
 - `unit-tests` already excludes `tests/system-tests` implicitly because the workspace root excludes that crate; nightly system coverage belongs only to the `system-tests` lane.
 - On Linux, `unit-tests` now also covers the packaged config-app handoff regression through `apps/config-app/tests/package_handoff.rs`, because that integration test is part of the normal `cargo test --workspace` run on `ubuntu-latest`.
 - The `ios-build` lane is macOS-only. Reproduce it locally with:

@@ -72,5 +72,5 @@ jobs:
             --lib \
             --all-features \
             --summary-only \
-            --ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs|lib\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
+            --ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
             --fail-under-lines 68

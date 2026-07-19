@@ -136,14 +136,23 @@ This prevents pushes that would fail the CI rustfmt check.
 CI enforces a minimum line coverage floor using `cargo-llvm-cov`:
 
 ```bash
-cargo llvm-cov --workspace --all-features --summary-only \
-	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(background-launcher|config-app|folder-agent|os-integration)/|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/client-sdk/src/content_addressed_client_cache.rs|crates/desktop-client-config/src/lib.rs|crates/desktop-status/|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_(conflicts|runtime|startup|state|ui)\.rs|crates/web-ui-backend/' \
-	--fail-under-lines 70
+cargo llvm-cov \
+	-p client-sdk \
+	-p sync-core \
+	-p transport-sdk \
+	-p rendezvous-server \
+	-p server-node-sdk \
+	--lib \
+	--all-features \
+	--summary-only \
+	--ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
+	--fail-under-lines 68
 ```
 
 Notes:
 
 - The excluded files are shell/bootstrap entrypoints, desktop/system-integration surfaces, and system-test-covered wrappers that currently have no direct unit coverage.
+- `crates/server-node-sdk/src/lib.rs` is deliberately included: its HTTP routes and request handling are exercised by the SDK's in-process router tests.
 - The threshold is intentionally conservative for now and can be raised as targeted tests are added.
 
 ## Notes for mobile integration
