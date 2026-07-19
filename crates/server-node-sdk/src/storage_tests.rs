@@ -420,6 +420,16 @@ fn host_dependency_report_marks_ready_and_missing_video_tools() {
         .unwrap();
     assert_eq!(image_check.status, HostDependencyStatus::Builtin);
 
+    let cockpit_check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "cockpit")
+        .unwrap();
+    assert!(matches!(
+        &cockpit_check.status,
+        HostDependencyStatus::Ready | HostDependencyStatus::Optional
+    ));
+
     let ffprobe_check = report
         .checks
         .iter()
@@ -450,6 +460,28 @@ fn host_dependency_report_marks_ready_and_missing_video_tools() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn storage_pool_config_can_be_validated_saved_and_loaded_after_restart() {
+    let (root, store) = StorageTestBackend::Sqlite
+        .init_store("storage-pool-config-save")
+        .await;
+    let config = store.storage_pool_config();
+    let config_path = PathBuf::from(store.storage_pool_config_path());
+
+    store.validate_storage_pool_config(&config).await.unwrap();
+    store.save_storage_pool_config(&config).await.unwrap();
+
+    let saved = serde_json::from_slice::<StoragePoolConfig>(&fs::read(&config_path).await.unwrap())
+        .unwrap();
+    assert_eq!(saved, config);
+
+    drop(store);
+    let reloaded = StorageTestBackend::Sqlite.open_store(root.clone()).await;
+    assert_eq!(reloaded.storage_pool_config(), config);
+    drop(reloaded);
+    let _ = fs::remove_dir_all(&root).await;
 }
 
 #[derive(Clone, Copy)]

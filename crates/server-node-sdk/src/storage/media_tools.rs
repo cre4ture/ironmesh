@@ -21,6 +21,7 @@ pub enum HostDependencyStatus {
     Ready,
     Missing,
     Builtin,
+    Optional,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +71,7 @@ impl MediaToolPaths {
                     resolved_path: None,
                     install_hint: None,
                 },
+                cockpit_dependency_check(),
                 binary_dependency_check(
                     "video-metadata",
                     "Video metadata extraction",
@@ -85,6 +87,53 @@ impl MediaToolPaths {
             ],
         }
     }
+}
+
+fn cockpit_dependency_check() -> HostDependencyCheck {
+    let candidates = cockpit_ws_candidate_paths();
+    cockpit_dependency_check_for_candidates(&candidates)
+}
+
+fn cockpit_dependency_check_for_candidates(candidates: &[PathBuf]) -> HostDependencyCheck {
+    let resolved_path = candidates
+        .iter()
+        .find_map(|candidate| resolve_host_dependency_path(candidate));
+
+    match resolved_path {
+        Some(path) => HostDependencyCheck {
+            id: "cockpit".to_string(),
+            feature: "Cockpit host administration".to_string(),
+            status: HostDependencyStatus::Ready,
+            summary: format!("Cockpit web service found at {}", path.display()),
+            detail: "Cockpit is available as a separate host-administration interface. Use its own sign-in and UI for host-level tasks such as restarting the IronMesh service, applying updates, or rebooting the host. IronMesh does not invoke Cockpit or share credentials with it.".to_string(),
+            configured_path: None,
+            resolved_path: Some(path.display().to_string()),
+            install_hint: None,
+        },
+        None => HostDependencyCheck {
+            id: "cockpit".to_string(),
+            feature: "Cockpit host administration".to_string(),
+            status: HostDependencyStatus::Optional,
+            summary: "Cockpit web service was not found on this host".to_string(),
+            detail: "Cockpit is optional and is not required by IronMesh. If you use Cockpit for host administration, install and access it separately to restart the IronMesh service, apply updates, or reboot the host.".to_string(),
+            configured_path: None,
+            resolved_path: None,
+            install_hint: Some(
+                "Install Cockpit with your host distribution's package manager if you want a separate web interface for host administration.".to_string(),
+            ),
+        },
+    }
+}
+
+fn cockpit_ws_candidate_paths() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("cockpit-ws")];
+    #[cfg(unix)]
+    candidates.extend([
+        PathBuf::from("/usr/lib/cockpit/cockpit-ws"),
+        PathBuf::from("/usr/libexec/cockpit-ws"),
+        PathBuf::from("/usr/libexec/cockpit/cockpit-ws"),
+    ]);
+    candidates
 }
 
 fn binary_dependency_check(
@@ -189,6 +238,44 @@ fn dependency_path_is_executable(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cockpit_dependency_check_reports_optional_and_ready_states() {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ironmesh-cockpit-dependency-{unique_suffix}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let missing_path = root.join("missing-cockpit-ws");
+
+        let missing = cockpit_dependency_check_for_candidates(&[missing_path]);
+        assert_eq!(missing.status, HostDependencyStatus::Optional);
+        assert!(missing.resolved_path.is_none());
+
+        let cockpit_ws_path = root.join("cockpit-ws");
+        std::fs::write(&cockpit_ws_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&cockpit_ws_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&cockpit_ws_path, permissions).unwrap();
+
+        let ready = cockpit_dependency_check_for_candidates(&[cockpit_ws_path.clone()]);
+        assert_eq!(ready.status, HostDependencyStatus::Ready);
+        assert_eq!(
+            ready.resolved_path.as_deref(),
+            Some(cockpit_ws_path.to_string_lossy().as_ref())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

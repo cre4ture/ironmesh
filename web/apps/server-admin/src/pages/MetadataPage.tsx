@@ -43,6 +43,7 @@ import {
 } from "recharts";
 import { formatBytes, formatRelativeUnixTs, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
+import { StoragePoolConfigurationCard } from "../components/StoragePoolConfigurationCard";
 
 type MetadataHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
 
@@ -427,8 +428,8 @@ export function MetadataPage() {
               <Text fw={700}>Storage Pool</Text>
               <Text size="sm" c="dimmed" maw={820}>
                 Chunks and immutable manifests are placed across these node-local paths. The
-                metadata database remains in the node data directory. Edit the configuration file
-                and restart the node to add, disable, or drain a path.
+                metadata database remains in the node data directory. Use the configuration editor
+                below, then restart the node to add, disable, or drain a path.
               </Text>
               <Text size="xs" c="dimmed">
                 Configuration: <Code>{storagePool?.config_path ?? "loading…"}</Code>
@@ -493,6 +494,12 @@ export function MetadataPage() {
           )}
         </Stack>
       </Card>
+
+      <StoragePoolConfigurationCard
+        config={storagePool?.config ?? null}
+        configPath={storagePool?.config_path ?? null}
+        loading={storagePoolQuery.isLoading}
+      />
 
       <Card withBorder radius="md" padding="lg">
         <Stack gap="md">

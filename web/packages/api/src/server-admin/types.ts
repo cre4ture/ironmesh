@@ -482,7 +482,7 @@ export type DataScrubTriggerResponse = {
   node_results: DataScrubTriggerNodeResult[];
 };
 
-export type HostDependencyStatus = "ready" | "missing" | "builtin";
+export type HostDependencyStatus = "ready" | "missing" | "builtin" | "optional";
 
 export type HostDependencyCheck = {
   id: string;
@@ -720,6 +720,11 @@ export type StoragePoolStatusResponse = {
   config_path: string;
   config: StoragePoolConfig;
   paths: StoragePathStats[];
+};
+
+export type StoragePoolConfigMutationResponse = {
+  config_path: string;
+  restart_required: boolean;
 };
 
 export type StoragePoolRebalanceReport = {

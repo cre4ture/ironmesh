@@ -296,54 +296,11 @@ impl StoragePool {
         config: StoragePoolConfig,
         node_id: Option<NodeId>,
     ) -> Result<Self> {
-        if config.version != STORAGE_POOL_CONFIG_VERSION {
-            bail!(
-                "unsupported storage pool config version: {} (expected {})",
-                config.version,
-                STORAGE_POOL_CONFIG_VERSION
-            );
-        }
-        if config.paths.is_empty() {
-            bail!("storage pool config must contain at least one path");
-        }
+        validate_storage_pool_config(&config).await?;
 
-        let mut ids = HashSet::new();
-        let mut comparison_paths = Vec::<PathBuf>::new();
         let mut paths = Vec::with_capacity(config.paths.len());
         for path_config in config.paths {
-            validate_storage_path_config(&path_config)?;
-            if !ids.insert(path_config.id.clone()) {
-                bail!(
-                    "storage pool config contains duplicate path id {}",
-                    path_config.id
-                );
-            }
-
             let exists = fs::try_exists(&path_config.path).await?;
-            let comparison_path = if exists {
-                std::fs::canonicalize(&path_config.path).with_context(|| {
-                    format!(
-                        "failed resolving storage path {}",
-                        path_config.path.display()
-                    )
-                })?
-            } else if path_config.path.is_absolute() {
-                path_config.path.clone()
-            } else {
-                std::env::current_dir()
-                    .context("failed resolving relative storage path")?
-                    .join(&path_config.path)
-            };
-            if comparison_paths.iter().any(|existing| {
-                comparison_path.starts_with(existing) || existing.starts_with(&comparison_path)
-            }) {
-                bail!(
-                    "storage paths must not overlap: {}",
-                    comparison_path.display()
-                );
-            }
-            comparison_paths.push(comparison_path);
-
             if !exists {
                 paths.push(StoragePathRuntime {
                     chunks_dir: path_config.path.join("chunks"),
@@ -623,6 +580,65 @@ impl StoragePool {
         }
         Ok((capacity, free))
     }
+}
+
+async fn validate_storage_pool_config(config: &StoragePoolConfig) -> Result<()> {
+    if config.version != STORAGE_POOL_CONFIG_VERSION {
+        bail!(
+            "unsupported storage pool config version: {} (expected {})",
+            config.version,
+            STORAGE_POOL_CONFIG_VERSION
+        );
+    }
+    if config.paths.is_empty() {
+        bail!("storage pool config must contain at least one path");
+    }
+
+    let mut ids = HashSet::new();
+    let mut comparison_paths = Vec::<PathBuf>::new();
+    for path_config in &config.paths {
+        validate_storage_path_config(path_config)?;
+        if !ids.insert(path_config.id.clone()) {
+            bail!(
+                "storage pool config contains duplicate path id {}",
+                path_config.id
+            );
+        }
+
+        let exists = fs::try_exists(&path_config.path).await?;
+        let comparison_path = if exists {
+            let metadata = fs::metadata(&path_config.path).await?;
+            if !metadata.is_dir() {
+                bail!(
+                    "storage path {} must be a directory",
+                    path_config.path.display()
+                );
+            }
+            std::fs::canonicalize(&path_config.path).with_context(|| {
+                format!(
+                    "failed resolving storage path {}",
+                    path_config.path.display()
+                )
+            })?
+        } else if path_config.path.is_absolute() {
+            path_config.path.clone()
+        } else {
+            std::env::current_dir()
+                .context("failed resolving relative storage path")?
+                .join(&path_config.path)
+        };
+        if comparison_paths.iter().any(|existing| {
+            comparison_path.starts_with(existing) || existing.starts_with(&comparison_path)
+        }) {
+            bail!(
+                "storage paths must not overlap: {}",
+                comparison_path.display()
+            );
+        }
+        comparison_paths.push(comparison_path);
+    }
+
+    Ok(())
 }
 
 fn validate_storage_path_config(path: &StoragePathConfig) -> Result<()> {
@@ -3137,6 +3153,17 @@ impl PersistentStore {
 
     pub fn storage_pool_config_path(&self) -> String {
         self.storage_pool.config_path().display().to_string()
+    }
+
+    pub async fn validate_storage_pool_config(&self, config: &StoragePoolConfig) -> Result<()> {
+        validate_storage_pool_config(config).await
+    }
+
+    pub async fn save_storage_pool_config(&self, config: &StoragePoolConfig) -> Result<()> {
+        self.validate_storage_pool_config(config).await?;
+        let payload = serde_json::to_vec_pretty(config)
+            .context("failed serializing storage pool configuration")?;
+        write_atomic(self.storage_pool.config_path(), &payload).await
     }
 
     pub fn storage_pool_capacity(&self) -> Result<(u64, u64)> {
