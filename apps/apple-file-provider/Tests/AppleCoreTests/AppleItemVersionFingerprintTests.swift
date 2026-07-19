@@ -71,20 +71,25 @@ final class AppleItemVersionFingerprintTests: XCTestCase {
         XCTAssertEqual(error.userInfo["IronmeshCurrentRevision"] as? String, "v2")
     }
 
-    func testDirectoryDeleteIsNotAdvertisedAndUsesSnapshotCASReason() {
+    func testDirectoryDeleteIsAdvertisedAndUsesRecursiveRemotePath() {
         XCTAssertFalse(AppleDeletionCapabilityPolicy.allowsDeletion(for: .root))
-        XCTAssertFalse(AppleDeletionCapabilityPolicy.allowsDeletion(for: .directory))
+        XCTAssertTrue(AppleDeletionCapabilityPolicy.allowsDeletion(for: .directory))
         XCTAssertTrue(AppleDeletionCapabilityPolicy.allowsDeletion(for: .file))
         XCTAssertTrue(AppleDeletionCapabilityPolicy.allowsDeletion(for: .temporaryFile))
 
-        let error = ironmeshDeletionRejectedError(
-            path: "documents",
-            reason: "directory_snapshot_cas_required"
-        )
-        XCTAssertEqual(error.code, NSFileProviderError.Code.deletionRejected.rawValue)
         XCTAssertEqual(
-            error.userInfo["IronmeshConflictReason"] as? String,
-            "directory_snapshot_cas_required"
+            AppleDeletePathPolicy.remotePath(
+                forRemotePath: "profile/documents",
+                kind: AppleFileProviderItemKind.directory
+            ),
+            "profile/documents/"
+        )
+        XCTAssertEqual(
+            AppleDeletePathPolicy.remotePath(
+                forRemotePath: "profile/documents/report.txt",
+                kind: AppleFileProviderItemKind.file
+            ),
+            "profile/documents/report.txt"
         )
     }
 

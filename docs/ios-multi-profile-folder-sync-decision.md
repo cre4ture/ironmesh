@@ -73,20 +73,28 @@ are intentionally different: rename remains `cannotSynchronize`, while delete us
 `fileProviderErrorForRejectedDeletion` with the current item so Files restores the retained remote
 version.
 
-Directory deletion is recursive in the current Rust client. A directory-marker revision cannot
+Directory deletion is recursive in the current Rust client. A directory-marker revision does not
 protect its children because normal child mutations do not atomically bump that marker. The
-extension therefore rejects directory deletion rather than issuing a subtree delete that could
-erase a child created after enumeration. Adding a versioned namespace/snapshot CAS token is a
-server protocol change tracked in
-[#148](https://github.com/cre4ture/ironmesh/issues/148). Until then, directory items deliberately
-omit File Provider's delete capability so Files does not present an operation the provider must
-reject.
+accepted product decision is nevertheless to advertise directory deletion on iOS and to use the
+existing durable snapshot and object-version history as the recovery mechanism. A concurrent
+child mutation can therefore be deleted with the subtree and disappear from Files, but it remains
+recoverable through snapshot/version restoration; Files does not restore it automatically. The
+provider preserves the trailing slash required by the Rust client to request a recursive delete.
+
+This is deliberately a recoverability guarantee, not namespace compare-and-swap semantics. The
+stronger namespace snapshot CAS proposal in
+[#148](https://github.com/cre4ture/ironmesh/issues/148) is deferred rather than required for iOS
+folder deletion. Snapshot persistence and retention remain operational requirements for this
+product decision.
 
 ## Consequences and boundaries
 
 - Multiple profiles can be configured, paused, resumed, removed, and recovered independently.
 - Remote/local changes and deletions survive app/extension restarts through Files plus the durable
   generation journal.
+- Directory deletion is enabled in Files. It recursively tombstones the remote subtree; a
+  concurrent child change is recoverable from snapshot/version history, but is not automatically
+  restored or presented as a File Provider conflict copy.
 - Offline operation ordering and materialized-data lifetime remain OS responsibilities; IronMesh
   does not maintain a second foreground queue.
 - Profile scopes may overlap. They are separate Files domains and can surface the same remote object;

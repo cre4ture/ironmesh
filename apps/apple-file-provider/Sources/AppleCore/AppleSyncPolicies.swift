@@ -75,11 +75,24 @@ public enum AppleSyncRecoverySignalPolicy {
 public enum AppleDeletionCapabilityPolicy {
     public static func allowsDeletion(for kind: AppleFileProviderItemIdentifierKind) -> Bool {
         switch kind {
-        case .file, .temporaryFile:
+        case .file, .temporaryFile, .directory:
             true
-        case .root, .directory:
+        case .root:
             false
         }
+    }
+}
+
+public enum AppleDeletePathPolicy {
+    public static func remotePath(
+        forRemotePath remotePath: String,
+        kind: AppleFileProviderItemKind
+    ) -> String {
+        let normalized = normalizedPath(remotePath)
+        guard kind == .directory, !normalized.isEmpty else {
+            return normalized
+        }
+        return "\(normalized)/"
     }
 }
 

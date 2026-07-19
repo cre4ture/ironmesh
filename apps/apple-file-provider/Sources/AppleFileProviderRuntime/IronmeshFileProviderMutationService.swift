@@ -175,19 +175,13 @@ extension IronmeshFileProviderService {
                 )
             }
 
-            if item.kind == .directory {
-                // A trailing-slash delete is recursive in the Rust client. A marker revision does
-                // not cover children because ordinary child writes do not bump that marker.
-                throw deletionRejectedError(
-                    for: item,
-                    reason: "directory_snapshot_cas_required"
-                )
-            }
-
             let result: AppleMutationResult
             do {
                 result = try bridge.delete(
-                    path: pathMapper.remotePath(forLocalPath: item.path),
+                    path: AppleDeletePathPolicy.remotePath(
+                        forRemotePath: pathMapper.remotePath(forLocalPath: item.path),
+                        kind: item.kind
+                    ),
                     expectedRevision: item.revisionHint
                 )
             } catch {

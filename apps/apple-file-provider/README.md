@@ -43,9 +43,10 @@ separate Files domain backed by the shared enrolled device connection.
   **Keep Downloaded** action; iOS has no provider-level per-profile eager-retention API.
 - File mutations carry File Provider's base version to a server-side preferred-head compare-and-swap.
   Concurrent content edits are preserved under a deterministic visible conflict-copy name. A
-  Directory deletion remains disabled until namespace-level snapshot CAS can protect concurrent
-  child mutations; directory items therefore do not advertise deletion in Files. The protocol
-  follow-up is tracked in [#148](https://github.com/cre4ture/ironmesh/issues/148).
+  directory deletion is recursive and enabled in Files. A concurrent child mutation may be
+  deleted with that subtree, but is recoverable from the durable snapshot/version history; Files
+  does not restore it automatically. Namespace-level snapshot CAS is deliberately deferred in
+  [#148](https://github.com/cre4ture/ironmesh/issues/148).
 
 See [the multi-profile sync ADR](../../docs/ios-multi-profile-folder-sync-decision.md) for the
 architecture, platform compromises, guarantees, and known boundaries.
