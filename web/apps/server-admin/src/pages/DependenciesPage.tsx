@@ -37,6 +37,7 @@ export function DependenciesPage() {
   const missingCount = checks.filter((check) => check.status === "missing").length;
   const readyCount = checks.filter((check) => check.status === "ready").length;
   const builtinCount = checks.filter((check) => check.status === "builtin").length;
+  const optionalCount = checks.filter((check) => check.status === "optional").length;
 
   return (
     <Stack gap="lg">
@@ -52,11 +53,17 @@ export function DependenciesPage() {
           video metadata or thumbnail generation.
         </Alert>
       ) : null}
+      {optionalCount > 0 ? (
+        <Alert color="blue" title="Optional host administration tooling unavailable">
+          Cockpit is not installed on this host. IronMesh does not require it, but you can install and use Cockpit as a
+          separate web interface for service restarts, updates, and host reboots.
+        </Alert>
+      ) : null}
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
-          This page checks the host system for runtime dependencies that affect server-node features. The current focus
-          is media processing, where image thumbnails use the built-in Rust pipeline while video metadata and poster
-          generation rely on external tools such as ffprobe and ffmpeg.
+          This page checks the host system for runtime dependencies that affect server-node features and reports whether
+          optional Cockpit host administration tooling is installed. Cockpit remains a separate, separately authenticated
+          interface for host-level operations; IronMesh does not restart services or the host itself.
         </Text>
         <Button variant="light" onClick={() => void refresh()} loading={loading}>
           Refresh
@@ -64,32 +71,39 @@ export function DependenciesPage() {
       </Group>
 
       <Grid>
-        <Grid.Col span={{ base: 12, md: 3 }}>
+        <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
           <StatCard
             label="Host OS"
             value={report?.host_os || (loading ? "loading..." : "unknown")}
             hint={`Last checked: ${formatUnixTs(report?.generated_at_unix)}`}
           />
         </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 3 }}>
+        <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
           <StatCard
-            label="Missing"
+            label="Required missing"
             value={loading && !report ? "loading..." : String(missingCount)}
             hint={missingCount > 0 ? "Resolve before media tests" : "No blocking host gaps detected"}
           />
         </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 3 }}>
+        <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
           <StatCard
             label="Resolved"
             value={loading && !report ? "loading..." : String(readyCount)}
             hint="External dependencies found on this node"
           />
         </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 3 }}>
+        <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
           <StatCard
             label="Built-in"
             value={loading && !report ? "loading..." : String(builtinCount)}
             hint="Checks that do not need host packages"
+          />
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
+          <StatCard
+            label="Optional"
+            value={loading && !report ? "loading..." : String(optionalCount)}
+            hint={optionalCount > 0 ? "Advisory checks unavailable" : "Optional tooling detected"}
           />
         </Grid.Col>
       </Grid>
@@ -141,6 +155,8 @@ function dependencyBadgeColor(status: HostDependencyStatus): string {
       return "red";
     case "builtin":
       return "blue";
+    case "optional":
+      return "gray";
   }
 }
 
@@ -152,5 +168,7 @@ function dependencyBadgeLabel(status: HostDependencyStatus): string {
       return "missing";
     case "builtin":
       return "built-in";
+    case "optional":
+      return "optional";
   }
 }

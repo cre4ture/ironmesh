@@ -104,7 +104,7 @@ export const serverAdminRoutes = [
   {
     id: "dependencies",
     label: "Dependencies",
-    description: "Check host runtime dependencies such as ffprobe and ffmpeg before media-heavy test rounds.",
+    description: "Check host runtime dependencies and optional host administration tooling such as Cockpit.",
     icon: IconServerCog,
     element: <DependenciesPage />
   },

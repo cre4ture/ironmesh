@@ -58,6 +58,8 @@ import type {
   StorageStatsCurrentResponse,
   StorageStatsSample,
   StoragePoolRebalanceReport,
+  StoragePoolConfig,
+  StoragePoolConfigMutationResponse,
   StoragePoolStatusResponse,
   StoreListRequestOptions,
   StoreListView,
@@ -761,6 +763,28 @@ export async function getStoragePoolStatus(
   adminTokenOverride?: string
 ): Promise<StoragePoolStatusResponse> {
   return fetchAdminJson<StoragePoolStatusResponse>(apiV1("/auth/storage/pool"), {
+    adminTokenOverride
+  });
+}
+
+export async function validateStoragePoolConfig(
+  config: StoragePoolConfig,
+  adminTokenOverride?: string
+): Promise<StoragePoolConfigMutationResponse> {
+  return fetchAdminJson<StoragePoolConfigMutationResponse>(apiV1("/auth/storage/pool/config/validate"), {
+    method: "POST",
+    body: config,
+    adminTokenOverride
+  });
+}
+
+export async function updateStoragePoolConfig(
+  config: StoragePoolConfig,
+  adminTokenOverride?: string
+): Promise<StoragePoolConfigMutationResponse> {
+  return fetchAdminJson<StoragePoolConfigMutationResponse>(apiV1("/auth/storage/pool/config"), {
+    method: "PUT",
+    body: config,
     adminTokenOverride
   });
 }

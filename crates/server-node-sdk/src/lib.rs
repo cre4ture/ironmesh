@@ -6867,6 +6867,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
                 .post(start_metadata_db_logical_distribution),
         )
         .route("/auth/storage/pool", get(storage_pool_status))
+        .route("/auth/storage/pool/config", put(update_storage_pool_config))
+        .route(
+            "/auth/storage/pool/config/validate",
+            post(validate_storage_pool_config_handler),
+        )
         .route("/auth/storage/pool/rebalance", post(rebalance_storage_pool))
         .route("/auth/versions/{key}", get(list_versions_admin))
         .route(
@@ -16798,6 +16803,12 @@ struct StoragePoolStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct StoragePoolConfigMutationResponse {
+    config_path: String,
+    restart_required: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct MetadataDbLogicalDistributionStatusResponse {
     state: MetadataDbLogicalDistributionActivityState,
     backend: MetadataBackendKind,
@@ -23138,6 +23149,138 @@ async fn storage_pool_status(
         }
     };
     (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn validate_storage_pool_config_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(config): Json<StoragePoolConfig>,
+) -> impl IntoResponse {
+    let action = "storage_pool_config_validate";
+    let audit_details = json!({
+        "version": config.version,
+        "path_count": config.paths.len(),
+    });
+    let authz =
+        match authorize_admin_request(&state, &headers, action, true, true, audit_details.clone())
+            .await
+        {
+            Ok(request) => request,
+            Err(status) => return status.into_response(),
+        };
+
+    let result = {
+        let store = read_store(&state, "storage_pool.config_validate").await;
+        let config_path = store.storage_pool_config_path();
+        store
+            .validate_storage_pool_config(&config)
+            .await
+            .map(|()| config_path)
+    };
+    match result {
+        Ok(config_path) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "success",
+                audit_details,
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(StoragePoolConfigMutationResponse {
+                    config_path,
+                    restart_required: true,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            let message = err.to_string();
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "validation_failed",
+                json!({ "error": message, "version": config.version, "path_count": config.paths.len() }),
+            )
+            .await;
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+        }
+    }
+}
+
+async fn update_storage_pool_config(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(config): Json<StoragePoolConfig>,
+) -> impl IntoResponse {
+    let action = "storage_pool_config_save";
+    let audit_details = json!({
+        "version": config.version,
+        "path_count": config.paths.len(),
+    });
+    let authz =
+        match authorize_admin_request(&state, &headers, action, false, true, audit_details.clone())
+            .await
+        {
+            Ok(request) => request,
+            Err(status) => return status.into_response(),
+        };
+
+    let result = {
+        let store = lock_store(&state, "storage_pool.config_save").await;
+        let config_path = store.storage_pool_config_path();
+        store
+            .save_storage_pool_config(&config)
+            .await
+            .map(|()| config_path)
+    };
+    match result {
+        Ok(config_path) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "success",
+                audit_details,
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(StoragePoolConfigMutationResponse {
+                    config_path,
+                    restart_required: true,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            let message = err.to_string();
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "save_failed",
+                json!({ "error": message, "version": config.version, "path_count": config.paths.len() }),
+            )
+            .await;
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+        }
+    }
 }
 
 async fn rebalance_storage_pool(
