@@ -21,6 +21,7 @@ AUTO_ADD_TARGET="${IRONMESH_RENDEZVOUS_DEPLOY_AUTO_ADD_TARGET:-${IRONMESH_RENDEZ
 SKIP_BUILD=0
 HOSTS_FILE=""
 LOCAL_BINARY=""
+EXPECTED_PACKAGE_VERSION=""
 
 declare -a REMOTES=()
 declare -a SSH_OPTIONS=()
@@ -350,7 +351,29 @@ resolve_remote_layout() {
     REMOTE_MATCH_PATTERN="$REMOTE_BINARY"
   fi
 
-  LOCAL_BINARY="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${BINARY_NAME}"
+}
+
+resolve_local_build_artifact() {
+  local metadata package_pattern target_pattern target_dir
+
+  require_command cargo
+  metadata="$(cargo metadata --manifest-path "$MANIFEST_PATH" --no-deps --format-version=1)"
+
+  package_pattern="\"name\":\"${PACKAGE_NAME}\",\"version\":\"([^\"]+)\""
+  if [[ "$metadata" =~ $package_pattern ]]; then
+    EXPECTED_PACKAGE_VERSION="${BASH_REMATCH[1]}"
+  else
+    fail "failed resolving package version for ${PACKAGE_NAME} from cargo metadata"
+  fi
+
+  target_pattern='"target_directory":"([^"]+)"'
+  if [[ "$metadata" =~ $target_pattern ]]; then
+    target_dir="${BASH_REMATCH[1]}"
+  else
+    fail "failed resolving Cargo target directory from cargo metadata"
+  fi
+
+  LOCAL_BINARY="${target_dir}/${TARGET_TRIPLE}/release/${BINARY_NAME}"
 }
 
 ensure_inputs() {
@@ -380,12 +403,25 @@ build_binary() {
     return 0
   fi
 
-  require_command cargo
   require_command rustup
   ensure_target_installed
   log "building ${PACKAGE_NAME} for ${TARGET_TRIPLE}"
   cargo build --manifest-path "$MANIFEST_PATH" --release --target "$TARGET_TRIPLE"
   [[ -x "$LOCAL_BINARY" ]] || fail "build finished without producing $LOCAL_BINARY"
+}
+
+verify_local_binary_version() {
+  local version_output first_line expected_line
+
+  [[ -x "$LOCAL_BINARY" ]] || fail "local binary not found: $LOCAL_BINARY"
+  version_output="$("$LOCAL_BINARY" --version 2>&1)" \
+    || fail "failed reading version from local binary $LOCAL_BINARY: $version_output"
+  first_line="${version_output%%$'\n'*}"
+  expected_line="${BINARY_NAME} ${EXPECTED_PACKAGE_VERSION}"
+
+  [[ "$first_line" == "$expected_line" ]] || fail \
+    "local binary version does not match ${PACKAGE_NAME} ${EXPECTED_PACKAGE_VERSION}: ${first_line} (${LOCAL_BINARY})"
+  log "verified local ${BINARY_NAME} version ${EXPECTED_PACKAGE_VERSION} at ${LOCAL_BINARY}"
 }
 
 stop_remote_service() {
@@ -577,7 +613,9 @@ main() {
   load_hosts_file
   ensure_inputs
   resolve_remote_layout
+  resolve_local_build_artifact
   build_binary
+  verify_local_binary_version
 
   for host in "${REMOTES[@]}"; do
     deploy_host "$host"
@@ -586,4 +624,6 @@ main() {
   log "deployment completed for ${#REMOTES[@]} remote(s)"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
