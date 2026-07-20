@@ -63,7 +63,7 @@ jobs:
 
       - name: Enforce line coverage threshold
         run: |
-          cargo llvm-cov \
+          cargo llvm-cov --locked \
             -p client-sdk \
             -p sync-core \
             -p transport-sdk \

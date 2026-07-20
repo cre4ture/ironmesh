@@ -99,7 +99,7 @@ resolve_local_binary() {
   LOCAL_BINARY="${ROOT_DIR}/target/${PROFILE}/ironmesh"
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
     log "building local ironmesh binary with cargo profile=${PROFILE}"
-    cargo build -p cli-client "--profile=${PROFILE}" --manifest-path "${ROOT_DIR}/Cargo.toml"
+    cargo build --locked -p cli-client "--profile=${PROFILE}" --manifest-path "${ROOT_DIR}/Cargo.toml"
   fi
 
   [[ -f "$LOCAL_BINARY" ]] || fail "built binary not found: $LOCAL_BINARY"

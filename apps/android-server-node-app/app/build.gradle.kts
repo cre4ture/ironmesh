@@ -277,6 +277,7 @@ fun registerRustBuildTask(taskName: String, buildType: String) = tasks.register<
             "-o",
             outDir.absolutePath,
             "build",
+            "--locked",
             "-p",
             "android-server-node-app",
         ),

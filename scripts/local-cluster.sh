@@ -140,7 +140,7 @@ ensure_binary() {
   fi
 
   echo "[local-cluster] Building fresh server-node binary..."
-  (cd "${ROOT_DIR}" && cargo build -p server-node)
+  (cd "${ROOT_DIR}" && cargo build --locked -p server-node)
 }
 
 ensure_openssl() {

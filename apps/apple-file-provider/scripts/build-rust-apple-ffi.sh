@@ -69,7 +69,7 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
 rustup target add "$RUST_TARGET" --toolchain nightly-2026-02-17 >/dev/null 2>&1 || true
 
 cd "$REPO_DIR"
-cargo build -p ios-app --target "$RUST_TARGET" $PROFILE_FLAG
+cargo build --locked -p ios-app --target "$RUST_TARGET" $PROFILE_FLAG
 apps/ios-app/scripts/generate_c_header.sh
 
 mkdir -p "$ARTIFACT_DIR"

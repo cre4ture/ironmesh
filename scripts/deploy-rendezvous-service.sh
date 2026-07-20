@@ -384,7 +384,7 @@ build_binary() {
   require_command rustup
   ensure_target_installed
   log "building ${PACKAGE_NAME} for ${TARGET_TRIPLE}"
-  cargo build --manifest-path "$MANIFEST_PATH" --release --target "$TARGET_TRIPLE"
+  cargo build --locked --manifest-path "$MANIFEST_PATH" --release --target "$TARGET_TRIPLE"
   [[ -x "$LOCAL_BINARY" ]] || fail "build finished without producing $LOCAL_BINARY"
 }
 
