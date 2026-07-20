@@ -1,3 +1,18 @@
+ironmesh (1.0.35-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add global rendezvous control-plane registration, relay security hardening,
+    and direct QUIC transport capabilities.
+  * Add storage pool and map import administration workflows with diagnostics and
+    user guidance in the server admin UI.
+  * Improve client and mobile synchronization behavior with connection-path and
+    gallery workflow enhancements.
+  * Expand hardware health reporting and reliability instrumentation for server
+    and relay deployments.
+  * Refresh S3 and media test coverage across transport and relay stacks.
+  * Roll the workspace release to 1.0.35.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 20 Jul 2026 03:01:13 +0200
+
 ironmesh (1.0.34-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add S3 frontend support with replicated control-plane APIs, relay-capable
