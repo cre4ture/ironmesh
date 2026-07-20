@@ -21459,7 +21459,7 @@ async fn renew_node_enrollment_for_authenticated_caller(
         .map(|details| details.certificate_fingerprint);
 
     let internal_tls_material = match issue_internal_node_tls_material_for_identity(
-        &state,
+        state,
         state.cluster_id,
         caller.node_id,
         issue_policy,
@@ -21483,7 +21483,7 @@ async fn renew_node_enrollment_for_authenticated_caller(
                     }
                 };
             match issue_public_node_tls_material_with_subject_alt_names(
-                &state,
+                state,
                 caller.node_id,
                 subject_alt_names,
                 issue_policy,
@@ -21500,7 +21500,7 @@ async fn renew_node_enrollment_for_authenticated_caller(
         None => None,
     };
 
-    let trust_roots = match bootstrap_trust_roots(&state) {
+    let trust_roots = match bootstrap_trust_roots(state) {
         Ok(trust_roots) => trust_roots,
         Err(status) => {
             return Err((status, "failed to resolve renewal trust roots".to_string()));
@@ -21510,7 +21510,7 @@ async fn renew_node_enrollment_for_authenticated_caller(
         cluster_id: state.cluster_id,
         node_id: caller.node_id,
         trust_roots,
-        enrollment_issuer_url: local_public_enrollment_issuer_url(&state).await,
+        enrollment_issuer_url: local_public_enrollment_issuer_url(state).await,
         public_tls_material,
         internal_tls_material,
     };
