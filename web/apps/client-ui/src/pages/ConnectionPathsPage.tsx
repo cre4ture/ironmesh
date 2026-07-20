@@ -29,6 +29,12 @@ type ConnectionSummary = {
   color: string;
 };
 
+type HolePunchingSummary = {
+  label: string;
+  detail: string;
+  color: string;
+};
+
 const SNAPSHOT_POLL_MS = 5000;
 
 export function ConnectionPathsPage() {
@@ -89,6 +95,7 @@ export function ConnectionPathsPage() {
   const activeEndpoint =
     routes?.endpoints.find((endpoint) => endpoint.active) ?? rankedEndpoints[0] ?? null;
   const preferredEndpoint = rankedEndpoints[0] ?? null;
+  const holePunchingSummary = buildHolePunchingSummary(routes, activeEndpoint);
   const directCount = routes?.endpoints.filter(isDirectPath).length ?? 0;
   const relayCount = routes?.endpoints.filter((endpoint) => endpoint.path_kind === "relay_tunnel").length ?? 0;
   const healthyCount =
@@ -156,12 +163,25 @@ export function ConnectionPathsPage() {
         />
       </SimpleGrid>
 
-      <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }}>
+      <SimpleGrid cols={{ base: 1, md: 2, xl: 5 }}>
         <StatCard label="Direct methods" value={loading ? "Loading..." : directCount} />
         <StatCard label="Relay methods" value={loading ? "Loading..." : relayCount} />
         <StatCard
           label="Current transport"
           value={rendezvous?.transport_mode ?? (loading ? "Loading..." : "Unknown")}
+        />
+        <StatCard
+          label="Hole punching"
+          value={
+            loading ? (
+              "Loading..."
+            ) : (
+              <Badge color={holePunchingSummary.color} variant="light">
+                {holePunchingSummary.label}
+              </Badge>
+            )
+          }
+          hint={holePunchingSummary.detail}
         />
         <StatCard
           label="Snapshot time"
@@ -207,6 +227,11 @@ export function ConnectionPathsPage() {
                           probing
                         </Badge>
                       ) : null}
+                      {endpoint.path_kind === "direct_quic" ? (
+                        <Badge color={holePunchingModeColor(endpoint)} variant="light">
+                          {holePunchingModeLabel(endpoint)}
+                        </Badge>
+                      ) : null}
                       {isCoolingDown(endpoint, snapshotUnixMs) ? (
                         <Badge color="red" variant="light">
                           cooling down
@@ -238,6 +263,14 @@ export function ConnectionPathsPage() {
                       <Table.Tr>
                         <Table.Th>Target node</Table.Th>
                         <Table.Td>{endpoint.target_node_id ?? "n/a"}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Hole punching mode</Table.Th>
+                        <Table.Td>
+                          {endpoint.path_kind === "direct_quic"
+                            ? holePunchingModeLabel(endpoint)
+                            : "n/a"}
+                        </Table.Td>
                       </Table.Tr>
                       <Table.Tr>
                         <Table.Th>Bootstrap order</Table.Th>
@@ -339,6 +372,87 @@ export function ConnectionPathsPage() {
       </Grid>
     </>
   );
+}
+
+function buildHolePunchingSummary(
+  routes: ClientConnectionRouteSnapshot | null,
+  activeEndpoint: ClientConnectionRouteEndpointSnapshot | null
+): HolePunchingSummary {
+  const directQuicEndpoints =
+    routes?.endpoints.filter((endpoint) => endpoint.path_kind === "direct_quic") ?? [];
+
+  if (directQuicEndpoints.length === 0) {
+    return {
+      label: "Unavailable",
+      detail: "No direct QUIC candidate is available for hole punching.",
+      color: "gray"
+    };
+  }
+
+  if (
+    activeEndpoint?.path_kind === "direct_quic" &&
+    holePunchingMode(activeEndpoint) === "direct"
+  ) {
+    return {
+      label: "Direct",
+      detail: "A direct QUIC path is currently selected.",
+      color: "green"
+    };
+  }
+
+  if (directQuicEndpoints.some((endpoint) => holePunchingMode(endpoint) === "direct")) {
+    return {
+      label: "Direct",
+      detail: "Hole punching has established a direct QUIC path; it is not the active route now.",
+      color: "green"
+    };
+  }
+
+  if (directQuicEndpoints.some((endpoint) => holePunchingMode(endpoint) === "unknown")) {
+    return {
+      label: "Checking",
+      detail: "The direct QUIC session has not reported a selected network path yet.",
+      color: "yellow"
+    };
+  }
+
+  return {
+    label: "Relay fallback",
+    detail: "Direct QUIC is available, but the current session is using its relay path.",
+    color: "teal"
+  };
+}
+
+function holePunchingMode(endpoint: ClientConnectionRouteEndpointSnapshot): "direct" | "relay" | "unknown" {
+  if (endpoint.hole_punching_mode === "direct") {
+    return "direct";
+  }
+  if (endpoint.hole_punching_mode === "relay") {
+    return "relay";
+  }
+  return "unknown";
+}
+
+function holePunchingModeLabel(endpoint: ClientConnectionRouteEndpointSnapshot): string {
+  switch (holePunchingMode(endpoint)) {
+    case "direct":
+      return "direct path";
+    case "relay":
+      return "relay fallback";
+    default:
+      return "not established";
+  }
+}
+
+function holePunchingModeColor(endpoint: ClientConnectionRouteEndpointSnapshot): string {
+  switch (holePunchingMode(endpoint)) {
+    case "direct":
+      return "green";
+    case "relay":
+      return "teal";
+    default:
+      return "gray";
+  }
 }
 
 function buildConnectionSummary(

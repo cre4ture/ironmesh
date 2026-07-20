@@ -52,6 +52,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("heading", { name: "Direct HTTPS to node-alpha" }).first()).toBeVisible();
   await expect(page.getByText("Relay via rendezvous-a.local:9443 to node-alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("Relay via rendezvous-b.local:9443 to node-alpha", { exact: true })).toBeVisible();
+  await expect(page.getByText("Hole punching", { exact: true })).toBeVisible();
+  await expect(page.getByText("direct path", { exact: true }).first()).toBeVisible();
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
   await expect(page.getByText("Recent client runtime logs", { exact: true })).toBeVisible();
@@ -787,6 +789,28 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         circuit_open_until_unix_ms: null,
         background_probe_in_flight: false,
         last_background_probe_unix_ms: 1_712_345_592_000,
+        last_error: null
+      },
+      {
+        index: 4,
+        path_kind: "direct_quic",
+        locator: "iroh://node-alpha",
+        bootstrap_rank: 2,
+        target_node_id: "node-alpha",
+        active: false,
+        score: 74.2,
+        ewma_latency_ms: 24.2,
+        ewma_throughput_bytes_per_sec: 210000,
+        consecutive_failures: 0,
+        total_failures: 0,
+        total_successes: 2,
+        last_measurement_unix_ms: 1_712_345_597_000,
+        last_success_unix_ms: 1_712_345_597_000,
+        last_failure_unix_ms: null,
+        circuit_open_until_unix_ms: null,
+        background_probe_in_flight: false,
+        last_background_probe_unix_ms: 1_712_345_596_000,
+        hole_punching_mode: "direct",
         last_error: null
       }
     ]

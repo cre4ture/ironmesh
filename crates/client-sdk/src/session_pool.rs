@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::NodeId;
+use futures_util::StreamExt;
 use iroh::SecretKey;
+use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,7 +61,12 @@ struct TransportSessionPoolStats {
     connect_count: AtomicU64,
     reuse_count: AtomicU64,
     reset_count: AtomicU64,
+    direct_connection_mode: AtomicU64,
 }
+
+const DIRECT_CONNECTION_MODE_UNKNOWN: u64 = 0;
+const DIRECT_CONNECTION_MODE_DIRECT: u64 = 1;
+const DIRECT_CONNECTION_MODE_RELAY: u64 = 2;
 
 impl TransportSessionPool {
     pub(crate) fn new_direct(
@@ -117,10 +124,27 @@ impl TransportSessionPool {
         }
     }
 
+    pub(crate) fn hole_punching_mode(&self) -> Option<&'static str> {
+        if !matches!(&self.target, SessionPoolTarget::DirectQuic { .. }) {
+            return None;
+        }
+
+        Some(
+            match self.stats.direct_connection_mode.load(Ordering::Relaxed) {
+                DIRECT_CONNECTION_MODE_DIRECT => "direct",
+                DIRECT_CONNECTION_MODE_RELAY => "relay",
+                _ => "unknown",
+            },
+        )
+    }
+
     pub(crate) async fn invalidate(&self) {
         let mut guard = self.cached_session.lock().await;
         if guard.take().is_some() {
             self.stats.reset_count.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .direct_connection_mode
+                .store(DIRECT_CONNECTION_MODE_UNKNOWN, Ordering::Relaxed);
         }
     }
 
@@ -182,6 +206,8 @@ impl TransportSessionPool {
                     .with_context(|| {
                         format!("failed opening direct QUIC transport session to {target_label}")
                     })?;
+                self.update_hole_punching_mode(&direct_quic.connection);
+                self.spawn_hole_punching_monitor(direct_quic.connection.clone());
                 (
                     direct_quic.session,
                     format!("failed performing direct QUIC transport handshake for {target_label}"),
@@ -214,6 +240,50 @@ impl TransportSessionPool {
         });
         self.stats.connect_count.fetch_add(1, Ordering::Relaxed);
         Ok(session)
+    }
+
+    fn update_hole_punching_mode(&self, connection: &Connection) {
+        let mode = connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| {
+                if path.is_ip() {
+                    DIRECT_CONNECTION_MODE_DIRECT
+                } else if path.is_relay() {
+                    DIRECT_CONNECTION_MODE_RELAY
+                } else {
+                    DIRECT_CONNECTION_MODE_UNKNOWN
+                }
+            })
+            .unwrap_or(DIRECT_CONNECTION_MODE_UNKNOWN);
+        self.stats
+            .direct_connection_mode
+            .store(mode, Ordering::Relaxed);
+    }
+
+    fn spawn_hole_punching_monitor(&self, connection: Connection) {
+        let stats = Arc::clone(&self.stats);
+        tokio::spawn(async move {
+            let mut events = connection.path_events();
+            while events.next().await.is_some() {
+                let mode = connection
+                    .paths()
+                    .iter()
+                    .find(|path| path.is_selected())
+                    .map(|path| {
+                        if path.is_ip() {
+                            DIRECT_CONNECTION_MODE_DIRECT
+                        } else if path.is_relay() {
+                            DIRECT_CONNECTION_MODE_RELAY
+                        } else {
+                            DIRECT_CONNECTION_MODE_UNKNOWN
+                        }
+                    })
+                    .unwrap_or(DIRECT_CONNECTION_MODE_UNKNOWN);
+                stats.direct_connection_mode.store(mode, Ordering::Relaxed);
+            }
+        });
     }
 
     pub(crate) async fn ensure_relay_session(

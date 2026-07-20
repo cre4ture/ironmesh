@@ -246,6 +246,8 @@ pub struct ClientConnectionRouteSnapshot {
 pub struct ClientConnectionRouteEndpointSnapshot {
     pub index: usize,
     pub path_kind: TransportPathKind,
+    #[serde(default)]
+    pub hole_punching_mode: Option<String>,
     pub locator: String,
     pub bootstrap_rank: usize,
     #[serde(default)]
@@ -380,6 +382,15 @@ impl ClientTransport {
                 session_pool.snapshot()
             }
             Self::Relay(relay) => relay.session_pool.snapshot(),
+        }
+    }
+
+    fn hole_punching_mode(&self) -> Option<String> {
+        match self {
+            Self::DirectQuic { session_pool, .. } => {
+                session_pool.hole_punching_mode().map(str::to_string)
+            }
+            Self::DirectHttp { .. } | Self::Relay(_) => None,
         }
     }
 
@@ -594,6 +605,7 @@ impl ClientEndpointRouter {
                 ClientConnectionRouteEndpointSnapshot {
                     index,
                     path_kind: endpoint.transport.transport_path_kind(),
+                    hole_punching_mode: endpoint.transport.hole_punching_mode(),
                     locator: endpoint.descriptor.locator.clone(),
                     bootstrap_rank: endpoint.descriptor.bootstrap_rank,
                     target_node_id: endpoint.transport.target_node_id(),

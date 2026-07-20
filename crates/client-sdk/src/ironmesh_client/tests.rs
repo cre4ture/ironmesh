@@ -2865,6 +2865,10 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
             route_snapshot.endpoints[0].path_kind,
             transport_sdk::TransportPathKind::DirectQuic
         );
+        assert_eq!(
+            route_snapshot.endpoints[0].hole_punching_mode.as_deref(),
+            Some("direct")
+        );
         assert_eq!(client.transport_session_pool_snapshot().connect_count, 1);
         assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
 

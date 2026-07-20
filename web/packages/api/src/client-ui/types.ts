@@ -27,6 +27,7 @@ export type ClientUiRuntimeInfo = {
 export type ClientConnectionRouteEndpointSnapshot = {
   index: number;
   path_kind: "direct_https" | "direct_quic" | "relay_tunnel";
+  hole_punching_mode?: "direct" | "relay" | "unknown" | string | null;
   locator: string;
   bootstrap_rank: number;
   target_node_id?: string | null;
