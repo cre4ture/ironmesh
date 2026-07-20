@@ -3920,7 +3920,59 @@ fn node_enrollment_due_for_renewal(package: &NodeEnrollmentPackage, now: u64) ->
     ]
     .into_iter()
     .flatten()
-    .any(|material| material.metadata.renew_after_unix <= now)
+    .any(|material| {
+        material.metadata.renew_after_unix <= now
+            || tls_material_requires_node_identity_san_migration(
+                material,
+                package.bootstrap.node_id,
+                package.bootstrap.cluster_id,
+            )
+    })
+}
+
+/// TLS credentials issued before stable node identities were added to the public certificate
+/// profile cannot be used by current direct transports.  Treat those credentials as due
+/// immediately, rather than waiting for their ordinary time-based renewal window.  The actual
+/// renewal request still uses the existing authenticated internal mTLS path.
+fn tls_material_requires_node_identity_san_migration(
+    material: &BootstrapMutualTlsMaterial,
+    expected_node_id: NodeId,
+    expected_cluster_id: ClusterId,
+) -> bool {
+    !certificate_has_expected_node_identity_uri_sans(
+        &material.cert_pem,
+        expected_node_id,
+        expected_cluster_id,
+    )
+    .unwrap_or(false)
+}
+
+fn certificate_has_expected_node_identity_uri_sans(
+    cert_pem: &str,
+    expected_node_id: NodeId,
+    expected_cluster_id: ClusterId,
+) -> Result<bool> {
+    let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+        .context("failed parsing TLS certificate PEM for node identity SAN migration")?;
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert_der.as_ref())
+        .context("failed parsing TLS certificate DER for node identity SAN migration")?;
+    let expected_node_uri = format!("urn:ironmesh:node:{expected_node_id}");
+    let expected_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
+    let mut has_node_uri = false;
+    let mut has_cluster_uri = false;
+
+    for extension in parsed.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+            for name in &san.general_names {
+                if let x509_parser::extensions::GeneralName::URI(uri) = name {
+                    has_node_uri |= *uri == expected_node_uri;
+                    has_cluster_uri |= *uri == expected_cluster_uri;
+                }
+            }
+        }
+    }
+
+    Ok(has_node_uri && has_cluster_uri)
 }
 
 async fn resolve_node_enrollment_issuer_descriptor(

@@ -806,6 +806,37 @@ fn default_tls_issue_policy() -> super::NodeTlsIssuePolicy {
     super::build_tls_issue_policy(None, None).unwrap()
 }
 
+fn issue_legacy_public_node_tls_material(
+    cluster_ca_pem: &str,
+    cluster_ca_key_pem: &str,
+    node_id: NodeId,
+    bind_addr: SocketAddr,
+    policy: super::NodeTlsIssuePolicy,
+) -> transport_sdk::BootstrapMutualTlsMaterial {
+    let issuer_key = rcgen::KeyPair::from_pem(cluster_ca_key_pem).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_pem(cluster_ca_pem, issuer_key).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        format!("ironmesh-public-{node_id}"),
+    );
+    params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64).unwrap();
+    params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64).unwrap();
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    params.subject_alt_names = vec![rcgen::SanType::IpAddress(bind_addr.ip())];
+
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key_pair, &issuer).unwrap();
+    let cert_pem = cert.pem();
+    transport_sdk::BootstrapMutualTlsMaterial {
+        ca_cert_pem: cluster_ca_pem.to_string(),
+        cert_pem: cert_pem.clone(),
+        key_pem: key_pair.serialize_pem(),
+        metadata: super::build_tls_material_metadata(&cert_pem, policy).unwrap(),
+    }
+}
+
 fn load_root_store_from_pem_file(path: &std::path::Path) -> RootCertStore {
     let mut reader = BufReader::new(File::open(path).unwrap());
     let mut roots = RootCertStore::empty();
@@ -9799,7 +9830,7 @@ async fn manual_node_enrollment_renewal_forces_live_tls_reload() {
 }
 
 #[tokio::test]
-async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_certificates() {
+async fn automatic_renewal_migrates_missing_identity_uri_sans() {
     let root = fresh_test_dir("node-auto-renew-served-certs");
     let issuer_dir = root.join("issuer");
     let issuer_bind_addr = free_bind_addr();
@@ -9877,13 +9908,29 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     let issue_policy = default_tls_issue_policy();
     let mut internal_material =
         super::issue_internal_node_tls_material(&state, &bootstrap, issue_policy).unwrap();
-    let mut public_material =
-        super::issue_public_node_tls_material(&state, &bootstrap, issue_policy)
-            .unwrap()
-            .unwrap();
-    let renew_after_unix = super::unix_ts().saturating_add(5);
+    // This mirrors enrollment packages issued before public node certificates carried the
+    // stable node/cluster URI SANs.  Their normal renewal window is still far away, but current
+    // direct transports cannot authenticate them safely until the profile is migrated.
+    let mut public_material = issue_legacy_public_node_tls_material(
+        &cluster_ca_pem,
+        &internal_ca_key_pem,
+        bootstrap.node_id,
+        bind_addr,
+        issue_policy,
+    );
+    let renew_after_unix = super::unix_ts().saturating_add(24 * 60 * 60);
     internal_material.metadata.renew_after_unix = renew_after_unix;
     public_material.metadata.renew_after_unix = renew_after_unix;
+    assert!(renew_after_unix > super::unix_ts());
+    assert!(
+        !super::certificate_has_expected_node_identity_uri_sans(
+            &public_material.cert_pem,
+            bootstrap.node_id,
+            state.cluster_id,
+        )
+        .unwrap(),
+        "legacy public certificate must not already satisfy the migration trigger"
+    );
     transport_sdk::NodeEnrollmentPackage {
         bootstrap,
         public_tls_material: Some(public_material.clone()),
@@ -10053,6 +10100,19 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
             .unwrap()
             .metadata
             .certificate_fingerprint
+    );
+    assert!(
+        super::certificate_has_expected_node_identity_uri_sans(
+            &renewed_package
+                .public_tls_material
+                .as_ref()
+                .unwrap()
+                .cert_pem,
+            expected_internal_node_id,
+            expected_internal_cluster_id,
+        )
+        .unwrap(),
+        "automatic renewal should migrate public certificates to stable node and cluster URI SANs"
     );
     assert_eq!(
         served_internal_fingerprint,
