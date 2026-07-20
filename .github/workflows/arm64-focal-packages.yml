@@ -60,9 +60,8 @@ jobs:
           mkdir -p artifacts
           sccache_dir="${RUNNER_TEMP}/sccache-arm64"
           mkdir -p "$sccache_dir"
-          workspace_parent="$(dirname "$GITHUB_WORKSPACE")"
           docker run --rm \
-            --volume "${workspace_parent}:/build" \
+            --volume "${GITHUB_WORKSPACE}:/build/ironmesh" \
             --volume "${sccache_dir}:/sccache" \
             --workdir /build/ironmesh \
             --env RUSTC_WRAPPER=sccache \
