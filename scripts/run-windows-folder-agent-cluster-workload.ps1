@@ -65,10 +65,10 @@ Write-Host "  repl timeout   : $ReplicationTimeoutMinutes min"
 Push-Location $repoRoot
 try {
     if (-not $SkipBuild) {
-        cargo test --manifest-path tests\system-tests\Cargo.toml --no-run
+        cargo test --locked --manifest-path tests\system-tests\Cargo.toml --no-run
     }
 
-    cargo test `
+    cargo test --locked `
         --manifest-path tests\system-tests\Cargo.toml `
         windows_folder_agent_cluster_upload_and_replication_workload `
         -- `

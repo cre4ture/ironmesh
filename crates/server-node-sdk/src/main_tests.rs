@@ -806,6 +806,37 @@ fn default_tls_issue_policy() -> super::NodeTlsIssuePolicy {
     super::build_tls_issue_policy(None, None).unwrap()
 }
 
+fn issue_legacy_public_node_tls_material(
+    cluster_ca_pem: &str,
+    cluster_ca_key_pem: &str,
+    node_id: NodeId,
+    bind_addr: SocketAddr,
+    policy: super::NodeTlsIssuePolicy,
+) -> transport_sdk::BootstrapMutualTlsMaterial {
+    let issuer_key = rcgen::KeyPair::from_pem(cluster_ca_key_pem).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_pem(cluster_ca_pem, issuer_key).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        format!("ironmesh-public-{node_id}"),
+    );
+    params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64).unwrap();
+    params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64).unwrap();
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    params.subject_alt_names = vec![rcgen::SanType::IpAddress(bind_addr.ip())];
+
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key_pair, &issuer).unwrap();
+    let cert_pem = cert.pem();
+    transport_sdk::BootstrapMutualTlsMaterial {
+        ca_cert_pem: cluster_ca_pem.to_string(),
+        cert_pem: cert_pem.clone(),
+        key_pem: key_pair.serialize_pem(),
+        metadata: super::build_tls_material_metadata(&cert_pem, policy).unwrap(),
+    }
+}
+
 fn load_root_store_from_pem_file(path: &std::path::Path) -> RootCertStore {
     let mut reader = BufReader::new(File::open(path).unwrap());
     let mut roots = RootCertStore::empty();
@@ -9498,7 +9529,7 @@ async fn renew_node_enrollment_rejects_node_missing_from_cluster_membership() {
 }
 
 #[tokio::test]
-async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_required() {
+async fn manual_node_enrollment_renewal_forces_live_tls_reload() {
     let root = fresh_test_dir("node-auto-renew");
     let issuer_dir = root.join("issuer");
     let issuer_bind_addr = free_bind_addr();
@@ -9512,6 +9543,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
     state.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
     state.network.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
 
@@ -9579,8 +9611,8 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
         super::issue_public_node_tls_material(&state, &bootstrap, issue_policy)
             .unwrap()
             .unwrap();
-    internal_material.metadata.renew_after_unix = super::unix_ts().saturating_sub(1);
-    public_material.metadata.renew_after_unix = super::unix_ts().saturating_sub(1);
+    internal_material.metadata.renew_after_unix = super::unix_ts().saturating_add(24 * 60 * 60);
+    public_material.metadata.renew_after_unix = super::unix_ts().saturating_add(24 * 60 * 60);
     transport_sdk::NodeEnrollmentPackage {
         bootstrap,
         public_tls_material: Some(public_material.clone()),
@@ -9591,7 +9623,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
 
     let mut config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
     config.enrollment_issuer_url = Some(issuer_public_url);
-    config.node_enrollment_auto_renew_enabled = true;
+    config.node_enrollment_auto_renew_enabled = false;
     let loaded_public_fingerprint =
         super::parse_certificate_details_from_path(&config.public_tls.as_ref().unwrap().cert_path)
             .unwrap()
@@ -9604,7 +9636,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
 
     state.network.enrollment_issuer_url = config.enrollment_issuer_url.clone();
     state.network.node_enrollment_path = Some(package_path.clone());
-    state.network.node_enrollment_auto_renew_enabled = true;
+    state.network.node_enrollment_auto_renew_enabled = false;
     register_cluster_node(
         &state,
         issuer_node_id,
@@ -9681,12 +9713,12 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     )
     .await;
 
-    assert!(
-        super::renew_node_enrollment_package_if_due(&state, &config)
-            .await
-            .unwrap()
-    );
-    super::reload_live_tls_from_disk(&state).await.unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    let response = super::renew_node_certificates_now(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
 
     let renewed_package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
     let renewed_public_fingerprint = renewed_package
@@ -9760,7 +9792,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
         super::NodeCertificateAutoRenewStatusView {
-            enabled: true,
+            enabled: false,
             enrollment_path: Some(package_path.display().to_string()),
             issuer_url: config.enrollment_issuer_url.clone(),
             check_interval_secs: Some(config.node_enrollment_auto_renew_check_secs),
@@ -9798,7 +9830,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
 }
 
 #[tokio::test]
-async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_certificates() {
+async fn automatic_renewal_migrates_missing_identity_uri_sans() {
     let root = fresh_test_dir("node-auto-renew-served-certs");
     let issuer_dir = root.join("issuer");
     let issuer_bind_addr = free_bind_addr();
@@ -9876,13 +9908,29 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     let issue_policy = default_tls_issue_policy();
     let mut internal_material =
         super::issue_internal_node_tls_material(&state, &bootstrap, issue_policy).unwrap();
-    let mut public_material =
-        super::issue_public_node_tls_material(&state, &bootstrap, issue_policy)
-            .unwrap()
-            .unwrap();
-    let renew_after_unix = super::unix_ts().saturating_add(5);
+    // This mirrors enrollment packages issued before public node certificates carried the
+    // stable node/cluster URI SANs.  Their normal renewal window is still far away, but current
+    // direct transports cannot authenticate them safely until the profile is migrated.
+    let mut public_material = issue_legacy_public_node_tls_material(
+        &cluster_ca_pem,
+        &internal_ca_key_pem,
+        bootstrap.node_id,
+        bind_addr,
+        issue_policy,
+    );
+    let renew_after_unix = super::unix_ts().saturating_add(24 * 60 * 60);
     internal_material.metadata.renew_after_unix = renew_after_unix;
     public_material.metadata.renew_after_unix = renew_after_unix;
+    assert!(renew_after_unix > super::unix_ts());
+    assert!(
+        !super::certificate_has_expected_node_identity_uri_sans(
+            &public_material.cert_pem,
+            bootstrap.node_id,
+            state.cluster_id,
+        )
+        .unwrap(),
+        "legacy public certificate must not already satisfy the migration trigger"
+    );
     transport_sdk::NodeEnrollmentPackage {
         bootstrap,
         public_tls_material: Some(public_material.clone()),
@@ -10052,6 +10100,19 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
             .unwrap()
             .metadata
             .certificate_fingerprint
+    );
+    assert!(
+        super::certificate_has_expected_node_identity_uri_sans(
+            &renewed_package
+                .public_tls_material
+                .as_ref()
+                .unwrap()
+                .cert_pem,
+            expected_internal_node_id,
+            expected_internal_cluster_id,
+        )
+        .unwrap(),
+        "automatic renewal should migrate public certificates to stable node and cluster URI SANs"
     );
     assert_eq!(
         served_internal_fingerprint,
@@ -10646,6 +10707,25 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
 
     cleanup_test_state(&state).await;
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn node_enrollment_issuer_resolves_local_node_without_membership_entry() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    {
+        let mut cluster = state.cluster.lock().await;
+        assert!(cluster.remove_node(state.node_id));
+    }
+
+    let issuer = super::resolve_node_enrollment_issuer_descriptor(&state, "http://127.0.0.1:39080")
+        .await
+        .expect("the local public issuer should not depend on a persisted membership entry");
+
+    assert_eq!(issuer.node_id, state.node_id);
+    assert_eq!(issuer.public_api_url(), Some("http://127.0.0.1:39080"));
+    assert_eq!(issuer.peer_api_url(), Some("https://127.0.0.1:49080"));
+
+    cleanup_test_state(&state).await;
 }
 
 async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
@@ -15029,6 +15109,7 @@ async fn build_test_state(
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
             node_enrollment_auto_renew_check_secs: 300,
+            node_enrollment_renewal_lock: Arc::new(Mutex::new(())),
             node_enrollment_auto_renew_state: Arc::new(Mutex::new(
                 super::NodeEnrollmentAutoRenewState::default(),
             )),
@@ -15083,6 +15164,9 @@ async fn build_test_state(
         )),
         hardware_health_runtime: Arc::new(Mutex::new(
             super::hardware_health::HardwareHealthRuntime::load(&root),
+        )),
+        reliability_telemetry_runtime: Arc::new(Mutex::new(
+            super::reliability_telemetry::ReliabilityTelemetryRuntime::load(&root),
         )),
     };
 

@@ -127,6 +127,7 @@ mod listing;
 mod map_config;
 mod map_dataset_import;
 mod natural_earth_import;
+mod reliability_telemetry;
 mod replication;
 mod s3_frontend;
 mod setup;
@@ -272,6 +273,7 @@ struct ServerState {
     runtime_log_control: RuntimeLogControl,
     process_stats_runtime: Arc<StdMutex<ProcessStatsRuntime>>,
     hardware_health_runtime: Arc<Mutex<hardware_health::HardwareHealthRuntime>>,
+    reliability_telemetry_runtime: Arc<Mutex<reliability_telemetry::ReliabilityTelemetryRuntime>>,
 }
 
 #[derive(Clone)]
@@ -345,6 +347,7 @@ struct ServerNetworkRuntime {
     node_enrollment_path: Option<PathBuf>,
     node_enrollment_auto_renew_enabled: bool,
     node_enrollment_auto_renew_check_secs: u64,
+    node_enrollment_renewal_lock: Arc<Mutex<()>>,
     node_enrollment_auto_renew_state: Arc<Mutex<NodeEnrollmentAutoRenewState>>,
     outbound_clients: Arc<RwLock<OutboundClients>>,
     peer_relay_sessions: PeerRelaySessionPool,
@@ -3919,7 +3922,59 @@ fn node_enrollment_due_for_renewal(package: &NodeEnrollmentPackage, now: u64) ->
     ]
     .into_iter()
     .flatten()
-    .any(|material| material.metadata.renew_after_unix <= now)
+    .any(|material| {
+        material.metadata.renew_after_unix <= now
+            || tls_material_requires_node_identity_san_migration(
+                material,
+                package.bootstrap.node_id,
+                package.bootstrap.cluster_id,
+            )
+    })
+}
+
+/// TLS credentials issued before stable node identities were added to the public certificate
+/// profile cannot be used by current direct transports.  Treat those credentials as due
+/// immediately, rather than waiting for their ordinary time-based renewal window.  The actual
+/// renewal request still uses the existing authenticated internal mTLS path.
+fn tls_material_requires_node_identity_san_migration(
+    material: &BootstrapMutualTlsMaterial,
+    expected_node_id: NodeId,
+    expected_cluster_id: ClusterId,
+) -> bool {
+    !certificate_has_expected_node_identity_uri_sans(
+        &material.cert_pem,
+        expected_node_id,
+        expected_cluster_id,
+    )
+    .unwrap_or(false)
+}
+
+fn certificate_has_expected_node_identity_uri_sans(
+    cert_pem: &str,
+    expected_node_id: NodeId,
+    expected_cluster_id: ClusterId,
+) -> Result<bool> {
+    let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+        .context("failed parsing TLS certificate PEM for node identity SAN migration")?;
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert_der.as_ref())
+        .context("failed parsing TLS certificate DER for node identity SAN migration")?;
+    let expected_node_uri = format!("urn:ironmesh:node:{expected_node_id}");
+    let expected_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
+    let mut has_node_uri = false;
+    let mut has_cluster_uri = false;
+
+    for extension in parsed.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+            for name in &san.general_names {
+                if let x509_parser::extensions::GeneralName::URI(uri) = name {
+                    has_node_uri |= *uri == expected_node_uri;
+                    has_cluster_uri |= *uri == expected_cluster_uri;
+                }
+            }
+        }
+    }
+
+    Ok(has_node_uri && has_cluster_uri)
 }
 
 async fn resolve_node_enrollment_issuer_descriptor(
@@ -3927,20 +3982,67 @@ async fn resolve_node_enrollment_issuer_descriptor(
     issuer_url: &str,
 ) -> Result<cluster::NodeDescriptor> {
     let expected_url = issuer_url.trim_end_matches('/');
-    let cluster = state.cluster.lock().await;
-    cluster
-        .list_nodes()
-        .into_iter()
-        .find(|node| {
+    let issuer_node = {
+        let cluster = state.cluster.lock().await;
+        cluster.list_nodes().into_iter().find(|node| {
             node.public_api_url()
                 .map(|value| value.trim_end_matches('/'))
                 == Some(expected_url)
         })
-        .with_context(|| {
-            format!(
-                "node enrollment auto-renew could not resolve issuer {expected_url} from current cluster membership"
-            )
-        })
+    };
+    if let Some(issuer_node) = issuer_node {
+        return Ok(issuer_node);
+    }
+
+    local_node_enrollment_issuer_descriptor(state, expected_url).with_context(|| {
+        format!(
+            "node enrollment auto-renew could not resolve issuer {expected_url} from current cluster membership or local node configuration"
+        )
+    })
+}
+
+fn local_node_enrollment_issuer_descriptor(
+    state: &ServerState,
+    expected_issuer_url: &str,
+) -> Option<cluster::NodeDescriptor> {
+    if !is_local_node_enrollment_issuer_url(state, expected_issuer_url) {
+        return None;
+    }
+
+    let direct_endpoints = current_advertised_direct_endpoints(state);
+    let reachability = node_reachability_from_direct_endpoints(&direct_endpoints, false, None);
+    if !reachability.has_peer_transport() {
+        return None;
+    }
+
+    Some(cluster::NodeDescriptor {
+        node_id: state.node_id,
+        reachability,
+        capabilities: NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: unix_ts(),
+        status: cluster::NodeStatus::Online,
+    })
+}
+
+fn is_local_node_enrollment_issuer_url(state: &ServerState, expected_issuer_url: &str) -> bool {
+    let direct_endpoints = current_advertised_direct_endpoints(state);
+    let local_public_urls =
+        direct_endpoint_urls_by_usage(&direct_endpoints, BootstrapEndpointUse::PublicApi);
+    state
+        .network
+        .primary_public_direct_url
+        .as_deref()
+        .into_iter()
+        .chain(local_public_urls.iter().map(String::as_str))
+        .any(|url| url.trim_end_matches('/') == expected_issuer_url)
 }
 
 async fn renew_node_enrollment_package_if_due(
@@ -3950,21 +4052,56 @@ async fn renew_node_enrollment_package_if_due(
     if !config.node_enrollment_auto_renew_enabled {
         return Ok(false);
     }
-    let Some(enrollment_path) = config.node_enrollment_path.as_ref() else {
+    let Some(enrollment_path) = config.node_enrollment_path.as_deref() else {
         return Ok(false);
     };
-    if config.internal_tls.is_none() {
-        bail!("node enrollment auto-renew requires configured internal TLS identity");
+
+    renew_node_enrollment_package(
+        state,
+        enrollment_path,
+        config.enrollment_issuer_url.as_deref(),
+        false,
+    )
+    .await
+}
+
+/// Request fresh enrollment TLS material immediately, irrespective of the normal renewal
+/// schedule. This intentionally remains independent from the background auto-renew setting so
+/// an operator can rotate certificates manually while periodic renewal is disabled.
+async fn renew_node_enrollment_package_now(state: &ServerState) -> Result<()> {
+    let enrollment_path = state
+        .network
+        .node_enrollment_path
+        .as_deref()
+        .context("certificate renewal requires a managed node enrollment package")?;
+    renew_node_enrollment_package(
+        state,
+        enrollment_path,
+        state.network.enrollment_issuer_url.as_deref(),
+        true,
+    )
+    .await?;
+    reload_live_tls_from_disk(state).await
+}
+
+async fn renew_node_enrollment_package(
+    state: &ServerState,
+    enrollment_path: &FsPath,
+    configured_issuer_url: Option<&str>,
+    force: bool,
+) -> Result<bool> {
+    if state.network.internal_tls_runtime.is_none() {
+        bail!("node enrollment renewal requires configured internal TLS identity");
     }
 
     let package = NodeEnrollmentPackage::from_path(enrollment_path)?;
     if package.bootstrap.mode != NodeBootstrapMode::Cluster {
         bail!(
-            "node enrollment auto-renew only supports cluster node enrollments in the first implementation"
+            "node enrollment renewal only supports cluster node enrollments in the first implementation"
         );
     }
     let now = unix_ts();
-    if !node_enrollment_due_for_renewal(&package, now) {
+    if !force && !node_enrollment_due_for_renewal(&package, now) {
         return Ok(false);
     }
 
@@ -3972,43 +4109,62 @@ async fn renew_node_enrollment_package_if_due(
         .bootstrap
         .enrollment_issuer_url
         .as_deref()
-        .or(config.enrollment_issuer_url.as_deref())
+        .or(configured_issuer_url)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.trim_end_matches('/').to_string())
-        .context("node enrollment auto-renew requires bootstrap.enrollment_issuer_url")?;
-    let issuer_node = resolve_node_enrollment_issuer_descriptor(state, &issuer_url).await?;
-    let response = execute_peer_request(
-        state,
-        &issuer_node,
-        reqwest::Method::POST,
-        "/cluster/node-enrollments/renew",
-        vec![RelayHttpHeader {
-            name: "content-type".to_string(),
-            value: "application/json".to_string(),
-        }],
-        serde_json::to_vec(&build_node_enrollment_renew_request(&package))
-            .context("failed encoding automatic node enrollment renewal request")?,
-    )
-    .await
-    .context("failed requesting automatic node enrollment renewal")?;
-    if !response.is_success() {
-        let error_body = String::from_utf8_lossy(&response.body).trim().to_string();
-        if error_body.is_empty() {
+        .context("node enrollment renewal requires bootstrap.enrollment_issuer_url")?;
+    let request = build_node_enrollment_renew_request(&package);
+    let renewed = if is_local_node_enrollment_issuer_url(state, &issuer_url) {
+        if package.bootstrap.cluster_id != state.cluster_id
+            || package.bootstrap.node_id != state.node_id
+        {
+            bail!("local node enrollment package identity does not match the running node");
+        }
+        renew_node_enrollment_for_authenticated_caller(
+            state,
+            InternalCaller {
+                node_id: state.node_id,
+                cluster_id: state.cluster_id,
+            },
+            request,
+        )
+        .await
+        .map_err(|(_, error)| anyhow!("local node enrollment renewal failed: {error}"))?
+    } else {
+        let issuer_node = resolve_node_enrollment_issuer_descriptor(state, &issuer_url).await?;
+        let response = execute_peer_request(
+            state,
+            &issuer_node,
+            reqwest::Method::POST,
+            "/cluster/node-enrollments/renew",
+            vec![RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            }],
+            serde_json::to_vec(&request)
+                .context("failed encoding node enrollment renewal request")?,
+        )
+        .await
+        .context("failed requesting node enrollment renewal")?;
+        if !response.is_success() {
+            let error_body = String::from_utf8_lossy(&response.body).trim().to_string();
+            if error_body.is_empty() {
+                bail!(
+                    "node enrollment renewal returned status {}",
+                    response.status
+                );
+            }
             bail!(
-                "automatic node enrollment renewal returned status {}",
-                response.status
+                "node enrollment renewal returned status {}: {}",
+                response.status,
+                error_body
             );
         }
-        bail!(
-            "automatic node enrollment renewal returned status {}: {}",
-            response.status,
-            error_body
-        );
-    }
-    let renewed = response
-        .json::<NodeEnrollmentRenewResponse>()
-        .context("failed decoding automatic node enrollment renewal response")?;
+        response
+            .json::<NodeEnrollmentRenewResponse>()
+            .context("failed decoding node enrollment renewal response")?
+    };
     let renewed = merge_node_enrollment_renew_response(package, renewed)?;
     renewed.validate()?;
     renewed.write_to_path(enrollment_path)?;
@@ -6937,6 +7093,7 @@ async fn run_inner(
             node_enrollment_path: config.node_enrollment_path.clone(),
             node_enrollment_auto_renew_enabled: config.node_enrollment_auto_renew_enabled,
             node_enrollment_auto_renew_check_secs: config.node_enrollment_auto_renew_check_secs,
+            node_enrollment_renewal_lock: Arc::new(Mutex::new(())),
             node_enrollment_auto_renew_state: Arc::new(Mutex::new(NodeEnrollmentAutoRenewState {
                 loaded_public_tls_fingerprint: tls_status
                     .public_tls
@@ -6985,6 +7142,9 @@ async fn run_inner(
         process_stats_runtime: Arc::new(StdMutex::new(ProcessStatsRuntime::default())),
         hardware_health_runtime: Arc::new(Mutex::new(
             hardware_health::HardwareHealthRuntime::load(&config.data_dir),
+        )),
+        reliability_telemetry_runtime: Arc::new(Mutex::new(
+            reliability_telemetry::ReliabilityTelemetryRuntime::load(&config.data_dir),
         )),
     };
     seed_process_temperature_stats_for_tests(&state);
@@ -7305,10 +7465,23 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             "/auth/node-certificates/status",
             get(node_certificate_status),
         )
+        .route(
+            "/auth/node-certificates/renew",
+            post(renew_node_certificates_now),
+        )
         .route("/auth/host/dependencies", get(host_dependency_status))
         .route(
             "/auth/hardware/health",
             get(hardware_health::hardware_health_current),
+        )
+        .route(
+            "/auth/telemetry/settings",
+            get(reliability_telemetry::telemetry_settings_get)
+                .put(reliability_telemetry::telemetry_settings_put),
+        )
+        .route(
+            "/auth/telemetry/preview",
+            get(reliability_telemetry::telemetry_preview_get),
         )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
@@ -10922,27 +11095,33 @@ fn spawn_node_enrollment_auto_renew(
                 renewal_state.last_attempt_unix = Some(unix_ts());
             }
 
-            match renew_node_enrollment_package_if_due(&state, &config).await {
-                Ok(true) => match reload_live_tls_from_disk(&state).await {
-                    Ok(()) => {
-                        {
-                            let mut renewal_state =
-                                state.network.node_enrollment_auto_renew_state.lock().await;
-                            renewal_state.last_success_unix = Some(unix_ts());
-                            renewal_state.last_error = None;
-                        }
-                        info!(
-                            enrollment_path = ?state.network.node_enrollment_path.as_ref().map(|path| path.display().to_string()),
-                            "node enrollment auto-renew reloaded live TLS material"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "node enrollment auto-renew reloaded package but failed to apply live TLS reload");
+            let renewal_result = {
+                // A manual renewal can be requested from the admin UI while this loop is running.
+                // Keep the enrollment file update and live TLS reload as one serialized operation.
+                let _renewal_guard = state.network.node_enrollment_renewal_lock.lock().await;
+                match renew_node_enrollment_package_if_due(&state, &config).await {
+                    Ok(true) => reload_live_tls_from_disk(&state)
+                        .await
+                        .context("node enrollment auto-renew reloaded package but failed to apply live TLS reload")
+                        .map(|()| true),
+                    Ok(false) => Ok(false),
+                    Err(err) => Err(err),
+                }
+            };
+
+            match renewal_result {
+                Ok(true) => {
+                    {
                         let mut renewal_state =
                             state.network.node_enrollment_auto_renew_state.lock().await;
-                        renewal_state.last_error = Some(err.to_string());
+                        renewal_state.last_success_unix = Some(unix_ts());
+                        renewal_state.last_error = None;
                     }
-                },
+                    info!(
+                        enrollment_path = ?state.network.node_enrollment_path.as_ref().map(|path| path.display().to_string()),
+                        "node enrollment auto-renew reloaded live TLS material"
+                    );
+                }
                 Ok(false) => {
                     let mut renewal_state =
                         state.network.node_enrollment_auto_renew_state.lock().await;
@@ -11976,25 +12155,7 @@ async fn latency_diagnostic(
     (StatusCode::OK, headers, vec![0_u8; response_bytes]).into_response()
 }
 
-async fn node_certificate_status(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let action = "auth/node-certificates/status";
-    let authz = match authorize_admin_request(
-        &state,
-        &headers,
-        action,
-        true,
-        true,
-        json!({ "node_id": state.node_id }),
-    )
-    .await
-    {
-        Ok(request) => request,
-        Err(status) => return status.into_response(),
-    };
-
+async fn current_node_certificate_status(state: &ServerState) -> NodeCertificateStatusResponse {
     let auto_renew_state = state
         .network
         .node_enrollment_auto_renew_state
@@ -12048,6 +12209,30 @@ async fn node_certificate_status(
         auto_renew_state.loaded_internal_tls_fingerprint.as_deref(),
     );
 
+    status
+}
+
+async fn node_certificate_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/node-certificates/status";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "node_id": state.node_id }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let status = current_node_certificate_status(&state).await;
+
     append_admin_audit(
         &state,
         action,
@@ -12066,6 +12251,106 @@ async fn node_certificate_status(
     .await;
 
     (StatusCode::OK, Json(status)).into_response()
+}
+
+async fn renew_node_certificates_now(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/node-certificates/renew";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        true,
+        json!({ "node_id": state.node_id, "forced": true }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    if state.network.node_enrollment_path.is_none() || state.network.internal_tls_runtime.is_none()
+    {
+        let error = "certificate renewal requires a managed node enrollment package and internal TLS identity";
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            false,
+            true,
+            "precondition_failed",
+            json!({ "error": error }),
+        )
+        .await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": error })),
+        )
+            .into_response();
+    }
+
+    let renewal_result = {
+        // The scheduled renewal loop and this operator action may run concurrently. Serialize
+        // the complete issue/write/reload sequence so they never race on the enrollment file.
+        let _renewal_guard = state.network.node_enrollment_renewal_lock.lock().await;
+        {
+            let mut renewal_state = state.network.node_enrollment_auto_renew_state.lock().await;
+            renewal_state.last_attempt_unix = Some(unix_ts());
+        }
+        renew_node_enrollment_package_now(&state).await
+    };
+
+    match renewal_result {
+        Ok(()) => {
+            {
+                let mut renewal_state = state.network.node_enrollment_auto_renew_state.lock().await;
+                renewal_state.last_success_unix = Some(unix_ts());
+                renewal_state.last_error = None;
+            }
+            let status = current_node_certificate_status(&state).await;
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "success",
+                json!({
+                    "public_tls_fingerprint": status.public_tls.certificate_fingerprint,
+                    "internal_tls_fingerprint": status.internal_tls.certificate_fingerprint,
+                    "restart_required": status.auto_renew.restart_required,
+                }),
+            )
+            .await;
+            info!("node enrollment certificates renewed by administrator and reloaded live");
+            (StatusCode::OK, Json(status)).into_response()
+        }
+        Err(err) => {
+            let error = err.to_string();
+            {
+                let mut renewal_state = state.network.node_enrollment_auto_renew_state.lock().await;
+                renewal_state.last_error = Some(error.clone());
+            }
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                false,
+                true,
+                "error",
+                json!({ "error": error }),
+            )
+            .await;
+            warn!(error = %error, "administrator-requested node enrollment certificate renewal failed");
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response()
+        }
+    }
 }
 
 async fn host_dependency_status(
@@ -21193,15 +21478,22 @@ async fn renew_node_enrollment_authenticated(
     caller: InternalCaller,
     Json(request): Json<NodeEnrollmentRenewRequest>,
 ) -> impl IntoResponse {
-    let error_response = |status: StatusCode, message: String| {
-        (status, Json(json!({ "error": message }))).into_response()
-    };
+    match renew_node_enrollment_for_authenticated_caller(&state, caller, request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err((status, error)) => (status, Json(json!({ "error": error }))).into_response(),
+    }
+}
 
+async fn renew_node_enrollment_for_authenticated_caller(
+    state: &ServerState,
+    caller: InternalCaller,
+    request: NodeEnrollmentRenewRequest,
+) -> std::result::Result<NodeEnrollmentRenewResponse, (StatusCode, String)> {
     if caller.cluster_id != state.cluster_id {
-        return error_response(
+        return Err((
             StatusCode::FORBIDDEN,
             "authenticated renewal caller does not belong to this cluster".to_string(),
-        );
+        ));
     }
 
     let renewal_authorized = {
@@ -21212,17 +21504,17 @@ async fn renew_node_enrollment_authenticated(
             .any(|node| node.node_id == caller.node_id)
     };
     if !renewal_authorized {
-        return error_response(
+        return Err((
             StatusCode::FORBIDDEN,
             "authenticated node is not currently authorized to renew in cluster membership"
                 .to_string(),
-        );
+        ));
     }
 
     let issue_policy = match build_tls_issue_policy(None, None) {
         Ok(policy) => policy,
         Err(status) => {
-            return error_response(status, "invalid issuer TLS validity policy".to_string());
+            return Err((status, "invalid issuer TLS validity policy".to_string()));
         }
     };
 
@@ -21233,17 +21525,17 @@ async fn renew_node_enrollment_authenticated(
         .map(|details| details.certificate_fingerprint);
 
     let internal_tls_material = match issue_internal_node_tls_material_for_identity(
-        &state,
+        state,
         state.cluster_id,
         caller.node_id,
         issue_policy,
     ) {
         Ok(material) => material,
         Err(status) => {
-            return error_response(
+            return Err((
                 status,
                 "failed to renew internal node TLS material".to_string(),
-            );
+            ));
         }
     };
 
@@ -21253,38 +21545,38 @@ async fn renew_node_enrollment_authenticated(
                 match extract_public_node_subject_alt_names_from_cert_pem(cert_pem) {
                     Ok(subject_alt_names) => subject_alt_names,
                     Err(err) => {
-                        return error_response(StatusCode::BAD_REQUEST, err.to_string());
+                        return Err((StatusCode::BAD_REQUEST, err.to_string()));
                     }
                 };
             match issue_public_node_tls_material_with_subject_alt_names(
-                &state,
+                state,
                 caller.node_id,
                 subject_alt_names,
                 issue_policy,
             ) {
                 Ok(material) => Some(material),
                 Err(status) => {
-                    return error_response(
+                    return Err((
                         status,
                         "failed to renew public node TLS material".to_string(),
-                    );
+                    ));
                 }
             }
         }
         None => None,
     };
 
-    let trust_roots = match bootstrap_trust_roots(&state) {
+    let trust_roots = match bootstrap_trust_roots(state) {
         Ok(trust_roots) => trust_roots,
         Err(status) => {
-            return error_response(status, "failed to resolve renewal trust roots".to_string());
+            return Err((status, "failed to resolve renewal trust roots".to_string()));
         }
     };
     let response = NodeEnrollmentRenewResponse {
         cluster_id: state.cluster_id,
         node_id: caller.node_id,
         trust_roots,
-        enrollment_issuer_url: local_public_enrollment_issuer_url(&state).await,
+        enrollment_issuer_url: local_public_enrollment_issuer_url(state).await,
         public_tls_material,
         internal_tls_material,
     };
@@ -21300,10 +21592,10 @@ async fn renew_node_enrollment_authenticated(
             .internal_tls_material
             .metadata
             .certificate_fingerprint,
-        "renewed node enrollment via internal mTLS authentication"
+        "renewed node enrollment after authenticated node renewal request"
     );
 
-    (StatusCode::CREATED, Json(response)).into_response()
+    Ok(response)
 }
 
 async fn issue_pairing_token_impl(

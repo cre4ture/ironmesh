@@ -17,7 +17,7 @@ if ([string]::IsNullOrWhiteSpace($DataDir)) {
 if ($Build -or -not (Test-Path $binaryPath)) {
     Push-Location $repoRoot
     try {
-        cargo build -p server-node --bin ironmesh-server-node
+        cargo build --locked -p server-node --bin ironmesh-server-node
     }
     finally {
         Pop-Location

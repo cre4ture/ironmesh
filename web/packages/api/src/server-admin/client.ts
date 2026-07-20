@@ -1068,6 +1068,15 @@ export async function getNodeCertificateStatus(
   });
 }
 
+export async function renewNodeCertificatesNow(
+  adminTokenOverride?: string
+): Promise<NodeCertificateStatusResponse> {
+  return fetchAdminJson<NodeCertificateStatusResponse>(apiV1("/auth/node-certificates/renew"), {
+    method: "POST",
+    adminTokenOverride
+  });
+}
+
 export async function getRendezvousConfig(
   adminTokenOverride?: string
 ): Promise<RendezvousConfigView> {

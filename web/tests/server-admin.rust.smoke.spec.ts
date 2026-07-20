@@ -97,6 +97,11 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Configured on this node").first()).toBeVisible();
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();
+  page.once("dialog", (dialog) => {
+    void dialog.accept();
+  });
+  await page.getByRole("button", { name: "Renew certificates now" }).click();
+  await expect(page.getByText("Certificates renewed", { exact: true })).toBeVisible({ timeout: 60_000 });
 
   await page.getByText("Control Plane", { exact: true }).click();
   await expect(page.getByText("Advertised direct node URLs")).toBeVisible();

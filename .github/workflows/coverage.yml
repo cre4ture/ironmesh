@@ -1,4 +1,4 @@
-name: Coverage
+name: Cov
 
 on:
   push:
@@ -20,6 +20,7 @@ env:
 
 jobs:
   coverage:
+    name: Cov
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -63,7 +64,7 @@ jobs:
 
       - name: Enforce line coverage threshold
         run: |
-          cargo llvm-cov \
+          cargo llvm-cov --locked \
             -p client-sdk \
             -p sync-core \
             -p transport-sdk \

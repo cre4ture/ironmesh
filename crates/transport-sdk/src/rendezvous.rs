@@ -24,6 +24,8 @@ use crate::relay::{RelayTicket, RelayTicketRequest};
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSession};
 use crate::relay_wake::{RelayWakeClient, RelayWakeRegistration};
 
+const MAX_RENDEZVOUS_ERROR_RESPONSE_BYTES: usize = 1024;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportCapability {
@@ -258,10 +260,8 @@ impl RendezvousControlClient {
         for base_url in &self.config.rendezvous_urls {
             let url = control_url(base_url, path)?;
             let result = match self.http.get(url.clone()).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(_) => Ok(()),
-                    Err(err) => Err(format!("rendezvous endpoint {url} returned error: {err}")),
-                },
+                Ok(response) if response.status().is_success() => Ok(()),
+                Ok(response) => Err(rendezvous_response_error(&url, response).await),
                 Err(err) => Err(self.decorate_transport_error(format!(
                     "failed contacting rendezvous endpoint {url}: {err}"
                 ))),
@@ -312,8 +312,8 @@ impl RendezvousControlClient {
             }
 
             match self.http.get(url.clone()).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(ok_response) => match ok_response.json::<DiscoveryResponse>().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<DiscoveryResponse>().await {
                         Ok(payload) => {
                             self.record_endpoint_result(base_url, Ok(()), true);
                             return Ok(payload);
@@ -324,13 +324,13 @@ impl RendezvousControlClient {
                             self.record_endpoint_result(base_url, Err(message.clone()), true);
                             return Err(anyhow!(message));
                         }
-                    },
-                    Err(err) => {
-                        let message = format!("rendezvous endpoint {url} returned error: {err}");
-                        self.record_endpoint_result(base_url, Err(message.clone()), true);
-                        last_error = Some(anyhow!(message));
                     }
-                },
+                }
+                Ok(response) => {
+                    let message = rendezvous_response_error(&url, response).await;
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
+                }
                 Err(err) => {
                     let message = self.decorate_transport_error(format!(
                         "failed contacting rendezvous endpoint {url}: {err}"
@@ -571,8 +571,8 @@ impl RendezvousControlClient {
         for base_url in &self.config.rendezvous_urls {
             let url = control_url(base_url, path)?;
             match self.http.get(url.clone()).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(ok_response) => match ok_response.json::<T>().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<T>().await {
                         Ok(payload) => {
                             self.record_endpoint_result(base_url, Ok(()), true);
                             return Ok(payload);
@@ -583,13 +583,13 @@ impl RendezvousControlClient {
                             self.record_endpoint_result(base_url, Err(message.clone()), true);
                             return Err(anyhow!(message));
                         }
-                    },
-                    Err(err) => {
-                        let message = format!("rendezvous endpoint {url} returned error: {err}");
-                        self.record_endpoint_result(base_url, Err(message.clone()), true);
-                        last_error = Some(anyhow!(message));
                     }
-                },
+                }
+                Ok(response) => {
+                    let message = rendezvous_response_error(&url, response).await;
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
+                }
                 Err(err) => {
                     let message = self.decorate_transport_error(format!(
                         "failed contacting rendezvous endpoint {url}: {err}"
@@ -612,8 +612,8 @@ impl RendezvousControlClient {
         for base_url in &self.config.rendezvous_urls {
             let url = control_url(base_url, path)?;
             match self.http.post(url.clone()).json(body).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(ok_response) => match ok_response.json::<T>().await {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<T>().await {
                         Ok(payload) => {
                             self.record_endpoint_result(base_url, Ok(()), true);
                             return Ok(payload);
@@ -624,13 +624,13 @@ impl RendezvousControlClient {
                             self.record_endpoint_result(base_url, Err(message.clone()), true);
                             return Err(anyhow!(message));
                         }
-                    },
-                    Err(err) => {
-                        let message = format!("rendezvous endpoint {url} returned error: {err}");
-                        self.record_endpoint_result(base_url, Err(message.clone()), true);
-                        last_error = Some(anyhow!(message));
                     }
-                },
+                }
+                Ok(response) => {
+                    let message = rendezvous_response_error(&url, response).await;
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
+                }
                 Err(err) => {
                     let message = self.decorate_transport_error(format!(
                         "failed contacting rendezvous endpoint {url}: {err}"
@@ -662,6 +662,65 @@ impl RendezvousControlClient {
             self.client_identity_pem.as_deref(),
             unix_timestamp(),
         )
+    }
+}
+
+async fn rendezvous_response_error(url: &Url, response: reqwest::Response) -> String {
+    let status = response.status();
+    let status_kind = if status.is_client_error() {
+        "client error"
+    } else if status.is_server_error() {
+        "server error"
+    } else {
+        "unexpected status"
+    };
+    let mut message =
+        format!("rendezvous endpoint {url} returned HTTP status {status_kind} ({status})");
+    if let Some(detail) = rendezvous_response_error_detail(response).await {
+        message.push_str(": ");
+        message.push_str(&detail);
+    }
+    message
+}
+
+async fn rendezvous_response_error_detail(mut response: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    let mut truncated = false;
+
+    while let Some(chunk) = response.chunk().await.ok()? {
+        let remaining = MAX_RENDEZVOUS_ERROR_RESPONSE_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let detail = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+    let detail = detail
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.is_empty() {
+        return None;
+    }
+
+    if truncated {
+        Some(format!("{detail} [response truncated]"))
+    } else {
+        Some(detail)
     }
 }
 
@@ -970,6 +1029,112 @@ mod tests {
             .expect_err("a legacy response must not downgrade an inner-mTLS request");
 
         assert!(error.to_string().contains("does not match requested mode"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn issue_relay_ticket_includes_bounded_rendezvous_error_detail() {
+        let cluster_id = Uuid::now_v7();
+        let router = Router::new().route(
+            "/control/relay/ticket",
+            post(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "relay ticket source device:requested does not match authenticated rendezvous client device:certificate",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test rendezvous server should run");
+        });
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let error = client
+            .issue_relay_ticket(&RelayTicketRequest {
+                cluster_id,
+                source: PeerIdentity::Device(Uuid::now_v7()),
+                target: PeerIdentity::Node(NodeId::now_v7()),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::InnerMtls,
+                requested_expires_in_secs: Some(60),
+            })
+            .await
+            .expect_err("an unauthorized ticket request must fail");
+
+        let message = error.to_string();
+        assert!(message.contains("HTTP status client error (401 Unauthorized)"));
+        assert!(message.contains("relay ticket source device:requested"));
+        assert!(message.contains("authenticated rendezvous client device:certificate"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn issue_relay_ticket_truncates_oversized_rendezvous_error_detail() {
+        let cluster_id = Uuid::now_v7();
+        let oversized_detail = format!(
+            "relay ticket rejection: {}",
+            "x".repeat(MAX_RENDEZVOUS_ERROR_RESPONSE_BYTES)
+        );
+        let router = Router::new().route(
+            "/control/relay/ticket",
+            post(move || {
+                let oversized_detail = oversized_detail.clone();
+                async move { (StatusCode::BAD_REQUEST, oversized_detail) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test rendezvous server should run");
+        });
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let error = client
+            .issue_relay_ticket(&RelayTicketRequest {
+                cluster_id,
+                source: PeerIdentity::Device(Uuid::now_v7()),
+                target: PeerIdentity::Node(NodeId::now_v7()),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                security_mode: RelayTunnelSecurityMode::InnerMtls,
+                requested_expires_in_secs: Some(60),
+            })
+            .await
+            .expect_err("an invalid ticket request must fail");
+
+        let message = error.to_string();
+        assert!(message.contains("HTTP status client error (400 Bad Request)"));
+        assert!(message.contains("relay ticket rejection:"));
+        assert!(message.contains("[response truncated]"));
         server.abort();
         let _ = server.await;
     }

@@ -185,6 +185,11 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Fingerprint: internal-cert-fingerprint", { exact: true })).toBeVisible();
+  page.once("dialog", (dialog) => {
+    void dialog.accept();
+  });
+  await page.getByRole("button", { name: "Renew certificates now" }).click();
+  await expect(page.getByText("Certificates renewed", { exact: true })).toBeVisible();
 
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByText("Recent server logs", { exact: true })).toBeVisible();
@@ -2489,7 +2494,10 @@ async function installServerAdminMocks(
       return json(route, { status: "revoked" });
     }
 
-    if (pathname === apiV1("/auth/node-certificates/status") && method === "GET") {
+    if (
+      (pathname === apiV1("/auth/node-certificates/status") && method === "GET") ||
+      (pathname === apiV1("/auth/node-certificates/renew") && method === "POST")
+    ) {
       return json(route, {
         public_tls: {
           name: "public",

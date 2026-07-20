@@ -4,6 +4,7 @@ members = [
     "crates/desktop-status",
     "crates/transport-sdk",
     "crates/rendezvous-server",
+    "crates/stats-collector-server",
     "crates/client-sdk",
     "crates/server-node-sdk",
     "crates/web-ui-backend",

@@ -1,9 +1,25 @@
-import { getNodeCertificateStatus, type NodeCertificateStatus, type NodeCertificateStatusResponse } from "@ironmesh/api";
+import {
+  getNodeCertificateStatus,
+  HttpError,
+  renewNodeCertificatesNow,
+  type NodeCertificateStatus,
+  type NodeCertificateStatusResponse
+} from "@ironmesh/api";
 import { ironmeshPrimaryColor, JsonBlock, StatCard } from "@ironmesh/ui";
 import { Alert, Badge, Button, Card, Grid, Group, Stack, Text } from "@mantine/core";
 import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 import { formatUnixTs } from "../lib/format";
+
+function requestErrorMessage(error: unknown): string {
+  if (error instanceof HttpError && error.payload && typeof error.payload === "object" && "error" in error.payload) {
+    const message = error.payload.error;
+    if (typeof message === "string" && message.trim()) {
+      return message;
+    }
+  }
+  return error instanceof Error ? error.message : String(error);
+}
 
 function CertificateDetailCard({
   title,
@@ -40,7 +56,9 @@ export function CertificatesPage() {
   const { adminTokenOverride } = useAdminAccess();
   const [status, setStatus] = useState<NodeCertificateStatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [renewing, setRenewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [renewalSuccess, setRenewalSuccess] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -49,7 +67,7 @@ export function CertificatesPage() {
       const payload = await getNodeCertificateStatus(adminTokenOverride);
       setStatus(payload);
     } catch (refreshError) {
-      setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
+      setError(requestErrorMessage(refreshError));
     } finally {
       setLoading(false);
     }
@@ -59,18 +77,57 @@ export function CertificatesPage() {
     void refresh();
   }, [refresh]);
 
+  const canRenewNow = Boolean(status?.auto_renew.enrollment_path && status.internal_tls.configured);
+
+  const renewNow = useCallback(async () => {
+    if (!canRenewNow) {
+      setError("Certificate renewal requires a managed node enrollment package and internal TLS identity.");
+      return;
+    }
+    const confirmed = window.confirm(
+      "Renew the public and internal node certificates now? New key material will be issued and loaded without restarting the server."
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setRenewing(true);
+    setError(null);
+    setRenewalSuccess(null);
+    try {
+      const payload = await renewNodeCertificatesNow(adminTokenOverride);
+      setStatus(payload);
+      setRenewalSuccess("New public and internal TLS certificates were issued and loaded live.");
+    } catch (renewalError) {
+      setError(requestErrorMessage(renewalError));
+    } finally {
+      setRenewing(false);
+    }
+  }, [adminTokenOverride, canRenewNow]);
+
   return (
     <Stack gap="lg">
       {error ? <Alert color="red" title="Request failed">{error}</Alert> : null}
+      {renewalSuccess ? <Alert color="green" title="Certificates renewed">{renewalSuccess}</Alert> : null}
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
           This view summarizes the currently loaded public and internal TLS material together with the
           auto-renew loop state. It is meant to replace the raw JSON-heavy lifecycle section from the old
           admin page without hiding the underlying details.
         </Text>
-        <Button variant="light" onClick={() => void refresh()} loading={loading}>
-          Refresh
-        </Button>
+        <Group gap="sm">
+          <Button
+            color={ironmeshPrimaryColor}
+            onClick={() => void renewNow()}
+            loading={renewing}
+            disabled={loading || !canRenewNow}
+          >
+            Renew certificates now
+          </Button>
+          <Button variant="light" onClick={() => void refresh()} loading={loading || renewing}>
+            Refresh
+          </Button>
+        </Group>
       </Group>
       <Grid>
         <Grid.Col span={{ base: 12, md: 4 }}>
@@ -121,6 +178,11 @@ export function CertificatesPage() {
           <Text size="sm">Issuer URL: {status?.auto_renew.issuer_url || "not configured"}</Text>
           <Text size="sm">Last attempt: {formatUnixTs(status?.auto_renew.last_attempt_unix)}</Text>
           <Text size="sm">Last error: {status?.auto_renew.last_error || "none"}</Text>
+          {!canRenewNow ? (
+            <Text size="sm" c="dimmed">
+              Renewing now is unavailable until this node has a managed enrollment package and internal TLS identity.
+            </Text>
+          ) : null}
         </Stack>
       </Card>
 

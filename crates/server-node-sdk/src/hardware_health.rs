@@ -19,25 +19,25 @@ pub(crate) struct HardwareHealthCurrentResponse {
 pub(crate) struct HardwareHealthReport {
     reporting_node_id: NodeId,
     generated_at_unix: u64,
-    ironmesh_version: String,
+    pub(crate) ironmesh_version: String,
     ironmesh_revision: String,
-    hardware_profile_id: String,
-    inventory: HardwareInventory,
-    node_lifecycle: HardwareNodeLifecycle,
-    collectors: Vec<HardwareHealthCollectorStatus>,
-    findings: Vec<HardwareHealthFinding>,
+    pub(crate) hardware_profile_id: String,
+    pub(crate) inventory: HardwareInventory,
+    pub(crate) node_lifecycle: HardwareNodeLifecycle,
+    pub(crate) collectors: Vec<HardwareHealthCollectorStatus>,
+    pub(crate) findings: Vec<HardwareHealthFinding>,
     health_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HardwareInventory {
+pub(crate) struct HardwareInventory {
     host_os: String,
     architecture: String,
     kernel_version: Option<String>,
     system: HardwareSystemInfo,
     cpu_packages: Vec<HardwareCpuPackage>,
     memory: HardwareMemoryInfo,
-    storage_devices: Vec<HardwareStorageDevice>,
+    pub(crate) storage_devices: Vec<HardwareStorageDevice>,
     network_interfaces: Vec<HardwareNetworkInterface>,
 }
 
@@ -78,41 +78,41 @@ struct HardwareMemoryInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HardwareStorageDevice {
+pub(crate) struct HardwareStorageDevice {
     component_ref: String,
-    component_instance_id: String,
+    pub(crate) component_instance_id: String,
     lifecycle: HardwareComponentLifecycle,
     block_device_name: String,
     vendor: Option<String>,
     model: Option<String>,
     firmware_version: Option<String>,
     capacity_bytes: Option<u64>,
-    interface_type: String,
+    pub(crate) interface_type: String,
     bus_type: Option<String>,
-    is_rotational: Option<bool>,
+    pub(crate) is_rotational: Option<bool>,
     logical_sector_size_bytes: Option<u64>,
     physical_sector_size_bytes: Option<u64>,
     pci_slot: Option<String>,
     driver: Option<String>,
-    smart: Option<HardwareStorageSmartInfo>,
+    pub(crate) smart: Option<HardwareStorageSmartInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HardwareStorageSmartInfo {
+pub(crate) struct HardwareStorageSmartInfo {
     smart_available: bool,
-    smart_passed: Option<bool>,
+    pub(crate) smart_passed: Option<bool>,
     temperature_celsius: Option<f32>,
-    power_on_hours: Option<u64>,
+    pub(crate) power_on_hours: Option<u64>,
     power_cycle_count: Option<u64>,
     unsafe_shutdown_count: Option<u64>,
-    percentage_used: Option<u64>,
+    pub(crate) percentage_used: Option<u64>,
     available_spare_percent: Option<u64>,
     available_spare_threshold_percent: Option<u64>,
     data_units_read: Option<u64>,
     data_units_written: Option<u64>,
-    media_errors: Option<u64>,
+    pub(crate) media_errors: Option<u64>,
     error_log_entries: Option<u64>,
-    reallocated_sector_count: Option<u64>,
+    pub(crate) reallocated_sector_count: Option<u64>,
     pending_sector_count: Option<u64>,
     offline_uncorrectable_sector_count: Option<u64>,
     crc_error_count: Option<u64>,
@@ -134,13 +134,13 @@ struct HardwareNetworkInterface {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HardwareNodeLifecycle {
+pub(crate) struct HardwareNodeLifecycle {
     node_first_seen_at_unix: u64,
     inventory_last_changed_at_unix: u64,
     boot_id: Option<String>,
     booted_at_unix: Option<u64>,
-    uptime_seconds: Option<u64>,
-    cumulative_observed_uptime_seconds: u64,
+    pub(crate) uptime_seconds: Option<u64>,
+    pub(crate) cumulative_observed_uptime_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,34 +151,34 @@ struct HardwareComponentLifecycle {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HardwareHealthCollectorStatus {
-    collector_id: String,
+pub(crate) struct HardwareHealthCollectorStatus {
+    pub(crate) collector_id: String,
     label: String,
     state: String,
-    available: bool,
+    pub(crate) available: bool,
     last_collected_at_unix: Option<u64>,
     last_error_code: Option<String>,
     detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HardwareHealthFinding {
+pub(crate) struct HardwareHealthFinding {
     source: String,
     category: String,
-    finding_code: String,
+    pub(crate) finding_code: String,
     severity: String,
     component_ref: Option<String>,
     component_instance_id: Option<String>,
     first_seen_at_unix: u64,
     last_seen_at_unix: u64,
-    occurrence_count: u64,
+    pub(crate) occurrence_count: u64,
     summary: String,
     evidence: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HardwareHealthRuntime {
-    report: Option<HardwareHealthReport>,
+    pub(crate) report: Option<HardwareHealthReport>,
     collecting: bool,
     last_attempt_unix: Option<u64>,
     last_success_unix: Option<u64>,
@@ -1983,6 +1983,164 @@ fn smart_temperature_celsius(value: &serde_json::Value) -> Option<f32> {
         });
     }
     smart_attribute_value(value, "Temperature_Celsius").map(|value| value as f32)
+}
+
+/// Test-only helpers for building a synthetic `HardwareHealthReport`, used by
+/// `reliability_telemetry`'s converter tests. Kept here (rather than in that sibling module)
+/// because most `HardwareHealthReport` fields are private to this module and struct-literal
+/// construction requires every field to be visible at the construction site.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn sample_report_for_telemetry_tests() -> HardwareHealthReport {
+        let storage_device = HardwareStorageDevice {
+            component_ref: "disk:nvme0n1".to_string(),
+            component_instance_id: "ci0123456789abcdef".to_string(),
+            lifecycle: HardwareComponentLifecycle {
+                first_seen_at_unix: 0,
+                last_seen_at_unix: 0,
+                sighting_count: 1,
+            },
+            block_device_name: "nvme0n1".to_string(),
+            vendor: Some("TestVendor".to_string()),
+            model: Some("TestModel".to_string()),
+            firmware_version: Some("1.0".to_string()),
+            capacity_bytes: Some(1_000_000_000_000),
+            interface_type: "nvme".to_string(),
+            bus_type: Some("nvme".to_string()),
+            is_rotational: Some(false),
+            logical_sector_size_bytes: Some(512),
+            physical_sector_size_bytes: Some(512),
+            pci_slot: Some("0000:01:00.0".to_string()),
+            driver: Some("nvme".to_string()),
+            smart: Some(HardwareStorageSmartInfo {
+                smart_available: true,
+                smart_passed: Some(true),
+                temperature_celsius: Some(35.0),
+                power_on_hours: Some(1234),
+                power_cycle_count: Some(10),
+                unsafe_shutdown_count: Some(0),
+                percentage_used: Some(5),
+                available_spare_percent: Some(100),
+                available_spare_threshold_percent: Some(10),
+                data_units_read: Some(1000),
+                data_units_written: Some(2000),
+                media_errors: Some(0),
+                error_log_entries: Some(0),
+                reallocated_sector_count: Some(0),
+                pending_sector_count: Some(0),
+                offline_uncorrectable_sector_count: Some(0),
+                crc_error_count: Some(0),
+            }),
+        };
+
+        let findings = vec![
+            HardwareHealthFinding {
+                source: "ironmesh_scrub".to_string(),
+                category: "data_integrity".to_string(),
+                finding_code: "chunk_hash_mismatch".to_string(),
+                severity: "critical".to_string(),
+                component_ref: Some("local_store".to_string()),
+                component_instance_id: None,
+                first_seen_at_unix: 1,
+                last_seen_at_unix: 2,
+                occurrence_count: 2,
+                summary: "test finding a".to_string(),
+                evidence: json!({}),
+            },
+            HardwareHealthFinding {
+                source: "ironmesh_scrub".to_string(),
+                category: "data_integrity".to_string(),
+                finding_code: "chunk_hash_mismatch".to_string(),
+                severity: "critical".to_string(),
+                component_ref: Some("local_store".to_string()),
+                component_instance_id: None,
+                first_seen_at_unix: 3,
+                last_seen_at_unix: 4,
+                occurrence_count: 3,
+                summary: "test finding b".to_string(),
+                evidence: json!({}),
+            },
+            HardwareHealthFinding {
+                source: "smart".to_string(),
+                category: "storage".to_string(),
+                finding_code: "smart_overall_failed".to_string(),
+                severity: "critical".to_string(),
+                component_ref: Some("disk:nvme0n1".to_string()),
+                component_instance_id: Some("ci0123456789abcdef".to_string()),
+                first_seen_at_unix: 5,
+                last_seen_at_unix: 5,
+                occurrence_count: 1,
+                summary: "test finding c".to_string(),
+                evidence: json!({}),
+            },
+        ];
+
+        let collectors = vec![
+            HardwareHealthCollectorStatus {
+                collector_id: "linux_inventory".to_string(),
+                label: "Linux inventory".to_string(),
+                state: "ready".to_string(),
+                available: true,
+                last_collected_at_unix: Some(1),
+                last_error_code: None,
+                detail: "ok".to_string(),
+            },
+            HardwareHealthCollectorStatus {
+                collector_id: "smartctl".to_string(),
+                label: "SMART / NVMe".to_string(),
+                state: "ready".to_string(),
+                available: true,
+                last_collected_at_unix: Some(1),
+                last_error_code: None,
+                detail: "ok".to_string(),
+            },
+        ];
+
+        HardwareHealthReport {
+            reporting_node_id: NodeId::from_u128(0),
+            generated_at_unix: 1_700_000_000,
+            ironmesh_version: "9.9.9-test".to_string(),
+            ironmesh_revision: "test-revision".to_string(),
+            hardware_profile_id: "hp-test".to_string(),
+            inventory: HardwareInventory {
+                host_os: "linux".to_string(),
+                architecture: "x86_64".to_string(),
+                kernel_version: None,
+                system: HardwareSystemInfo {
+                    vendor: None,
+                    product_name: None,
+                    product_version: None,
+                    board_vendor: None,
+                    board_name: None,
+                    board_version: None,
+                    bios_vendor: None,
+                    bios_version: None,
+                    bios_date: None,
+                },
+                cpu_packages: Vec::new(),
+                memory: HardwareMemoryInfo {
+                    installed_bytes: 0,
+                    page_size_bytes: None,
+                    details_complete: false,
+                },
+                storage_devices: vec![storage_device],
+                network_interfaces: Vec::new(),
+            },
+            node_lifecycle: HardwareNodeLifecycle {
+                node_first_seen_at_unix: 0,
+                inventory_last_changed_at_unix: 0,
+                boot_id: Some("boot-test".to_string()),
+                booted_at_unix: Some(0),
+                uptime_seconds: Some(100),
+                cumulative_observed_uptime_seconds: 200,
+            },
+            collectors,
+            findings,
+            health_notes: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -354,7 +354,7 @@ fun registerRustBuildTask(taskName: String, buildType: String) = tasks.register<
     executable("cargo")
 
     val argsList = mutableListOf<String>()
-    argsList.addAll(listOf("ndk", "-t", "arm64-v8a", "-t", "x86_64", "-o", outDir.absolutePath, "build", "-p", "android-app"))
+    argsList.addAll(listOf("ndk", "-t", "arm64-v8a", "-t", "x86_64", "-o", outDir.absolutePath, "build", "--locked", "-p", "android-app"))
     if (buildType == "release") {
         argsList.add("--release")
     }
