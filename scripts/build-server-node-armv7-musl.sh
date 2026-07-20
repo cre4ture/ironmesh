@@ -180,6 +180,7 @@ main() {
     # app process.
     CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-C target-cpu=cortex-a7" \
       cargo zigbuild \
+      --locked \
       --config profile.release.panic='"abort"' \
       --target "${TARGET_TRIPLE}" --release -p "${PACKAGE}" --bin "${BIN_NAME}"
   )

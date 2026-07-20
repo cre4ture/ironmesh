@@ -4,9 +4,9 @@
 
 ## Validation
 
-- [ ] `cargo +stable check --workspace`
-- [ ] `cargo +stable clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo +stable test --workspace`
+- [ ] `cargo +stable check --locked --workspace`
+- [ ] `cargo +stable clippy --locked --workspace --all-targets -- -D warnings`
+- [ ] `cargo +stable test --locked --workspace`
 - [ ] Nightly/system-tests run when relevant
 
 ## Context Refresh

@@ -74,4 +74,4 @@ jobs:
           cache-targets: false
 
       - name: Run system tests
-        run: cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
+        run: cargo -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml

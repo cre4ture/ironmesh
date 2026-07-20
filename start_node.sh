@@ -63,7 +63,7 @@ ensure_server_node_built() {
     return 0
   fi
 
-  (cd "$REPO_ROOT" && cargo build --release -p server-node)
+  (cd "$REPO_ROOT" && cargo build --locked --release -p server-node)
   SERVER_NODE_BUILT=1
 }
 
@@ -159,7 +159,7 @@ start_node() {
   mkdir -p "$data_dir"
 
   local run_command
-  run_command="cargo run --release -p server-node"
+  run_command="cargo run --locked --release -p server-node"
   if [[ -n "$MEMORY_MAX" || -n "$MEMORY_HIGH" ]]; then
     require_systemd_run
 

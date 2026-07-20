@@ -99,9 +99,9 @@ function Resolve-DriverExecutable {
 if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
-        cargo build -p server-node --bin ironmesh-server-node
-        cargo build -p os-integration --bin ironmesh-os-integration
-        cargo build --manifest-path tests\system-tests\Cargo.toml --bin windows_cfapi_cluster_workload_driver
+        cargo build --locked -p server-node --bin ironmesh-server-node
+        cargo build --locked -p os-integration --bin ironmesh-os-integration
+        cargo build --locked --manifest-path tests\system-tests\Cargo.toml --bin windows_cfapi_cluster_workload_driver
     }
     finally {
         Pop-Location

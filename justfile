@@ -10,16 +10,16 @@ fmt-check:
     cargo fmt --all -- --check
 
 check-stable:
-    cargo +stable check --workspace
+    cargo +stable check --locked --workspace
 
 clippy-stable:
-    cargo +stable clippy --workspace --all-targets -- -D warnings
+    cargo +stable clippy --locked --workspace --all-targets -- -D warnings
 
 test-stable:
-    cargo +stable test --workspace
+    cargo +stable test --locked --workspace
 
 coverage:
-    cargo +stable llvm-cov --workspace --all-features --summary-only \
+    cargo +stable llvm-cov --locked --workspace --all-features --summary-only \
         --ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(ironmesh-folder-agent|os-integration|ironmesh-config-app|ironmesh-background-launcher)/src/main.rs|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/desktop-client-config/src/lib.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_ui.rs|crates/web-ui-backend/src/lib.rs' \
         --fail-under-lines 70
 
@@ -45,23 +45,23 @@ audit:
     cargo audit
 
 deny:
-    cargo deny --exclude system-tests check advisories licenses sources bans
+    cargo deny --locked --exclude system-tests check advisories licenses sources bans
 
 test-all:
     just test-stable
     just test-system-nightly
 
 test-system-nightly:
-    cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
+    cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml
 
 test-system-nightly-one name:
-    cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib -- {{name}} --exact --nocapture
+    cargo +nightly -Z bindeps test --locked --manifest-path tests/system-tests/Cargo.toml --lib -- {{name}} --exact --nocapture
 
 ci-stable:
     cargo fmt --all -- --check
-    cargo +stable check --workspace
-    cargo +stable clippy --workspace --all-targets -- -D warnings
-    cargo +stable test --workspace
+    cargo +stable check --locked --workspace
+    cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+    cargo +stable test --locked --workspace
 
 ci-required:
     just ci-stable
@@ -70,7 +70,7 @@ ci-required:
     just test-system-nightly
 
 ci-ios:
-    cargo test -p ios-app
+    cargo test --locked -p ios-app
     cd apps/apple-file-provider && swift test
     DEST="$$(IRONMESH_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp apps/apple-file-provider/scripts/prepare-ios-simulator.sh apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj IronmeshIosProject)" && \
         xcodebuild test \

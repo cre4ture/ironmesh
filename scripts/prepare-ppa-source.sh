@@ -33,9 +33,9 @@ find_cargo_bin() {
   command -v cargo
 }
 
-refresh_workspace_lockfile() {
-  log "refreshing root Cargo.lock for packaging"
-  "${CARGO_BIN}" generate-lockfile
+verify_workspace_lockfile() {
+  log "verifying root Cargo.lock for packaging"
+  "${CARGO_BIN}" metadata --locked --no-deps --format-version 1 >/dev/null
 }
 
 copy_dist_dir() {
@@ -168,7 +168,7 @@ copy_dist_dir \
   "${ROOT_DIR}/web/apps/client-ui/dist" \
   "${PREBUILT_WEB_DIR}/client-ui"
 
-refresh_workspace_lockfile
+verify_workspace_lockfile
 
 log "vendoring Rust dependencies with ${CARGO_BIN}"
 rm -rf "${VENDORED_DIR}"
