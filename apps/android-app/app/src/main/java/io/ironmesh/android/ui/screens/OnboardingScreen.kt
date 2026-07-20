@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -23,9 +24,13 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
+import io.ironmesh.android.ui.EnrollmentDiagnosticStep
+import io.ironmesh.android.ui.EnrollmentDiagnosticStepId
+import io.ironmesh.android.ui.EnrollmentDiagnosticStepStatus
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.components.PermissionExplainerCard
 import io.ironmesh.android.ui.components.SectionCard
+import io.ironmesh.android.ui.components.TimelineDot
 
 @Composable
 fun OnboardingScreen(
@@ -96,6 +101,10 @@ fun OnboardingScreen(
             }
         }
 
+        if (state.enrollmentDiagnostics.isNotEmpty()) {
+            EnrollmentDiagnosticsCard(state.enrollmentDiagnostics)
+        }
+
         PermissionExplainerCard(
             title = stringResource(R.string.folder_access_title),
             body = stringResource(R.string.folder_access_body),
@@ -112,4 +121,75 @@ fun OnboardingScreen(
             status = stringResource(R.string.permission_needed),
         )
     }
+}
+
+@Composable
+private fun EnrollmentDiagnosticsCard(
+    steps: List<EnrollmentDiagnosticStep>,
+) {
+    SectionCard(
+        title = stringResource(R.string.enrollment_diagnostics_title),
+        supportingText = stringResource(R.string.enrollment_diagnostics_body),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            steps.forEach { step ->
+                val status = enrollmentDiagnosticStatusLabel(step.status)
+                val color = when (step.status) {
+                    EnrollmentDiagnosticStepStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
+                    EnrollmentDiagnosticStepStatus.IN_PROGRESS -> MaterialTheme.colorScheme.primary
+                    EnrollmentDiagnosticStepStatus.SUCCEEDED -> MaterialTheme.colorScheme.primary
+                    EnrollmentDiagnosticStepStatus.FAILED -> MaterialTheme.colorScheme.error
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    TimelineDot(
+                        color = color,
+                        modifier = Modifier
+                            .padding(top = 6.dp)
+                            .size(10.dp),
+                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = enrollmentDiagnosticStepLabel(step.id),
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            text = status,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = color,
+                        )
+                        step.detail
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { detail ->
+                                SelectionContainer {
+                                    Text(
+                                        text = detail,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (step.status == EnrollmentDiagnosticStepStatus.FAILED) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                    )
+                                }
+                            }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun enrollmentDiagnosticStepLabel(stepId: EnrollmentDiagnosticStepId): String = when (stepId) {
+    EnrollmentDiagnosticStepId.BOOTSTRAP -> stringResource(R.string.enrollment_step_bootstrap)
+    EnrollmentDiagnosticStepId.VERIFY_ACCESS -> stringResource(R.string.enrollment_step_verify_access)
+    EnrollmentDiagnosticStepId.SAVE_IDENTITY -> stringResource(R.string.enrollment_step_save_identity)
+}
+
+@Composable
+private fun enrollmentDiagnosticStatusLabel(status: EnrollmentDiagnosticStepStatus): String = when (status) {
+    EnrollmentDiagnosticStepStatus.PENDING -> stringResource(R.string.enrollment_status_pending)
+    EnrollmentDiagnosticStepStatus.IN_PROGRESS -> stringResource(R.string.enrollment_status_in_progress)
+    EnrollmentDiagnosticStepStatus.SUCCEEDED -> stringResource(R.string.enrollment_status_succeeded)
+    EnrollmentDiagnosticStepStatus.FAILED -> stringResource(R.string.enrollment_status_failed)
 }
