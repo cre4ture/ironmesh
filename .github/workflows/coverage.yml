@@ -1,4 +1,4 @@
-name: Coverage
+name: Cov
 
 on:
   push:
@@ -20,6 +20,7 @@ env:
 
 jobs:
   coverage:
+    name: Cov
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"

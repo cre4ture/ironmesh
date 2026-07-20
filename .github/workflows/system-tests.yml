@@ -1,4 +1,4 @@
-name: System Tests
+name: Sys
 
 on:
   push:
@@ -20,13 +20,16 @@ env:
 
 jobs:
   system-tests:
+    name: Sys (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            label: linux
+          - os: windows-latest
+            label: win
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
