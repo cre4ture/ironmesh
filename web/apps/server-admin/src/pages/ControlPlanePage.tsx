@@ -456,12 +456,13 @@ export function ControlPlanePage() {
                   <Radio
                     value="standalone_service"
                     label="Standalone ironmesh-rendezvous-service"
-                    description="Exports a standalone-friendly package with inline cluster certificate material so the service only needs this JSON package plus the passphrase."
+                    description="Includes the client CA certificate and a TLS identity for the standalone service. The cluster signer stays on this node; the service needs this JSON package and its passphrase."
                   />
                 </Stack>
               </Radio.Group>
               <PasswordInput
                 label="Passphrase"
+                description="Encrypts the exported JSON, including the service TLS private key. Use a unique secret of at least 12 characters, store it separately, and provide the same passphrase every time the standalone service starts. It is not the admin token or cluster signer."
                 value={rendezvousPassphrase}
                 onChange={(event) => setRendezvousPassphrase(event.currentTarget.value)}
               />
@@ -479,6 +480,7 @@ export function ControlPlanePage() {
               )}
               <TextInput
                 label="Public rendezvous URL override"
+                description="Optional: leave empty to use this node’s configured rendezvous URL. Otherwise enter the exact public HTTPS URL clients use, including its port (for example https://creax.de:44043). It is embedded in the package and TLS certificate, but does not configure DNS, port forwarding, or existing bootstraps."
                 value={rendezvousPublicUrl}
                 onChange={(event) => setRendezvousPublicUrl(event.currentTarget.value)}
                 placeholder="https://rendezvous.example:9443"

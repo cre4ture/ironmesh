@@ -276,6 +276,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByLabel("Standalone ironmesh-rendezvous-service").click();
   await expect(page.getByRole("textbox", { name: "Target node ID" })).toHaveCount(1);
   await expect(page.getByText("No target node ID is needed for the standalone service package.")).toBeVisible();
+  await expect(page.getByText(/Encrypts the exported JSON, including the service TLS private key/)).toBeVisible();
+  await expect(page.getByText(/leave empty to use this node’s configured rendezvous URL/)).toBeVisible();
   await page.getByLabel("Passphrase").first().fill("rendezvous-passphrase");
   await page.getByRole("button", { name: "Export standalone rendezvous package" }).click();
   await expect(page.getByText("https://node-beta.local/rendezvous")).toBeVisible();
