@@ -1,27 +1,47 @@
 <p align="center">
-  <img src="docs/assets/ironmesh-logo.svg" alt="ironmesh logo" width="560" />
+  <img src="docs/assets/ironmesh-favicon.svg" alt="BerryKeep logo" width="144" />
 </p>
 
-# Ironmesh
+# BerryKeep
 
 Private, self-hosted storage for files and media, built around clustered server
 nodes and native access paths.
 
-Ironmesh is building toward a private, self-hosted storage system that makes clustered files, folders, and media feel as approachable as a consumer cloud drive, while keeping deployment, trust, and data ownership in your hands. The project combines secure multi-node storage, offline-friendly sync and conflict handling, and native filesystem access paths so the same data can surface cleanly in web, mobile, and OS file-manager workflows.
+BerryKeep is building toward a private, self-hosted storage system that makes clustered files, folders, and media feel as approachable as a consumer cloud drive, while keeping deployment, trust, and data ownership in your hands. The project combines secure multi-node storage, offline-friendly sync and conflict handling, and native filesystem access paths so the same data can surface cleanly in web, mobile, and OS file-manager workflows.
+
+## Renaming from IronMesh
+
+This project is being renamed from **IronMesh** to **BerryKeep** because the
+former name is already used by another project. The repository and
+user-facing product surfaces are now moving to the BerryKeep name and the new
+grape-and-leaf icon.
+
+The rename is deliberately incremental. To preserve compatibility with
+existing installs, data, automation, and package upgrades, many technical
+identifiers still use the legacy `ironmesh` name. These include Cargo package
+and crate names, binary and command names, environment variables, systemd
+service and user names, data directories, the APT repository and package
+names, application identities, and some asset and source-file names.
+
+No action is required from existing users: continue using the installation,
+service, and configuration commands in this README exactly as written. A
+future compatibility-aware migration will update the remaining identifiers;
+until then, an `ironmesh` reference in a command, path, package name, or
+configuration key is expected and does not identify a separate product.
 
 ## Project Status
 
-Ironmesh is experimental software under active development. Versioned packages
+BerryKeep is experimental software under active development. Versioned packages
 and tagged releases exist so deployments and upgrades can be tested, but they
 do not mean the project is production-ready yet.
 
 - Maturity: experimental. APIs, storage details, replication behavior, and
   operational workflows may still change between releases.
-- Guarantees: Ironmesh does not currently offer availability, durability,
+- Guarantees: BerryKeep does not currently offer availability, durability,
   support, or backward-compatibility guarantees for use as a live primary
   storage system.
-- Data safety: do not use Ironmesh as the only copy of important data. Keep
-  independent backups and recovery procedures outside Ironmesh.
+- Data safety: do not use BerryKeep as the only copy of important data. Keep
+  independent backups and recovery procedures outside BerryKeep.
 - Security reporting: report vulnerabilities privately as described in
   [SECURITY.md](SECURITY.md).
 - License: MIT. See [LICENSE](LICENSE).
@@ -33,21 +53,21 @@ Current direction highlights:
 - Secure onboarding and connectivity through guided zero-touch cluster setup, certificate-backed identities, and rendezvous/relay paths for harder network topologies.
 - Media-aware browsing with cached thumbnails and metadata designed to support gallery-style experiences without downloading original files first.
 
-Ironmesh draws inspiration from [PicApport](https://www.picapport.de/de/index.php) on the self-hosted media/gallery side and [Syncthing](https://syncthing.net/) on the private, direct-first synchronization side.
+BerryKeep draws inspiration from [PicApport](https://www.picapport.de/de/index.php) on the self-hosted media/gallery side and [Syncthing](https://syncthing.net/) on the private, direct-first synchronization side.
 
 ## Personal motivation
 
 As a software engineer, I want the same relationship with my computer and my data that a skilled mechanic has with a car: the ability to repair it, understand it, and extend it when needed. That desire does not come from distrust of large cloud providers, just as a mechanic's wish to work on a car does not imply suspicion of major manufacturers. It comes from knowing the craft well enough to want meaningful influence over the systems one depends on.
 
-Ironmesh is also a test of what is now possible for an individual builder. AI coding agents have expanded the practical reach of small teams and solo engineers by an order of magnitude, and part of this project is to explore that shift seriously. Proving that this kind of ambitious, deeply owned software can be built in a new way is not separate from the project's purpose; it is one of its central goals.
+BerryKeep is also a test of what is now possible for an individual builder. AI coding agents have expanded the practical reach of small teams and solo engineers by an order of magnitude, and part of this project is to explore that shift seriously. Proving that this kind of ambitious, deeply owned software can be built in a new way is not separate from the project's purpose; it is one of its central goals.
 
-## At A Glance
+## At A Glance (Legacy Diagram)
 
 <p align="center">
   <a href="docs/assets/ironmesh-at-a-glance.png">
     <img
       src="docs/assets/ironmesh-at-a-glance.png"
-      alt="IronMesh at a glance overview diagram"
+      alt="IronMesh at a glance overview diagram (legacy branding)"
       width="1200"
     />
   </a>
@@ -55,7 +75,7 @@ Ironmesh is also a test of what is now possible for an individual builder. AI co
 
 ## Install On Ubuntu
 
-Ironmesh Ubuntu packages are published from the signed apt repository at:
+BerryKeep Ubuntu packages are published from the signed APT repository at:
 
 ```text
 https://creax.de/apt/ironmesh
@@ -82,7 +102,8 @@ sudo apt install ca-certificates curl gnupg
 sudo install -d -m 0755 /usr/share/keyrings
 ```
 
-Install the Ironmesh repository signing key:
+Install the legacy `ironmesh` repository signing key (the package
+infrastructure is not renamed yet):
 
 ```bash
 curl -fsSL https://creax.de/apt/ironmesh/ironmesh-archive-keyring.asc \
