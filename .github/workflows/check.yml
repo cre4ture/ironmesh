@@ -5,6 +5,12 @@ on:
     branches:
       - main
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -248,17 +254,18 @@ jobs:
       - name: Compute Android build matrix
         id: set-matrix
         env:
+          ANDROID_RELEASE_REQUESTED: ${{ contains(github.event.pull_request.labels.*.name, 'ci:android-release') }}
           IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 }}
         run: |
           # Debug legs run the cheap JVM unit tests (+ server-node package
           # validation build). They always run, including on pull requests.
           DEBUG_TARGETS='{"label":"app dbg","module":"android-app","directory":"apps/android-app","variant":"debug","artifact":""},{"label":"node dbg","module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"debug","artifact":""}'
           # Release legs build the signed "performance testing" APKs. They are
-          # expensive, so build them only on push to main / workflow_dispatch
-          # (never on pull_request) and only when the signing keystore secret
-          # is available.
+          # expensive, so build them on push to main / workflow_dispatch, or
+          # on pull requests explicitly marked with ci:android-release. The
+          # signing keystore secret must be available in all cases.
           RELEASE_TARGETS='{"label":"app rel","module":"android-app","directory":"apps/android-app","variant":"release","artifact":"android-release-performance"},{"label":"node rel","module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"release","artifact":"android-server-node-release-performance"}'
-          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] && [ -n "${IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
+          if { [ "${GITHUB_EVENT_NAME}" != "pull_request" ] || [ "${ANDROID_RELEASE_REQUESTED}" = "true" ]; } && [ -n "${IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
             TARGETS="[${DEBUG_TARGETS},${RELEASE_TARGETS}]"
           else
             TARGETS="[${DEBUG_TARGETS}]"

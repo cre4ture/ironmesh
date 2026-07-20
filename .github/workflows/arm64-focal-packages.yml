@@ -61,10 +61,11 @@ jobs:
           sccache_dir="${RUNNER_TEMP}/sccache-arm64"
           mkdir -p "$sccache_dir"
           workspace_parent="$(dirname "$GITHUB_WORKSPACE")"
+          workspace_dir="$(basename "$GITHUB_WORKSPACE")"
           docker run --rm \
             --volume "${workspace_parent}:/build" \
             --volume "${sccache_dir}:/sccache" \
-            --workdir /build/ironmesh \
+            --workdir "/build/${workspace_dir}" \
             --env RUSTC_WRAPPER=sccache \
             --env SCCACHE_DIR=/sccache \
             --env SCCACHE_CACHE_SIZE=2G \
@@ -81,7 +82,7 @@ jobs:
                 build-essential ca-certificates clang curl dh-sysuser git \
                 libfuse3-dev pkg-config
               apt-get install -y --no-install-recommends -t focal-backports debhelper
-              git config --global --add safe.directory /build/ironmesh
+              git config --global --add safe.directory "$PWD"
               curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain nightly-2026-02-17
               export PATH=/root/.cargo/bin:$PATH
@@ -97,7 +98,7 @@ jobs:
                 \( -name "ironmesh-*_*_arm64.deb" \
                   -o -name "ironmesh_*_arm64.changes" \
                   -o -name "ironmesh_*_arm64.buildinfo" \) \
-                -exec cp -v {} /build/ironmesh/artifacts/ \;
+                -exec cp -v {} artifacts/ \;
             '
           # actions/cache runs its post-job save as the runner user, but the
           # container wrote the cache as root; hand ownership back so it saves.

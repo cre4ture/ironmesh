@@ -1,5 +1,17 @@
 # CI runbook
 
+## Android release builds on pull requests
+
+Pull requests run the Android debug checks by default. To request the signed
+internal release APKs, add the `ci:android-release` label to the pull request.
+The label triggers a workflow run immediately and remains effective for later
+pushes to the pull request while it is present.
+
+This requires the repository secrets `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`
+and the corresponding release-signing credentials. For pull requests from
+forks, GitHub does not expose these secrets to the standard `pull_request`
+workflow, so the release legs remain unavailable there by design.
+
 ## Required checks (branch protection alignment)
 
 For branch `main`, require these status checks:
