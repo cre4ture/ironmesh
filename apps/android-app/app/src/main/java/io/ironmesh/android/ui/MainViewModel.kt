@@ -130,6 +130,7 @@ data class MainUiState(
     val deviceAuthState: DeviceAuthState = DeviceAuthState(),
     val bootstrapInput: String = "",
     val deviceLabelInput: String = "",
+    val enrollmentDiagnostics: List<EnrollmentDiagnosticStep> = emptyList(),
     val key: String = "demo-key",
     val payload: String = "hello from android",
     val status: String = "Ready",
@@ -931,53 +932,121 @@ class MainViewModel(
     fun enrollDevice() {
         val bootstrapJson = uiState.value.bootstrapInput.trim()
         if (bootstrapJson.isBlank()) {
-            setStatus("Error: Bootstrap claim or bundle is required")
+            val detail = "Bootstrap claim or bundle is required"
+            uiState.value = uiState.value.copy(
+                status = "Error: $detail",
+                enrollmentDiagnostics = newEnrollmentDiagnostics().withEnrollmentDiagnosticStatus(
+                    stepId = EnrollmentDiagnosticStepId.BOOTSTRAP,
+                    status = EnrollmentDiagnosticStepStatus.FAILED,
+                    detail = detail,
+                ),
+            )
             return
         }
 
         val label = uiState.value.deviceLabelInput.trim().takeIf { it.isNotBlank() }
         val existingDeviceId = uiState.value.deviceAuthState.deviceId.takeIf { it.isNotBlank() }
-        uiState.value = uiState.value.copy(loading = true, status = "Enrolling device...")
+        uiState.value = uiState.value.copy(
+            loading = true,
+            status = "Enrolling device...",
+            enrollmentDiagnostics = newEnrollmentDiagnostics().withEnrollmentDiagnosticStatus(
+                stepId = EnrollmentDiagnosticStepId.BOOTSTRAP,
+                status = EnrollmentDiagnosticStepStatus.IN_PROGRESS,
+            ),
+        )
         viewModelScope.launch {
-            runCatching {
-                val authState = withContext(Dispatchers.IO) {
+            val authState = try {
+                withContext(Dispatchers.IO) {
                     repository.enrollWithBootstrap(
                         bootstrapJson = bootstrapJson,
                         deviceId = existingDeviceId,
                         label = label,
                     )
                 }
-                uiState.value = uiState.value.copy(status = "Verifying enrollment...")
+            } catch (error: Throwable) {
+                finishEnrollmentWithError(EnrollmentDiagnosticStepId.BOOTSTRAP, error)
+                return@launch
+            }
+
+            uiState.value = uiState.value.copy(
+                status = "Verifying enrollment...",
+                enrollmentDiagnostics = uiState.value.enrollmentDiagnostics
+                    .withEnrollmentDiagnosticStatus(
+                        stepId = EnrollmentDiagnosticStepId.BOOTSTRAP,
+                        status = EnrollmentDiagnosticStepStatus.SUCCEEDED,
+                    )
+                    .withEnrollmentDiagnosticStatus(
+                        stepId = EnrollmentDiagnosticStepId.VERIFY_ACCESS,
+                        status = EnrollmentDiagnosticStepStatus.IN_PROGRESS,
+                    ),
+            )
+            try {
                 withContext(Dispatchers.IO) {
                     repository.verifyEnrollmentAccess(authState)
+                }
+            } catch (error: Throwable) {
+                finishEnrollmentWithError(EnrollmentDiagnosticStepId.VERIFY_ACCESS, error)
+                return@launch
+            }
+
+            uiState.value = uiState.value.copy(
+                status = "Saving device identity...",
+                enrollmentDiagnostics = uiState.value.enrollmentDiagnostics
+                    .withEnrollmentDiagnosticStatus(
+                        stepId = EnrollmentDiagnosticStepId.VERIFY_ACCESS,
+                        status = EnrollmentDiagnosticStepStatus.SUCCEEDED,
+                    )
+                    .withEnrollmentDiagnosticStatus(
+                        stepId = EnrollmentDiagnosticStepId.SAVE_IDENTITY,
+                        status = EnrollmentDiagnosticStepStatus.IN_PROGRESS,
+                    ),
+            )
+            try {
+                withContext(Dispatchers.IO) {
                     repository.stopWebUi()
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
                 }
-                authState
+            } catch (error: Throwable) {
+                finishEnrollmentWithError(EnrollmentDiagnosticStepId.SAVE_IDENTITY, error)
+                return@launch
             }
-                .onSuccess { authState ->
-                    stopConnectionRoutesMonitor()
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        deviceAuthState = authState,
-                        bootstrapInput = "",
-                        deviceLabelInput = authState.label.orEmpty(),
-                        connectionRoutes = null,
-                        connectionRoutesError = null,
-                        connectionRoutesLastLoadedUnixMs = 0L,
-                        selectedSection = MainSection.HOME,
-                        webUiSession = null,
-                        status = "Device enrolled: ${authState.deviceId}",
-                    )
-                    FolderSyncScheduler.reschedule(getApplication())
-                }
-                .onFailure { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        status = "Error: ${error.message}",
-                    )
-                }
+
+            stopConnectionRoutesMonitor()
+            uiState.value = uiState.value.copy(
+                loading = false,
+                deviceAuthState = authState,
+                bootstrapInput = "",
+                deviceLabelInput = authState.label.orEmpty(),
+                enrollmentDiagnostics = uiState.value.enrollmentDiagnostics
+                    .withEnrollmentDiagnosticStatus(
+                        stepId = EnrollmentDiagnosticStepId.SAVE_IDENTITY,
+                        status = EnrollmentDiagnosticStepStatus.SUCCEEDED,
+                    ),
+                connectionRoutes = null,
+                connectionRoutesError = null,
+                connectionRoutesLastLoadedUnixMs = 0L,
+                selectedSection = MainSection.HOME,
+                webUiSession = null,
+                status = "Device enrolled: ${authState.deviceId}",
+            )
+            FolderSyncScheduler.reschedule(getApplication())
         }
+    }
+
+    private fun finishEnrollmentWithError(
+        stepId: EnrollmentDiagnosticStepId,
+        error: Throwable,
+    ) {
+        val detail = enrollmentDiagnosticErrorDetail(error)
+        uiState.value = uiState.value.copy(
+            loading = false,
+            status = "Error: $detail",
+            enrollmentDiagnostics = uiState.value.enrollmentDiagnostics.withEnrollmentDiagnosticStatus(
+                stepId = stepId,
+                status = EnrollmentDiagnosticStepStatus.FAILED,
+                detail = detail,
+            ),
+        )
     }
 
     private fun execute(loadingMessage: String, action: suspend () -> String) {

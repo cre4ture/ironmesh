@@ -13,6 +13,15 @@
     <string name="scan_qr">Scan QR</string>
     <string name="enroll_device">Enroll device</string>
     <string name="enrolling">Enrolling</string>
+    <string name="enrollment_diagnostics_title">Enrollment details</string>
+    <string name="enrollment_diagnostics_body">The current attempt is shown step by step. Error details can be selected and copied.</string>
+    <string name="enrollment_step_bootstrap">Process bootstrap claim or bundle</string>
+    <string name="enrollment_step_verify_access">Verify signed server access</string>
+    <string name="enrollment_step_save_identity">Save device identity</string>
+    <string name="enrollment_status_pending">Not started</string>
+    <string name="enrollment_status_in_progress">In progress</string>
+    <string name="enrollment_status_succeeded">Succeeded</string>
+    <string name="enrollment_status_failed">Failed</string>
     <string name="required_access">Required access</string>
     <string name="required_access_body">Folder access is needed for sync. Photo metadata access keeps original image details. Wi-Fi access is only required when you restrict profiles to named networks.</string>
     <string name="home_title">Home</string>
