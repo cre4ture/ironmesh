@@ -127,6 +127,7 @@ mod listing;
 mod map_config;
 mod map_dataset_import;
 mod natural_earth_import;
+mod reliability_telemetry;
 mod replication;
 mod s3_frontend;
 mod setup;
@@ -272,6 +273,7 @@ struct ServerState {
     runtime_log_control: RuntimeLogControl,
     process_stats_runtime: Arc<StdMutex<ProcessStatsRuntime>>,
     hardware_health_runtime: Arc<Mutex<hardware_health::HardwareHealthRuntime>>,
+    reliability_telemetry_runtime: Arc<Mutex<reliability_telemetry::ReliabilityTelemetryRuntime>>,
 }
 
 #[derive(Clone)]
@@ -6986,6 +6988,9 @@ async fn run_inner(
         hardware_health_runtime: Arc::new(Mutex::new(
             hardware_health::HardwareHealthRuntime::load(&config.data_dir),
         )),
+        reliability_telemetry_runtime: Arc::new(Mutex::new(
+            reliability_telemetry::ReliabilityTelemetryRuntime::load(&config.data_dir),
+        )),
     };
     seed_process_temperature_stats_for_tests(&state);
 
@@ -7309,6 +7314,15 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route(
             "/auth/hardware/health",
             get(hardware_health::hardware_health_current),
+        )
+        .route(
+            "/auth/telemetry/settings",
+            get(reliability_telemetry::telemetry_settings_get)
+                .put(reliability_telemetry::telemetry_settings_put),
+        )
+        .route(
+            "/auth/telemetry/preview",
+            get(reliability_telemetry::telemetry_preview_get),
         )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 

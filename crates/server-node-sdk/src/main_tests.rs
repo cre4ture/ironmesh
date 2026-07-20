@@ -15084,6 +15084,9 @@ async fn build_test_state(
         hardware_health_runtime: Arc::new(Mutex::new(
             super::hardware_health::HardwareHealthRuntime::load(&root),
         )),
+        reliability_telemetry_runtime: Arc::new(Mutex::new(
+            super::reliability_telemetry::ReliabilityTelemetryRuntime::load(&root),
+        )),
     };
 
     if seed_gap {
