@@ -8,6 +8,15 @@ use bytes::Bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static ANDROID_CLIENT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_android_client_cache_for_test() {
+        *android_client_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
 
     fn sample_profile(
         profile_id: &str,
@@ -83,6 +92,65 @@ mod tests {
         );
         assert!(status.service_message.contains("1 with errors"));
         assert!(status.active_summary.contains("Photos: running"));
+    }
+
+    #[test]
+    fn android_client_configuration_cache_reuses_matching_configuration() {
+        let _guard = ANDROID_CLIENT_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_android_client_cache_for_test();
+
+        let build_count = AtomicUsize::new(0);
+        let key = AndroidClientCacheKey {
+            connection_input: "http://127.0.0.1:18080".to_string(),
+            server_ca_pem: None,
+            client_identity_json: None,
+        };
+
+        let first = cached_configured_sdk_build_for_key(key.clone(), |_| {
+            build_count.fetch_add(1, Ordering::SeqCst);
+            Ok(ConfiguredAndroidSdk {
+                client: IronMeshClient::from_direct_base_url("http://127.0.0.1:18080"),
+                client_identity: None,
+            })
+        })
+        .expect("first client configuration should be cached");
+        let second = cached_configured_sdk_build_for_key(key.clone(), |_| {
+            build_count.fetch_add(1, Ordering::SeqCst);
+            Ok(ConfiguredAndroidSdk {
+                client: IronMeshClient::from_direct_base_url("http://127.0.0.1:18081"),
+                client_identity: None,
+            })
+        })
+        .expect("matching client configuration should use the cache");
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first.client.connection_route_snapshot().endpoints[0].locator,
+            second.client.connection_route_snapshot().endpoints[0].locator,
+        );
+
+        let changed_key = AndroidClientCacheKey {
+            connection_input: "http://127.0.0.1:18081".to_string(),
+            ..key
+        };
+        let changed = cached_configured_sdk_build_for_key(changed_key, |_| {
+            build_count.fetch_add(1, Ordering::SeqCst);
+            Ok(ConfiguredAndroidSdk {
+                client: IronMeshClient::from_direct_base_url("http://127.0.0.1:18081"),
+                client_identity: None,
+            })
+        })
+        .expect("changed client configuration should rebuild the client");
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            changed.client.connection_route_snapshot().endpoints[0].locator,
+            "http://127.0.0.1:18081",
+        );
+
+        clear_android_client_cache_for_test();
     }
 }
 use client_sdk::{
@@ -1043,12 +1111,12 @@ fn start_embedded_web_ui(
         .local_addr()
         .context("failed to read embedded web ui listener address")?;
     let local_url = format!("http://127.0.0.1:{}/", address.port());
-    let configured = configured_sdk_build(
+    let configured = cached_configured_sdk_build(
         connection_input.clone(),
         server_ca_pem.clone(),
         client_identity_json.clone(),
     )?;
-    let client = configured.client;
+    let client = configured.client.with_connection_name("android web ui");
     let mut web_ui_config =
         web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
     let (_, client_bootstrap_json) = split_connection_input(connection_input.clone())?;
@@ -1326,6 +1394,7 @@ fn split_connection_input(
     }
 }
 
+#[derive(Clone)]
 struct ConfiguredAndroidSdk {
     client: IronMeshClient,
     client_identity: Option<ClientIdentityMaterial>,
@@ -1428,30 +1497,43 @@ struct AndroidClientCacheKey {
 
 struct AndroidClientCacheEntry {
     key: AndroidClientCacheKey,
-    client: IronMeshClient,
+    configured: ConfiguredAndroidSdk,
 }
 
 /// Building an `IronMeshClient` from scratch runs a network connection-quality
 /// probe (see `order_clients_by_startup_probe` in client-sdk), so every JNI
-/// call on the Android data plane (thumbnail streaming in particular) shares
-/// one cached client per distinct connection identity instead of rebuilding
-/// it - and re-probing targets - on every call.
+/// call, including the embedded Web UI, shares one cached configuration per
+/// distinct connection identity instead of rebuilding it - and re-probing
+/// targets - on every call.
 fn android_client_cache() -> &'static Mutex<Option<AndroidClientCacheEntry>> {
     static CACHE: OnceLock<Mutex<Option<AndroidClientCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-fn cached_configured_sdk(
+fn cached_configured_sdk_build(
     connection_input: impl Into<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-) -> Result<IronMeshClient> {
+) -> Result<ConfiguredAndroidSdk> {
     let key = AndroidClientCacheKey {
         connection_input: connection_input.into(),
         server_ca_pem,
         client_identity_json,
     };
 
+    cached_configured_sdk_build_for_key(key, |key| {
+        configured_sdk_build(
+            key.connection_input.clone(),
+            key.server_ca_pem.clone(),
+            key.client_identity_json.clone(),
+        )
+    })
+}
+
+fn cached_configured_sdk_build_for_key(
+    key: AndroidClientCacheKey,
+    build: impl FnOnce(&AndroidClientCacheKey) -> Result<ConfiguredAndroidSdk>,
+) -> Result<ConfiguredAndroidSdk> {
     // Recover from poisoning rather than propagating it: a panic while building one
     // client must not permanently break every future JNI call in the process.
     let mut slot = android_client_cache()
@@ -1461,19 +1543,27 @@ fn cached_configured_sdk(
     if let Some(entry) = slot.as_ref()
         && entry.key == key
     {
-        return Ok(entry.client.clone());
+        return Ok(entry.configured.clone());
     }
 
-    let client = configured_sdk(
-        key.connection_input.clone(),
-        key.server_ca_pem.clone(),
-        key.client_identity_json.clone(),
-    )?;
+    let configured = build(&key)?;
     *slot = Some(AndroidClientCacheEntry {
         key,
-        client: client.clone(),
+        configured: configured.clone(),
     });
-    Ok(client)
+    Ok(configured)
+}
+
+fn cached_configured_sdk(
+    connection_input: impl Into<String>,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<IronMeshClient> {
+    Ok(
+        cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?
+            .client
+            .with_connection_name("android foreground"),
+    )
 }
 
 fn cached_configured_client_node(
