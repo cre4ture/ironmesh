@@ -47,4 +47,16 @@ data class ConnectionRouteEndpointSnapshot(
     val lastBackgroundProbeUnixMs: Long? = null,
     @Json(name = "last_error")
     val lastError: String? = null,
+    @Json(name = "recent_attempts")
+    val recentAttempts: List<ConnectionRouteAttemptSnapshot> = emptyList(),
+)
+
+data class ConnectionRouteAttemptSnapshot(
+    val startedUnixMs: Long,
+    val finishedUnixMs: Long? = null,
+    val method: String,
+    val url: String,
+    val timeoutMs: Long? = null,
+    val outcome: String,
+    val error: String? = null,
 )
