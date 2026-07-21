@@ -4,6 +4,8 @@ Official project language: English
 
 Prefer own worktree for each PR. Avoid using the default worktree.
 
+This project is under heavy development by multiple Agents on multiple seperate hosts. Before starting a new task, ensure you have the latest changes from remote main.
+
 Work pacing and delivery rules live in [PACE.md](PACE.md).
 
 # Skills
