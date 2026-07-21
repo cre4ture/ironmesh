@@ -275,6 +275,8 @@ pub struct ClientConnectionRouteEndpointSnapshot {
     pub last_background_probe_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub recent_attempts: Vec<ClientConnectionAttempt>,
 }
 
 #[derive(Debug)]
@@ -623,6 +625,7 @@ impl ClientEndpointRouter {
                     background_probe_in_flight: state.background_probe_in_flight,
                     last_background_probe_unix_ms: state.last_background_probe_unix_ms,
                     last_error: state.last_error.clone(),
+                    recent_attempts: state.recent_attempts.clone(),
                 }
             })
             .collect();

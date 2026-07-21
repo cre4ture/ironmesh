@@ -35,6 +35,20 @@ class EmbeddedWebUiSession(
     override fun toString(): String = "EmbeddedWebUiSession(url=$url, authorization=<redacted>)"
 }
 
+data class EnrollmentAccessVerification(
+    val elapsedMs: Long,
+    val connectionRoutes: ConnectionRouteSnapshot? = null,
+)
+
+class EnrollmentAccessVerificationException(
+    val elapsedMs: Long,
+    val connectionRoutes: ConnectionRouteSnapshot? = null,
+    cause: Throwable,
+) : IllegalStateException(
+    "Enrollment succeeded, but signed access verification failed: ${cause.message}",
+    cause,
+)
+
 class IronmeshRepository {
     private fun normalizedClientIdentityJson(clientIdentityJson: String?): String? {
         return clientIdentityJson?.trim()?.takeIf { it.isNotEmpty() }
@@ -89,7 +103,7 @@ class IronmeshRepository {
 
     suspend fun verifyEnrollmentAccess(
         authState: DeviceAuthState,
-    ) {
+    ): EnrollmentAccessVerification {
         val connectionInput = authState.preferredConnectionInput()
         check(connectionInput.isNotBlank()) {
             "enrollment did not return a usable connection target"
@@ -99,19 +113,44 @@ class IronmeshRepository {
             "enrollment did not return a usable client identity"
         }
 
-        runCatching {
+        val startedAtNanos = System.nanoTime()
+        return try {
             storeIndex(
                 connectionInput = connectionInput,
                 depth = 1,
                 serverCaPem = authState.serverCaPem?.takeIf { it.isNotBlank() },
                 clientIdentityJson = clientIdentityJson,
             )
-        }.getOrElse { error ->
-            throw IllegalStateException(
-                "Enrollment succeeded, but signed access verification failed: ${error.message}",
-                error,
+            EnrollmentAccessVerification(
+                elapsedMs = elapsedMillisSince(startedAtNanos),
+                connectionRoutes = enrollmentConnectionRoutes(authState, connectionInput, clientIdentityJson),
+            )
+        } catch (error: Throwable) {
+            throw EnrollmentAccessVerificationException(
+                elapsedMs = elapsedMillisSince(startedAtNanos),
+                connectionRoutes = enrollmentConnectionRoutes(authState, connectionInput, clientIdentityJson),
+                cause = error,
             )
         }
+    }
+
+    private fun enrollmentConnectionRoutes(
+        authState: DeviceAuthState,
+        connectionInput: String,
+        clientIdentityJson: String,
+    ): ConnectionRouteSnapshot? {
+        return runCatching {
+            getConnectionRouteSnapshot(
+                connectionInput = connectionInput,
+                serverCaPem = authState.serverCaPem?.takeIf { it.isNotBlank() },
+                clientIdentityJson = clientIdentityJson,
+                refresh = false,
+            )
+        }.getOrNull()
+    }
+
+    private fun elapsedMillisSince(startedAtNanos: Long): Long {
+        return ((System.nanoTime() - startedAtNanos) / 1_000_000L).coerceAtLeast(0L)
     }
 
     suspend fun putObject(
