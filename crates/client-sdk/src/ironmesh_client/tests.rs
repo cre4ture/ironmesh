@@ -1133,6 +1133,27 @@ async fn spawn_relay_test_server_at_with_security(
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("listener should bind");
+    spawn_relay_test_server_on_listener_with_security(
+        listener,
+        response_status,
+        response_headers,
+        response_body,
+        response_delay_ms,
+        object_write_failures_remaining,
+        security,
+    )
+    .await
+}
+
+async fn spawn_relay_test_server_on_listener_with_security(
+    listener: tokio::net::TcpListener,
+    response_status: u16,
+    response_headers: Vec<RelayHttpHeader>,
+    response_body: Vec<u8>,
+    response_delay_ms: u64,
+    object_write_failures_remaining: usize,
+    security: RelayTestSecurity,
+) -> (RelayTestState, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().expect("listener addr");
     let state = RelayTestState {
         public_url: format!("http://{addr}"),
@@ -2865,6 +2886,10 @@ async fn direct_quic_transport_executes_request_and_reports_diagnostics() {
             route_snapshot.endpoints[0].path_kind,
             transport_sdk::TransportPathKind::DirectQuic
         );
+        assert_eq!(
+            route_snapshot.endpoints[0].hole_punching_mode.as_deref(),
+            Some("direct")
+        );
         assert_eq!(client.transport_session_pool_snapshot().connect_count, 1);
         assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
 
@@ -3388,13 +3413,23 @@ async fn refresh_connection_route_snapshot_times_out_stalled_probe() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_probe_reprioritizes_recovered_relay_endpoint() {
-    let reserved_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("listener should bind");
-    let primary_addr = reserved_listener
+    let primary_listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind"),
+    );
+    let primary_addr = primary_listener
         .local_addr()
         .expect("listener should have addr");
-    drop(reserved_listener);
+    let placeholder_listener = Arc::clone(&primary_listener);
+    let placeholder_server = tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = placeholder_listener.accept().await else {
+                return;
+            };
+            drop(socket);
+        }
+    });
 
     let primary_url = format!("http://{primary_addr}");
     let fallback_body = serde_json::to_vec(&serde_json::json!({
@@ -3443,8 +3478,12 @@ async fn background_probe_reprioritizes_recovered_relay_endpoint() {
         "route": "primary",
     }))
     .expect("primary relay body should serialize");
-    let (primary_state, primary_server) = spawn_relay_test_server_at_with_security(
-        primary_addr,
+    placeholder_server.abort();
+    let _ = placeholder_server.await;
+    let primary_listener = Arc::try_unwrap(primary_listener)
+        .unwrap_or_else(|_| panic!("placeholder should release the primary listener"));
+    let (primary_state, primary_server) = spawn_relay_test_server_on_listener_with_security(
+        primary_listener,
         200,
         vec![
             RelayHttpHeader {
