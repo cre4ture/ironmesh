@@ -1,12 +1,16 @@
 package io.ironmesh.android.data
 
+import android.util.Log
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import io.ironmesh.android.ui.MainViewModel
+import io.ironmesh.android.ui.enrollmentVerificationSuccessDetail
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -78,6 +82,28 @@ class RendezvousCertificateRenewalInstrumentationTest {
         assertTrue(
             "expected store index request, got $capturedPaths",
             capturedPaths.contains("/api/v1/store/index?depth=1"),
+        )
+    }
+
+    @Test
+    fun verifyEnrollmentAccess_reportsTheCompletedSignedRequestTimingAndRoute() = runBlocking {
+        val scenario = JSONObject(RustClientTestBridge.startRendezvousRenewalScenario())
+        val bootstrapJson = scenario.getString("connectionBootstrapJson")
+        val expiredClientIdentityJson = scenario.getString("expiredClientIdentityJson")
+        val authState = deviceAuthState(
+            connectionBootstrapJson = bootstrapJson,
+            clientIdentityJson = expiredClientIdentityJson,
+        )
+
+        val verification = IronmeshRepository().verifyEnrollmentAccess(authState)
+        val detail = enrollmentVerificationSuccessDetail(verification)
+
+        Log.i("EnrollmentDiagnosticsTest", detail)
+        assertTrue("expected a non-negative verification duration", verification.elapsedMs >= 0L)
+        assertNotNull("expected a route snapshot after signed access", verification.connectionRoutes)
+        assertTrue(
+            "expected completed store-index timing in '$detail'",
+            detail.contains("request completed in"),
         )
     }
 

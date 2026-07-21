@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.provider.DocumentsContract
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -15,6 +16,7 @@ import io.ironmesh.android.api.StoreIndexResponse
 import io.ironmesh.android.api.StoreIndexSortOrder
 import io.ironmesh.android.data.ConnectionRouteSnapshot
 import io.ironmesh.android.data.DeviceAuthState
+import io.ironmesh.android.data.EnrollmentAccessVerification
 import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
@@ -74,6 +76,8 @@ private const val GALLERY_FLATTENED_DEPTH = 64
 private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
 private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
 private const val CONNECTION_ROUTE_SNAPSHOT_POLL_MS = 5_000L
+private const val ENROLLMENT_VERIFICATION_POLL_MS = 5_000L
+private const val ENROLLMENT_LOG_TAG = "EnrollmentDiagnostics"
 
 data class FolderSyncHistoryState(
     val expanded: Boolean = false,
@@ -175,6 +179,7 @@ class MainViewModel(
     private var galleryRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
     private var connectionRoutesMonitorJob: Job? = null
+    private var enrollmentVerificationMonitorJob: Job? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile
     private var processLifecycleObserverActive = true
@@ -217,6 +222,7 @@ class MainViewModel(
     override fun onCleared() {
         processLifecycleObserverActive = false
         unregisterProcessLifecycleObserver()
+        stopEnrollmentVerificationMonitor()
         repository.stopWebUi()
         super.onCleared()
     }
@@ -978,16 +984,29 @@ class MainViewModel(
                     .withEnrollmentDiagnosticStatus(
                         stepId = EnrollmentDiagnosticStepId.VERIFY_ACCESS,
                         status = EnrollmentDiagnosticStepStatus.IN_PROGRESS,
+                        detail = enrollmentVerificationProgressDetail(
+                            elapsedMs = 0L,
+                            connectionRoutes = null,
+                        ),
                     ),
             )
+            val verificationStartedAtNanos = System.nanoTime()
+            startEnrollmentVerificationMonitor(authState, verificationStartedAtNanos)
+            Log.i(ENROLLMENT_LOG_TAG, "signed access verification started")
+            val verification: EnrollmentAccessVerification
             try {
-                withContext(Dispatchers.IO) {
+                verification = withContext(Dispatchers.IO) {
                     repository.verifyEnrollmentAccess(authState)
                 }
             } catch (error: Throwable) {
                 finishEnrollmentWithError(EnrollmentDiagnosticStepId.VERIFY_ACCESS, error)
                 return@launch
             }
+            stopEnrollmentVerificationMonitor()
+            Log.i(
+                ENROLLMENT_LOG_TAG,
+                enrollmentVerificationSuccessDetail(verification),
+            )
 
             uiState.value = uiState.value.copy(
                 status = "Saving device identity...",
@@ -995,6 +1014,7 @@ class MainViewModel(
                     .withEnrollmentDiagnosticStatus(
                         stepId = EnrollmentDiagnosticStepId.VERIFY_ACCESS,
                         status = EnrollmentDiagnosticStepStatus.SUCCEEDED,
+                        detail = enrollmentVerificationSuccessDetail(verification),
                     )
                     .withEnrollmentDiagnosticStatus(
                         stepId = EnrollmentDiagnosticStepId.SAVE_IDENTITY,
@@ -1037,7 +1057,11 @@ class MainViewModel(
         stepId: EnrollmentDiagnosticStepId,
         error: Throwable,
     ) {
+        stopEnrollmentVerificationMonitor()
         val detail = enrollmentDiagnosticErrorDetail(error)
+        if (stepId == EnrollmentDiagnosticStepId.VERIFY_ACCESS) {
+            Log.e(ENROLLMENT_LOG_TAG, detail, error)
+        }
         uiState.value = uiState.value.copy(
             loading = false,
             status = "Error: $detail",
@@ -1385,6 +1409,55 @@ class MainViewModel(
     private fun stopConnectionRoutesMonitor() {
         connectionRoutesMonitorJob?.cancel()
         connectionRoutesMonitorJob = null
+    }
+
+    private fun startEnrollmentVerificationMonitor(
+        authState: DeviceAuthState,
+        startedAtNanos: Long,
+    ) {
+        stopEnrollmentVerificationMonitor()
+        enrollmentVerificationMonitorJob = viewModelScope.launch {
+            while (isActive) {
+                delay(ENROLLMENT_VERIFICATION_POLL_MS)
+                val routes = withContext(Dispatchers.IO) {
+                    runCatching {
+                        repository.getConnectionRouteSnapshot(
+                            connectionInput = authState.preferredConnectionInput(),
+                            serverCaPem = authState.serverCaPem?.takeIf { it.isNotBlank() },
+                            clientIdentityJson = authState.toClientIdentityJson(),
+                            refresh = false,
+                        )
+                    }.getOrNull()
+                }
+                val detail = enrollmentVerificationProgressDetail(
+                    elapsedMs = elapsedMillisSince(startedAtNanos),
+                    connectionRoutes = routes,
+                )
+                val diagnostic = uiState.value.enrollmentDiagnostics
+                    .firstOrNull { it.id == EnrollmentDiagnosticStepId.VERIFY_ACCESS }
+                if (diagnostic?.status != EnrollmentDiagnosticStepStatus.IN_PROGRESS) {
+                    return@launch
+                }
+                uiState.value = uiState.value.copy(
+                    enrollmentDiagnostics = uiState.value.enrollmentDiagnostics
+                        .withEnrollmentDiagnosticStatus(
+                            stepId = EnrollmentDiagnosticStepId.VERIFY_ACCESS,
+                            status = EnrollmentDiagnosticStepStatus.IN_PROGRESS,
+                            detail = detail,
+                        ),
+                )
+                Log.i(ENROLLMENT_LOG_TAG, detail)
+            }
+        }
+    }
+
+    private fun stopEnrollmentVerificationMonitor() {
+        enrollmentVerificationMonitorJob?.cancel()
+        enrollmentVerificationMonitorJob = null
+    }
+
+    private fun elapsedMillisSince(startedAtNanos: Long): Long {
+        return ((System.nanoTime() - startedAtNanos) / 1_000_000L).coerceAtLeast(0L)
     }
 
     private suspend fun loadConnectionRoutes(
