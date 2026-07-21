@@ -237,6 +237,11 @@ type GallerySurfaceProps = {
   basemaps?: GalleryBasemapConfig[] | null;
   /** Cluster-configured initial choice. A config update overrides an old local choice. */
   preferredBasemapId?: string | null;
+  /** True while the caller is resolving the cluster-configured map variants. */
+  basemapConfigurationLoading?: boolean;
+  /** A refresh failure is shown without discarding a previously loaded map. */
+  basemapConfigurationError?: string | null;
+  retryBasemapConfiguration?: () => void;
   allowedMediaKinds?: GalleryMediaKind[];
   loadSnapshots: () => Promise<GallerySnapshot[]>;
   loadEntries: (
@@ -264,6 +269,9 @@ export function GallerySurface({
   initialViewMode,
   basemaps,
   preferredBasemapId,
+  basemapConfigurationLoading = false,
+  basemapConfigurationError,
+  retryBasemapConfiguration,
   allowedMediaKinds,
   loadSnapshots,
   loadEntries,
@@ -1477,6 +1485,9 @@ export function GallerySurface({
                   basemaps={availableBasemaps}
                   activeBasemap={activeBasemap}
                   onSelectBasemap={setActiveBasemapId}
+                  basemapConfigurationLoading={basemapConfigurationLoading}
+                  basemapConfigurationError={basemapConfigurationError}
+                  retryBasemapConfiguration={retryBasemapConfiguration}
                   activeProjection={activeMapProjection}
                   onSelectProjection={setActiveMapProjection}
                   entries={geotaggedEntries}
@@ -2008,6 +2019,9 @@ type GalleryMapPanelProps = {
   basemaps: GalleryBasemapConfig[];
   activeBasemap: GalleryBasemapConfig | null;
   onSelectBasemap: (id: string) => void;
+  basemapConfigurationLoading: boolean;
+  basemapConfigurationError?: string | null;
+  retryBasemapConfiguration?: () => void;
   activeProjection: GalleryMapProjection;
   onSelectProjection: (projection: GalleryMapProjection) => void;
   entries: GalleryEntry[];
@@ -2022,6 +2036,9 @@ function GalleryMapPanel({
   basemaps,
   activeBasemap,
   onSelectBasemap,
+  basemapConfigurationLoading,
+  basemapConfigurationError,
+  retryBasemapConfiguration,
   activeProjection,
   onSelectProjection,
   entries,
@@ -2085,6 +2102,16 @@ function GalleryMapPanel({
     };
   }, [isFullscreen]);
 
+  if (!activeBasemap) {
+    return (
+      <GalleryMapConfigurationStatus
+        loading={basemapConfigurationLoading}
+        error={basemapConfigurationError}
+        onRetry={retryBasemapConfiguration}
+      />
+    );
+  }
+
   const fallbackMap = (
     <GalleryWorldMap
       entries={entries}
@@ -2096,10 +2123,6 @@ function GalleryMapPanel({
       onToggleFullscreen={toggleFullscreen}
     />
   );
-
-  if (!activeBasemap) {
-    return fallbackMap;
-  }
 
   const basemapMap = (
     <GalleryBasemapMap
@@ -2116,47 +2139,140 @@ function GalleryMapPanel({
       fallback={fallbackMap}
     />
   );
+  const fullscreenPortalTarget =
+    isFullscreen && typeof document !== "undefined" ? document.body : null;
+  const mapDisplayControls = (
+    <Card data-gallery-map-display-controls="true" withBorder radius="md" padding="sm">
+      <Group align="flex-end" gap="sm" wrap="wrap" role="group" aria-label="Gallery map display options">
+        <Select
+          label="Map display"
+          data={basemaps.map((basemap) => ({
+            value: basemap.id,
+            label: basemap.label ?? basemap.modeLabel ?? basemap.id
+          }))}
+          value={activeBasemap.id}
+          onChange={(id) => {
+            if (id) {
+              onSelectBasemap(id);
+            }
+          }}
+          allowDeselect={false}
+          style={{ flex: "1 1 260px" }}
+        />
+        <Stack gap={6}>
+          <Text size="sm" fw={500}>
+            Projection
+          </Text>
+          <Group gap="xs">
+            <Button
+              variant={activeProjection === "mercator" ? "filled" : "default"}
+              aria-pressed={activeProjection === "mercator"}
+              onClick={() => onSelectProjection("mercator")}
+            >
+              Flat
+            </Button>
+            <Button
+              variant={activeProjection === "globe" ? "filled" : "default"}
+              aria-pressed={activeProjection === "globe"}
+              onClick={() => onSelectProjection("globe")}
+            >
+              Globe
+            </Button>
+          </Group>
+        </Stack>
+      </Group>
+    </Card>
+  );
+  const configurationNotice = basemapConfigurationError ? (
+    <Alert color="yellow" title="Map styles could not be refreshed">
+      <Stack gap="xs">
+        <Text size="sm">
+          The last successfully loaded map styles remain available. {basemapConfigurationError}
+        </Text>
+        {retryBasemapConfiguration ? (
+          <Button
+            variant="light"
+            size="xs"
+            leftSection={<IconRefresh size={14} />}
+            onClick={retryBasemapConfiguration}
+            style={{ alignSelf: "flex-start" }}
+          >
+            Retry map styles
+          </Button>
+        ) : null}
+      </Stack>
+    </Alert>
+  ) : null;
 
   return (
     <Stack gap="sm">
-      <div style={{ display: isFullscreen ? "none" : undefined }}>
-        {basemaps.length > 1 || activeBasemap ? (
-          <Group gap="sm">
-            {basemaps.length > 1
-              ? basemaps.map((basemap) => (
-                  <Button
-                    key={basemap.id}
-                    variant={basemap.id === activeBasemap.id ? "filled" : "default"}
-                    onClick={() => onSelectBasemap(basemap.id)}
-                  >
-                    {basemap.modeLabel ?? basemap.label ?? basemap.id}
-                  </Button>
-                ))
-              : null}
-            {activeBasemap ? (
-              <Group gap="xs">
-                <Button
-                  variant={activeProjection === "mercator" ? "filled" : "default"}
-                  aria-pressed={activeProjection === "mercator"}
-                  onClick={() => onSelectProjection("mercator")}
-                >
-                  Flat
-                </Button>
-                <Button
-                  variant={activeProjection === "globe" ? "filled" : "default"}
-                  aria-pressed={activeProjection === "globe"}
-                  onClick={() => onSelectProjection("globe")}
-                >
-                  Globe
-                </Button>
-              </Group>
-            ) : null}
-          </Group>
-        ) : null}
-      </div>
+      {fullscreenPortalTarget
+        ? createPortal(
+            <div
+              style={{
+                position: "fixed",
+                left: 12,
+                top: 12,
+                zIndex: 152,
+                width: "min(440px, calc(100vw - 24px))"
+              }}
+            >
+              {mapDisplayControls}
+            </div>,
+            fullscreenPortalTarget
+          )
+        : mapDisplayControls}
 
+      {configurationNotice}
       <div>{basemapMap}</div>
     </Stack>
+  );
+}
+
+type GalleryMapConfigurationStatusProps = {
+  loading: boolean;
+  error?: string | null;
+  onRetry?: () => void;
+};
+
+function GalleryMapConfigurationStatus({
+  loading,
+  error,
+  onRetry
+}: GalleryMapConfigurationStatusProps) {
+  if (loading) {
+    return (
+      <Card withBorder radius="md" padding="xl">
+        <Stack gap="sm" align="center">
+          <Loader />
+          <Text fw={700}>Loading gallery map styles</Text>
+          <Text c="dimmed" size="sm" ta="center">
+            The gallery is retrieving the map variants configured by your administrator.
+          </Text>
+        </Stack>
+      </Card>
+    );
+  }
+
+  const title = error ? "Gallery map styles are unavailable" : "No gallery map styles are visible";
+  const message = error
+    ? `The map configuration could not be loaded. ${error}`
+    : "An administrator needs to make at least one gallery map variant visible.";
+
+  return (
+    <Card withBorder radius="md" padding="xl">
+      <Stack gap="sm" align="center">
+        <Text fw={700}>{title}</Text>
+        <Text c="dimmed" size="sm" ta="center">
+          {message}
+        </Text>
+        {onRetry ? (
+          <Button leftSection={<IconRefresh size={16} />} onClick={onRetry}>
+            Retry map styles
+          </Button>
+        ) : null}
+      </Stack>
+    </Card>
   );
 }
 

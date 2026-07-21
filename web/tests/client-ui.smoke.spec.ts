@@ -502,6 +502,84 @@ test("client-ui gallery recovers from a basemap metadata failure", async ({ page
   expect(pageErrors).toEqual([]);
 });
 
+test("client-ui gallery lists configured map styles and keeps them available in fullscreen", async ({
+  page
+}) => {
+  await installClientUiMocks(page, {
+    mapConfiguration: {
+      active_variant_id: "natural-earth-globe",
+      variants: [
+        {
+          id: "natural-earth-globe",
+          label: "Natural Earth Globe",
+          mode_label: "Globe",
+          description: "Small global overview map.",
+          attribution: "Made with Natural Earth.",
+          kind: "raster",
+          style: "raster",
+          enabled: true,
+          raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
+        },
+        {
+          id: "natural-earth-labels",
+          label: "Natural Earth Globe + labels",
+          mode_label: "Labels",
+          description: "Natural Earth base map with country, city, and border labels.",
+          attribution: "Made with Natural Earth.",
+          kind: "hybrid",
+          style: "natural_earth",
+          enabled: true,
+          raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
+          vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
+        },
+        {
+          id: "openmaptiles-street",
+          label: "OpenMapTiles Street",
+          mode_label: "Street",
+          description: "Detailed global OpenMapTiles street map.",
+          attribution: "Map data © OpenStreetMap contributors.",
+          kind: "vector",
+          style: "openmaptiles",
+          enabled: true,
+          vector_manifest_key: "sys/maps/openmaptiles-street.mbtiles.manifest.json"
+        }
+      ]
+    }
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  const mapDisplay = page.getByRole("textbox", { name: "Map display", exact: true });
+  await expect(mapDisplay).toHaveValue("Natural Earth Globe");
+  await mapDisplay.click();
+  await expect(page.getByRole("option", { name: "Natural Earth Globe + labels" })).toBeVisible();
+  await expect(page.getByRole("option", { name: "OpenMapTiles Street" })).toBeVisible();
+  await page.getByRole("option", { name: "Natural Earth Globe + labels" }).click();
+  await expect(mapDisplay).toHaveValue("Natural Earth Globe + labels");
+
+  await page.getByRole("button", { name: "Fullscreen map" }).click();
+  await expect(mapDisplay).toBeVisible();
+  const mapDisplayControls = page.locator('[data-gallery-map-display-controls="true"]');
+  expect(
+    await mapDisplayControls.evaluate((element) => element.parentElement?.parentElement?.tagName)
+  ).toBe("BODY");
+});
+
+test("client-ui gallery does not replace unavailable map configuration with the built-in atlas", async ({
+  page
+}) => {
+  await installClientUiMocks(page, { mapConfigurationStatus: 503 });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+
+  await expect(page.getByText("Gallery map styles are unavailable")).toBeVisible();
+  await expect(page.getByText("HTTP 503")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry map styles" })).toBeVisible();
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toHaveCount(0);
+});
+
 test("client-ui gallery exposes all sort orders", async ({ page }) => {
   await installClientUiMocks(page);
   await page.goto("/");
@@ -684,7 +762,33 @@ test("client-ui desktop navigation can collapse and scroll on short viewports", 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
   mapMetadataStatus?: number;
+  mapConfigurationStatus?: number;
+  mapConfiguration?: MockGalleryMapConfiguration;
 };
+
+type MockGalleryMapConfiguration = {
+  active_variant_id: string;
+  variants: Array<Record<string, unknown>>;
+};
+
+function defaultGalleryMapConfiguration(): MockGalleryMapConfiguration {
+  return {
+    active_variant_id: "natural-earth-globe",
+    variants: [
+      {
+        id: "natural-earth-globe",
+        label: "Natural Earth Globe",
+        mode_label: "Globe",
+        description: "Small global overview map.",
+        attribution: "Made with Natural Earth.",
+        kind: "raster",
+        style: "raster",
+        enabled: true,
+        raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
+      }
+    ]
+  };
+}
 
 async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOptions) {
   const imageBody = tinyPngBuffer();
@@ -1059,25 +1163,18 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/maps/config") && method === "GET") {
+      if (options?.mapConfigurationStatus) {
+        await route.fulfill({
+          status: options.mapConfigurationStatus,
+          contentType: "application/json",
+          body: JSON.stringify({ message: "mocked map configuration failure" })
+        });
+        return;
+      }
+
       return json(route, {
         stored: true,
-        configuration: {
-          version: 1,
-          active_variant_id: "natural-earth-globe",
-          variants: [
-            {
-              id: "natural-earth-globe",
-              label: "Natural Earth Globe",
-              mode_label: "Globe",
-              description: "Small global overview map.",
-              attribution: "Made with Natural Earth.",
-              kind: "raster",
-              style: "raster",
-              enabled: true,
-              raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
-            }
-          ]
-        }
+        configuration: options?.mapConfiguration ?? defaultGalleryMapConfiguration()
       });
     }
 

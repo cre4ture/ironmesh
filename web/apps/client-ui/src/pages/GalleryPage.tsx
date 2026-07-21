@@ -16,7 +16,7 @@ import {
   type GalleryMediaRequests,
   type GallerySurfaceViewMode
 } from "@ironmesh/ui";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const MOBILE_VIEWER_THUMBNAIL_PROFILE = "mobile_viewer";
 
@@ -28,30 +28,63 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
   const [mapConfiguration, setMapConfiguration] = useState<
     Awaited<ReturnType<typeof getClientGalleryMapConfiguration>> | null
   >(null);
+  const [mapConfigurationLoading, setMapConfigurationLoading] = useState(true);
+  const [mapConfigurationError, setMapConfigurationError] = useState<string | null>(null);
+  const mapConfigurationMountedRef = useRef(true);
+  const mapConfigurationRequestVersionRef = useRef(0);
+
   useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const next = await getClientGalleryMapConfiguration();
-        if (!cancelled) {
-          // Polling must not replace an equivalent response: `basemaps` then
-          // keeps its identity and the map does not get recreated every 15s.
-          setMapConfiguration((current) =>
-            sameMapConfiguration(current, next) ? current : next
-          );
-        }
-      } catch {
-        // The gallery remains usable while a transient node or replication hop
-        // is unavailable. The next refresh picks up the shared setting.
-      }
-    };
-    void refresh();
-    const interval = window.setInterval(() => void refresh(), 15_000);
+    mapConfigurationMountedRef.current = true;
     return () => {
-      cancelled = true;
-      window.clearInterval(interval);
+      mapConfigurationMountedRef.current = false;
     };
   }, []);
+
+  const refreshMapConfiguration = useCallback(async () => {
+    if (!mapConfigurationMountedRef.current) {
+      return;
+    }
+    const requestVersion = mapConfigurationRequestVersionRef.current + 1;
+    mapConfigurationRequestVersionRef.current = requestVersion;
+    setMapConfigurationLoading(true);
+    try {
+      const next = await getClientGalleryMapConfiguration();
+      if (
+        !mapConfigurationMountedRef.current ||
+        requestVersion !== mapConfigurationRequestVersionRef.current
+      ) {
+        return;
+      }
+      // Polling must not replace an equivalent response: `basemaps` then
+      // keeps its identity and the map does not get recreated every 15s.
+      setMapConfiguration((current) =>
+        sameMapConfiguration(current, next) ? current : next
+      );
+      setMapConfigurationError(null);
+    } catch (error) {
+      if (
+        mapConfigurationMountedRef.current &&
+        requestVersion === mapConfigurationRequestVersionRef.current
+      ) {
+        setMapConfigurationError(mapConfigurationErrorMessage(error));
+      }
+    } finally {
+      if (
+        mapConfigurationMountedRef.current &&
+        requestVersion === mapConfigurationRequestVersionRef.current
+      ) {
+        setMapConfigurationLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshMapConfiguration();
+    const interval = window.setInterval(() => void refreshMapConfiguration(), 15_000);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [refreshMapConfiguration]);
   const basemaps = useMemo(
     () => galleryBasemapsFromConfiguration(mapConfiguration?.configuration.variants ?? []),
     [mapConfiguration]
@@ -109,6 +142,9 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
         allowedMediaKinds={["image", "video"]}
         basemaps={basemaps}
         preferredBasemapId={mapConfiguration?.configuration.active_variant_id}
+        basemapConfigurationLoading={mapConfigurationLoading}
+        basemapConfigurationError={mapConfigurationError}
+        retryBasemapConfiguration={() => void refreshMapConfiguration()}
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
         getMediaRequests={getMediaRequests}
@@ -120,6 +156,14 @@ export function GalleryPage({ initialViewMode }: GalleryPageProps = {}) {
       />
     </>
   );
+}
+
+function mapConfigurationErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  return "The gallery map configuration could not be loaded.";
 }
 
 function sameMapConfiguration(

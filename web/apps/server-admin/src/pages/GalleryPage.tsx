@@ -37,6 +37,7 @@ export function GalleryPage() {
     staleTime: 5_000
   });
   const mapConfiguration = mapConfigurationQuery.data ?? null;
+  const mapConfigurationError = errorMessage(mapConfigurationQuery.error);
   const basemaps = galleryBasemapsFromConfiguration(
     mapConfiguration?.configuration.variants ?? []
   );
@@ -117,6 +118,9 @@ export function GalleryPage() {
         allowedMediaKinds={["image", "video"]}
         basemaps={basemaps}
         preferredBasemapId={mapConfiguration?.configuration.active_variant_id}
+        basemapConfigurationLoading={mapConfigurationQuery.isLoading}
+        basemapConfigurationError={mapConfigurationError}
+        retryBasemapConfiguration={() => void mapConfigurationQuery.refetch()}
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
         getMediaRequests={getMediaRequests}
@@ -128,6 +132,10 @@ export function GalleryPage() {
       />
     </Stack>
   );
+}
+
+function errorMessage(error: unknown): string | null {
+  return error instanceof Error && error.message.trim() ? error.message : null;
 }
 
 function adminBinaryObjectUrl(
