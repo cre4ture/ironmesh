@@ -611,6 +611,15 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
         )
     })??;
 
+    if result.summary.success_count == 0 {
+        let detail = result
+            .samples
+            .iter()
+            .find_map(|sample| sample.error.as_deref())
+            .unwrap_or("all latency probe samples failed");
+        bail!("startup signed latency probe failed for {target_label}: {detail}");
+    }
+
     let latency_ms = result
         .summary
         .avg_total_duration_ms
@@ -843,6 +852,42 @@ mod tests {
         assert_eq!(ordered[1].direct_server_base_url(), Some(slow_url.as_str()));
         fast_server.join().expect("fast server should finish");
         slow_server.join().expect("slow server should finish");
+    }
+
+    #[test]
+    fn signed_startup_probe_rejects_report_without_successful_sample() {
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("probe test listener address should resolve");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("probe should connect");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 11\r\n\r\nunavailable",
+                )
+                .expect("failed probe response should write");
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("probe test runtime should build");
+        let error = runtime
+            .block_on(probe_signed_client_startup_quality(
+                &IronMeshClient::from_direct_base_url(format!("http://{address}")),
+            ))
+            .expect_err("an all-failed diagnostic report must not mark the path reachable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("startup signed latency probe failed")
+        );
+        server.join().expect("probe test server should finish");
     }
 
     #[test]
