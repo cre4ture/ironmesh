@@ -1,12 +1,27 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
+import { registerGalleryMapContractTests } from "./gallery-map.contract";
 
 const API_V1_PREFIX = "/api/v1";
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
 }
+
+registerGalleryMapContractTests({
+  name: "client-ui",
+  setup: (page, options) =>
+    installClientUiMocks(page, {
+      mapConfiguration: options.mapConfiguration,
+      mapConfigurationStatus: options.mapConfigurationStatus
+    }),
+  openGallery: async (page) => {
+    await page.goto("/");
+    await page.getByText("Gallery", { exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  }
+});
 
 async function dispatchCtrlWheel(locator: Locator, deltaY: number): Promise<void> {
   await locator.evaluate((element, wheelDelta) => {
@@ -500,84 +515,6 @@ test("client-ui gallery recovers from a basemap metadata failure", async ({ page
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("button", { name: "Grid" })).toHaveAttribute("aria-pressed", "true");
   expect(pageErrors).toEqual([]);
-});
-
-test("client-ui gallery lists configured map styles and keeps them available in fullscreen", async ({
-  page
-}) => {
-  await installClientUiMocks(page, {
-    mapConfiguration: {
-      active_variant_id: "natural-earth-globe",
-      variants: [
-        {
-          id: "natural-earth-globe",
-          label: "Natural Earth Globe",
-          mode_label: "Globe",
-          description: "Small global overview map.",
-          attribution: "Made with Natural Earth.",
-          kind: "raster",
-          style: "raster",
-          enabled: true,
-          raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
-        },
-        {
-          id: "natural-earth-labels",
-          label: "Natural Earth Globe + labels",
-          mode_label: "Labels",
-          description: "Natural Earth base map with country, city, and border labels.",
-          attribution: "Made with Natural Earth.",
-          kind: "hybrid",
-          style: "natural_earth",
-          enabled: true,
-          raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
-          vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
-        },
-        {
-          id: "openmaptiles-street",
-          label: "OpenMapTiles Street",
-          mode_label: "Street",
-          description: "Detailed global OpenMapTiles street map.",
-          attribution: "Map data © OpenStreetMap contributors.",
-          kind: "vector",
-          style: "openmaptiles",
-          enabled: true,
-          vector_manifest_key: "sys/maps/openmaptiles-street.mbtiles.manifest.json"
-        }
-      ]
-    }
-  });
-  await page.goto("/");
-  await page.getByText("Gallery", { exact: true }).click();
-  await page.getByRole("button", { name: "Map" }).click();
-
-  const mapDisplay = page.getByRole("textbox", { name: "Map display", exact: true });
-  await expect(mapDisplay).toHaveValue("Natural Earth Globe");
-  await mapDisplay.click();
-  await expect(page.getByRole("option", { name: "Natural Earth Globe + labels" })).toBeVisible();
-  await expect(page.getByRole("option", { name: "OpenMapTiles Street" })).toBeVisible();
-  await page.getByRole("option", { name: "Natural Earth Globe + labels" }).click();
-  await expect(mapDisplay).toHaveValue("Natural Earth Globe + labels");
-
-  await page.getByRole("button", { name: "Fullscreen map" }).click();
-  await expect(mapDisplay).toBeVisible();
-  const mapDisplayControls = page.locator('[data-gallery-map-display-controls="true"]');
-  expect(
-    await mapDisplayControls.evaluate((element) => element.parentElement?.parentElement?.tagName)
-  ).toBe("BODY");
-});
-
-test("client-ui gallery does not replace unavailable map configuration with the built-in atlas", async ({
-  page
-}) => {
-  await installClientUiMocks(page, { mapConfigurationStatus: 503 });
-  await page.goto("/");
-  await page.getByText("Gallery", { exact: true }).click();
-  await page.getByRole("button", { name: "Map" }).click();
-
-  await expect(page.getByText("Gallery map styles are unavailable")).toBeVisible();
-  await expect(page.getByText("HTTP 503")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Retry map styles" })).toBeVisible();
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toHaveCount(0);
 });
 
 test("client-ui gallery exposes all sort orders", async ({ page }) => {

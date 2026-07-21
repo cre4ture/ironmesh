@@ -1,11 +1,75 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
+import type { GalleryMapConfiguration } from "@ironmesh/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { registerGalleryMapContractTests } from "./gallery-map.contract";
 
 const API_V1_PREFIX = "/api/v1";
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
+}
+
+registerGalleryMapContractTests({
+  name: "server-admin",
+  setup: (page, options) =>
+    installServerAdminMocks(page, {
+      mapConfiguration: options.mapConfiguration,
+      mapConfigurationStatus: options.mapConfigurationStatus
+    }),
+  openGallery: async (page) => {
+    await page.goto("/");
+    await page.getByRole("button", { name: "Unlock server-admin" }).click();
+    await page.getByLabel("Admin password").fill("hunter2-harder");
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.getByText("Gallery", { exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  }
+});
+
+function defaultServerAdminGalleryMapConfiguration(): GalleryMapConfiguration {
+  return {
+    version: 1,
+    active_variant_id: "natural-earth-globe",
+    variants: [
+      {
+        id: "natural-earth-globe",
+        label: "Natural Earth Globe",
+        mode_label: "Globe",
+        description: "Small global overview map.",
+        attribution: "Made with Natural Earth.",
+        kind: "raster",
+        style: "raster",
+        enabled: true,
+        raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
+      },
+      {
+        id: "natural-earth-labels",
+        label: "Natural Earth Globe + labels",
+        mode_label: "Labels",
+        description: "Natural Earth base map with country, city, and border labels.",
+        attribution: "Made with Natural Earth.",
+        kind: "hybrid",
+        style: "natural_earth",
+        enabled: false,
+        raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
+        vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
+      },
+      {
+        id: "natural-earth-hypso",
+        label: "Natural Earth Hypsometric Relief",
+        mode_label: "Relief",
+        description: "Cross-blended hypsometric tints with shaded relief and water.",
+        attribution: "Made with Natural Earth.",
+        kind: "raster",
+        style: "raster",
+        enabled: false,
+        raster_manifest_key: "sys/maps/natural-earth-hypso.mbtiles.manifest.json"
+      }
+    ]
+  };
 }
 
 test("server-admin runtime smoke flow renders and navigates", async ({ page }) => {
@@ -205,10 +269,6 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   );
   await expect(page.getByText("2 photos", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Map" }).click();
-  await expect(
-    page.getByText("Using Natural Earth Globe from your self-hosted basemap dataset.")
-  ).toBeVisible();
-  await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
   await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
@@ -1182,6 +1242,8 @@ async function installServerAdminMocks(
     protectDashboardAdminRoutesUntilSessionConfirmed?: boolean;
     galleryEntries?: AdminMockStoreEntry[];
     cockpitStatus?: "ready" | "optional";
+    mapConfiguration?: GalleryMapConfiguration;
+    mapConfigurationStatus?: number;
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -1716,48 +1778,18 @@ async function installServerAdminMocks(
     }
 
     if (pathname === apiV1("/auth/maps/config") && method === "GET") {
+      if (options?.mapConfigurationStatus) {
+        await route.fulfill({
+          status: options.mapConfigurationStatus,
+          contentType: "application/json",
+          body: JSON.stringify({ message: "mocked map configuration failure" })
+        });
+        return;
+      }
+
       return json(route, {
         stored: true,
-        configuration: {
-          version: 1,
-          active_variant_id: "natural-earth-globe",
-          variants: [
-            {
-              id: "natural-earth-globe",
-              label: "Natural Earth Globe",
-              mode_label: "Globe",
-              description: "Small global overview map.",
-              attribution: "Made with Natural Earth.",
-              kind: "raster",
-              style: "raster",
-              enabled: true,
-              raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json"
-            },
-            {
-              id: "natural-earth-labels",
-              label: "Natural Earth Globe + labels",
-              mode_label: "Labels",
-              description: "Natural Earth base map with country, city, and border labels.",
-              attribution: "Made with Natural Earth.",
-              kind: "hybrid",
-              style: "natural_earth",
-              enabled: false,
-              raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
-              vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
-            },
-            {
-              id: "natural-earth-hypso",
-              label: "Natural Earth Hypsometric Relief",
-              mode_label: "Relief",
-              description: "Cross-blended hypsometric tints with shaded relief and water.",
-              attribution: "Made with Natural Earth.",
-              kind: "raster",
-              style: "raster",
-              enabled: false,
-              raster_manifest_key: "sys/maps/natural-earth-hypso.mbtiles.manifest.json"
-            }
-          ]
-        }
+        configuration: options?.mapConfiguration ?? defaultServerAdminGalleryMapConfiguration()
       });
     }
 
