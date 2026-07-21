@@ -2,6 +2,8 @@
 
 Official project language: English
 
+Prefer own worktree for each PR. Avoid using the default worktree.
+
 Work pacing and delivery rules live in [PACE.md](PACE.md).
 
 # Skills
