@@ -1,3 +1,15 @@
+ironmesh (1.0.36-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Harden global rendezvous registration, relay security, and legacy client
+    identity migration paths.
+  * Improve gallery maps, connection-path diagnostics, and Android embedded
+    Web UI session behavior.
+  * Extend server reliability telemetry and tighten package, lockfile, and
+    Android release CI coverage.
+  * Roll the workspace release to 1.0.36.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 22 Jul 2026 12:16:10 +0200
+
 ironmesh (1.0.35-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add global rendezvous control-plane registration, relay security hardening,
