@@ -527,6 +527,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
             post(complete_upload_session_route),
         )
         .route("/media/thumbnail", get(get_media_thumbnail))
+        .route("/maps/config", get(crate::map_config::public_config))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))

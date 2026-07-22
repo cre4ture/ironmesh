@@ -584,7 +584,7 @@ async fn enroll_from_bootstrap(
 
 fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient> {
     let client_identity_path = configured_client_identity_path(cli);
-    let client_identity = read_client_identity_from_cli(cli)?;
+    let mut client_identity = read_client_identity_from_cli(cli)?;
     let server_ca_override = read_server_ca_override_from_cli(cli)?;
     let authenticated = client_identity.is_some();
     let client_device_id = client_identity
@@ -602,6 +602,21 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
             "building authenticated client from bootstrap"
         );
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
+        if let Some(identity) = client_identity.as_mut()
+            && bootstrap.renew_rendezvous_identity_if_needed(identity)?
+        {
+            match persist_renewed_client_identity(client_identity_path.as_deref(), identity) {
+                Ok(()) => info!(
+                    client_identity_file = path_for_log(client_identity_path.as_deref()),
+                    "persisted renewed rendezvous client identity"
+                ),
+                Err(error) => warn!(
+                    error = %error,
+                    client_identity_file = path_for_log(client_identity_path.as_deref()),
+                    "renewed rendezvous client identity could not be persisted; continuing with the in-memory identity"
+                ),
+            }
+        }
         let refreshed_targets = match bootstrap
             .refresh_dynamic_targets_blocking(client_identity.as_ref())
         {
@@ -1313,6 +1328,15 @@ fn read_client_identity_from_cli(cli: &Cli) -> Result<Option<ClientIdentityMater
     Ok(None)
 }
 
+fn persist_renewed_client_identity(
+    client_identity_path: Option<&Path>,
+    identity: &ClientIdentityMaterial,
+) -> Result<()> {
+    let client_identity_path = client_identity_path
+        .context("renewed rendezvous client identity has no configured identity file to persist")?;
+    identity.write_to_path(client_identity_path)
+}
+
 fn read_server_ca_override_from_cli(cli: &Cli) -> Result<Option<String>> {
     read_optional_utf8_file(cli.server_ca_pem_file.as_deref())
 }
@@ -1888,6 +1912,31 @@ mod tests {
             state.source_security.clone(),
         )
         .with_client_identity(state.identity.clone())
+    }
+
+    #[test]
+    fn renewed_rendezvous_identity_is_persisted_to_the_configured_file() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "ironmesh-cli-rendezvous-persistence-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let identity_path = test_dir.join("client.identity.json");
+        let mut identity = ClientIdentityMaterial::generate(uuid::Uuid::now_v7(), None, None)
+            .expect("client identity should generate");
+        identity.rendezvous_client_identity_pem = Some("renewed-rendezvous-identity".to_string());
+
+        persist_renewed_client_identity(Some(&identity_path), &identity)
+            .expect("renewed identity should be persisted");
+
+        let persisted = ClientIdentityMaterial::from_path(&identity_path)
+            .expect("renewed identity should remain readable");
+        assert_eq!(
+            persisted.rendezvous_client_identity_pem.as_deref(),
+            Some("renewed-rendezvous-identity")
+        );
+
+        std::fs::remove_dir_all(&test_dir).expect("test directory should be removed");
     }
 
     #[test]

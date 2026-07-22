@@ -401,15 +401,22 @@ impl ConnectionBootstrap {
         build_http_client_with_identity_from_planned_targets(&planned_targets, identity)
     }
 
-    /// Like [`build_client_with_identity`] but automatically renews the rendezvous client
-    /// certificate when it is expired or expiring soon.  If renewal succeeds the updated PEM is
-    /// written back into `identity.rendezvous_client_identity_pem`; the caller is responsible for
-    /// persisting the change.  Renewal failures are logged as warnings and do not prevent the
-    /// client from being built.
-    pub fn build_client_with_identity_renewing(
+    /// Renews an expired, expiring, or legacy rendezvous client certificate when a direct target
+    /// is available.
+    ///
+    /// Legacy certificates that do not contain this bootstrap's cluster URI SAN cannot complete
+    /// rendezvous mTLS.  Their renewal request is therefore deliberately restricted to direct
+    /// client targets; it is authenticated with the durable client credential rather than the
+    /// rendezvous certificate.  Renewal failures are logged and leave the current identity
+    /// untouched so normal direct connectivity can continue.
+    ///
+    /// Returns `true` only when a freshly-issued certificate was written into
+    /// `identity.rendezvous_client_identity_pem`. The caller is responsible for persisting that
+    /// change.
+    pub fn renew_rendezvous_identity_if_needed(
         &self,
         identity: &mut ClientIdentityMaterial,
-    ) -> Result<IronMeshClient> {
+    ) -> Result<bool> {
         self.validate()?;
         identity.validate()?;
         if identity.cluster_id != self.cluster_id {
@@ -422,30 +429,50 @@ impl ConnectionBootstrap {
 
         let planned_targets = self.planned_targets()?;
 
+        let Some(rendezvous_client_identity_pem) =
+            identity.rendezvous_client_identity_pem.as_deref()
+        else {
+            return Ok(false);
+        };
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let needs_renewal = identity
-            .rendezvous_client_identity_pem
-            .as_deref()
-            .is_some_and(|pem| {
-                transport_sdk::rendezvous_client_identity_needs_renewal_at(pem.as_bytes(), now)
-            });
+        let requires_cluster_san_migration =
+            match transport_sdk::rendezvous_client_identity_has_expected_cluster_uri_san(
+                rendezvous_client_identity_pem.as_bytes(),
+                self.cluster_id,
+            ) {
+                Ok(has_expected_cluster_san) => !has_expected_cluster_san,
+                Err(error) => {
+                    // A malformed local identity cannot authenticate to rendezvous either. The
+                    // direct renewal endpoint authenticates via the regular client credential, so it
+                    // is safe and preferable to replace it when a direct route is available.
+                    tracing::warn!(
+                        error = %error,
+                        "could not inspect rendezvous identity cluster SAN; attempting direct renewal"
+                    );
+                    true
+                }
+            };
+        let needs_time_based_renewal = transport_sdk::rendezvous_client_identity_needs_renewal_at(
+            rendezvous_client_identity_pem.as_bytes(),
+            now,
+        );
+        let needs_renewal = requires_cluster_san_migration || needs_time_based_renewal;
 
         if needs_renewal {
-            // If the cert is already past its expiry the relay connection itself fails mTLS, so
-            // we must reach the cluster via a direct target.  If the cert is merely approaching
-            // expiry the relay is still usable, so we can renew through any available target.
-            let already_expired = identity
-                .rendezvous_client_identity_pem
-                .as_deref()
-                .is_some_and(|pem| {
-                    transport_sdk::rendezvous_client_identity_is_expired_at(pem.as_bytes(), now)
-                });
-
-            let renewal_targets: Vec<_> = if already_expired {
+            // A certificate that is expired or lacks the expected cluster URI SAN cannot
+            // authenticate to modern rendezvous endpoints. In both cases renewal must go through
+            // a direct target and must never try a relay route first.
+            let requires_direct_renewal = requires_cluster_san_migration
+                || transport_sdk::rendezvous_client_identity_is_expired_at(
+                    rendezvous_client_identity_pem.as_bytes(),
+                    now,
+                );
+            let renewal_targets: Vec<_> = if requires_direct_renewal {
                 planned_targets
                     .iter()
                     .filter(|target| target.path_kind != TransportPathKind::RelayTunnel)
@@ -457,12 +484,14 @@ impl ConnectionBootstrap {
 
             if renewal_targets.is_empty() {
                 tracing::warn!(
-                    "rendezvous identity needs renewal but no usable targets are available"
+                    requires_cluster_san_migration,
+                    "rendezvous identity needs renewal but no direct target is available"
                 );
             } else {
                 match try_renew_rendezvous_identity(&renewal_targets, identity) {
                     Ok(new_pem) => {
                         identity.rendezvous_client_identity_pem = Some(new_pem);
+                        return Ok(true);
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -474,7 +503,21 @@ impl ConnectionBootstrap {
             }
         }
 
-        build_http_client_with_identity_from_planned_targets(&planned_targets, identity)
+        Ok(false)
+    }
+
+    /// Like [`build_client_with_identity`] but automatically renews the rendezvous client
+    /// certificate when it is expired, expiring soon, or missing the expected cluster URI SAN.
+    /// If renewal succeeds the updated PEM is written back into
+    /// `identity.rendezvous_client_identity_pem`; the caller is responsible for persisting the
+    /// change. Renewal failures are logged as warnings and do not prevent the client from being
+    /// built.
+    pub fn build_client_with_identity_renewing(
+        &self,
+        identity: &mut ClientIdentityMaterial,
+    ) -> Result<IronMeshClient> {
+        self.renew_rendezvous_identity_if_needed(identity)?;
+        self.build_client_with_identity(identity)
     }
 
     pub fn build_client(&self) -> Result<IronMeshClient> {
@@ -1503,9 +1546,16 @@ impl From<&BootstrapEnrollmentResult> for DeviceEnrollmentResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::Query, routing::get};
+    use axum::{
+        Json, Router,
+        extract::Query,
+        routing::{get, post},
+    };
     use serde::Deserialize;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use transport_sdk::candidates::ConnectionCandidateTransportHints;
     use transport_sdk::{
         CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim, ClientBootstrapClaimTrust,
@@ -2280,6 +2330,60 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_cluster_san_identity_never_uses_relay_for_renewal() {
+        let cluster_id = ClusterId::now_v7();
+        let relay_requests = Arc::new(AtomicUsize::new(0));
+        let relay_requests_for_handler = Arc::clone(&relay_requests);
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("relay listener should bind");
+        let relay_addr = relay_listener
+            .local_addr()
+            .expect("relay listener should have an address");
+        let relay_app = Router::new().route(
+            "/control/relay/ticket",
+            post(move || {
+                let relay_requests = Arc::clone(&relay_requests_for_handler);
+                async move {
+                    relay_requests.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let relay_server = tokio::spawn(async move {
+            let _ = axum::serve(relay_listener, relay_app).await;
+        });
+
+        let mut bootstrap = direct_bootstrap_for_url(cluster_id, "http://127.0.0.1:9");
+        bootstrap.relay_mode = RelayMode::Required;
+        bootstrap.rendezvous_mtls_required = true;
+        bootstrap.rendezvous_urls = vec![format!("http://{relay_addr}")];
+        bootstrap.direct_endpoints[0].node_id = Some(NodeId::new_v4());
+
+        let mut identity = identity_for_bootstrap(cluster_id);
+        identity.credential_pem = Some("issued-credential".to_string());
+        identity.rendezvous_client_identity_pem =
+            Some(EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM.to_string());
+
+        let renewed = tokio::task::spawn_blocking(move || {
+            bootstrap.renew_rendezvous_identity_if_needed(&mut identity)
+        })
+        .await
+        .expect("renewal task should not panic")
+        .expect("relay-only migration attempt should be handled");
+
+        assert!(!renewed, "legacy SAN migration requires a direct target");
+        assert_eq!(
+            relay_requests.load(Ordering::SeqCst),
+            0,
+            "legacy SAN migration must not send a renewal request through relay"
+        );
+
+        relay_server.abort();
+        let _ = relay_server.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

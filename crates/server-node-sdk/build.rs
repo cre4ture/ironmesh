@@ -4,6 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const PNPM_PACKAGE_MANAGER: &str = "pnpm@10.6.0";
+
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
@@ -165,6 +167,7 @@ fn main() {
             .join("ironmesh-favicon.svg")
             .display()
     );
+    println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=IRONMESH_PREBUILT_WEB_DIR");
     if let Some(prebuilt_web_dir) = prebuilt_web_dir.as_deref() {
         println!(
@@ -415,9 +418,11 @@ fn run_frontend_build(web_workspace_dir: &Path) {
         );
     }
 
+    install_frontend_dependencies(web_workspace_dir);
+
     let status = run_pnpm_command(web_workspace_dir, &["build"]).unwrap_or_else(|error| {
         panic!(
-            "failed to execute `pnpm build` in {}: {error}. Install Node.js and pnpm, then ensure `pnpm` is on PATH.",
+            "failed to execute `corepack {PNPM_PACKAGE_MANAGER} build` in {}: {error}. Install a supported Node.js release with Corepack enabled and ensure `corepack` is on PATH.",
             web_workspace_dir.display()
         )
     });
@@ -430,18 +435,36 @@ fn run_frontend_build(web_workspace_dir: &Path) {
     }
 }
 
+fn install_frontend_dependencies(web_workspace_dir: &Path) {
+    let status = run_pnpm_command(web_workspace_dir, &["install", "--frozen-lockfile"])
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to execute `corepack {PNPM_PACKAGE_MANAGER} install --frozen-lockfile` in {}: {error}. Install a supported Node.js release with Corepack enabled and ensure `corepack` is on PATH.",
+                web_workspace_dir.display()
+            )
+        });
+
+    if !status.success() {
+        panic!(
+            "`corepack {PNPM_PACKAGE_MANAGER} install --frozen-lockfile` failed in {}. Resolve the locked frontend dependencies before running cargo again; this command never updates pnpm-lock.yaml.",
+            web_workspace_dir.display()
+        );
+    }
+}
+
 fn run_pnpm_command(
     web_workspace_dir: &Path,
     args: &[&str],
 ) -> Result<std::process::ExitStatus, io::Error> {
-    let mut commands = vec!["pnpm"];
+    let mut commands = vec!["corepack"];
     if cfg!(windows) {
-        commands.insert(0, "pnpm.cmd");
+        commands.insert(0, "corepack.cmd");
     }
 
     let mut last_error = None;
     for program in commands {
         match Command::new(program)
+            .arg(PNPM_PACKAGE_MANAGER)
             .args(args)
             .current_dir(web_workspace_dir)
             .status()
@@ -454,6 +477,7 @@ fn run_pnpm_command(
         }
     }
 
-    Err(last_error
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pnpm executable not found")))
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "corepack executable not found")
+    }))
 }

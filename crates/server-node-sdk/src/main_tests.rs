@@ -11375,6 +11375,102 @@ run_on_main_metadata_backends!(
     multiplex_transport_public_fast_path_requires_client_auth_turso
 );
 
+async fn multiplex_transport_map_config_routes_to_authenticated_client_api_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.access.client_auth_control.require_client_auth = true;
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        state.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
+    {
+        let mut credentials = state.access.client_credentials.lock().await;
+        credentials.credentials.push(super::ClientCredentialRecord {
+            device_id: identity.device_id.to_string(),
+            label: Some("Gallery map transport test".to_string()),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
+            issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
+            created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+    }
+
+    let path = "/api/v1/maps/config";
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        path,
+        super::unix_ts(),
+        Some("gallery-map-transport".to_string()),
+    )
+    .unwrap();
+    let headers = vec![
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_CLUSTER_ID.to_string(),
+            value: signed_headers.cluster_id.to_string(),
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_DEVICE_ID.to_string(),
+            value: signed_headers.device_id,
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_CREDENTIAL_FINGERPRINT.to_string(),
+            value: signed_headers.credential_fingerprint,
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_AUTH_TIMESTAMP.to_string(),
+            value: signed_headers.timestamp_unix.to_string(),
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_AUTH_NONCE.to_string(),
+            value: signed_headers.nonce,
+        },
+        transport_sdk::TransportHeader {
+            name: transport_sdk::HEADER_AUTH_SIGNATURE.to_string(),
+            value: signed_headers.signature_base64,
+        },
+    ];
+    let request = transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        "GET",
+        path,
+        headers,
+        Vec::new(),
+    );
+    let response = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &super::transport_service::TransportExecutionScope::Public,
+        &request,
+    )
+    .await
+    .expect("transport map configuration request should execute");
+
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    let payload = serde_json::from_slice::<serde_json::Value>(&response.body)
+        .expect("transport map configuration response should be JSON");
+    assert!(payload["configuration"]["variants"].is_array());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    multiplex_transport_map_config_routes_to_authenticated_client_api_impl,
+    multiplex_transport_map_config_routes_to_authenticated_client_api,
+    multiplex_transport_map_config_routes_to_authenticated_client_api_turso
+);
+
 async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let upload_id = "transport-upload-session-route".to_string();

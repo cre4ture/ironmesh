@@ -910,6 +910,38 @@ pub fn rendezvous_client_identity_is_expired_at(pem: &[u8], now_unix: u64) -> bo
         .is_some_and(|not_after| not_after <= now_unix)
 }
 
+/// Returns whether the end-entity certificate in a rendezvous client identity contains the
+/// cluster URI SAN expected by the bootstrap that is about to use it.
+///
+/// Older client identities predate cluster-scoped rendezvous authentication and contain only a
+/// device URI SAN.  Those identities are still sufficient to authenticate a direct API renewal
+/// request, but cannot authenticate to a current rendezvous endpoint.  Keeping this check beside
+/// the other identity parsing helpers lets callers migrate them before attempting relay or
+/// discovery traffic.
+pub fn rendezvous_client_identity_has_expected_cluster_uri_san(
+    client_identity_pem: &[u8],
+    expected_cluster_id: ClusterId,
+) -> Result<bool> {
+    let certificate_der = rendezvous_client_identity_certificate_der(client_identity_pem)?;
+    let (_, certificate) = parse_x509_certificate(certificate_der.as_ref())
+        .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
+    let expected_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
+
+    Ok(certificate.extensions().iter().any(|extension| {
+        matches!(
+            extension.parsed_extension(),
+            x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san)
+                if san.general_names.iter().any(|name| {
+                    matches!(
+                        name,
+                        x509_parser::extensions::GeneralName::URI(uri)
+                            if *uri == expected_cluster_uri
+                    )
+                })
+        )
+    }))
+}
+
 fn rendezvous_client_identity_expiry_diagnostic_at(
     client_identity_pem: &[u8],
     now_unix: u64,
@@ -925,6 +957,19 @@ fn rendezvous_client_identity_expiry_diagnostic_at(
 }
 
 pub fn rendezvous_client_identity_not_after_unix(client_identity_pem: &[u8]) -> Result<u64> {
+    let certificate_der = rendezvous_client_identity_certificate_der(client_identity_pem)?;
+    let (_, certificate) = parse_x509_certificate(certificate_der.as_ref())
+        .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
+    let not_after_unix = certificate.validity().not_after.timestamp();
+    if not_after_unix < 0 {
+        bail!("rendezvous client certificate not_after is before the unix epoch");
+    }
+    Ok(not_after_unix as u64)
+}
+
+fn rendezvous_client_identity_certificate_der(
+    client_identity_pem: &[u8],
+) -> Result<CertificateDer<'static>> {
     let mut cert_reader = Cursor::new(client_identity_pem);
     let certificate = CertificateDer::pem_reader_iter(&mut cert_reader)
         .next()
@@ -932,13 +977,7 @@ pub fn rendezvous_client_identity_not_after_unix(client_identity_pem: &[u8]) -> 
         .context("failed parsing rendezvous client certificate chain")?
         .ok_or_else(|| anyhow!("rendezvous client identity PEM is missing a certificate chain"))?;
 
-    let (_, certificate) = parse_x509_certificate(certificate.as_ref())
-        .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
-    let not_after_unix = certificate.validity().not_after.timestamp();
-    if not_after_unix < 0 {
-        bail!("rendezvous client certificate not_after is before the unix epoch");
-    }
-    Ok(not_after_unix as u64)
+    Ok(certificate)
 }
 
 fn format_diagnostic_timestamp(unix: u64) -> String {
@@ -960,6 +999,7 @@ mod tests {
         routing::{get, post},
     };
     use common::NodeId;
+    use rcgen::{CertificateParams, KeyPair, SanType};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -977,6 +1017,20 @@ mod tests {
         "jkjn2HXRB0g2pB2aeAIhALe+yYYMAqULo8WmhjcudAgQm/1vYSjowEWtUcMCY2J3\n",
         "-----END CERTIFICATE-----\n"
     );
+
+    fn rendezvous_identity_pem_with_cluster_san(cluster_id: ClusterId) -> String {
+        let key_pair = KeyPair::generate().expect("test identity key should generate");
+        let mut params = CertificateParams::new(Vec::new()).expect("test certificate params");
+        params.subject_alt_names = vec![SanType::URI(
+            format!("urn:ironmesh:cluster:{cluster_id}")
+                .try_into()
+                .expect("test cluster SAN should parse"),
+        )];
+        let certificate = params
+            .self_signed(&key_pair)
+            .expect("test identity certificate should issue");
+        format!("{}{}", certificate.pem(), key_pair.serialize_pem())
+    }
 
     #[tokio::test]
     async fn issue_relay_ticket_rejects_inner_mtls_downgrade() {
@@ -1417,6 +1471,35 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn rendezvous_identity_cluster_san_check_distinguishes_current_and_legacy_certificates() {
+        let expected_cluster_id = ClusterId::now_v7();
+        let correct_identity = rendezvous_identity_pem_with_cluster_san(expected_cluster_id);
+        let wrong_identity = rendezvous_identity_pem_with_cluster_san(ClusterId::now_v7());
+
+        assert!(
+            rendezvous_client_identity_has_expected_cluster_uri_san(
+                correct_identity.as_bytes(),
+                expected_cluster_id,
+            )
+            .expect("current identity should parse")
+        );
+        assert!(
+            !rendezvous_client_identity_has_expected_cluster_uri_san(
+                wrong_identity.as_bytes(),
+                expected_cluster_id,
+            )
+            .expect("identity with another cluster SAN should parse")
+        );
+        assert!(
+            !rendezvous_client_identity_has_expected_cluster_uri_san(
+                TEST_RENDEZVOUS_CLIENT_CERT_PEM.as_bytes(),
+                expected_cluster_id,
+            )
+            .expect("legacy identity should parse")
+        );
     }
 
     #[test]

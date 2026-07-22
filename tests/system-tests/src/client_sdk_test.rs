@@ -34,9 +34,11 @@ mod tests {
         UploadSessionChunkRef, build_http_client_with_identity_from_planned_targets,
         enroll_connection_input_blocking,
     };
+    use rcgen::{CertificateParams, KeyPair, SanType};
     use serde_json::json;
     use time::OffsetDateTime;
     use transport_sdk::{
+        rendezvous_client_identity_has_expected_cluster_uri_san,
         rendezvous_client_identity_is_expired_at, rendezvous_client_identity_needs_renewal_at,
     };
     use uuid::Uuid;
@@ -50,6 +52,23 @@ mod tests {
         wait_for_online_nodes, wait_for_rendezvous_candidate_endpoint,
         wait_for_rendezvous_mesh_peer_connected, wait_for_rendezvous_registered_endpoints,
     };
+
+    fn legacy_rendezvous_identity_without_cluster_san() -> String {
+        let key_pair = KeyPair::generate().expect("legacy identity key should generate");
+        let now = OffsetDateTime::now_utc();
+        let mut params = CertificateParams::new(Vec::new()).expect("legacy certificate params");
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(30);
+        params.subject_alt_names = vec![SanType::URI(
+            format!("urn:ironmesh:device:{}", Uuid::now_v7())
+                .try_into()
+                .expect("legacy device SAN should parse"),
+        )];
+        let certificate = params
+            .self_signed(&key_pair)
+            .expect("legacy identity certificate should issue");
+        format!("{}{}", certificate.pem(), key_pair.serialize_pem())
+    }
 
     async fn start_authenticated_test_client(
         bind: &str,
@@ -1456,7 +1475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_client_with_identity_renewing_renews_expired_rendezvous_cert_via_direct()
+    async fn build_client_with_identity_renewing_migrates_legacy_rendezvous_cert_via_direct()
     -> Result<()> {
         let bind = "127.0.0.1:19252";
         let cluster_id = "11111111-1111-7111-8111-111111111152";
@@ -1478,12 +1497,6 @@ mod tests {
             start_open_server_with_env(bind, &server_data_dir, node_id, 1, &node_env).await?;
         let http = reqwest::Client::new();
 
-        assert!(
-            OffsetDateTime::now_utc().unix_timestamp()
-                > KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX,
-            "expired rendezvous identity fixture is no longer expired for the current test clock"
-        );
-
         let result = async {
             let enrolled = issue_bootstrap_bundle_and_enroll_client(
                 &http,
@@ -1502,9 +1515,29 @@ mod tests {
             );
 
             let mut identity = enrolled.identity.clone();
-            // Inject the known-expired cert to trigger automatic renewal on connect.
-            identity.rendezvous_client_identity_pem =
-                Some(KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM.to_string());
+            // This fixture predates cluster-scoped rendezvous authentication: it has the device
+            // URI SAN but no cluster URI SAN. Current rendezvous servers reject it, so the
+            // client must renew through the available direct target before relay/discovery use.
+            let legacy_identity_pem = legacy_rendezvous_identity_without_cluster_san();
+            identity.rendezvous_client_identity_pem = Some(legacy_identity_pem.clone());
+            let cluster_id = cluster_id
+                .parse()
+                .expect("test cluster ID should parse");
+            assert!(
+                !rendezvous_client_identity_has_expected_cluster_uri_san(
+                    legacy_identity_pem.as_bytes(),
+                    cluster_id,
+                )
+                .expect("legacy rendezvous identity should parse"),
+                "fixture must exercise the legacy missing-cluster-SAN migration"
+            );
+            assert!(
+                !rendezvous_client_identity_needs_renewal_at(
+                    legacy_identity_pem.as_bytes(),
+                    OffsetDateTime::now_utc().unix_timestamp() as u64,
+                ),
+                "legacy fixture must be outside the time-based renewal window"
+            );
 
             let bootstrap = enrolled.bootstrap.clone();
             let (result, renewed_identity) = tokio::task::spawn_blocking(move || {
@@ -1523,8 +1556,8 @@ mod tests {
 
             assert_ne!(
                 new_pem,
-                KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_PEM,
-                "identity should have been updated with a fresh cert, not the expired fixture"
+                legacy_identity_pem,
+                "identity should have been updated with a fresh certificate"
             );
 
             let now_unix = std::time::SystemTime::now()
@@ -1539,6 +1572,14 @@ mod tests {
             assert!(
                 !rendezvous_client_identity_needs_renewal_at(new_pem.as_bytes(), now_unix),
                 "renewed cert should not need immediate renewal"
+            );
+            assert!(
+                rendezvous_client_identity_has_expected_cluster_uri_san(
+                    new_pem.as_bytes(),
+                    cluster_id,
+                )
+                .expect("renewed rendezvous identity should parse"),
+                "renewed certificate must carry the bootstrap cluster URI SAN"
             );
 
             Ok::<(), anyhow::Error>(())
