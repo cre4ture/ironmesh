@@ -7217,6 +7217,7 @@ async fn start_background_runtimes(
     spawn_storage_stats_refresher(state.clone());
     spawn_process_stats_sampler(state.clone());
     hardware_health::spawn_hardware_health_sampler(state.clone());
+    reliability_telemetry::spawn_reliability_telemetry_sender(state.clone());
     spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
     spawn_direct_quic_multiplex_agent(state.clone());
