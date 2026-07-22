@@ -1,6 +1,46 @@
 # Server-Node Hardware & Reliability Telemetry Strategy
 
-Status: Concept / not yet implemented
+Status: Implemented (core), with a few deliberately deferred extensions (see "Implementation
+status" below).
+
+## Implementation status
+
+The core of this strategy is implemented across the node and a new central collector service:
+
+- **Node payload projection** (Section 2, 7): `crates/server-node-sdk/src/reliability_telemetry.rs`
+  — a pure, allow-listed converter from the existing `hardware_health_report` into a reduced,
+  pseudonymized batch. No raw struct passthrough, so new hardware-health fields cannot silently
+  leak into telemetry.
+- **Pseudonymization & opt-out** (Section 3, 4.1): HMAC-derived `telemetry_subject_id` with a
+  locally persisted salt; `IRONMESH_RELIABILITY_TELEMETRY_ENABLED` env default plus a persisted
+  admin override.
+- **Transparency endpoints** (Section 3.3): admin-authenticated
+  `GET/PUT /api/v1/auth/telemetry/settings` and `GET /api/v1/auth/telemetry/preview`, surfaced in
+  the `server-admin` HardwarePage (toggle, exact payload preview, subject id, last-sent state, and
+  a bounded sent-history).
+- **Background sender** (Section 6): a rare 6-24h timer that POSTs the batch to the collector, with
+  bounded retries, content-fingerprint deduplication, and node-local last-sent/error bookkeeping.
+- **RAM ECC (EDAC) and CPU thermal-throttle collectors** (Section 2.4): real Linux sysfs
+  collection feeding `memory_ecc` and the findings summary.
+- **Central collector** (Section 5): `crates/stats-collector-server` — tolerant ingestion with
+  per-IP/per-subject rate limiting and append-only SQLite storage, a k-anonymity-safe public
+  `GET /v1/stats/summary` (Section 4.3), admin-token-guarded GDPR access/erasure endpoints
+  (Section 4.5), a retention sweeper (Section 4.6), and a server-side country-derivation seam
+  (Section 4.2).
+
+Deliberately **deferred** (documented at their respective sections, not blockers for the above):
+
+- The first-run bootstrap consent screen (Section 4.4) — the opt-out env/admin toggle is live, but
+  the guided setup-time disclosure is left to the `zero-touch-cluster-setup` work.
+- A production GeoIP-backed `CountryResolver` (Section 4.2) — the seam and no-op resolver ship
+  here; no GeoIP database dependency is bundled.
+- Network interface error-rate metrics (Section 2.5), `telemetry_subject_id` rotation (Section 8),
+  node-side daily SMART aggregation (Section 8), and an anonymous ingestion token (Section 5.2) —
+  optional later stages.
+- Production TLS termination / deployment wiring for the collector at `creax.de:44044` — a
+  deployment concern, not hardcoded in the crate.
+- The legal review of the opt-out-by-default posture (Section 4.4/8) remains a prerequisite before
+  any production rollout that actually transmits data off-cluster.
 
 Related documents:
 
