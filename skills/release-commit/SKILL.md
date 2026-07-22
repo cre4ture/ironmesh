@@ -1,6 +1,6 @@
 ---
 name: release-commit
-description: Cut a new Ironmesh release commit and tag. Use when Codex needs to prepare a release in this repository by making GitHub Actions green, bumping the workspace version, refreshing the system-tests lockfile, updating the Debian changelog, and committing, tagging, and pushing the release.
+description: Cut a new Ironmesh release commit and tag. Use when Codex needs to prepare a release in this repository by making GitHub Actions green, bumping the workspace version, refreshing both Cargo lockfiles, updating the Debian changelog, and committing, tagging, and pushing the release.
 ---
 
 # Release Commit
@@ -51,6 +51,9 @@ Read [references/ironmesh-release-facts.md](references/ironmesh-release-facts.md
 ## Update the Release Files
 
 - Bump `[workspace.package].version` in the root `Cargo.toml`.
+- Refresh the root `Cargo.lock` with Cargo after the version bump; CI runs the
+  workspace with `--locked`, so every workspace package entry must carry the
+  release version.
 - Refresh `tests/system-tests/Cargo.lock` after the version bump using the appropriate Cargo workflow for that crate; do not hand-edit the lockfile.
 - Update `debian/changelog` by preserving the current package metadata style and Debian revision pattern from the existing top entry.
 - Summarize the release since the previous release tag concisely.

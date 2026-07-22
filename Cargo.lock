@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-linux-fuse"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "blake3",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-windows-cfapi"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "blake3",
@@ -153,7 +153,7 @@ checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
 name = "android-app"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "android-server-node-app"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "jni 0.21.1",
@@ -965,7 +965,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli-client"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "client-sdk"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-client-config"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "git-version",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-status"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "client-sdk",
@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "ios-app"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -3096,7 +3096,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-background-launcher"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "desktop-client-config",
@@ -3105,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-config-app"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-folder-agent"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4201,7 +4201,7 @@ dependencies = [
 
 [[package]]
 name = "os-integration"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "adapter-linux-fuse",
  "adapter-windows-cfapi",
@@ -4937,7 +4937,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rendezvous-server"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -4967,7 +4967,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-service"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -5484,7 +5484,7 @@ dependencies = [
 
 [[package]]
 name = "server-node"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5497,7 +5497,7 @@ dependencies = [
 
 [[package]]
 name = "server-node-sdk"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "aead",
  "aes-gcm-siv",
@@ -5805,7 +5805,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stats-collector-server"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -5903,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "sync-agent-core"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -5923,7 +5923,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "serde",
 ]
@@ -6246,7 +6246,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-display-status"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "embedded-graphics",
@@ -6566,7 +6566,7 @@ dependencies = [
 
 [[package]]
 name = "transport-sdk"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -7162,7 +7162,7 @@ dependencies = [
 
 [[package]]
 name = "web-ui-backend"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -7594,7 +7594,7 @@ dependencies = [
 
 [[package]]
 name = "windows-thumbnail-provider"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "adapter-windows-cfapi",
  "anyhow",

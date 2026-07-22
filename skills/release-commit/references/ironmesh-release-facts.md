@@ -5,6 +5,8 @@ Keep this file limited to stable repo-specific facts. Discover common commands f
 ## Release artifacts
 
 - The workspace release version lives in the root `Cargo.toml` under `[workspace.package].version`.
+- The root `Cargo.lock` records all workspace package versions and is required
+  by root CI commands that use `--locked`.
 - `tests/system-tests` is excluded from the main workspace and carries its own `Cargo.lock`.
 - `debian/changelog` must gain a new top entry for each release.
 
@@ -16,6 +18,8 @@ Keep this file limited to stable repo-specific facts. Discover common commands f
 ## Version update rules
 
 - Bump the workspace version first.
+- Refresh the root `Cargo.lock` with Cargo and verify its workspace package
+  entries picked up the new release version.
 - Refresh `tests/system-tests/Cargo.lock` after the version bump instead of editing it by hand.
 - Verify that workspace package entries in that lockfile picked up the new release version.
 
