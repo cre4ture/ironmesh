@@ -17,7 +17,9 @@ admin UI is picked up by the client UI on its next configuration refresh.
 | --- | --- | --- |
 | `natural-earth-globe` | Small raster world overview based on Natural Earth | enabled and active |
 | `natural-earth-labels` | The Natural Earth base plus cities, borders, and optional roads | disabled until its overlay is imported |
+| `natural-earth-vector` | Natural Earth physical layers, borders, and places as one zoomable vector-tile map | disabled until its vector package is imported |
 | `natural-earth-hypso` | Cross-blended hypsometric relief with shaded relief and water | disabled until its raster is imported |
+| `natural-earth-1` | Natural Earth I land cover with shaded relief and water | disabled until its raster is imported |
 | `openmaptiles-street` | A detailed global vector street map | disabled until its larger artifact is imported |
 | `maptiler-satellite` | The original MapTiler Satellite 2017 planet package | disabled; retained for upgrades |
 | `maptiler-hybrid` | The original MapTiler satellite package with its OpenMapTiles overlay | disabled; retained for upgrades |
@@ -82,14 +84,15 @@ for a desired map outcome first and then adapts the remaining questions to that
 profile:
 
 1. choose **Natural Earth physical world map**, **Natural Earth physical world
-   map + labels**, **Natural Earth hypsometric relief map**, or **An existing
-   MBTiles package**;
+   map + labels**, **Natural Earth vector world map**, **Natural Earth
+   hypsometric relief map**, **Natural Earth I relief and water map**, or **An existing MBTiles package**;
 2. confirm the fixed official Natural Earth source, or paste one HTTP(S) URL
    (or a copied `wget -c ...` command) for an existing MBTiles package;
 3. confirm the fixed `natural-earth-globe` raster destination, the fixed
    raster and vector destinations for the labels profile, the fixed
-   `natural-earth-hypso` relief-raster destination, or select the configured
-   variant artifact and part size for an MBTiles package;
+   `natural-earth-vector` vector destination, the fixed `natural-earth-hypso`
+   or `natural-earth-1` relief-raster destination, or select the configured variant artifact and
+   part size for an MBTiles package;
 4. review the source and destination, then start the background job.
 
 The source file name is never a destination. The selected cluster
@@ -146,6 +149,16 @@ the standard `natural-earth-globe` or labels packages. The source archive is
 about 379 MB; as with the other automatic imports, it requires `unzip`,
 `gdalwarp`, `gdal_translate`, and `gdaladdo` on the server `PATH`.
 
+Choose **Natural Earth I relief and water map** to import Natural Earth's 10m
+Natural Earth I with Shaded Relief and Water dataset. The node downloads the
+fixed official `NE1_HR_LC_SR_W.zip` archive, uses its land-cover, shaded-relief,
+and water raster directly, reprojects it to Web Mercator with bilinear
+resampling, and publishes a validated PNG MBTiles package to the
+`natural-earth-1` artifact. This is a visual raster background; it complements
+rather than replaces the scalable `natural-earth-vector` map. The source
+archive is about 323 MB and requires `unzip`, `gdalwarp`, `gdal_translate`, and
+`gdaladdo` on the server `PATH`.
+
 For the `natural_earth` vector style, the overlay uses this compact source-layer
 contract:
 
@@ -169,6 +182,20 @@ tolerates the optional `ne_roads` layer, which is deliberately left out of the
 automatic profile because Natural Earth has only limited global road coverage.
 It can be added later by replacing the same configured vector artifact with a
 compatible custom package.
+
+### Automatic Natural Earth vector map
+
+Choose **Natural Earth vector world map** to package the official 10m physical
+and cultural archives into one PBF vector MBTiles artifact. It includes land,
+ocean, lakes, rivers, coastlines, country borders, country labels, and
+populated places. MapLibre renders these layers as vectors, so linework remains
+sharp when the gallery map is enlarged; it does not add street-level geographic
+detail beyond Natural Earth's intended overview-map scale.
+
+The automatic artifact is written to `natural-earth-vector` and is disabled by
+default. It needs only `unzip` and `ogr2ogr` from `gdal-bin`; no rasterization
+or Web-Mercator conversion is performed. The package is generated through zoom
+6, after which MapLibre can overscale its vector geometry without blur.
 
 ## Detailed street packages
 

@@ -112,7 +112,9 @@ pub(crate) fn default_configuration() -> ClusterMapConfiguration {
                 raster_manifest_key: Some("sys/maps/natural-earth-globe.mbtiles.manifest.json".to_string()),
                 vector_manifest_key: Some("sys/maps/natural-earth-labels.mbtiles.manifest.json".to_string()),
             },
+            natural_earth_vector_variant(),
             natural_earth_hypso_variant(),
+            natural_earth_one_variant(),
             ClusterMapVariant {
                 id: "openmaptiles-street".to_string(),
                 label: "OpenMapTiles Street".to_string(),
@@ -132,6 +134,21 @@ pub(crate) fn default_configuration() -> ClusterMapConfiguration {
     }
 }
 
+fn natural_earth_vector_variant() -> ClusterMapVariant {
+    ClusterMapVariant {
+        id: "natural-earth-vector".to_string(),
+        label: "Natural Earth Vector".to_string(),
+        mode_label: "Vector".to_string(),
+        description: "Natural Earth physical world map with country and city labels rendered from vector tiles. Enable after its vector package is imported.".to_string(),
+        attribution: "Made with Natural Earth. Free vector and raster map data in the public domain.".to_string(),
+        kind: MapVariantKind::Vector,
+        style: MapVariantStyle::NaturalEarth,
+        enabled: false,
+        raster_manifest_key: None,
+        vector_manifest_key: Some("sys/maps/natural-earth-vector.mbtiles.manifest.json".to_string()),
+    }
+}
+
 fn natural_earth_hypso_variant() -> ClusterMapVariant {
     ClusterMapVariant {
         id: "natural-earth-hypso".to_string(),
@@ -143,6 +160,21 @@ fn natural_earth_hypso_variant() -> ClusterMapVariant {
         style: MapVariantStyle::Raster,
         enabled: false,
         raster_manifest_key: Some("sys/maps/natural-earth-hypso.mbtiles.manifest.json".to_string()),
+        vector_manifest_key: None,
+    }
+}
+
+fn natural_earth_one_variant() -> ClusterMapVariant {
+    ClusterMapVariant {
+        id: "natural-earth-1".to_string(),
+        label: "Natural Earth I Relief + Water".to_string(),
+        mode_label: "Relief I".to_string(),
+        description: "Satellite-derived land cover with shaded relief and water. Enable after its raster is imported.".to_string(),
+        attribution: "Made with Natural Earth. Free vector and raster map data in the public domain.".to_string(),
+        kind: MapVariantKind::Raster,
+        style: MapVariantStyle::Raster,
+        enabled: false,
+        raster_manifest_key: Some("sys/maps/natural-earth-one.mbtiles.manifest.json".to_string()),
         vector_manifest_key: None,
     }
 }
@@ -228,7 +260,10 @@ fn add_default_map_variants(
     }
 
     let mut changed = false;
-    for variant in std::iter::once(natural_earth_hypso_variant()).chain(legacy_maptiler_variants())
+    for variant in std::iter::once(natural_earth_vector_variant())
+        .chain(std::iter::once(natural_earth_hypso_variant()))
+        .chain(std::iter::once(natural_earth_one_variant()))
+        .chain(legacy_maptiler_variants())
     {
         if configuration
             .variants
@@ -704,6 +739,39 @@ mod tests {
     }
 
     #[test]
+    fn natural_earth_one_variant_exposes_its_automatic_import_target() {
+        let configuration = default_configuration();
+        let target = resolve_import_target(
+            &configuration,
+            "natural-earth-1",
+            MapVariantAssetKind::Raster,
+        )
+        .expect("default Natural Earth I raster target");
+
+        assert_eq!(target.logical_key, "sys/maps/natural-earth-one.mbtiles");
+        assert_eq!(
+            target.manifest_key,
+            "sys/maps/natural-earth-one.mbtiles.manifest.json"
+        );
+    }
+
+    #[test]
+    fn natural_earth_vector_variant_exposes_its_automatic_import_target() {
+        let configuration = default_configuration();
+        let target = resolve_import_target(
+            &configuration,
+            "natural-earth-vector",
+            MapVariantAssetKind::Vector,
+        )
+        .expect("default Natural Earth vector target");
+        assert_eq!(target.logical_key, "sys/maps/natural-earth-vector.mbtiles");
+        assert_eq!(
+            target.manifest_key,
+            "sys/maps/natural-earth-vector.mbtiles.manifest.json"
+        );
+    }
+
+    #[test]
     fn configuration_rejects_a_disabled_active_variant() {
         let mut configuration = default_configuration();
         configuration.variants[0].enabled = false;
@@ -714,7 +782,10 @@ mod tests {
     fn previous_default_configuration_is_enriched_with_later_optional_profiles() {
         let mut previous_configuration = default_configuration();
         previous_configuration.variants.retain(|variant| {
-            !variant.id.starts_with("maptiler-") && variant.id != "natural-earth-hypso"
+            !variant.id.starts_with("maptiler-")
+                && variant.id != "natural-earth-hypso"
+                && variant.id != "natural-earth-vector"
+                && variant.id != "natural-earth-1"
         });
 
         let (configuration, changed) = add_default_map_variants(previous_configuration);
@@ -743,6 +814,18 @@ mod tests {
                 .variants
                 .iter()
                 .any(|variant| variant.id == "natural-earth-hypso")
+        );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "natural-earth-vector")
+        );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "natural-earth-1")
         );
         assert!(validate_configuration(&configuration).is_ok());
     }
