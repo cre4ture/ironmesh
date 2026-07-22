@@ -96,6 +96,7 @@ export type NaturalEarthImportState = "running" | "ready" | "failed";
 export type NaturalEarthImportProfile =
   | "physical"
   | "physical_with_labels"
+  | "physical_vector"
   | "cross_blended_hypso";
 
 export type NaturalEarthImportLogEntry = {

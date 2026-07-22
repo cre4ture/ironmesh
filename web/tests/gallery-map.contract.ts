@@ -40,6 +40,17 @@ const configuredMapVariants: GalleryMapConfiguration = {
       vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
     },
     {
+      id: "natural-earth-vector",
+      label: "Natural Earth Vector",
+      mode_label: "Vector",
+      description: "Natural Earth physical world map rendered from vector tiles.",
+      attribution: "Made with Natural Earth.",
+      kind: "vector",
+      style: "natural_earth",
+      enabled: true,
+      vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
+    },
+    {
       id: "openmaptiles-street",
       label: "OpenMapTiles Street",
       mode_label: "Street",
@@ -79,10 +90,14 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(mapDisplay).toHaveValue("Natural Earth Globe");
     await mapDisplay.click();
     await expect(page.getByRole("option", { name: "Natural Earth Globe + labels" })).toBeVisible();
+    await expect(page.getByRole("option", { name: "Natural Earth Vector" })).toBeVisible();
     await expect(page.getByRole("option", { name: "OpenMapTiles Street" })).toBeVisible();
     await expect(page.getByRole("option", { name: "Hidden operator map" })).toHaveCount(0);
     await page.getByRole("option", { name: "Natural Earth Globe + labels" }).click();
     await expect(mapDisplay).toHaveValue("Natural Earth Globe + labels");
+    await mapDisplay.click();
+    await page.getByRole("option", { name: "Natural Earth Vector" }).click();
+    await expect(mapDisplay).toHaveValue("Natural Earth Vector");
 
     await page.getByRole("button", { name: "Fullscreen map" }).click();
     await expect(mapDisplay).toBeVisible();

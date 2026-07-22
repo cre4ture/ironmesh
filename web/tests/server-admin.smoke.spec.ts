@@ -58,6 +58,17 @@ function defaultServerAdminGalleryMapConfiguration(): GalleryMapConfiguration {
         vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
       },
       {
+        id: "natural-earth-vector",
+        label: "Natural Earth Vector",
+        mode_label: "Vector",
+        description: "Natural Earth physical world map rendered from vector tiles.",
+        attribution: "Made with Natural Earth.",
+        kind: "vector",
+        style: "natural_earth",
+        enabled: false,
+        vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
+      },
+      {
         id: "natural-earth-hypso",
         label: "Natural Earth Hypsometric Relief",
         mode_label: "Relief",
@@ -857,6 +868,85 @@ test("server-admin map import wizard starts the Natural Earth labels background 
   await page.getByText("Conversion log (1 entries)", { exact: true }).click();
   await expect(
     page.getByText("Phase: Downloading Natural Earth populated places archive", { exact: true })
+  ).toBeVisible();
+});
+
+test("server-admin map import wizard starts the Natural Earth vector background job", async ({ page }) => {
+  let naturalEarthStartRequest: Record<string, unknown> | null = null;
+  let naturalEarthJob: Record<string, unknown> | null = null;
+
+  await installServerAdminMocks(page);
+  await page.route(`**${apiV1("/auth/maps/import")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: null, can_start_new: true });
+    }
+    return route.fallback();
+  });
+  await page.route(`**${apiV1("/auth/maps/import/natural-earth")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: naturalEarthJob, can_start_new: naturalEarthJob === null });
+    }
+    if (route.request().method() === "POST") {
+      naturalEarthStartRequest = JSON.parse(route.request().postData() ?? "{}");
+      naturalEarthJob = {
+        id: "natural-earth-vector-job-1",
+        state: "running",
+        profile: "physical_vector",
+        phase: "Preparing Natural Earth physical vector layers",
+        source_url: "https://naciscdn.org/naturalearth/10m/physical/10m_physical.zip",
+        logical_key: "sys/maps/natural-earth-vector.mbtiles",
+        manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json",
+        logical_size_bytes: 0,
+        artifacts: [
+          {
+            variant_id: "natural-earth-vector",
+            asset: "vector",
+            logical_key: "sys/maps/natural-earth-vector.mbtiles",
+            manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json",
+            logical_size_bytes: 0
+          }
+        ],
+        error: null,
+        log_entries: [],
+        started_at_unix: 1_700_000_000,
+        updated_at_unix: 1_700_000_001
+      };
+      return json(route, naturalEarthJob);
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await page.getByRole("radio", { name: "Natural Earth vector world map" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Official Natural Earth source", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(
+    page.getByText("Configured Natural Earth vector destination", { exact: true })
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("alert", { name: "Configured Natural Earth vector destination" })
+      .getByText("sys/maps/natural-earth-vector.mbtiles.manifest.json", { exact: true })
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Review before starting the background job", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Start background import" }).click();
+
+  await expect.poll(() => naturalEarthStartRequest).not.toBeNull();
+  expect(naturalEarthStartRequest).toMatchObject({ profile: "physical_vector" });
+  await expect(
+    page.getByText("Preparing Natural Earth physical vector layers", { exact: true })
+  ).toBeVisible();
+  await expect(
+    page.getByText("vector: sys/maps/natural-earth-vector.mbtiles.manifest.json", { exact: true })
   ).toBeVisible();
 });
 

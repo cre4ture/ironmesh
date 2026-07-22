@@ -1578,6 +1578,27 @@ function buildNaturalEarthVectorStyle(
         "source-layer": "ne_lakes",
         paint: { "fill-color": "#8fc3dc" }
       },
+      {
+        id: "natural-earth-rivers",
+        type: "line",
+        source: "basemap",
+        "source-layer": "ne_rivers",
+        minzoom: 2,
+        paint: {
+          "line-color": "#68aad6",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 2, 0.35, 5, 0.65, 8, 1.1]
+        }
+      },
+      {
+        id: "natural-earth-coastline",
+        type: "line",
+        source: "basemap",
+        "source-layer": "ne_coastline",
+        paint: {
+          "line-color": "#5e757a",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 1, 0.35, 5, 0.65, 8, 1.1]
+        }
+      },
       ...naturalEarthOverlayLayers("basemap", false)
     ]
   } as StyleSpecification;

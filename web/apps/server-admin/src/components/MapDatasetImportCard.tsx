@@ -78,6 +78,10 @@ export function MapDatasetImportCard() {
     importTargets.find(
       (target) => target.variantId === "natural-earth-labels" && target.asset === "vector"
     ) ?? null;
+  const naturalEarthVectorTarget =
+    importTargets.find(
+      (target) => target.variantId === "natural-earth-vector" && target.asset === "vector"
+    ) ?? null;
   const naturalEarthHypsoTarget =
     importTargets.find(
       (target) => target.variantId === "natural-earth-hypso" && target.asset === "raster"
@@ -173,6 +177,8 @@ export function MapDatasetImportCard() {
           naturalEarthLabelsVectorTarget !== null
         : selectedImportProfile === "natural-earth-cross-blended-hypso"
           ? canStartNaturalEarthImport && naturalEarthHypsoTarget !== null
+          : selectedImportProfile === "natural-earth-vector"
+            ? canStartNaturalEarthImport && naturalEarthVectorTarget !== null
           : canStartMapImport;
   const importControlsLocked =
     mapImportStatus?.can_start_new === false ||
@@ -192,6 +198,10 @@ export function MapDatasetImportCard() {
     }
     if (selectedImportProfile === "natural-earth-physical-with-labels") {
       void startNaturalEarthImportMutation.mutateAsync("physical_with_labels");
+      return;
+    }
+    if (selectedImportProfile === "natural-earth-vector") {
+      void startNaturalEarthImportMutation.mutateAsync("physical_vector");
       return;
     }
     if (selectedImportProfile === "natural-earth-cross-blended-hypso") {
@@ -245,6 +255,7 @@ export function MapDatasetImportCard() {
             naturalEarthTarget={naturalEarthTarget}
             naturalEarthLabelsRasterTarget={naturalEarthLabelsRasterTarget}
             naturalEarthLabelsVectorTarget={naturalEarthLabelsVectorTarget}
+            naturalEarthVectorTarget={naturalEarthVectorTarget}
             naturalEarthHypsoTarget={naturalEarthHypsoTarget}
             mapConfigurationLoading={mapConfigurationQuery.isLoading}
             controlsLocked={importControlsLocked}
@@ -315,6 +326,7 @@ function NaturalEarthImportStateBadge({ job }: { job: NaturalEarthImportJobView 
 
 function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView }) {
   const includesLabels = job.profile === "physical_with_labels";
+  const isVectorMap = job.profile === "physical_vector";
   const profileDetails = naturalEarthImportProfileDetails(job.profile);
   const artifacts = job.artifacts ?? [];
   return (
@@ -380,6 +392,12 @@ function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView })
             you want the gallery to use it.
           </Alert>
         ) : null}
+        {isVectorMap && job.state === "ready" ? (
+          <Alert color="blue" variant="light" title="Enable the vector map variant">
+            The vector map is published. In Gallery map variants, make <Code>Natural Earth Vector</Code>{" "}
+            visible and select it as the initial map when you want the gallery to use it.
+          </Alert>
+        ) : null}
         {job.log_entries.length > 0 ? (
           <Accordion variant="contained">
             <Accordion.Item value="natural-earth-import-log">
@@ -421,6 +439,11 @@ function naturalEarthImportProfileDetails(profile: NaturalEarthImportProfile): {
     case "physical_with_labels":
       return {
         title: "Natural Earth physical world map + labels",
+        source: "Official Natural Earth 10m physical and cultural archives"
+      };
+    case "physical_vector":
+      return {
+        title: "Natural Earth vector world map",
         source: "Official Natural Earth 10m physical and cultural archives"
       };
     case "cross_blended_hypso":
