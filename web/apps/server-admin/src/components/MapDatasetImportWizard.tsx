@@ -21,6 +21,7 @@ export type MapImportProfile =
   | "natural-earth-physical-with-labels"
   | "natural-earth-vector"
   | "natural-earth-cross-blended-hypso"
+  | "natural-earth-one"
   | "remote-mbtiles";
 
 export type MapDatasetImportWizardTarget = {
@@ -49,6 +50,7 @@ type MapDatasetImportWizardProps = {
   naturalEarthLabelsVectorTarget: MapDatasetImportWizardTarget | null;
   naturalEarthVectorTarget: MapDatasetImportWizardTarget | null;
   naturalEarthHypsoTarget: MapDatasetImportWizardTarget | null;
+  naturalEarthOneTarget: MapDatasetImportWizardTarget | null;
   mapConfigurationLoading: boolean;
   controlsLocked: boolean;
   canStartImport: boolean;
@@ -75,6 +77,7 @@ export function MapDatasetImportWizard({
   naturalEarthLabelsVectorTarget,
   naturalEarthVectorTarget,
   naturalEarthHypsoTarget,
+  naturalEarthOneTarget,
   mapConfigurationLoading,
   controlsLocked,
   canStartImport,
@@ -102,7 +105,11 @@ export function MapDatasetImportWizard({
           ? [naturalEarthHypsoTarget].filter(
               (target): target is MapDatasetImportWizardTarget => target !== null
             )
-        : [];
+          : profile === "natural-earth-one"
+            ? [naturalEarthOneTarget].filter(
+                (target): target is MapDatasetImportWizardTarget => target !== null
+              )
+            : [];
   const hasNaturalEarthDestination =
     profile === "natural-earth-physical"
       ? naturalEarthTarget !== null
@@ -110,7 +117,9 @@ export function MapDatasetImportWizard({
         ? naturalEarthLabelsRasterTarget !== null && naturalEarthLabelsVectorTarget !== null
         : profile === "natural-earth-vector"
           ? naturalEarthVectorTarget !== null
-          : naturalEarthHypsoTarget !== null;
+          : profile === "natural-earth-cross-blended-hypso"
+            ? naturalEarthHypsoTarget !== null
+            : naturalEarthOneTarget !== null;
   const canContinue =
     (step === 0 && profile !== null) ||
     (step === 1 && (naturalEarthTargets.length > 0 || source.trim().length > 0)) ||
@@ -150,6 +159,7 @@ export function MapDatasetImportWizard({
           naturalEarthLabelsVectorTarget={naturalEarthLabelsVectorTarget}
           naturalEarthVectorTarget={naturalEarthVectorTarget}
           naturalEarthHypsoTarget={naturalEarthHypsoTarget}
+          naturalEarthOneTarget={naturalEarthOneTarget}
           mapConfigurationLoading={mapConfigurationLoading}
           partSizeGiB={partSizeGiB}
           controlsLocked={controlsLocked}
@@ -223,6 +233,12 @@ function MapTypeStep({
           disabled={controlsLocked}
         />
         <Radio
+          value="natural-earth-one"
+          label="Natural Earth I relief and water map"
+          description="Download the official Natural Earth I land-cover raster with shaded relief and water, then create a richer globe raster automatically."
+          disabled={controlsLocked}
+        />
+        <Radio
           value="remote-mbtiles"
           label="An existing MBTiles package"
           description="Download a compatible MBTiles file from an HTTP URL and publish it to one configured map artifact."
@@ -254,7 +270,8 @@ function MapSourceStep({
     profile === "natural-earth-physical" ||
     profile === "natural-earth-physical-with-labels" ||
     profile === "natural-earth-vector" ||
-    profile === "natural-earth-cross-blended-hypso"
+    profile === "natural-earth-cross-blended-hypso" ||
+    profile === "natural-earth-one"
   ) {
     return (
       <Alert color="blue" variant="light" title="Official Natural Earth source">
@@ -264,7 +281,9 @@ function MapSourceStep({
             ? "The server downloads the fixed Natural Earth physical, countries, populated-places, and country-boundaries archives, then builds the globe raster and its labels overlay."
             : profile === "natural-earth-vector"
               ? "The server downloads the fixed Natural Earth physical and cultural archives, then packages land, water, rivers, coastlines, boundaries, and place labels as vector tiles."
-              : "The server downloads the fixed Natural Earth Cross Blended Hypso raster with shaded relief and water, then converts it to a globe MBTiles package."}{" "}
+              : profile === "natural-earth-cross-blended-hypso"
+                ? "The server downloads the fixed Natural Earth Cross Blended Hypso raster with shaded relief and water, then converts it to a globe MBTiles package."
+                : "The server downloads the fixed Natural Earth I land-cover raster with shaded relief and water, then converts it to a globe MBTiles package."}{" "}
         No URL or file needs to be supplied. GDAL and unzip must be installed on this node.
       </Alert>
     );
@@ -294,6 +313,7 @@ function MapDestinationStep({
   naturalEarthLabelsVectorTarget,
   naturalEarthVectorTarget,
   naturalEarthHypsoTarget,
+  naturalEarthOneTarget,
   mapConfigurationLoading,
   partSizeGiB,
   controlsLocked,
@@ -310,6 +330,7 @@ function MapDestinationStep({
   | "naturalEarthLabelsVectorTarget"
   | "naturalEarthVectorTarget"
   | "naturalEarthHypsoTarget"
+  | "naturalEarthOneTarget"
   | "mapConfigurationLoading"
   | "partSizeGiB"
   | "controlsLocked"
@@ -364,6 +385,21 @@ function MapDestinationStep({
     ) : (
       <Alert color="red" title="Natural Earth relief destination is not configured">
         Add a raster artifact for the <Code>natural-earth-hypso</Code> variant before starting this
+        profile.
+      </Alert>
+    );
+  }
+
+  if (profile === "natural-earth-one") {
+    return naturalEarthOneTarget ? (
+      <Alert color="blue" variant="light" title="Configured Natural Earth I destination">
+        The generated Natural Earth I relief-and-water raster will replace <Code>{naturalEarthOneTarget.label}</Code>{" "}
+        at <Code>{naturalEarthOneTarget.manifestKey}</Code>. This target is fixed so the map keeps
+        its expected projection and style.
+      </Alert>
+    ) : (
+      <Alert color="red" title="Natural Earth I destination is not configured">
+        Add a raster artifact for the <Code>natural-earth-1</Code> variant before starting this
         profile.
       </Alert>
     );
@@ -469,7 +505,9 @@ function MapReviewStep({
                     ? "Natural Earth vector world map"
                     : profile === "natural-earth-cross-blended-hypso"
                       ? "Natural Earth hypsometric relief map"
-                      : "Existing MBTiles package"}
+                      : profile === "natural-earth-one"
+                        ? "Natural Earth I relief and water map"
+                        : "Existing MBTiles package"}
             </Text>
           </WizardDetail>
           <WizardDetail label="Source">
@@ -482,7 +520,9 @@ function MapReviewStep({
                     ? "Official Natural Earth 10m physical and cultural archives"
                     : profile === "natural-earth-cross-blended-hypso"
                       ? "Official Natural Earth 10m Cross Blended Hypso raster archive"
-                      : source.trim()}
+                      : profile === "natural-earth-one"
+                        ? "Official Natural Earth I 10m shaded-relief and water raster archive"
+                        : source.trim()}
             </Text>
           </WizardDetail>
           {naturalEarthTargets.length > 0 ? (

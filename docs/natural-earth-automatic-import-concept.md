@@ -7,7 +7,8 @@ file. Natural Earth publishes source Shapefiles, so its physical world map and
 labels overlay need controlled server-side conversion. This feature produces the
 existing `natural-earth-globe` raster variant, the `natural-earth-labels`
 hybrid variant, the `natural-earth-vector` vector variant, and the
-`natural-earth-hypso` relief raster variant from fixed official sources.
+`natural-earth-hypso` and `natural-earth-1` relief raster variants from fixed
+official sources.
 
 ## Wizard workflow
 
@@ -21,14 +22,17 @@ wizard**. The first step chooses a map profile, not a low-level input format:
   with physical layers, borders, and place labels;
 - **Natural Earth hypsometric relief map** — a controlled conversion of
   Natural Earth's Cross Blended Hypso raster with shaded relief and water;
+- **Natural Earth I relief and water map** — a controlled conversion of
+  Natural Earth I land cover with shaded relief and water;
 - **An existing MBTiles package** — the resumable HTTP MBTiles importer.
 
-The four Natural Earth profiles have fixed official sources and fixed configured
+The five Natural Earth profiles have fixed official sources and fixed configured
 destinations, so they only ask for confirmation. The labels profile publishes a
 raster and a vector artifact for `natural-earth-labels`; the raster-only profile
 publishes the `natural-earth-globe` artifact; the vector profile publishes the
 `natural-earth-vector` artifact; the relief profile publishes the
-`natural-earth-hypso` artifact. The MBTiles profile asks for an HTTP source, a
+`natural-earth-hypso` artifact; the Natural Earth I profile publishes the
+`natural-earth-1` artifact. The MBTiles profile asks for an HTTP source, a
 configured variant artifact, and its part size. Every final button starts a
 background job and returns immediately to its progress panel.
 
@@ -113,8 +117,24 @@ does not restyle it or reconstruct its colors from vectors. It reprojects that
 raster to Web Mercator with bilinear resampling, adds an alpha channel for the
 PNG tile output, creates MBTiles overviews, validates the result, and only then
 publishes the configured `natural-earth-hypso` manifest. The source archive is
-about 379 MB, so the controlled source-download limit is 512 MiB; generated
-artifacts remain limited to 512 MiB.
+about 379 MB, and Natural Earth I with Shaded Relief and Water is about 323 MB,
+so the controlled source-download limit is 512 MiB; generated artifacts remain
+limited to 512 MiB.
+
+### Natural Earth I relief and water raster
+
+The Natural Earth I profile downloads this official 10m archive:
+
+```text
+https://naciscdn.org/naturalearth/10m/raster/NE1_HR_LC_SR_W.zip
+```
+
+The archive contains `NE1_HR_LC_SR_W.tif`: satellite-derived land-cover colors
+combined with shaded relief and water. The importer preserves this cartographic
+raster, reprojects it to Web Mercator with bilinear resampling, creates PNG
+MBTiles overviews, validates the result, and then publishes the configured
+`natural-earth-1` manifest. It is a visual overview background, so the vector
+profile remains the appropriate choice when zooming sharply matters.
 
 ## Operational behavior
 

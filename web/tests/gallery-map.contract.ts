@@ -51,6 +51,17 @@ const configuredMapVariants: GalleryMapConfiguration = {
       vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
     },
     {
+      id: "natural-earth-1",
+      label: "Natural Earth I Relief + Water",
+      mode_label: "Relief I",
+      description: "Natural Earth I land cover with shaded relief and water.",
+      attribution: "Made with Natural Earth.",
+      kind: "raster",
+      style: "raster",
+      enabled: true,
+      raster_manifest_key: "sys/maps/natural-earth-one.mbtiles.manifest.json"
+    },
+    {
       id: "openmaptiles-street",
       label: "OpenMapTiles Street",
       mode_label: "Street",
@@ -91,6 +102,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await mapDisplay.click();
     await expect(page.getByRole("option", { name: "Natural Earth Globe + labels" })).toBeVisible();
     await expect(page.getByRole("option", { name: "Natural Earth Vector" })).toBeVisible();
+    await expect(page.getByRole("option", { name: "Natural Earth I Relief + Water" })).toBeVisible();
     await expect(page.getByRole("option", { name: "OpenMapTiles Street" })).toBeVisible();
     await expect(page.getByRole("option", { name: "Hidden operator map" })).toHaveCount(0);
     await page.getByRole("option", { name: "Natural Earth Globe + labels" }).click();
@@ -98,6 +110,9 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await mapDisplay.click();
     await page.getByRole("option", { name: "Natural Earth Vector" }).click();
     await expect(mapDisplay).toHaveValue("Natural Earth Vector");
+    await mapDisplay.click();
+    await page.getByRole("option", { name: "Natural Earth I Relief + Water" }).click();
+    await expect(mapDisplay).toHaveValue("Natural Earth I Relief + Water");
 
     await page.getByRole("button", { name: "Fullscreen map" }).click();
     await expect(mapDisplay).toBeVisible();

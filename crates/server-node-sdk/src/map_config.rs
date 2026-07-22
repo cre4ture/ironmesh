@@ -114,6 +114,7 @@ pub(crate) fn default_configuration() -> ClusterMapConfiguration {
             },
             natural_earth_vector_variant(),
             natural_earth_hypso_variant(),
+            natural_earth_one_variant(),
             ClusterMapVariant {
                 id: "openmaptiles-street".to_string(),
                 label: "OpenMapTiles Street".to_string(),
@@ -159,6 +160,21 @@ fn natural_earth_hypso_variant() -> ClusterMapVariant {
         style: MapVariantStyle::Raster,
         enabled: false,
         raster_manifest_key: Some("sys/maps/natural-earth-hypso.mbtiles.manifest.json".to_string()),
+        vector_manifest_key: None,
+    }
+}
+
+fn natural_earth_one_variant() -> ClusterMapVariant {
+    ClusterMapVariant {
+        id: "natural-earth-1".to_string(),
+        label: "Natural Earth I Relief + Water".to_string(),
+        mode_label: "Relief I".to_string(),
+        description: "Satellite-derived land cover with shaded relief and water. Enable after its raster is imported.".to_string(),
+        attribution: "Made with Natural Earth. Free vector and raster map data in the public domain.".to_string(),
+        kind: MapVariantKind::Raster,
+        style: MapVariantStyle::Raster,
+        enabled: false,
+        raster_manifest_key: Some("sys/maps/natural-earth-one.mbtiles.manifest.json".to_string()),
         vector_manifest_key: None,
     }
 }
@@ -246,6 +262,7 @@ fn add_default_map_variants(
     let mut changed = false;
     for variant in std::iter::once(natural_earth_vector_variant())
         .chain(std::iter::once(natural_earth_hypso_variant()))
+        .chain(std::iter::once(natural_earth_one_variant()))
         .chain(legacy_maptiler_variants())
     {
         if configuration
@@ -722,6 +739,23 @@ mod tests {
     }
 
     #[test]
+    fn natural_earth_one_variant_exposes_its_automatic_import_target() {
+        let configuration = default_configuration();
+        let target = resolve_import_target(
+            &configuration,
+            "natural-earth-1",
+            MapVariantAssetKind::Raster,
+        )
+        .expect("default Natural Earth I raster target");
+
+        assert_eq!(target.logical_key, "sys/maps/natural-earth-one.mbtiles");
+        assert_eq!(
+            target.manifest_key,
+            "sys/maps/natural-earth-one.mbtiles.manifest.json"
+        );
+    }
+
+    #[test]
     fn natural_earth_vector_variant_exposes_its_automatic_import_target() {
         let configuration = default_configuration();
         let target = resolve_import_target(
@@ -751,6 +785,7 @@ mod tests {
             !variant.id.starts_with("maptiler-")
                 && variant.id != "natural-earth-hypso"
                 && variant.id != "natural-earth-vector"
+                && variant.id != "natural-earth-1"
         });
 
         let (configuration, changed) = add_default_map_variants(previous_configuration);
@@ -785,6 +820,12 @@ mod tests {
                 .variants
                 .iter()
                 .any(|variant| variant.id == "natural-earth-vector")
+        );
+        assert!(
+            configuration
+                .variants
+                .iter()
+                .any(|variant| variant.id == "natural-earth-1")
         );
         assert!(validate_configuration(&configuration).is_ok());
     }

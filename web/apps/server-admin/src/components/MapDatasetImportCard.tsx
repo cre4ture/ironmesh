@@ -86,6 +86,10 @@ export function MapDatasetImportCard() {
     importTargets.find(
       (target) => target.variantId === "natural-earth-hypso" && target.asset === "raster"
     ) ?? null;
+  const naturalEarthOneTarget =
+    importTargets.find(
+      (target) => target.variantId === "natural-earth-1" && target.asset === "raster"
+    ) ?? null;
   useEffect(() => {
     if (!selectedTargetKey || !importTargets.some((target) => target.key === selectedTargetKey)) {
       setSelectedTargetKey(importTargets[0]?.key ?? null);
@@ -177,6 +181,8 @@ export function MapDatasetImportCard() {
           naturalEarthLabelsVectorTarget !== null
         : selectedImportProfile === "natural-earth-cross-blended-hypso"
           ? canStartNaturalEarthImport && naturalEarthHypsoTarget !== null
+          : selectedImportProfile === "natural-earth-one"
+            ? canStartNaturalEarthImport && naturalEarthOneTarget !== null
           : selectedImportProfile === "natural-earth-vector"
             ? canStartNaturalEarthImport && naturalEarthVectorTarget !== null
           : canStartMapImport;
@@ -206,6 +212,10 @@ export function MapDatasetImportCard() {
     }
     if (selectedImportProfile === "natural-earth-cross-blended-hypso") {
       void startNaturalEarthImportMutation.mutateAsync("cross_blended_hypso");
+      return;
+    }
+    if (selectedImportProfile === "natural-earth-one") {
+      void startNaturalEarthImportMutation.mutateAsync("natural_earth_one");
       return;
     }
     if (selectedImportProfile === "remote-mbtiles") {
@@ -257,6 +267,7 @@ export function MapDatasetImportCard() {
             naturalEarthLabelsVectorTarget={naturalEarthLabelsVectorTarget}
             naturalEarthVectorTarget={naturalEarthVectorTarget}
             naturalEarthHypsoTarget={naturalEarthHypsoTarget}
+            naturalEarthOneTarget={naturalEarthOneTarget}
             mapConfigurationLoading={mapConfigurationQuery.isLoading}
             controlsLocked={importControlsLocked}
             canStartImport={canStartSelectedImport}
@@ -327,6 +338,7 @@ function NaturalEarthImportStateBadge({ job }: { job: NaturalEarthImportJobView 
 function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView }) {
   const includesLabels = job.profile === "physical_with_labels";
   const isVectorMap = job.profile === "physical_vector";
+  const isNaturalEarthOneMap = job.profile === "natural_earth_one";
   const profileDetails = naturalEarthImportProfileDetails(job.profile);
   const artifacts = job.artifacts ?? [];
   return (
@@ -398,6 +410,13 @@ function NaturalEarthImportProgress({ job }: { job: NaturalEarthImportJobView })
             visible and select it as the initial map when you want the gallery to use it.
           </Alert>
         ) : null}
+        {isNaturalEarthOneMap && job.state === "ready" ? (
+          <Alert color="blue" variant="light" title="Enable the Natural Earth I map variant">
+            The Natural Earth I raster is published. In Gallery map variants, make{" "}
+            <Code>Natural Earth I Relief + Water</Code> visible and select it as the initial map when
+            you want the gallery to use it.
+          </Alert>
+        ) : null}
         {job.log_entries.length > 0 ? (
           <Accordion variant="contained">
             <Accordion.Item value="natural-earth-import-log">
@@ -450,6 +469,11 @@ function naturalEarthImportProfileDetails(profile: NaturalEarthImportProfile): {
       return {
         title: "Natural Earth hypsometric relief map",
         source: "Official Natural Earth 10m Cross Blended Hypso raster archive"
+      };
+    case "natural_earth_one":
+      return {
+        title: "Natural Earth I relief and water map",
+        source: "Official Natural Earth I 10m shaded-relief and water raster archive"
       };
   }
 }

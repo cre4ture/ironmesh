@@ -78,6 +78,17 @@ function defaultServerAdminGalleryMapConfiguration(): GalleryMapConfiguration {
         style: "raster",
         enabled: false,
         raster_manifest_key: "sys/maps/natural-earth-hypso.mbtiles.manifest.json"
+      },
+      {
+        id: "natural-earth-1",
+        label: "Natural Earth I Relief + Water",
+        mode_label: "Relief I",
+        description: "Natural Earth I land cover with shaded relief and water.",
+        attribution: "Made with Natural Earth.",
+        kind: "raster",
+        style: "raster",
+        enabled: false,
+        raster_manifest_key: "sys/maps/natural-earth-one.mbtiles.manifest.json"
       }
     ]
   };
@@ -1026,6 +1037,85 @@ test("server-admin map import wizard imports the Natural Earth hypsometric relie
   expect(naturalEarthStartRequest).toMatchObject({ profile: "cross_blended_hypso" });
   await expect(
     page.getByText("Rendering the cross-blended hypsometric relief map", { exact: true })
+  ).toBeVisible();
+});
+
+test("server-admin map import wizard imports the Natural Earth I relief and water variant", async ({ page }) => {
+  let naturalEarthStartRequest: Record<string, unknown> | null = null;
+  let naturalEarthJob: Record<string, unknown> | null = null;
+
+  await installServerAdminMocks(page);
+  await page.route(`**${apiV1("/auth/maps/import")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, { active_job: null, can_start_new: true });
+    }
+    return route.fallback();
+  });
+  await page.route(`**${apiV1("/auth/maps/import/natural-earth")}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return json(route, {
+        active_job: naturalEarthJob,
+        can_start_new: naturalEarthJob === null
+      });
+    }
+    if (route.request().method() === "POST") {
+      naturalEarthStartRequest = JSON.parse(route.request().postData() ?? "{}");
+      naturalEarthJob = {
+        id: "natural-earth-one-job-1",
+        state: "running",
+        profile: "natural_earth_one",
+        phase: "Rendering the Natural Earth I shaded-relief and water map",
+        source_url: "https://naciscdn.org/naturalearth/10m/raster/NE1_HR_LC_SR_W.zip",
+        logical_key: "sys/maps/natural-earth-one.mbtiles",
+        manifest_key: "sys/maps/natural-earth-one.mbtiles.manifest.json",
+        logical_size_bytes: 0,
+        artifacts: [
+          {
+            variant_id: "natural-earth-1",
+            asset: "raster",
+            logical_key: "sys/maps/natural-earth-one.mbtiles",
+            manifest_key: "sys/maps/natural-earth-one.mbtiles.manifest.json",
+            logical_size_bytes: 0
+          }
+        ],
+        error: null,
+        log_entries: [],
+        started_at_unix: 1_700_000_000,
+        updated_at_unix: 1_700_000_001
+      };
+      return json(route, naturalEarthJob);
+    }
+    return route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await page.getByRole("radio", { name: "Natural Earth I relief and water map" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Official Natural Earth source", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(
+    page.getByText("Configured Natural Earth I destination", { exact: true })
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("alert", { name: "Configured Natural Earth I destination" })
+      .getByText("sys/maps/natural-earth-one.mbtiles.manifest.json", { exact: true })
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByText("Review before starting the background job", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Start background import" }).click();
+
+  await expect.poll(() => naturalEarthStartRequest).not.toBeNull();
+  expect(naturalEarthStartRequest).toMatchObject({ profile: "natural_earth_one" });
+  await expect(
+    page.getByText("Rendering the Natural Earth I shaded-relief and water map", { exact: true })
   ).toBeVisible();
 });
 

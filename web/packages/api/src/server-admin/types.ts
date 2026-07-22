@@ -97,7 +97,8 @@ export type NaturalEarthImportProfile =
   | "physical"
   | "physical_with_labels"
   | "physical_vector"
-  | "cross_blended_hypso";
+  | "cross_blended_hypso"
+  | "natural_earth_one";
 
 export type NaturalEarthImportLogEntry = {
   timestamp_unix: number;

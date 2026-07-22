@@ -17,6 +17,8 @@ const NATURAL_EARTH_BOUNDARIES_10M_URL: &str =
     "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_boundary_lines_land.zip";
 const NATURAL_EARTH_CROSS_BLENDED_HYPSO_10M_URL: &str =
     "https://naciscdn.org/naturalearth/10m/raster/HYP_HR_SR_W.zip";
+const NATURAL_EARTH_ONE_SHADED_RELIEF_WATER_10M_URL: &str =
+    "https://naciscdn.org/naturalearth/10m/raster/NE1_HR_LC_SR_W.zip";
 const NATURAL_EARTH_IMPORT_MAX_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
 const NATURAL_EARTH_IMPORT_PART_BYTES: usize = 256 * 1024 * 1024;
@@ -52,6 +54,7 @@ pub(crate) enum NaturalEarthImportProfile {
     PhysicalWithLabels,
     PhysicalVector,
     CrossBlendedHypso,
+    NaturalEarthOne,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +279,9 @@ async fn start_import(
             "natural-earth-hypso",
             map_config::MapVariantAssetKind::Raster,
         ),
+        NaturalEarthImportProfile::NaturalEarthOne => {
+            ("natural-earth-1", map_config::MapVariantAssetKind::Raster)
+        }
     };
     let target = map_config::resolve_import_target(
         &configuration.configuration,
@@ -374,6 +380,7 @@ fn natural_earth_source_url(profile: NaturalEarthImportProfile) -> &'static str 
         | NaturalEarthImportProfile::PhysicalWithLabels
         | NaturalEarthImportProfile::PhysicalVector => NATURAL_EARTH_PHYSICAL_10M_URL,
         NaturalEarthImportProfile::CrossBlendedHypso => NATURAL_EARTH_CROSS_BLENDED_HYPSO_10M_URL,
+        NaturalEarthImportProfile::NaturalEarthOne => NATURAL_EARTH_ONE_SHADED_RELIEF_WATER_10M_URL,
     }
 }
 
@@ -396,6 +403,10 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
         let (raster_artifact_path, vector_artifact_path) = match job.profile {
             NaturalEarthImportProfile::CrossBlendedHypso => (
                 Some(create_cross_blended_hypso_mbtiles(state, &staging_dir).await?),
+                None,
+            ),
+            NaturalEarthImportProfile::NaturalEarthOne => (
+                Some(create_natural_earth_one_mbtiles(state, &staging_dir).await?),
                 None,
             ),
             NaturalEarthImportProfile::Physical | NaturalEarthImportProfile::PhysicalWithLabels => {
@@ -481,6 +492,50 @@ async fn create_cross_blended_hypso_mbtiles(
     )
     .await?;
     update_phase(state, "Validating generated relief MBTiles").await;
+    validate_generated_mbtiles(state, &artifact_path).await?;
+    Ok(artifact_path)
+}
+
+async fn create_natural_earth_one_mbtiles(
+    state: &ServerState,
+    staging_dir: &Path,
+) -> Result<PathBuf> {
+    let extracted_dir = staging_dir.join("source");
+    fs::create_dir_all(&extracted_dir).await?;
+    download_and_extract_natural_earth_archive(
+        state,
+        NaturalEarthSourceArchive {
+            url: NATURAL_EARTH_ONE_SHADED_RELIEF_WATER_10M_URL,
+            archive_name: "natural-earth-one-shaded-relief-water.zip",
+            description: "Natural Earth I shaded-relief and water archive",
+        },
+        &extracted_dir,
+        staging_dir,
+    )
+    .await?;
+    let source_raster = find_layer(&extracted_dir, "NE1_HR_LC_SR_W.tif")?;
+    let mercator_raster = staging_dir.join("natural-earth-one-mercator.tif");
+    let artifact_path = staging_dir.join("natural-earth-one.mbtiles");
+    update_phase(
+        state,
+        "Rendering the Natural Earth I shaded-relief and water map",
+    )
+    .await;
+    project_and_create_mbtiles(
+        state,
+        &source_raster,
+        &mercator_raster,
+        &artifact_path,
+        staging_dir,
+        RasterMbtilesConversion {
+            name: "Natural Earth I with Shaded Relief and Water",
+            description: "Natural Earth I 10m land cover with shaded relief and water",
+            resampling: "bilinear",
+            add_destination_alpha: true,
+        },
+    )
+    .await?;
+    update_phase(state, "Validating generated Natural Earth I MBTiles").await;
     validate_generated_mbtiles(state, &artifact_path).await?;
     Ok(artifact_path)
 }
@@ -793,6 +848,9 @@ fn required_import_commands(
 ) -> Vec<(&'static str, &'static str)> {
     let mut commands = match profile {
         NaturalEarthImportProfile::CrossBlendedHypso => {
+            REQUIRED_CROSS_BLENDED_HYPSO_IMPORT_COMMANDS.to_vec()
+        }
+        NaturalEarthImportProfile::NaturalEarthOne => {
             REQUIRED_CROSS_BLENDED_HYPSO_IMPORT_COMMANDS.to_vec()
         }
         NaturalEarthImportProfile::PhysicalVector => REQUIRED_VECTOR_IMPORT_COMMANDS.to_vec(),
@@ -1511,6 +1569,7 @@ async fn validate_generated_vector_mbtiles(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_natural_earth_label_metadata(metadata_json: Option<&str>) -> Result<()> {
     validate_natural_earth_vector_metadata(
         metadata_json,
@@ -1540,7 +1599,7 @@ fn validate_natural_earth_vector_metadata(
         .filter_map(|layer| layer.get("id").and_then(serde_json::Value::as_str))
         .collect::<std::collections::HashSet<_>>();
     let missing_layers = required_layers
-        .into_iter()
+        .iter()
         .filter(|layer| !layer_names.contains(layer.as_str()))
         .collect::<Vec<_>>();
     if !missing_layers.is_empty() {
@@ -1744,6 +1803,22 @@ mod tests {
             NATURAL_EARTH_CROSS_BLENDED_HYPSO_10M_URL
         );
         let commands = required_import_commands(NaturalEarthImportProfile::CrossBlendedHypso);
+        assert!(commands.iter().any(|(command, _)| *command == "gdalwarp"));
+        assert!(
+            !commands
+                .iter()
+                .any(|(command, _)| *command == "gdal_rasterize")
+        );
+        assert!(!commands.iter().any(|(command, _)| *command == "ogr2ogr"));
+    }
+
+    #[test]
+    fn natural_earth_one_profile_uses_the_official_relief_and_water_raster() {
+        assert_eq!(
+            natural_earth_source_url(NaturalEarthImportProfile::NaturalEarthOne),
+            NATURAL_EARTH_ONE_SHADED_RELIEF_WATER_10M_URL
+        );
+        let commands = required_import_commands(NaturalEarthImportProfile::NaturalEarthOne);
         assert!(commands.iter().any(|(command, _)| *command == "gdalwarp"));
         assert!(
             !commands
