@@ -10,7 +10,7 @@ import {
   restoreStoreVersion,
   restoreStorePathFromSnapshot
 } from "@ironmesh/api";
-import { ExplorerSurface, PageHeader } from "@ironmesh/ui";
+import { ExplorerSurface, PageHeader, type ExplorerLoadEntriesOptions } from "@ironmesh/ui";
 import { useCallback } from "react";
 
 type ExplorerPageProps = {
@@ -25,8 +25,8 @@ export function ExplorerPage({ queueFilesToPrefix, onOpenStore }: ExplorerPagePr
       prefix: string,
       depth: number,
       snapshotId: string | null,
-      view: "raw" | "tree" = "tree"
-    ) => listStoreEntries(prefix, depth, snapshotId, { view }),
+      options?: ExplorerLoadEntriesOptions
+    ) => listStoreEntries(prefix, depth, snapshotId, options),
     []
   );
   const readValue = useCallback(

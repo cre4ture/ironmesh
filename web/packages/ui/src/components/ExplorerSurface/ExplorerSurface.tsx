@@ -8,6 +8,7 @@ import {
   Grid,
   Group,
   NumberInput,
+  Pagination,
   Select,
   Stack,
   Switch,
@@ -36,6 +37,7 @@ import {
 
 const DEFAULT_EXPLORER_PREVIEW_BYTES = 1024;
 const EXPLORER_RENAME_SCAN_DEPTH = 1024;
+const EXPLORER_PAGE_SIZE = 100;
 
 export type ExplorerSnapshot = {
   id: string;
@@ -53,11 +55,31 @@ export type ExplorerEntry = {
 };
 
 export type ExplorerListView = "raw" | "tree";
+export type ExplorerListSortOrder =
+  | "modified_asc"
+  | "modified_desc"
+  | "path_asc"
+  | "path_desc"
+  | "size_asc"
+  | "size_desc"
+  | "type_asc"
+  | "type_desc";
+
+export type ExplorerLoadEntriesOptions = {
+  view?: ExplorerListView;
+  offset?: number;
+  limit?: number;
+  sort?: ExplorerListSortOrder;
+};
 
 export type ExplorerListResponse = {
   prefix: string;
   depth: number;
   entry_count: number;
+  total_entry_count?: number;
+  offset?: number;
+  limit?: number | null;
+  has_more?: boolean;
   entries: ExplorerEntry[];
 };
 
@@ -114,7 +136,7 @@ export type ExplorerSurfaceProps = {
     prefix: string,
     depth: number,
     snapshotId: string | null,
-    view?: ExplorerListView
+    options?: ExplorerLoadEntriesOptions
   ) => Promise<ExplorerListResponse>;
   readValue: (
     key: string,
@@ -164,6 +186,7 @@ export function ExplorerSurface({
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<ExplorerSnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<ExplorerListResponse | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
   const [selectedPayload, setSelectedPayload] = useState<unknown>({
     message: "Select an object or version to preview it."
   });
@@ -188,14 +211,8 @@ export function ExplorerSurface({
   const canRestoreSnapshot = snapshotId != null && mutations?.restoreSnapshotPath != null;
 
   const sortedEntries = useMemo(() => {
-    const entries = (entriesPayload?.entries ?? []).filter((entry) =>
-      shouldDisplayExplorerEntry(entry, prefix)
-    );
-    entries.sort((left, right) =>
-      compareExplorerEntries(left, right, sortField, sortDirection, prefix)
-    );
-    return entries;
-  }, [entriesPayload, prefix, sortDirection, sortField]);
+    return (entriesPayload?.entries ?? []).filter((entry) => shouldDisplayExplorerEntry(entry, prefix));
+  }, [entriesPayload, prefix]);
 
   useEffect(() => {
     void refreshSnapshots();
@@ -218,13 +235,31 @@ export function ExplorerSurface({
     }
   }
 
-  async function refreshEntries(nextPrefix?: string) {
+  async function refreshEntries(
+    nextPrefix?: string,
+    options?: {
+      page?: number;
+      snapshotId?: string | null;
+      sortField?: ExplorerSortField;
+      sortDirection?: ExplorerSortDirection;
+    }
+  ) {
     setLoading("entries");
     setError(null);
     const targetPrefix = nextPrefix ?? prefix;
+    const targetPage = Math.max(1, options?.page ?? currentPage);
+    const targetSnapshotId = options?.snapshotId === undefined ? snapshotId : options.snapshotId;
+    const targetSortField = options?.sortField ?? sortField;
+    const targetSortDirection = options?.sortDirection ?? sortDirection;
     try {
-      const payload = await loadEntries(targetPrefix.trim(), depth, snapshotId);
+      const payload = await loadEntries(targetPrefix.trim(), depth, targetSnapshotId, {
+        view: "tree",
+        offset: (targetPage - 1) * EXPLORER_PAGE_SIZE,
+        limit: EXPLORER_PAGE_SIZE,
+        sort: explorerServerSortOrder(targetSortField, targetSortDirection)
+      });
       setEntriesPayload(payload);
+      setCurrentPage(targetPage);
       if (typeof nextPrefix === "string") {
         setPrefix(nextPrefix);
       }
@@ -237,7 +272,7 @@ export function ExplorerSurface({
 
   async function readEntry(entry: ExplorerEntry) {
     if (entry.entry_type === "prefix" || entry.path.endsWith("/")) {
-      await refreshEntries(entry.path);
+      await refreshEntries(entry.path, { page: 1 });
       return;
     }
 
@@ -439,7 +474,9 @@ export function ExplorerSurface({
   }
 
   async function renamePrefixSubtree(fromPath: string, toPath: string): Promise<number> {
-    const sourcePayload = await loadEntries(fromPath, EXPLORER_RENAME_SCAN_DEPTH, null, "raw");
+    const sourcePayload = await loadEntries(fromPath, EXPLORER_RENAME_SCAN_DEPTH, null, {
+      view: "raw"
+    });
     const concreteSourcePaths = sourcePayload.entries
       .filter((candidate) => candidate.entry_type !== "prefix")
       .map((candidate) => normalizeExplorerPath(candidate.path, candidate.path.endsWith("/")))
@@ -449,7 +486,9 @@ export function ExplorerSurface({
       throw new Error(`No stored objects were found under "${fromPath}" to rename.`);
     }
 
-    const targetPayload = await loadEntries(toPath, EXPLORER_RENAME_SCAN_DEPTH, null, "raw");
+    const targetPayload = await loadEntries(toPath, EXPLORER_RENAME_SCAN_DEPTH, null, {
+      view: "raw"
+    });
     const blockingTargetPaths = targetPayload.entries
       .filter((candidate) => candidate.entry_type !== "prefix")
       .map((candidate) => normalizeExplorerPath(candidate.path, candidate.path.endsWith("/")))
@@ -672,13 +711,34 @@ export function ExplorerSurface({
   }
 
   function toggleSort(field: ExplorerSortField) {
+    const nextDirection: ExplorerSortDirection =
+      sortField === field
+        ? sortDirection === "asc"
+          ? "desc"
+          : "asc"
+        : field === "size" || field === "modified"
+          ? "desc"
+          : "asc";
     if (sortField === field) {
-      setSortDirection((current) => (current === "asc" ? "desc" : "asc"));
-      return;
+      setSortDirection(nextDirection);
+    } else {
+      setSortField(field);
+      setSortDirection(nextDirection);
     }
-    setSortField(field);
-    setSortDirection(field === "size" || field === "modified" ? "desc" : "asc");
+    void refreshEntries(undefined, {
+      page: 1,
+      sortField: field,
+      sortDirection: nextDirection
+    });
   }
+
+  const totalEntryCount = entriesPayload?.total_entry_count ?? entriesPayload?.entry_count ?? 0;
+  const pageCount = Math.max(1, Math.ceil(totalEntryCount / EXPLORER_PAGE_SIZE));
+  const visibleEntryStart = totalEntryCount === 0 ? 0 : (currentPage - 1) * EXPLORER_PAGE_SIZE + 1;
+  const visibleEntryEnd = Math.min(
+    totalEntryCount,
+    (currentPage - 1) * EXPLORER_PAGE_SIZE + sortedEntries.length
+  );
 
   const helperText = snapshotId
     ? canRestoreSnapshot
@@ -808,17 +868,25 @@ export function ExplorerSurface({
                   }))
                 ]}
                 value={snapshotId ?? ""}
-                onChange={(value) => setSnapshotId(value || null)}
+                onChange={(value) => {
+                  setSnapshotId(value || null);
+                  setCurrentPage(1);
+                }}
               />
             </Grid.Col>
           </Grid>
           <Group justify="space-between" align="center">
             <Group gap="sm">
-              <Button onClick={() => void refreshEntries()}>Load entries</Button>
-              <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
+              <Button onClick={() => void refreshEntries(undefined, { page: 1 })}>
+                Load entries
+              </Button>
+              <Button
+                variant="default"
+                onClick={() => void refreshEntries(parentPrefix(prefix), { page: 1 })}
+              >
                 Up one prefix
               </Button>
-              <Button variant="subtle" onClick={() => void refreshEntries("")}>
+              <Button variant="subtle" onClick={() => void refreshEntries("", { page: 1 })}>
                 Root
               </Button>
             </Group>
@@ -1057,6 +1125,20 @@ export function ExplorerSurface({
               </Table.Tbody>
             </Table>
           </Table.ScrollContainer>
+          {totalEntryCount > 0 ? (
+            <Group justify="space-between" align="center" data-explorer-pagination="true">
+              <Text size="sm" c="dimmed">
+                Showing {visibleEntryStart}–{visibleEntryEnd} of {totalEntryCount} entries
+              </Text>
+              {pageCount > 1 ? (
+                <Pagination
+                  total={pageCount}
+                  value={currentPage}
+                  onChange={(page) => void refreshEntries(undefined, { page })}
+                />
+              ) : null}
+            </Group>
+          ) : null}
           {showEntriesPayload && entriesPayload ? <JsonBlock value={entriesPayload} /> : null}
         </Stack>
       </Card>
@@ -1222,52 +1304,20 @@ function renderExplorerHeader(
   );
 }
 
-function compareExplorerEntries(
-  left: ExplorerEntry,
-  right: ExplorerEntry,
+function explorerServerSortOrder(
   field: ExplorerSortField,
-  direction: ExplorerSortDirection,
-  prefix: string
-): number {
-  const leftIsPrefix = left.entry_type === "prefix" || left.path.endsWith("/");
-  const rightIsPrefix = right.entry_type === "prefix" || right.path.endsWith("/");
-  const leftDisplayPath = explorerDisplayPath(left, prefix);
-  const rightDisplayPath = explorerDisplayPath(right, prefix);
-
-  let result = 0;
+  direction: ExplorerSortDirection
+): ExplorerListSortOrder {
   switch (field) {
     case "path":
-      result = leftDisplayPath.localeCompare(rightDisplayPath);
-      break;
+      return direction === "asc" ? "path_asc" : "path_desc";
     case "type":
-      result = normalizeExplorerType(left).localeCompare(normalizeExplorerType(right));
-      if (result === 0) {
-        result = leftDisplayPath.localeCompare(rightDisplayPath);
-      }
-      break;
+      return direction === "asc" ? "type_asc" : "type_desc";
     case "size":
-      result = compareNullableNumbers(
-        leftIsPrefix ? null : left.size_bytes,
-        rightIsPrefix ? null : right.size_bytes,
-        direction
-      );
-      if (result === 0) {
-        result = leftDisplayPath.localeCompare(rightDisplayPath);
-      }
-      break;
+      return direction === "asc" ? "size_asc" : "size_desc";
     case "modified":
-      result = compareNullableNumbers(left.modified_at_unix, right.modified_at_unix, direction);
-      if (result === 0) {
-        result = leftDisplayPath.localeCompare(rightDisplayPath);
-      }
-      break;
+      return direction === "asc" ? "modified_asc" : "modified_desc";
   }
-
-  return field === "size" || field === "modified"
-    ? result
-    : direction === "asc"
-      ? result
-      : -result;
 }
 
 function shouldDisplayExplorerEntry(entry: ExplorerEntry, prefix: string): boolean {
@@ -1317,27 +1367,6 @@ function normalizeExplorerPrefix(prefix: string): string {
 
 function normalizeExplorerPath(path: string, isPrefix: boolean): string {
   return normalizeStorePath(path, isPrefix);
-}
-
-function compareNullableNumbers(
-  left: number | null | undefined,
-  right: number | null | undefined,
-  direction: ExplorerSortDirection
-): number {
-  if (left == null && right == null) {
-    return 0;
-  }
-  if (left == null) {
-    return 1;
-  }
-  if (right == null) {
-    return -1;
-  }
-  return direction === "asc" ? left - right : right - left;
-}
-
-function normalizeExplorerType(entry: ExplorerEntry): string {
-  return entry.entry_type === "prefix" || entry.path.endsWith("/") ? "prefix" : entry.entry_type;
 }
 
 function normalizeExplorerVersionType(version: ExplorerVersionEntry): string {

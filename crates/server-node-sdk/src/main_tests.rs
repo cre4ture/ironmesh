@@ -13609,6 +13609,90 @@ run_on_main_metadata_backends!(
     list_store_index_cursor_mode_pages_raw_entries_turso
 );
 
+async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/a.png",
+                bytes::Bytes::from_static(b"a"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        locked
+            .put_object_versioned(
+                "gallery/b.png",
+                bytes::Bytes::from_static(b"b"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(1),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+
+    let second_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(1),
+                limit: Some(1),
+                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+                media_filter: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+    assert!(
+        second_response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("store-index-page-cache;desc=hit")),
+        "the second index page should reuse the prepared result"
+    );
+    let second_body = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(second_payload["entries"][0]["path"], "gallery/b.png");
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_reuses_paginated_page_cache_impl,
+    list_store_index_reuses_paginated_page_cache,
+    list_store_index_reuses_paginated_page_cache_turso
+);
+
 #[test]
 fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
     let mut entries = vec![
@@ -15177,6 +15261,9 @@ async fn build_test_state(
             )),
             namespace_change_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             namespace_change_tx,
+            store_index_page_cache: Arc::new(std::sync::Mutex::new(
+                super::StoreIndexPageCache::default(),
+            )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<

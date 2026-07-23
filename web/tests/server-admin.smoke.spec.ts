@@ -2977,17 +2977,9 @@ function buildAdminStoreIndexResponse(
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
-
-  if (!mediaFilter) {
-    return {
-      prefix,
-      depth,
-      entry_count: entries.length,
-      entries
-    };
-  }
-
-  const filteredEntries = entries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter));
+  const filteredEntries = mediaFilter
+    ? entries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter))
+    : entries;
   const totalEntryCount = filteredEntries.length;
   const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);
   const limitParam = searchParams.get("limit");

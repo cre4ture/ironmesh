@@ -111,6 +111,9 @@ const STORAGE_STATS_REFRESH_INTERVAL_SECS: u64 = 300;
 const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
 const PROCESS_STATS_SAMPLE_INTERVAL_SECS: u64 = 2;
 const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
+const STORE_INDEX_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
+const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
+const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
@@ -290,6 +293,7 @@ struct ServerStorageRuntime {
     metadata_db_distribution_runtime: Arc<StdMutex<MetadataDbLogicalDistributionRuntime>>,
     namespace_change_sequence: Arc<AtomicU64>,
     namespace_change_tx: watch::Sender<u64>,
+    store_index_page_cache: Arc<StdMutex<StoreIndexPageCache>>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -7068,6 +7072,7 @@ async fn run_inner(
             )),
             namespace_change_sequence: Arc::new(AtomicU64::new(0)),
             namespace_change_tx: watch::channel(0).0,
+            store_index_page_cache: Arc::new(StdMutex::new(StoreIndexPageCache::default())),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -12588,6 +12593,12 @@ enum StoreIndexSortOrder {
     PathDesc,
     CapturedAsc,
     CapturedDesc,
+    TypeAsc,
+    TypeDesc,
+    SizeAsc,
+    SizeDesc,
+    ModifiedAsc,
+    ModifiedDesc,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -12633,13 +12644,13 @@ struct PeerMediaArtifactResponse {
     thumbnail_payload_b64: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct MediaGpsResponse {
     latitude: f64,
     longitude: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct MediaThumbnailResponse {
     url: String,
     profile: String,
@@ -12649,7 +12660,7 @@ struct MediaThumbnailResponse {
     size_bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct MediaIndexResponse {
     status: String,
     content_fingerprint: String,
@@ -12664,7 +12675,7 @@ struct MediaIndexResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct StoreIndexEntry {
     path: String,
     entry_type: String,
@@ -12682,7 +12693,7 @@ struct StoreIndexEntry {
     media: Option<MediaIndexResponse>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct StoreIndexMediaSummary {
     ready_count: usize,
     pending_count: usize,
@@ -12706,6 +12717,79 @@ struct StoreIndexResponse {
     next_cursor: Option<String>,
     media_summary: StoreIndexMediaSummary,
     entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoreIndexPageCacheKey {
+    prefix: String,
+    depth: usize,
+    snapshot: Option<String>,
+    view: Option<StoreIndexView>,
+    sort: Option<StoreIndexSortOrder>,
+    media_filter: Option<StoreIndexMediaFilter>,
+    thumbnail_route: String,
+}
+
+#[derive(Debug)]
+struct StoreIndexPageCacheValue {
+    prefix: String,
+    depth: usize,
+    matching_key_count: usize,
+    visible_file_count: usize,
+    total_entry_count: usize,
+    media_summary: StoreIndexMediaSummary,
+    entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Debug)]
+struct StoreIndexPageCacheEntry {
+    key: StoreIndexPageCacheKey,
+    namespace_change_sequence: u64,
+    created_at: Instant,
+    value: Arc<StoreIndexPageCacheValue>,
+}
+
+#[derive(Debug, Default)]
+struct StoreIndexPageCache {
+    entries: VecDeque<StoreIndexPageCacheEntry>,
+}
+
+impl StoreIndexPageCache {
+    fn get(
+        &mut self,
+        key: &StoreIndexPageCacheKey,
+        namespace_change_sequence: u64,
+    ) -> Option<Arc<StoreIndexPageCacheValue>> {
+        let position = self.entries.iter().position(|entry| {
+            entry.key == *key
+                && entry.namespace_change_sequence == namespace_change_sequence
+                && entry.created_at.elapsed() <= STORE_INDEX_PAGE_CACHE_TTL
+        })?;
+        let entry = self.entries.remove(position)?;
+        let value = Arc::clone(&entry.value);
+        self.entries.push_front(entry);
+        Some(value)
+    }
+
+    fn insert(
+        &mut self,
+        key: StoreIndexPageCacheKey,
+        namespace_change_sequence: u64,
+        value: StoreIndexPageCacheValue,
+    ) {
+        if value.total_entry_count > STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT {
+            return;
+        }
+
+        self.entries.retain(|entry| entry.key != key);
+        self.entries.push_front(StoreIndexPageCacheEntry {
+            key,
+            namespace_change_sequence,
+            created_at: Instant::now(),
+            value: Arc::new(value),
+        });
+        self.entries.truncate(STORE_INDEX_PAGE_CACHE_MAX_SCOPES);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -14565,6 +14649,104 @@ async fn list_store_index_admin(
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
 }
 
+fn store_index_page_cache_key(
+    query: &StoreIndexQuery,
+    thumbnail_route: &str,
+) -> Option<StoreIndexPageCacheKey> {
+    if !matches!(query.view, Some(StoreIndexView::Tree)) || query.limit.is_none() {
+        return None;
+    }
+
+    Some(StoreIndexPageCacheKey {
+        prefix: query.prefix.clone().unwrap_or_default(),
+        depth: query.depth.unwrap_or(1).max(1),
+        snapshot: query.snapshot.clone(),
+        view: query.view,
+        sort: query.sort,
+        media_filter: query.media_filter,
+        thumbnail_route: thumbnail_route.to_string(),
+    })
+}
+
+fn with_store_index_response_headers(
+    state: &ServerState,
+    request_id: Uuid,
+    mut response: Response,
+    server_timing: String,
+    matching_key_count: usize,
+    visible_file_count: usize,
+) -> Response {
+    let change_sequence = state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst);
+    if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-change-sequence", header_value);
+    }
+    if let Ok(header_value) = HeaderValue::from_str(&request_id.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-store-index-request-id", header_value);
+    }
+    if let Ok(header_value) = HeaderValue::from_str(&server_timing) {
+        response.headers_mut().insert("server-timing", header_value);
+    }
+    if let Ok(header_value) = HeaderValue::from_str(&matching_key_count.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-store-index-matching-keys", header_value);
+    }
+    if let Ok(header_value) = HeaderValue::from_str(&visible_file_count.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-store-index-visible-files", header_value);
+    }
+    response
+}
+
+fn cached_store_index_page_response(
+    state: &ServerState,
+    query: &StoreIndexQuery,
+    request_id: Uuid,
+    request_started_at: Instant,
+    cached: Arc<StoreIndexPageCacheValue>,
+) -> Response {
+    let offset = query.offset.unwrap_or(0).min(cached.total_entry_count);
+    let limit = query.limit.map(|value| value.max(1));
+    let end = limit
+        .map(|value| offset.saturating_add(value).min(cached.total_entry_count))
+        .unwrap_or(cached.total_entry_count);
+    let has_more = end < cached.total_entry_count;
+    let entries = cached.entries[offset..end].to_vec();
+    let total_ms = request_started_at.elapsed().as_millis();
+    let response = (
+        StatusCode::OK,
+        Json(StoreIndexResponse {
+            prefix: cached.prefix.clone(),
+            depth: cached.depth,
+            entry_count: entries.len(),
+            total_entry_count: cached.total_entry_count,
+            offset,
+            limit,
+            has_more,
+            next_cursor: None,
+            media_summary: cached.media_summary.clone(),
+            entries,
+        }),
+    )
+        .into_response();
+    with_store_index_response_headers(
+        state,
+        request_id,
+        response,
+        format!("store-index-page-cache;desc=hit, total;dur={total_ms}"),
+        cached.matching_key_count,
+        cached.visible_file_count,
+    )
+}
+
 async fn list_store_index_response(
     state: &ServerState,
     query: StoreIndexQuery,
@@ -14576,6 +14758,29 @@ async fn list_store_index_response(
     let depth = query.depth.unwrap_or(1).max(1);
     let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
     let cursor_mode = query.cursor.is_some() || query.page_size.is_some();
+    let page_cache_key = store_index_page_cache_key(&query, thumbnail_route);
+    let namespace_change_sequence = state
+        .storage
+        .namespace_change_sequence
+        .load(Ordering::SeqCst);
+
+    if let Some(cache_key) = page_cache_key.as_ref() {
+        let cached = match state.storage.store_index_page_cache.lock() {
+            Ok(mut cache) => cache.get(cache_key, namespace_change_sequence),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .get(cache_key, namespace_change_sequence),
+        };
+        if let Some(cached) = cached {
+            return cached_store_index_page_response(
+                state,
+                &query,
+                request_id,
+                request_started_at,
+                cached,
+            );
+        }
+    }
 
     let snapshot_scan_started_at = Instant::now();
     let (store_index_inspector, snapshot_scan_waited_ms) = {
@@ -14825,10 +15030,36 @@ async fn list_store_index_response(
     let has_more = limit
         .map(|value| offset.saturating_add(value) < total_entry_count)
         .unwrap_or(false);
-    entries = match limit {
-        Some(value) => entries.into_iter().skip(offset).take(value).collect(),
-        None => entries.into_iter().skip(offset).collect(),
-    };
+    if let Some(cache_key) =
+        page_cache_key.filter(|_| total_entry_count <= STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT)
+    {
+        let end = limit
+            .map(|value| offset.saturating_add(value).min(total_entry_count))
+            .unwrap_or(total_entry_count);
+        let cached = StoreIndexPageCacheValue {
+            prefix: prefix.clone(),
+            depth,
+            matching_key_count: keys.len(),
+            visible_file_count: entry_plan.file_entries.len(),
+            total_entry_count,
+            media_summary: media_summary.clone(),
+            entries,
+        };
+        entries = cached.entries[offset..end].to_vec();
+        match state.storage.store_index_page_cache.lock() {
+            Ok(mut cache) => cache.insert(cache_key, namespace_change_sequence, cached),
+            Err(poisoned) => {
+                poisoned
+                    .into_inner()
+                    .insert(cache_key, namespace_change_sequence, cached)
+            }
+        }
+    } else {
+        entries = match limit {
+            Some(value) => entries.into_iter().skip(offset).take(value).collect(),
+            None => entries.into_iter().skip(offset).collect(),
+        };
+    }
     let pagination_ms = pagination_started_at.elapsed().as_millis();
     let returned_entry_count = entries.len();
     let total_ms = request_started_at.elapsed().as_millis();
@@ -14882,7 +15113,7 @@ async fn list_store_index_response(
         );
     }
 
-    let mut response = (
+    let response = (
         StatusCode::OK,
         Json(StoreIndexResponse {
             prefix,
@@ -14898,37 +15129,16 @@ async fn list_store_index_response(
         }),
     )
         .into_response();
-    let change_sequence = state
-        .storage
-        .namespace_change_sequence
-        .load(Ordering::SeqCst);
-    if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
-        response
-            .headers_mut()
-            .insert("x-ironmesh-change-sequence", header_value);
-    }
-    if let Ok(header_value) = HeaderValue::from_str(&request_id.to_string()) {
-        response
-            .headers_mut()
-            .insert("x-ironmesh-store-index-request-id", header_value);
-    }
-    let server_timing = format!(
-        "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
-    );
-    if let Ok(header_value) = HeaderValue::from_str(&server_timing) {
-        response.headers_mut().insert("server-timing", header_value);
-    }
-    if let Ok(header_value) = HeaderValue::from_str(&keys.len().to_string()) {
-        response
-            .headers_mut()
-            .insert("x-ironmesh-store-index-matching-keys", header_value);
-    }
-    if let Ok(header_value) = HeaderValue::from_str(&entry_plan.file_entries.len().to_string()) {
-        response
-            .headers_mut()
-            .insert("x-ironmesh-store-index-visible-files", header_value);
-    }
-    response
+    with_store_index_response_headers(
+        state,
+        request_id,
+        response,
+        format!(
+            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
+        ),
+        keys.len(),
+        entry_plan.file_entries.len(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14959,6 +15169,12 @@ async fn list_store_index_response_cursor_mode(
                 StoreIndexSortOrder::PathDesc
                     | StoreIndexSortOrder::CapturedAsc
                     | StoreIndexSortOrder::CapturedDesc
+                    | StoreIndexSortOrder::TypeAsc
+                    | StoreIndexSortOrder::TypeDesc
+                    | StoreIndexSortOrder::SizeAsc
+                    | StoreIndexSortOrder::SizeDesc
+                    | StoreIndexSortOrder::ModifiedAsc
+                    | StoreIndexSortOrder::ModifiedDesc
             )
         )
     {
@@ -15366,6 +15582,28 @@ fn store_index_entry_captured_at(entry: &StoreIndexEntry) -> u64 {
         .unwrap_or(0)
 }
 
+fn store_index_entry_type(entry: &StoreIndexEntry) -> &str {
+    if entry.entry_type == "prefix" || entry.path.ends_with('/') {
+        "prefix"
+    } else {
+        &entry.entry_type
+    }
+}
+
+fn compare_store_index_optional_u64(
+    left: Option<u64>,
+    right: Option<u64>,
+    descending: bool,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(left), Some(right)) if descending => right.cmp(&left),
+        (Some(left), Some(right)) => left.cmp(&right),
+    }
+}
+
 fn sort_store_index_entries(entries: &mut [StoreIndexEntry], sort: StoreIndexSortOrder) {
     entries.sort_by(|left, right| match sort {
         StoreIndexSortOrder::PathAsc => left.path.cmp(&right.path),
@@ -15376,6 +15614,48 @@ fn sort_store_index_entries(entries: &mut [StoreIndexEntry], sort: StoreIndexSor
         StoreIndexSortOrder::CapturedDesc => store_index_entry_captured_at(right)
             .cmp(&store_index_entry_captured_at(left))
             .then_with(|| left.path.cmp(&right.path)),
+        StoreIndexSortOrder::TypeAsc => store_index_entry_type(left)
+            .cmp(store_index_entry_type(right))
+            .then_with(|| left.path.cmp(&right.path)),
+        StoreIndexSortOrder::TypeDesc => store_index_entry_type(right)
+            .cmp(store_index_entry_type(left))
+            .then_with(|| right.path.cmp(&left.path)),
+        StoreIndexSortOrder::SizeAsc => compare_store_index_optional_u64(
+            if store_index_entry_type(left) == "prefix" {
+                None
+            } else {
+                left.size_bytes
+            },
+            if store_index_entry_type(right) == "prefix" {
+                None
+            } else {
+                right.size_bytes
+            },
+            false,
+        )
+        .then_with(|| left.path.cmp(&right.path)),
+        StoreIndexSortOrder::SizeDesc => compare_store_index_optional_u64(
+            if store_index_entry_type(left) == "prefix" {
+                None
+            } else {
+                left.size_bytes
+            },
+            if store_index_entry_type(right) == "prefix" {
+                None
+            } else {
+                right.size_bytes
+            },
+            true,
+        )
+        .then_with(|| left.path.cmp(&right.path)),
+        StoreIndexSortOrder::ModifiedAsc => {
+            compare_store_index_optional_u64(left.modified_at_unix, right.modified_at_unix, false)
+                .then_with(|| left.path.cmp(&right.path))
+        }
+        StoreIndexSortOrder::ModifiedDesc => {
+            compare_store_index_optional_u64(left.modified_at_unix, right.modified_at_unix, true)
+                .then_with(|| left.path.cmp(&right.path))
+        }
     });
 }
 

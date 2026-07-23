@@ -2026,6 +2026,12 @@ pub enum StoreIndexSortOrder {
     PathDesc,
     CapturedAsc,
     CapturedDesc,
+    TypeAsc,
+    TypeDesc,
+    SizeAsc,
+    SizeDesc,
+    ModifiedAsc,
+    ModifiedDesc,
 }
 
 impl StoreIndexSortOrder {
@@ -2035,6 +2041,12 @@ impl StoreIndexSortOrder {
             Self::PathDesc => "path_desc",
             Self::CapturedAsc => "captured_asc",
             Self::CapturedDesc => "captured_desc",
+            Self::TypeAsc => "type_asc",
+            Self::TypeDesc => "type_desc",
+            Self::SizeAsc => "size_asc",
+            Self::SizeDesc => "size_desc",
+            Self::ModifiedAsc => "modified_asc",
+            Self::ModifiedDesc => "modified_desc",
         }
     }
 }

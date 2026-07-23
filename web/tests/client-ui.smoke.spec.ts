@@ -657,6 +657,77 @@ test("client-ui gallery virtual pages do not keep oversized spacer heights after
     .toBeLessThanOrEqual(2);
 });
 
+test("client-ui gallery reuses an evicted virtual page without requesting it again", async ({
+  page
+}) => {
+  test.setTimeout(45_000);
+  await page.addInitScript(() => {
+    window.localStorage.setItem("ironmesh.gallery.thumbnails_per_row", "8");
+    window.localStorage.setItem("ironmesh.gallery.show_metadata", "false");
+  });
+
+  const pageOffsets: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname !== apiV1("/store/list") || !url.searchParams.has("media_filter")) {
+      return;
+    }
+    pageOffsets.push(url.searchParams.get("offset") ?? "0");
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries: createGalleryPaginationMockStoreEntries(500)
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByAltText("gallery/paginated-001.jpg", { exact: true })).toBeVisible();
+
+  const virtualPageSlots = page.locator('[data-gallery-virtual-page-slot="true"]');
+  await expect(virtualPageSlots).toHaveCount(8);
+  await virtualPageSlots.last().scrollIntoViewIfNeeded();
+  await expect
+    .poll(() => pageOffsets.some((offset) => Number(offset) > 0), {
+      message: "expected the distant virtual gallery pages to load"
+    })
+    .toBe(true);
+
+  const initialPageRequestCount = pageOffsets.filter((offset) => offset === "0").length;
+  await virtualPageSlots.first().scrollIntoViewIfNeeded();
+  await expect(page.getByAltText("gallery/paginated-001.jpg", { exact: true })).toBeVisible();
+  await page.waitForTimeout(300);
+
+  expect(pageOffsets.filter((offset) => offset === "0")).toHaveLength(initialPageRequestCount);
+});
+
+test("client-ui explorer fetches result pages instead of the complete index", async ({ page }) => {
+  const requestPages: Array<{ offset: string | null; limit: string | null }> = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname !== apiV1("/store/list") || !url.searchParams.has("limit")) {
+      return;
+    }
+    requestPages.push({
+      offset: url.searchParams.get("offset"),
+      limit: url.searchParams.get("limit")
+    });
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries: createGalleryPaginationMockStoreEntries(250)
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await expect(page.locator('[data-explorer-pagination="true"]')).toContainText("Showing 1–100 of");
+
+  const pagination = page.locator('[data-explorer-pagination="true"]');
+  await pagination.getByRole("button", { name: "2", exact: true }).click();
+  await expect
+    .poll(() => requestPages.some((request) => request.offset === "100" && request.limit === "100"))
+    .toBe(true);
+  await expect(pagination).toContainText("Showing 101–200 of");
+  expect(requestPages.every((request) => request.limit === "100")).toBe(true);
+});
+
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
   test.setTimeout(45_000);
 
@@ -1537,17 +1608,9 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
-
-  if (!mediaFilter) {
-    return {
-      prefix,
-      depth,
-      entry_count: entries.length,
-      entries
-    };
-  }
-
-  const filteredEntries = entries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter));
+  const filteredEntries = mediaFilter
+    ? entries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))
+    : entries;
   const sortedEntries = sortMockGalleryEntries(filteredEntries, searchParams.get("sort"));
   const totalEntryCount = sortedEntries.length;
   const offset = Math.max(0, Number(searchParams.get("offset") ?? "0") || 0);

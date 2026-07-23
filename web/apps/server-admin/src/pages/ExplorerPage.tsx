@@ -9,7 +9,7 @@ import {
   restoreAdminStoreVersion,
   restoreAdminStorePathFromSnapshot
 } from "@ironmesh/api";
-import { ExplorerSurface } from "@ironmesh/ui";
+import { ExplorerSurface, type ExplorerLoadEntriesOptions } from "@ironmesh/ui";
 import { useCallback } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 
@@ -25,8 +25,8 @@ export function ExplorerPage() {
       prefix: string,
       depth: number,
       snapshotId: string | null,
-      view: "raw" | "tree" = "tree"
-    ) => listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride, { view }),
+      options?: ExplorerLoadEntriesOptions
+    ) => listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride, options),
     [adminTokenOverride]
   );
   const readValue = useCallback(

@@ -2495,6 +2495,12 @@ async fn web_store_list(
         Some("path_desc") => Some(StoreIndexSortOrder::PathDesc),
         Some("captured_asc") => Some(StoreIndexSortOrder::CapturedAsc),
         Some("captured_desc") => Some(StoreIndexSortOrder::CapturedDesc),
+        Some("type_asc") => Some(StoreIndexSortOrder::TypeAsc),
+        Some("type_desc") => Some(StoreIndexSortOrder::TypeDesc),
+        Some("size_asc") => Some(StoreIndexSortOrder::SizeAsc),
+        Some("size_desc") => Some(StoreIndexSortOrder::SizeDesc),
+        Some("modified_asc") => Some(StoreIndexSortOrder::ModifiedAsc),
+        Some("modified_desc") => Some(StoreIndexSortOrder::ModifiedDesc),
         Some(other) => {
             return error_response(
                 StatusCode::BAD_REQUEST,

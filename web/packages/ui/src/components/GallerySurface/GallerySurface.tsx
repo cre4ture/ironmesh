@@ -93,6 +93,7 @@ const GALLERY_VIRTUAL_PAGE_ROW_COUNT = 8;
 const GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS = 1;
 const GALLERY_VIRTUAL_PAGE_KEEP_RADIUS = 2;
 const GALLERY_VIRTUAL_PAGE_ROOT_MARGIN = "900px 0px";
+const GALLERY_GRID_PAGE_CACHE_MAX_ENTRY_COUNT = 2_048;
 
 const EMPTY_GALLERY_MEDIA_SUMMARY: GalleryMediaSummary = {
   ready_count: 0,
@@ -218,6 +219,8 @@ type GalleryGridPageState = {
   error?: string | null;
 };
 
+type GalleryGridPageCache = Map<number, GalleryGridPageState>;
+
 type GalleryGridCollection = {
   prefix: string;
   depth: number;
@@ -315,6 +318,7 @@ export function GallerySurface({
   const loadedScopeRef = useRef<GalleryLoadedScope | null>(null);
   const gridCollectionRef = useRef<GalleryGridCollection | null>(null);
   const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
+  const gridPageCacheRef = useRef<GalleryGridPageCache>(new Map());
   const galleryRequestVersionRef = useRef(0);
 
   useEffect(() => {
@@ -716,7 +720,9 @@ export function GallerySurface({
     setNavigationPayload(null);
     setMapPayload(null);
     setGridCollection(null);
+    gridPagesRef.current = {};
     setGridPages({});
+    gridPageCacheRef.current.clear();
     setGridPageHeights({});
     setVisiblePageSet(new Set());
 
@@ -777,13 +783,14 @@ export function GallerySurface({
 
       setNavigationPayload(navigation);
       setGridCollection(nextCollection);
-      setGridPages({
-        0: {
-          status: "ready",
-          entries: firstPagePayload.entries,
-          error: null
-        }
-      });
+      const firstPage: GalleryGridPageState = {
+        status: "ready",
+        entries: firstPagePayload.entries,
+        error: null
+      };
+      cacheGridPage(0, firstPage, nextCollection.pageSize);
+      gridPagesRef.current = { 0: firstPage };
+      setGridPages(gridPagesRef.current);
       loadedScopeRef.current = targetScope;
       setLoadedScope(targetScope);
       if (syncPrefixInput) {
@@ -817,14 +824,17 @@ export function GallerySurface({
       return existing;
     }
 
-    setGridPages((current) => ({
-      ...current,
-      [pageIndex]: {
-        status: "loading",
-        entries: current[pageIndex]?.entries ?? [],
-        error: null
-      }
-    }));
+    const cachedPage = takeCachedGridPage(pageIndex);
+    if (cachedPage) {
+      setGridPageState(pageIndex, cachedPage);
+      return cachedPage;
+    }
+
+    setGridPageState(pageIndex, {
+      status: "loading",
+      entries: existing?.entries ?? [],
+      error: null
+    });
 
     const requestVersion = galleryRequestVersionRef.current;
 
@@ -857,10 +867,8 @@ export function GallerySurface({
         entries: payload.entries,
         error: null
       };
-      setGridPages((current) => ({
-        ...current,
-        [pageIndex]: nextPage
-      }));
+      cacheGridPage(pageIndex, nextPage, collection.pageSize);
+      setGridPageState(pageIndex, nextPage);
       return nextPage;
     } catch (nextError) {
       if (requestVersion !== galleryRequestVersionRef.current) {
@@ -872,12 +880,54 @@ export function GallerySurface({
         entries: [],
         error: nextError instanceof Error ? nextError.message : "Failed to load gallery page"
       };
-      setGridPages((current) => ({
-        ...current,
-        [pageIndex]: nextPage
-      }));
+      setGridPageState(pageIndex, nextPage);
       return nextPage;
     }
+  }
+
+  function setGridPageState(pageIndex: number, page: GalleryGridPageState) {
+    gridPagesRef.current = {
+      ...gridPagesRef.current,
+      [pageIndex]: page
+    };
+    setGridPages((current) => ({
+      ...current,
+      [pageIndex]: page
+    }));
+  }
+
+  function cacheGridPage(pageIndex: number, page: GalleryGridPageState, pageSize: number) {
+    if (page.status !== "ready") {
+      return;
+    }
+
+    const cache = gridPageCacheRef.current;
+    cache.delete(pageIndex);
+    cache.set(pageIndex, page);
+
+    const maxCachedPages = Math.max(
+      1,
+      Math.floor(GALLERY_GRID_PAGE_CACHE_MAX_ENTRY_COUNT / Math.max(1, pageSize))
+    );
+    while (cache.size > maxCachedPages) {
+      const oldestPageIndex = cache.keys().next().value;
+      if (oldestPageIndex === undefined) {
+        break;
+      }
+      cache.delete(oldestPageIndex);
+    }
+  }
+
+  function takeCachedGridPage(pageIndex: number): GalleryGridPageState | null {
+    const cache = gridPageCacheRef.current;
+    const page = cache.get(pageIndex);
+    if (!page) {
+      return null;
+    }
+
+    cache.delete(pageIndex);
+    cache.set(pageIndex, page);
+    return page;
   }
 
   function handleGridPageMeasured(pageIndex: number, height: number) {
@@ -955,6 +1005,24 @@ export function GallerySurface({
 
       return changed ? next : current;
     });
+
+    const collection = gridCollectionRef.current;
+    if (!collection) {
+      return;
+    }
+    for (const [pageKey, page] of Array.from(gridPageCacheRef.current.entries())) {
+      const entries = page.entries.map((entry) =>
+        entry.path === path
+          ? {
+              ...entry,
+              media
+            }
+          : entry
+      );
+      if (entries.some((entry, index) => entry !== page.entries[index])) {
+        cacheGridPage(Number(pageKey), { ...page, entries }, collection.pageSize);
+      }
+    }
   }
 
   async function handleRetrySelectedMedia() {
