@@ -44,7 +44,18 @@ administrator can:
 
 1. choose the shared initial gallery map;
 2. enable or hide profiles without deleting their already imported artifacts;
-3. use the advanced JSON editor to add future profiles or change artifact keys.
+3. create a hybrid profile by choosing any configured raster artifact and any
+   configured vector artifact, then select its Natural Earth or OpenMapTiles
+   overlay schema;
+4. use the advanced JSON editor to add future profiles or change artifact keys.
+
+The hybrid creator reuses the two selected manifest keys; it does not copy or
+convert map data. New hybrid profiles start hidden so an administrator can
+review their name and attribution before making them visible. A full vector map
+is a valid overlay source: hybrid styles draw only their supported labels,
+borders, and optional roads. The selected schema must still match the vector
+source (`ne_places`/`ne_boundaries` for Natural Earth, `place`/`boundary` for
+OpenMapTiles).
 
 The server rejects an invalid document. A configuration must have an enabled
 active variant, unique lower-case variant IDs, and valid `sys/maps/*.mbtiles.manifest.json`

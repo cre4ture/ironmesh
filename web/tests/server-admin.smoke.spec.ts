@@ -441,6 +441,48 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   expect(requestedPaths).not.toContain("/auth/bootstrap-claims/issue");
 });
 
+test("server-admin creates a hybrid map from configured raster and vector artifacts", async ({ page }) => {
+  let savedConfiguration: GalleryMapConfiguration | null = null;
+
+  await installServerAdminMocks(page);
+  await page.route(`**${apiV1("/auth/maps/config")}`, async (route) => {
+    if (route.request().method() !== "PUT") {
+      return route.fallback();
+    }
+    savedConfiguration = JSON.parse(route.request().postData() ?? "{}") as GalleryMapConfiguration;
+    return json(route, { stored: true, configuration: savedConfiguration });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await expect(page.getByText("Create hybrid map variant", { exact: true })).toBeVisible();
+  await page.getByRole("textbox", { name: "Raster background" }).click();
+  await page.getByRole("option", { name: /Natural Earth I Relief \+ Water/ }).click();
+  await page.getByRole("textbox", { name: "Vector label overlay" }).click();
+  await page.getByRole("option", { name: /Natural Earth Vector/ }).click();
+  await page.getByLabel("Hybrid map name").fill("Relief with Natural Earth labels");
+  await page.getByRole("button", { name: "Create hybrid variant" }).click();
+
+  await expect.poll(() => savedConfiguration).not.toBeNull();
+  const created = savedConfiguration?.variants.find(
+    (variant) => variant.label === "Relief with Natural Earth labels"
+  );
+  expect(created).toMatchObject({
+    id: "hybrid-natural-earth-1-natural-earth-vector",
+    kind: "hybrid",
+    style: "natural_earth",
+    enabled: false,
+    raster_manifest_key: "sys/maps/natural-earth-one.mbtiles.manifest.json",
+    vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
+  });
+});
+
 test("server-admin explorer restores snapshot entries", async ({ page }) => {
   const mockState = await installServerAdminMocks(page);
 
