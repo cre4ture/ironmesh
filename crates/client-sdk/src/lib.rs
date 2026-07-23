@@ -10,7 +10,8 @@ mod session_pool;
 
 pub use bootstrap::{
     BootstrapEnrollmentResult, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
-    PlannedConnectionBootstrapTarget, ResolvedConnectionBootstrap, enroll_bootstrap_claim_blocking,
+    EnrolledClientConnection, PlannedConnectionBootstrapTarget, ResolvedConnectionBootstrap,
+    enroll_bootstrap_claim_blocking, enroll_client_connection_blocking,
     enroll_connection_input_blocking,
 };
 pub use client_node::ClientNode;

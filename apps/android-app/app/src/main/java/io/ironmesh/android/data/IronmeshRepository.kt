@@ -12,18 +12,14 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.io.InputStream
 import java.io.OutputStream
 
-data class BootstrapEnrollmentData(
+data class EnrolledClientConnectionData(
     val cluster_id: String,
-    val connection_bootstrap_json: String? = null,
+    val connection_input: String,
     val device_id: String,
     @Json(name = "device_label")
-    val label: String? = null,
-    val public_key_pem: String,
-    val private_key_pem: String,
-    val credential_pem: String,
-    val rendezvous_client_identity_pem: String? = null,
-    val server_base_url: String? = null,
+    val device_label: String? = null,
     val server_ca_pem: String? = null,
+    val client_identity_json: String,
 )
 
 class EmbeddedWebUiSession(
@@ -85,19 +81,15 @@ class IronmeshRepository {
     ): DeviceAuthState {
         val enrolled = decodeJson(
             RustClientBridge.enrollWithBootstrap(bootstrapJson, deviceId, label),
-            BootstrapEnrollmentData::class.java,
+            EnrolledClientConnectionData::class.java,
         )
         return DeviceAuthState(
             clusterId = enrolled.cluster_id,
             deviceId = enrolled.device_id,
-            label = enrolled.label,
-            connectionBootstrapJson = enrolled.connection_bootstrap_json?.trim().orEmpty(),
-            directServerBaseUrl = enrolled.server_base_url.orEmpty(),
+            label = enrolled.device_label,
+            connectionInput = enrolled.connection_input,
             serverCaPem = enrolled.server_ca_pem,
-            publicKeyPem = enrolled.public_key_pem,
-            privateKeyPem = enrolled.private_key_pem,
-            credentialPem = enrolled.credential_pem,
-            rendezvousClientIdentityPem = enrolled.rendezvous_client_identity_pem,
+            clientIdentityJson = enrolled.client_identity_json,
         )
     }
 

@@ -26,6 +26,29 @@ class DeviceAuthStatePersistenceTest {
     }
 
     @Test
+    fun saveAndLoadRoundTripKeepsRustNormalizedIdentityAsOneProtectedPayload() {
+        val preferences = InMemoryDeviceAuthPreferences()
+        val secretStore = InMemoryDeviceIdentitySecretStore()
+        val persistence = DeviceAuthStatePersistence(preferences, secretStore, codec)
+        val identityJson = """{"cluster_id":"cluster-1","device_id":"device-1","private_key_pem":"private-key-secret","credential_pem":"issued-credential"}"""
+        val state = DeviceAuthState(
+            clusterId = "cluster-1",
+            deviceId = "device-1",
+            label = "Phone",
+            connectionInput = "{\"version\":1}",
+            serverCaPem = "demo-ca",
+            clientIdentityJson = identityJson,
+        )
+
+        persistence.save(state)
+
+        assertPreferencesAreSanitized(preferences.raw.orEmpty())
+        assertEquals(identityJson, secretStore.secret?.clientIdentityJson)
+        assertEquals(state, persistence.load())
+        assertEquals(identityJson, persistence.load().toClientIdentityJson())
+    }
+
+    @Test
     fun loadMigratesCompleteLegacyIdentityAfterProtectedWriteSucceeds() {
         val legacyState = completeState(privateKeyPem = "legacy-private")
         val preferences = InMemoryDeviceAuthPreferences(raw = codec.encode(legacyState))
@@ -302,6 +325,7 @@ class DeviceAuthStatePersistenceTest {
     }
 
     private fun assertPreferencesAreSanitized(raw: String) {
+        assertFalse(raw.contains("clientIdentityJson"))
         assertFalse(raw.contains("privateKeyPem"))
         assertFalse(raw.contains("credentialPem"))
         assertFalse(raw.contains("rendezvousClientIdentityPem"))

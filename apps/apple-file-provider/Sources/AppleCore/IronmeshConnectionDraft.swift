@@ -112,7 +112,15 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
     }
 
     public var requiresEnrollment: Bool {
-        hasBootstrapPayload && !hasClientIdentity
+        // A claim is only an enrollment input, never a reconnectable client configuration. Keep
+        // a partially persisted claim on the onboarding screen even if a Keychain write from an
+        // interrupted enrollment left an identity behind.
+        if Self.looksLikeBootstrapClaim(bootstrapInput) ||
+            Self.looksLikeBootstrapClaim(directConnectionInput)
+        {
+            return true
+        }
+        return hasBootstrapPayload && !hasClientIdentity
     }
 
     public var connectionConfiguration: AppleConnectionConfiguration? {
@@ -232,6 +240,24 @@ public struct IronmeshConnectionDraft: Codable, Equatable, Sendable {
 
     public static func looksLikeBootstrap(_ value: String) -> Bool {
         value.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{")
+    }
+
+    public static func looksLikeBootstrapClaim(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let values = object as? [String: Any]
+        else {
+            return false
+        }
+
+        if values["kind"] as? String == "client_bootstrap_claim" {
+            return true
+        }
+
+        // The compact claim form deliberately has only short field names. This is only a
+        // recovery guard for stale native state; Rust remains the authoritative parser.
+        return ["v", "k", "c", "n", "r", "t"].allSatisfy { values[$0] != nil }
     }
 
     private static func normalizedScannedPayload(_ value: String) -> String? {

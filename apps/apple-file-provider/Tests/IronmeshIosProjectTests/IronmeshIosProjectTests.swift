@@ -83,6 +83,17 @@ final class IronmeshIosProjectTests: XCTestCase {
         XCTAssertFalse(ready.requiresEnrollment)
     }
 
+    func testPersistedBootstrapClaimStillRequiresEnrollmentWhenIdentityExists() {
+        let compactClaim = #"{"v":1,"k":"client_bootstrap_claim","c":"cluster","n":"node","r":[],"t":"token"}"#
+        let draft = IronmeshConnectionDraft(
+            bootstrapInput: compactClaim,
+            clientIdentityJSON: #"{"device_id":"ios-demo"}"#
+        )
+
+        XCTAssertTrue(IronmeshConnectionDraft.looksLikeBootstrapClaim(compactClaim))
+        XCTAssertTrue(draft.requiresEnrollment)
+    }
+
     func testFileProviderDomainRefreshReportsMissingDomain() async {
         let coordinator = AppleFileProviderDomainCoordinator(
             manager: MockFileProviderDomainManager()

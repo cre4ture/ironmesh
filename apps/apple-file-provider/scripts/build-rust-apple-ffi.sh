@@ -72,7 +72,17 @@ cd "$REPO_DIR"
 cargo build --locked -p ios-app --target "$RUST_TARGET" $PROFILE_FLAG
 apps/ios-app/scripts/generate_c_header.sh
 
+CARGO_TARGET_DIR="$(
+    cargo metadata --no-deps --format-version 1 |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
+)"
+
+if [ -z "$CARGO_TARGET_DIR" ]; then
+    echo "unable to resolve Cargo target directory" >&2
+    exit 1
+fi
+
 mkdir -p "$ARTIFACT_DIR"
 TEMP_ARCHIVE="$ARTIFACT_DIR/libios_app.a.tmp.$$"
-cp "$REPO_DIR/target/$RUST_TARGET/$PROFILE_DIR/libios_app.a" "$TEMP_ARCHIVE"
+cp "$CARGO_TARGET_DIR/$RUST_TARGET/$PROFILE_DIR/libios_app.a" "$TEMP_ARCHIVE"
 mv "$TEMP_ARCHIVE" "$ARTIFACT_DIR/libios_app.a"

@@ -351,7 +351,7 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         _ connectionInput: String,
         deviceID: String?,
         label: String?
-    ) throws -> AppleBootstrapEnrollmentResult {
+    ) throws -> AppleEnrolledConnection {
         var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = withOptionalCString(connectionInput) { connectionPointer in
@@ -376,7 +376,7 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         let json = consumeString(jsonPointer)
         let data = Data(json.utf8)
         do {
-            return try JSONDecoder().decode(AppleBootstrapEnrollmentResult.self, from: data)
+            return try JSONDecoder().decode(AppleEnrolledConnection.self, from: data)
         } catch {
             throw IronmeshRustFFIError(message: "Failed to decode enrollment JSON: \(error.localizedDescription)")
         }

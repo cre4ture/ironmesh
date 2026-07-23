@@ -7,6 +7,8 @@ data class DeviceAuthState(
     val clusterId: String = "",
     val deviceId: String = "",
     val label: String? = null,
+    @Json(name = "connectionInput")
+    val connectionInput: String = "",
     val connectionBootstrapJson: String = "",
     @Json(name = "serverBaseUrl")
     val directServerBaseUrl: String = "",
@@ -15,15 +17,23 @@ data class DeviceAuthState(
     val privateKeyPem: String? = null,
     val credentialPem: String? = null,
     val rendezvousClientIdentityPem: String? = null,
+    @Json(name = "clientIdentityJson")
+    val clientIdentityJson: String? = null,
 ) {
     fun hasClientIdentity(): Boolean =
-        clusterId.isNotBlank() &&
-            deviceId.isNotBlank() &&
-            !publicKeyPem.isNullOrBlank() &&
-            !privateKeyPem.isNullOrBlank() &&
-            !credentialPem.isNullOrBlank()
+        !clientIdentityJson.isNullOrBlank() ||
+            (clusterId.isNotBlank() &&
+                deviceId.isNotBlank() &&
+                !publicKeyPem.isNullOrBlank() &&
+                !privateKeyPem.isNullOrBlank() &&
+                !credentialPem.isNullOrBlank())
 
     fun preferredConnectionInput(): String {
+        val normalizedConnectionInput = connectionInput.trim()
+        if (normalizedConnectionInput.isNotEmpty()) {
+            return normalizedConnectionInput
+        }
+
         val bootstrapJson = connectionBootstrapJson.trim()
         if (bootstrapJson.isNotEmpty()) {
             return bootstrapJson
@@ -38,6 +48,8 @@ data class DeviceAuthState(
     }
 
     fun toClientIdentityJson(): String? {
+        clientIdentityJson?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+
         if (!hasClientIdentity()) {
             return null
         }

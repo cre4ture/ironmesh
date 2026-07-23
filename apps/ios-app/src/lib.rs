@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
+#[cfg(test)]
+use client_sdk::EnrolledClientConnection;
 use client_sdk::{
-    BootstrapEnrollmentResult, ClientConnectionAttempt, ClientConnectionDiagnostics,
-    ClientConnectionRouteSnapshot, ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode,
-    ConnectionBootstrap, ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter,
-    StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder, StoreIndexView,
-    VersionGraphSummary, enroll_connection_input_blocking, normalize_server_base_url,
+    ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
+    ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, VersionGraphSummary,
+    enroll_client_connection_blocking, normalize_server_base_url,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
@@ -91,13 +93,6 @@ pub struct ApplePutResponse {
 pub struct AppleDeleteResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_graph: Option<VersionGraphSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppleEnrollmentResponse {
-    #[serde(flatten)]
-    pub enrollment: BootstrapEnrollmentResult,
-    pub client_identity_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -795,18 +790,12 @@ pub fn enroll_connection_input_json(
     device_id_override: Option<&str>,
     device_label_override: Option<&str>,
 ) -> Result<String> {
-    let enrollment = enroll_connection_input_blocking(
+    let connection = enroll_client_connection_blocking(
         connection_input.as_ref(),
         device_id_override,
         device_label_override,
     )?;
-    let client_identity_json = serde_json::to_string(&enrollment.client_identity_material()?)
-        .context("failed to serialize client identity JSON")?;
-    let response = AppleEnrollmentResponse {
-        enrollment,
-        client_identity_json,
-    };
-    serde_json::to_string(&response).context("failed to serialize Apple enrollment response")
+    serde_json::to_string(&connection).context("failed to serialize Apple enrolled connection")
 }
 
 pub fn web_gui_html() -> String {
@@ -1899,44 +1888,31 @@ mod tests {
         assert_eq!(status, FFI_OK);
         assert!(error_out.is_null());
 
-        let response: AppleEnrollmentResponse =
-            serde_json::from_str(&read_string(json_out)).expect("enrollment response should parse");
-        assert_eq!(response.enrollment.cluster_id, cluster_id);
-        assert!(response.enrollment.connection_bootstrap_json.is_some());
-        assert!(response.enrollment.server_base_url.is_some());
+        let response: EnrolledClientConnection = serde_json::from_str(&read_string(json_out))
+            .expect("enrolled connection response should parse");
+        assert_eq!(response.cluster_id, cluster_id);
+        assert!(!response.connection_input.is_empty());
         assert!(!response.client_identity_json.is_empty());
 
         let client_identity = ClientIdentityMaterial::from_json_str(&response.client_identity_json)
             .expect("client identity json should parse");
         assert_eq!(client_identity.cluster_id, cluster_id);
-        assert_eq!(
-            client_identity.credential_pem,
-            Some(response.enrollment.credential_pem.clone())
-        );
-        assert_eq!(
-            client_identity.public_key_pem,
-            response.enrollment.public_key_pem
-        );
+        assert!(client_identity.credential_pem.is_some());
+        assert!(!client_identity.public_key_pem.is_empty());
 
-        let persisted_bootstrap = ConnectionBootstrap::from_json_str(
-            response
-                .enrollment
-                .connection_bootstrap_json
-                .as_deref()
-                .expect("persisted bootstrap should be present"),
-        )
-        .expect("persisted bootstrap should parse");
+        let persisted_bootstrap = ConnectionBootstrap::from_json_str(&response.connection_input)
+            .expect("persisted bootstrap should parse");
         assert_eq!(persisted_bootstrap.cluster_id, cluster_id);
         assert_eq!(
             persisted_bootstrap
                 .device_id
                 .as_ref()
                 .map(ToString::to_string),
-            Some(response.enrollment.device_id)
+            Some(response.device_id)
         );
         assert_eq!(
             persisted_bootstrap.device_label.as_deref(),
-            response.enrollment.label.as_deref()
+            response.device_label.as_deref()
         );
         assert!(persisted_bootstrap.pairing_token.is_none());
     }
