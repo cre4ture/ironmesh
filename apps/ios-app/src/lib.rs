@@ -3,9 +3,9 @@ use bytes::Bytes;
 use client_sdk::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
     ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    EnrolledClientConnection, ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter,
-    StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder, StoreIndexView,
-    VersionGraphSummary, enroll_client_connection_blocking, normalize_server_base_url,
+    ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexRequestOptions,
+    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, VersionGraphSummary,
+    enroll_client_connection_blocking, normalize_server_base_url,
 };
 use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
