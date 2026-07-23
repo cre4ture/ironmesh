@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
+#[cfg(test)]
+use client_sdk::EnrolledClientConnection;
 use client_sdk::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
     ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
