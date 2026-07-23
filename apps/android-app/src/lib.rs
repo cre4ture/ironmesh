@@ -154,11 +154,11 @@ mod tests {
     }
 }
 use client_sdk::{
-    BootstrapEnrollmentResult, ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent,
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, StoreIndexMediaFilter,
-    StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, enroll_connection_input_blocking,
-    set_connection_diagnostics_observer,
+    ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent, ClientIdentityMaterial,
+    ClientNode, ConnectionBootstrap, EnrolledClientConnection, IronMeshClient,
+    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView,
+    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    enroll_client_connection_blocking, set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -1727,13 +1727,13 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enr
         let bootstrap_json: String = env.get_string(&bootstrap_json)?.into();
         let device_id = normalize_optional_string(optional_jstring(&mut env, device_id)?);
         let label = normalize_optional_string(optional_jstring(&mut env, label)?);
-        let enrolled: BootstrapEnrollmentResult = enroll_connection_input_blocking(
+        let connection: EnrolledClientConnection = enroll_client_connection_blocking(
             &bootstrap_json,
             device_id.as_deref(),
             label.as_deref(),
         )?;
-        serde_json::to_string(&enrolled)
-            .context("failed to serialize bootstrap enrollment response")
+        serde_json::to_string(&connection)
+            .context("failed to serialize enrolled client connection response")
     })();
 
     match result {

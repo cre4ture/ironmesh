@@ -20,6 +20,9 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use x509_parser::prelude::FromDer;
 
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SERVER_CERTIFICATE_DER_BYTES: usize = 64 * 1024;
+const MAX_SERVER_CERTIFICATE_DER_NESTING: usize = 64;
+const SERVER_CERTIFICATE_PARSER_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 pub trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -216,7 +219,32 @@ fn validate_expected_node_server_identity(
     cert: &CertificateDer<'_>,
     expected: ExpectedNodeServerIdentity,
 ) -> Result<()> {
-    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+    let certificate_der = cert.as_ref();
+    if certificate_der.len() > MAX_SERVER_CERTIFICATE_DER_BYTES {
+        bail!(
+            "server certificate exceeds the {} byte parser limit",
+            MAX_SERVER_CERTIFICATE_DER_BYTES
+        );
+    }
+    validate_der_nesting_depth(certificate_der)?;
+
+    let certificate_der = certificate_der.to_vec();
+    std::thread::Builder::new()
+        .name("ironmesh-x509-parser".to_owned())
+        .stack_size(SERVER_CERTIFICATE_PARSER_STACK_BYTES)
+        .spawn(move || {
+            validate_expected_node_server_identity_on_parser_stack(&certificate_der, expected)
+        })
+        .context("failed creating server certificate parser thread")?
+        .join()
+        .map_err(|_| anyhow!("server certificate parser thread panicked"))?
+}
+
+fn validate_expected_node_server_identity_on_parser_stack(
+    certificate_der: &[u8],
+    expected: ExpectedNodeServerIdentity,
+) -> Result<()> {
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
         .context("failed parsing server certificate")?;
     let expected_node_uri = format!("urn:ironmesh:node:{}", expected.node_id);
     let expected_cluster_uri = format!("urn:ironmesh:cluster:{}", expected.cluster_id);
@@ -246,6 +274,101 @@ fn validate_expected_node_server_identity(
     }
 
     Ok(())
+}
+
+fn validate_der_nesting_depth(certificate_der: &[u8]) -> Result<()> {
+    if certificate_der.is_empty() {
+        bail!("server certificate is empty");
+    }
+
+    let mut cursor = 0;
+    let mut container_ends = vec![certificate_der.len()];
+
+    loop {
+        while container_ends.last().is_some_and(|end| *end == cursor) {
+            container_ends.pop();
+        }
+        if container_ends.is_empty() {
+            return if cursor == certificate_der.len() {
+                Ok(())
+            } else {
+                bail!("server certificate DER has trailing data")
+            };
+        }
+
+        let current_container_end = *container_ends
+            .last()
+            .expect("non-empty DER container stack");
+        if cursor >= current_container_end {
+            bail!("server certificate DER ends inside a container");
+        }
+        let tag = *certificate_der
+            .get(cursor)
+            .ok_or_else(|| anyhow!("server certificate DER ends in a tag"))?;
+        cursor += 1;
+
+        if tag & 0x1F == 0x1F {
+            let mut tag_octet_count = 0;
+            loop {
+                let tag_octet = *certificate_der
+                    .get(cursor)
+                    .ok_or_else(|| anyhow!("server certificate DER ends in a tag identifier"))?;
+                cursor += 1;
+                tag_octet_count += 1;
+                if tag_octet_count > 5 {
+                    bail!("server certificate DER tag identifier is too long");
+                }
+                if tag_octet & 0x80 == 0 {
+                    break;
+                }
+            }
+        }
+
+        let length_octet = *certificate_der
+            .get(cursor)
+            .ok_or_else(|| anyhow!("server certificate DER ends in a length"))?;
+        cursor += 1;
+        let content_length = if length_octet & 0x80 == 0 {
+            usize::from(length_octet)
+        } else {
+            let length_octet_count = usize::from(length_octet & 0x7F);
+            if length_octet_count == 0 {
+                bail!("server certificate DER uses an indefinite length");
+            }
+            if length_octet_count > std::mem::size_of::<usize>() {
+                bail!("server certificate DER length is too large");
+            }
+
+            let length_end = cursor
+                .checked_add(length_octet_count)
+                .ok_or_else(|| anyhow!("server certificate DER length overflows"))?;
+            let length_bytes = certificate_der
+                .get(cursor..length_end)
+                .ok_or_else(|| anyhow!("server certificate DER ends in a long-form length"))?;
+            cursor = length_end;
+            length_bytes
+                .iter()
+                .fold(0usize, |length, byte| (length << 8) | usize::from(*byte))
+        };
+        let content_end = cursor
+            .checked_add(content_length)
+            .ok_or_else(|| anyhow!("server certificate DER content length overflows"))?;
+        if content_end > current_container_end {
+            bail!("server certificate DER element exceeds its container");
+        }
+
+        if tag & 0x20 != 0 {
+            if container_ends.len() >= MAX_SERVER_CERTIFICATE_DER_NESTING {
+                bail!(
+                    "server certificate DER exceeds the {} level nesting limit",
+                    MAX_SERVER_CERTIFICATE_DER_NESTING
+                );
+            }
+            container_ends.push(content_end);
+        } else {
+            cursor = content_end;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -383,25 +506,7 @@ mod tests {
             node_id: NodeId::new_v4(),
             cluster_id: ClusterId::new_v4(),
         };
-        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.subject_alt_names = vec![
-            SanType::DnsName("old-address.example".try_into().expect("DNS SAN")),
-            SanType::URI(
-                format!("urn:ironmesh:node:{}", expected.node_id)
-                    .try_into()
-                    .expect("node URI SAN"),
-            ),
-            SanType::URI(
-                format!("urn:ironmesh:cluster:{}", expected.cluster_id)
-                    .try_into()
-                    .expect("cluster URI SAN"),
-            ),
-        ];
-        let key = KeyPair::generate().expect("certificate key");
-        let cert = params.self_signed(&key).expect("self-signed certificate");
-        let cert_der =
-            CertificateDer::from_pem_slice(cert.pem().as_bytes()).expect("certificate DER");
+        let cert_der = server_certificate_with_identity(expected);
 
         validate_expected_node_server_identity(&cert_der, expected)
             .expect("IronMesh identity should not depend on the locator DNS SAN");
@@ -415,6 +520,38 @@ mod tests {
             )
             .is_err(),
             "a mismatched cluster identity must still be rejected"
+        );
+    }
+
+    #[test]
+    fn expected_node_identity_check_does_not_use_the_callers_small_stack() {
+        let expected = ExpectedNodeServerIdentity {
+            node_id: NodeId::new_v4(),
+            cluster_id: ClusterId::new_v4(),
+        };
+        let cert_der = server_certificate_with_identity(expected);
+
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || validate_expected_node_server_identity(&cert_der, expected))
+            .expect("small-stack caller thread")
+            .join()
+            .expect("small-stack caller must not panic")
+            .expect("certificate identity validation should succeed");
+    }
+
+    #[test]
+    fn rejects_excessively_nested_server_certificate_der() {
+        let mut der = vec![0x05, 0x00];
+        for _ in 0..MAX_SERVER_CERTIFICATE_DER_NESTING {
+            der = der_sequence(der);
+        }
+
+        let error = validate_der_nesting_depth(&der)
+            .expect_err("excessive DER nesting must be rejected before certificate parsing");
+        assert!(
+            error.to_string().contains("nesting limit"),
+            "unexpected DER nesting error: {error:#}"
         );
     }
 
@@ -485,5 +622,40 @@ mod tests {
                 .is_err(),
             "the verifier must reject a certificate from a different cluster"
         );
+    }
+
+    fn der_sequence(contents: Vec<u8>) -> Vec<u8> {
+        let mut der = vec![0x30];
+        match contents.len() {
+            0..=127 => der.push(contents.len() as u8),
+            128..=255 => der.extend([0x81, contents.len() as u8]),
+            256..=65_535 => der.extend([0x82, (contents.len() >> 8) as u8, contents.len() as u8]),
+            _ => panic!("test DER sequence is too large"),
+        }
+        der.extend(contents);
+        der
+    }
+
+    fn server_certificate_with_identity(
+        expected: ExpectedNodeServerIdentity,
+    ) -> CertificateDer<'static> {
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.subject_alt_names = vec![
+            SanType::DnsName("old-address.example".try_into().expect("DNS SAN")),
+            SanType::URI(
+                format!("urn:ironmesh:node:{}", expected.node_id)
+                    .try_into()
+                    .expect("node URI SAN"),
+            ),
+            SanType::URI(
+                format!("urn:ironmesh:cluster:{}", expected.cluster_id)
+                    .try_into()
+                    .expect("cluster URI SAN"),
+            ),
+        ];
+        let key = KeyPair::generate().expect("certificate key");
+        let cert = params.self_signed(&key).expect("self-signed certificate");
+        CertificateDer::from_pem_slice(cert.pem().as_bytes()).expect("certificate DER")
     }
 }

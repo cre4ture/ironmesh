@@ -136,6 +136,24 @@ pub struct BootstrapEnrollmentResult {
     pub expires_at_unix: Option<u64>,
 }
 
+/// The complete, normalized connection state produced by a successful client enrollment.
+///
+/// Platform applications must persist `connection_input`, `server_ca_pem`, and the device
+/// metadata together, while placing `client_identity_json` in their platform secure store. This
+/// prevents each native shell from independently choosing between a bootstrap claim, a completed
+/// bootstrap bundle, and a direct server URL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrolledClientConnection {
+    pub connection_input: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ca_pem: Option<String>,
+    pub client_identity_json: String,
+    pub cluster_id: ClusterId,
+    pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_label: Option<String>,
+}
+
 impl BootstrapEnrollmentResult {
     pub fn client_identity_material(&self) -> Result<ClientIdentityMaterial> {
         let identity = ClientIdentityMaterial {
@@ -154,6 +172,49 @@ impl BootstrapEnrollmentResult {
         };
         identity.validate()?;
         Ok(identity)
+    }
+
+    /// Converts an enrollment response into the single state contract consumed by mobile apps.
+    ///
+    /// The connection bundle is parsed and re-serialized here, before it reaches platform
+    /// storage. Consequently, a bootstrap claim can never be mistaken for a reconnectable client
+    /// bootstrap after a successful enrollment.
+    pub fn enrolled_client_connection(&self) -> Result<EnrolledClientConnection> {
+        let client_identity = self.client_identity_material()?;
+        let connection_input = match self
+            .connection_bootstrap_json
+            .as_deref()
+            .and_then(|value| normalize_optional(Some(value)))
+        {
+            Some(raw_bootstrap) => ConnectionBootstrap::from_json_str(&raw_bootstrap)
+                .context("enrollment returned an invalid persisted connection bootstrap")?
+                .to_json_pretty()
+                .context("failed to normalize persisted connection bootstrap")?,
+            None => {
+                let server_base_url = self
+                    .server_base_url
+                    .as_deref()
+                    .and_then(|value| normalize_optional(Some(value)))
+                    .ok_or_else(|| {
+                        anyhow!("enrollment returned no reconnectable connection target")
+                    })?;
+                normalize_server_base_url(&server_base_url)
+                    .context("enrollment returned an invalid direct server URL")?
+                    .to_string()
+            }
+        };
+
+        Ok(EnrolledClientConnection {
+            connection_input,
+            server_ca_pem: self
+                .server_ca_pem
+                .as_deref()
+                .and_then(|value| normalize_optional(Some(value))),
+            client_identity_json: client_identity.to_json_pretty()?,
+            cluster_id: client_identity.cluster_id,
+            device_id: client_identity.device_id.to_string(),
+            device_label: client_identity.label,
+        })
     }
 }
 
@@ -1295,6 +1356,19 @@ pub fn enroll_connection_input_blocking(
         .enroll_blocking(device_id_override, device_label_override)
 }
 
+/// Enrolls a device and returns the platform persistence contract in one operation.
+///
+/// Mobile bridges should use this instead of exposing `BootstrapEnrollmentResult`, which contains
+/// protocol-level fields that native code could otherwise recombine inconsistently.
+pub fn enroll_client_connection_blocking(
+    raw_input: &str,
+    device_id_override: Option<&str>,
+    device_label_override: Option<&str>,
+) -> Result<EnrolledClientConnection> {
+    enroll_connection_input_blocking(raw_input, device_id_override, device_label_override)?
+        .enrolled_client_connection()
+}
+
 pub fn enroll_bootstrap_claim_blocking(
     claim: &ClientBootstrapClaim,
     device_id_override: Option<&str>,
@@ -2059,6 +2133,50 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy response should deserialize");
 
         assert_eq!(parsed.label.as_deref(), Some("Phone"));
+    }
+
+    #[test]
+    fn enrollment_result_produces_a_valid_persisted_mobile_connection() {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.pairing_token = None;
+        let device_id = "019d04a8-3099-75bc-8ff5-f5bd9a78bb83".to_string();
+        bootstrap.device_id = Some(device_id.clone());
+        bootstrap.device_label = Some("Tablet".to_string());
+        let response = BootstrapEnrollmentResult {
+            cluster_id: bootstrap.cluster_id,
+            server_base_url: Some("https://public.example/".to_string()),
+            server_ca_pem: Some("public-ca".to_string()),
+            connection_bootstrap_json: Some(
+                bootstrap
+                    .to_json_pretty()
+                    .expect("bootstrap should serialize"),
+            ),
+            device_id: device_id.clone(),
+            label: Some("Tablet".to_string()),
+            public_key_pem: "public-key".to_string(),
+            private_key_pem: "private-key".to_string(),
+            credential_pem: "credential".to_string(),
+            rendezvous_client_identity_pem: None,
+            created_at_unix: Some(10),
+            expires_at_unix: Some(20),
+        };
+
+        let connection = response
+            .enrolled_client_connection()
+            .expect("enrollment should produce a normalized connection");
+
+        let persisted_bootstrap = ConnectionBootstrap::from_json_str(&connection.connection_input)
+            .expect("normalized connection input should be a reconnectable bootstrap");
+        let persisted_identity =
+            ClientIdentityMaterial::from_json_str(&connection.client_identity_json)
+                .expect("normalized client identity should be valid");
+        assert_eq!(persisted_bootstrap.cluster_id, response.cluster_id);
+        assert_eq!(connection.device_id, device_id);
+        assert_eq!(connection.device_label.as_deref(), Some("Tablet"));
+        assert_eq!(
+            persisted_identity.device_id.to_string(),
+            connection.device_id
+        );
     }
 
     #[derive(Debug, Deserialize)]

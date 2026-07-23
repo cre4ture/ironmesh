@@ -1,6 +1,7 @@
 package io.ironmesh.android.data
 
 data class DeviceIdentitySecret(
+    val clientIdentityJson: String = "",
     val clusterId: String,
     val deviceId: String,
     val label: String?,
@@ -9,8 +10,18 @@ data class DeviceIdentitySecret(
     val credentialPem: String,
     val rendezvousClientIdentityPem: String?,
 ) {
-    fun applyingTo(state: DeviceAuthState): DeviceAuthState =
-        state.copy(
+    fun applyingTo(state: DeviceAuthState): DeviceAuthState {
+        val normalizedClientIdentityJson = clientIdentityJson.trim()
+        if (normalizedClientIdentityJson.isNotEmpty()) {
+            return state.copy(
+                clusterId = clusterId,
+                deviceId = deviceId,
+                label = label,
+                clientIdentityJson = normalizedClientIdentityJson,
+            )
+        }
+
+        return state.copy(
             clusterId = clusterId,
             deviceId = deviceId,
             label = label,
@@ -19,9 +30,24 @@ data class DeviceIdentitySecret(
             credentialPem = credentialPem,
             rendezvousClientIdentityPem = rendezvousClientIdentityPem,
         )
+    }
 
     companion object {
         fun fromState(state: DeviceAuthState): DeviceIdentitySecret? {
+            val normalizedClientIdentityJson = state.clientIdentityJson?.trim().orEmpty()
+            if (normalizedClientIdentityJson.isNotEmpty()) {
+                return DeviceIdentitySecret(
+                    clientIdentityJson = normalizedClientIdentityJson,
+                    clusterId = state.clusterId.requiredIdentityValue("cluster ID"),
+                    deviceId = state.deviceId.requiredIdentityValue("device ID"),
+                    label = state.label?.takeIf { it.isNotBlank() },
+                    publicKeyPem = "",
+                    privateKeyPem = "",
+                    credentialPem = "",
+                    rendezvousClientIdentityPem = null,
+                )
+            }
+
             if (!state.hasSensitiveIdentityMaterial()) {
                 return null
             }
@@ -67,7 +93,8 @@ class DeviceIdentityRecoveryRequiredException(
 )
 
 internal fun DeviceAuthState.hasSensitiveIdentityMaterial(): Boolean =
-    !privateKeyPem.isNullOrBlank() ||
+    !clientIdentityJson.isNullOrBlank() ||
+        !privateKeyPem.isNullOrBlank() ||
         !credentialPem.isNullOrBlank() ||
         !rendezvousClientIdentityPem.isNullOrBlank()
 
@@ -78,6 +105,7 @@ internal fun DeviceAuthState.hasIdentityMetadata(): Boolean =
 
 internal fun DeviceAuthState.withoutSensitiveIdentityMaterial(): DeviceAuthState =
     copy(
+        clientIdentityJson = null,
         privateKeyPem = null,
         credentialPem = null,
         rendezvousClientIdentityPem = null,

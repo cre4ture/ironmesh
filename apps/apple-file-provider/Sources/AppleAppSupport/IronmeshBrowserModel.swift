@@ -822,7 +822,6 @@ final class IronmeshBrowserModel: ObservableObject {
 
         let deviceID = draft.enrolledDeviceID.nilIfBlank
         let deviceLabel = draft.deviceLabel.nilIfBlank
-        let fallbackConnectionInput = draft.directConnectionInput.nilIfBlank ?? bundleDefaults.directConnectionInput
         let remoteSession = remoteSession
         let enroller = enroller
 
@@ -839,13 +838,17 @@ final class IronmeshBrowserModel: ObservableObject {
                     )
                 }.value
 
-                draft.directConnectionInput = enrollment.resolvedConnectionInput ?? fallbackConnectionInput
-                draft.bootstrapInput = ""
-                draft.serverCAPem = enrollment.serverCAPem ?? draft.serverCAPem
-                draft.clientIdentityJSON = try enrollment.resolvedClientIdentityJSON()
-                draft.enrolledDeviceID = enrollment.deviceID
-                draft.deviceLabel = enrollment.label ?? draft.deviceLabel
-                try syncSharedSettingsFromDraft()
+                var updatedDraft = draft
+                updatedDraft.directConnectionInput = enrollment.connectionInput
+                updatedDraft.bootstrapInput = ""
+                updatedDraft.serverCAPem = enrollment.serverCAPem ?? updatedDraft.serverCAPem
+                updatedDraft.clientIdentityJSON = enrollment.clientIdentityJSON
+                updatedDraft.enrolledDeviceID = enrollment.deviceID
+                updatedDraft.deviceLabel = enrollment.deviceLabel ?? updatedDraft.deviceLabel
+                try settingsStore.save(
+                    enrollment.storedState(serverCAPemFallback: updatedDraft.serverCAPem.nilIfBlank)
+                )
+                draft = updatedDraft
                 invalidateConnectionRouteState()
 
                 if let configuration = draft.connectionConfiguration {

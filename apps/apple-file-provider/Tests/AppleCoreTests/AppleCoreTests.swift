@@ -155,48 +155,42 @@ final class AppleCoreTests: XCTestCase {
         XCTAssertEqual(effective.clientIdentityJSON, #"{"device_id":"abc"}"#)
     }
 
-    func testEnrollmentResultBuildsClientIdentityJSONWhenMissing() throws {
-        let enrollment = AppleBootstrapEnrollmentResult(
+    func testEnrolledConnectionBuildsStoredStateFromRustContract() {
+        let enrollment = AppleEnrolledConnection(
             clusterID: "cluster-1",
-            connectionBootstrapJSON: #"{"version":1}"#,
+            connectionInput: #"{"version":1,"cluster_id":"cluster-1"}"#,
             deviceID: "device-1",
-            label: "Phone",
-            publicKeyPEM: "public-key",
-            privateKeyPEM: "private-key",
-            credentialPEM: "credential",
-            rendezvousClientIdentityPEM: "rendezvous",
-            serverBaseURL: "https://example.test/",
+            deviceLabel: "Phone",
             serverCAPem: "ca",
-            createdAtUnix: 123,
-            expiresAtUnix: 456
+            clientIdentityJSON: #"{"cluster_id":"cluster-1","device_id":"device-1"}"#
         )
 
-        let json = try enrollment.resolvedClientIdentityJSON()
-        let decoded = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        let state = enrollment.storedState()
 
-        XCTAssertEqual(decoded?["cluster_id"] as? String, "cluster-1")
-        XCTAssertEqual(decoded?["device_id"] as? String, "device-1")
-        XCTAssertEqual(decoded?["credential_pem"] as? String, "credential")
-        XCTAssertEqual(decoded?["rendezvous_client_identity_pem"] as? String, "rendezvous")
+        XCTAssertEqual(state.connectionInput, enrollment.connectionInput)
+        XCTAssertEqual(state.clientIdentityJSON, enrollment.clientIdentityJSON)
+        XCTAssertEqual(state.deviceID, "device-1")
+        XCTAssertEqual(state.deviceLabel, "Phone")
+        XCTAssertNil(state.bootstrapInputDraft)
     }
 
-    func testEnrollmentResultDecodesDeviceLabelAlias() throws {
+    func testEnrolledConnectionDecodesRustFieldNames() throws {
         let json = #"""
         {
           "cluster_id": "cluster-1",
+          "connection_input": "https://example.test/",
           "device_id": "device-1",
           "device_label": "Phone",
-          "public_key_pem": "public-key",
-          "private_key_pem": "private-key",
-          "credential_pem": "credential"
+          "client_identity_json": "{\"cluster_id\":\"cluster-1\",\"device_id\":\"device-1\"}"
         }
         """#
 
         let enrollment = try JSONDecoder().decode(
-            AppleBootstrapEnrollmentResult.self,
+            AppleEnrolledConnection.self,
             from: Data(json.utf8)
         )
 
-        XCTAssertEqual(enrollment.label, "Phone")
+        XCTAssertEqual(enrollment.deviceLabel, "Phone")
+        XCTAssertEqual(enrollment.connectionInput, "https://example.test/")
     }
 }

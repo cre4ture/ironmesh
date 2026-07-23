@@ -119,6 +119,9 @@ targets:
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]: YES
+        CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]: YES
+        CODE_SIGN_IDENTITY[sdk=iphonesimulator*]: "-"
 
   IronmeshIosFileProviderExtension:
     type: app-extension
@@ -154,6 +157,9 @@ targets:
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]: YES
+        CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]: YES
+        CODE_SIGN_IDENTITY[sdk=iphonesimulator*]: "-"
 
   IronmeshAppleProjectTests:
     type: bundle.unit-test
