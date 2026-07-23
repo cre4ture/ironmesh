@@ -24,6 +24,7 @@ pub(crate) struct HardwareHealthReport {
     pub(crate) hardware_profile_id: String,
     pub(crate) inventory: HardwareInventory,
     pub(crate) node_lifecycle: HardwareNodeLifecycle,
+    pub(crate) memory_ecc: HardwareMemoryEcc,
     pub(crate) collectors: Vec<HardwareHealthCollectorStatus>,
     pub(crate) findings: Vec<HardwareHealthFinding>,
     health_notes: Vec<String>,
@@ -75,6 +76,30 @@ struct HardwareMemoryInfo {
     installed_bytes: u64,
     page_size_bytes: Option<u64>,
     details_complete: bool,
+}
+
+/// RAM ECC error counters, read from the Linux EDAC subsystem
+/// (`/sys/devices/system/edac/mc/mc*/{ce_count,ue_count}`). Modeled as an optional signal with an
+/// explicit `available` flag (doc Section 2.4): most consumer boards have no ECC RAM / EDAC driver
+/// and report `available: false` rather than a misleading zero. Kept out of `HardwareInventory` on
+/// purpose so these fluctuating counters never feed the deterministic `hardware_profile_id` hash.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HardwareMemoryEcc {
+    pub(crate) available: bool,
+    pub(crate) correctable_error_count: Option<u64>,
+    pub(crate) uncorrectable_error_count: Option<u64>,
+    pub(crate) memory_controller_count: u32,
+}
+
+impl HardwareMemoryEcc {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            correctable_error_count: None,
+            uncorrectable_error_count: None,
+            memory_controller_count: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +234,7 @@ struct PersistedComponentLifecycle {
 struct CollectedHardwareHealth {
     generated_at_unix: u64,
     inventory: HardwareInventory,
+    memory_ecc: HardwareMemoryEcc,
     collectors: Vec<HardwareHealthCollectorStatus>,
     findings: Vec<HardwareHealthFinding>,
     boot_id: Option<String>,
@@ -452,6 +478,7 @@ fn finalize_hardware_health_report(
         hardware_profile_id,
         inventory,
         node_lifecycle,
+        memory_ecc: collected.memory_ecc,
         collectors: collected.collectors,
         findings,
         health_notes,
@@ -574,6 +601,14 @@ async fn collect_hardware_health(state: &ServerState) -> Result<CollectedHardwar
     let temp_findings = temperature_findings_from_runtime(state, generated_at_unix);
     findings.extend(temp_findings);
 
+    let (memory_ecc, edac_collector, edac_findings) = collect_memory_ecc(generated_at_unix);
+    collectors.push(edac_collector);
+    findings.extend(edac_findings);
+
+    let (throttle_collector, throttle_findings) = collect_cpu_thermal_throttle(generated_at_unix);
+    collectors.push(throttle_collector);
+    findings.extend(throttle_findings);
+
     findings.sort_by(|left, right| {
         severity_rank(&left.severity)
             .cmp(&severity_rank(&right.severity))
@@ -584,6 +619,7 @@ async fn collect_hardware_health(state: &ServerState) -> Result<CollectedHardwar
     Ok(CollectedHardwareHealth {
         generated_at_unix,
         inventory,
+        memory_ecc,
         collectors,
         findings,
         boot_id: current_boot_id(),
@@ -1860,6 +1896,271 @@ fn read_symlink_file_name(path: impl AsRef<FsPath>) -> Option<String> {
     })
 }
 
+fn edac_collector_status(
+    generated_at_unix: u64,
+    available: bool,
+    detail: impl Into<String>,
+) -> HardwareHealthCollectorStatus {
+    HardwareHealthCollectorStatus {
+        collector_id: "edac".to_string(),
+        label: "RAM ECC (EDAC)".to_string(),
+        state: if available { "ready" } else { "unavailable" }.to_string(),
+        available,
+        last_collected_at_unix: Some(generated_at_unix),
+        last_error_code: None,
+        detail: detail.into(),
+    }
+}
+
+fn cpu_throttle_collector_status(
+    generated_at_unix: u64,
+    available: bool,
+    detail: impl Into<String>,
+) -> HardwareHealthCollectorStatus {
+    HardwareHealthCollectorStatus {
+        collector_id: "cpu_thermal_throttle".to_string(),
+        label: "CPU thermal throttling".to_string(),
+        state: if available { "ready" } else { "unavailable" }.to_string(),
+        available,
+        last_collected_at_unix: Some(generated_at_unix),
+        last_error_code: None,
+        detail: detail.into(),
+    }
+}
+
+/// Reads RAM ECC error counters from the Linux EDAC subsystem (doc Section 2.4). Returns the
+/// collected counters, a collector-status entry, and findings for any observed
+/// corrected/uncorrected errors. Reports `available: false` (not a misleading zero) on non-Linux
+/// platforms and on boards without ECC RAM / a loaded EDAC driver.
+fn collect_memory_ecc(
+    generated_at_unix: u64,
+) -> (
+    HardwareMemoryEcc,
+    HardwareHealthCollectorStatus,
+    Vec<HardwareHealthFinding>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        collect_memory_ecc_linux(generated_at_unix)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (
+            HardwareMemoryEcc::unavailable(),
+            edac_collector_status(
+                generated_at_unix,
+                false,
+                "EDAC ECC counters are only collected on Linux.",
+            ),
+            Vec::new(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_memory_ecc_linux(
+    generated_at_unix: u64,
+) -> (
+    HardwareMemoryEcc,
+    HardwareHealthCollectorStatus,
+    Vec<HardwareHealthFinding>,
+) {
+    let no_controllers_detail = "No EDAC memory controllers present (board/BIOS without ECC support, or the EDAC driver is not loaded).";
+    let Ok(entries) = fs::read_dir("/sys/devices/system/edac/mc") else {
+        return (
+            HardwareMemoryEcc::unavailable(),
+            edac_collector_status(generated_at_unix, false, no_controllers_detail),
+            Vec::new(),
+        );
+    };
+
+    let mut controller_count = 0_u32;
+    let mut correctable = 0_u64;
+    let mut uncorrectable = 0_u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("mc") {
+            continue;
+        }
+        let path = entry.path();
+        let ce = read_trimmed_file(path.join("ce_count")).and_then(|v| v.parse::<u64>().ok());
+        let ue = read_trimmed_file(path.join("ue_count")).and_then(|v| v.parse::<u64>().ok());
+        // Only treat a controller as present when at least one counter is actually readable, so a
+        // stray directory without the expected files doesn't flip `available` to true.
+        if ce.is_none() && ue.is_none() {
+            continue;
+        }
+        controller_count += 1;
+        correctable = correctable.saturating_add(ce.unwrap_or(0));
+        uncorrectable = uncorrectable.saturating_add(ue.unwrap_or(0));
+    }
+
+    if controller_count == 0 {
+        return (
+            HardwareMemoryEcc::unavailable(),
+            edac_collector_status(generated_at_unix, false, no_controllers_detail),
+            Vec::new(),
+        );
+    }
+
+    let mut findings = Vec::new();
+    if uncorrectable > 0 {
+        findings.push(ecc_finding(
+            generated_at_unix,
+            "memory_uncorrectable_ecc_errors",
+            "critical",
+            uncorrectable,
+            format!(
+                "EDAC reports {uncorrectable} uncorrectable ECC memory error(s) across {controller_count} controller(s)."
+            ),
+        ));
+    }
+    if correctable > 0 {
+        findings.push(ecc_finding(
+            generated_at_unix,
+            "memory_correctable_ecc_errors",
+            "warn",
+            correctable,
+            format!(
+                "EDAC reports {correctable} corrected ECC memory error(s) across {controller_count} controller(s)."
+            ),
+        ));
+    }
+
+    let ecc = HardwareMemoryEcc {
+        available: true,
+        correctable_error_count: Some(correctable),
+        uncorrectable_error_count: Some(uncorrectable),
+        memory_controller_count: controller_count,
+    };
+    let detail = format!(
+        "{controller_count} EDAC controller(s); corrected={correctable}, uncorrected={uncorrectable}."
+    );
+    (
+        ecc,
+        edac_collector_status(generated_at_unix, true, detail),
+        findings,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn ecc_finding(
+    generated_at_unix: u64,
+    finding_code: &str,
+    severity: &str,
+    occurrence_count: u64,
+    summary: String,
+) -> HardwareHealthFinding {
+    HardwareHealthFinding {
+        source: "edac".to_string(),
+        category: "memory".to_string(),
+        finding_code: finding_code.to_string(),
+        severity: severity.to_string(),
+        component_ref: Some("memory".to_string()),
+        component_instance_id: None,
+        first_seen_at_unix: generated_at_unix,
+        last_seen_at_unix: generated_at_unix,
+        occurrence_count,
+        summary,
+        evidence: json!({ "source": "edac" }),
+    }
+}
+
+/// Reads CPU thermal-throttle event counts from
+/// `/sys/devices/system/cpu/cpu*/thermal_throttle/{core,package}_throttle_count` (doc Section 2.4,
+/// used as a thermal-problem proxy in lieu of unreliable MCE data). Emits a finding when any
+/// throttling has been observed.
+fn collect_cpu_thermal_throttle(
+    generated_at_unix: u64,
+) -> (HardwareHealthCollectorStatus, Vec<HardwareHealthFinding>) {
+    #[cfg(target_os = "linux")]
+    {
+        collect_cpu_thermal_throttle_linux(generated_at_unix)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (
+            cpu_throttle_collector_status(
+                generated_at_unix,
+                false,
+                "CPU thermal-throttle counters are only collected on Linux.",
+            ),
+            Vec::new(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_cpu_thermal_throttle_linux(
+    generated_at_unix: u64,
+) -> (HardwareHealthCollectorStatus, Vec<HardwareHealthFinding>) {
+    let unavailable_detail =
+        "No CPU thermal-throttle counters exposed by the kernel for this platform.";
+    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
+        return (
+            cpu_throttle_collector_status(generated_at_unix, false, unavailable_detail),
+            Vec::new(),
+        );
+    };
+
+    let mut any_readable = false;
+    let mut throttle_total = 0_u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Match cpu0, cpu1, ... but not "cpufreq", "cpuidle", etc.
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if name.len() == 3 {
+            continue;
+        }
+        let throttle_dir = entry.path().join("thermal_throttle");
+        for counter in ["core_throttle_count", "package_throttle_count"] {
+            if let Some(value) =
+                read_trimmed_file(throttle_dir.join(counter)).and_then(|v| v.parse::<u64>().ok())
+            {
+                any_readable = true;
+                throttle_total = throttle_total.saturating_add(value);
+            }
+        }
+    }
+
+    if !any_readable {
+        return (
+            cpu_throttle_collector_status(generated_at_unix, false, unavailable_detail),
+            Vec::new(),
+        );
+    }
+
+    let mut findings = Vec::new();
+    if throttle_total > 0 {
+        findings.push(HardwareHealthFinding {
+            source: "cpu_thermal".to_string(),
+            category: "thermal".to_string(),
+            finding_code: "cpu_thermal_throttling".to_string(),
+            severity: "warn".to_string(),
+            component_ref: Some("cpu".to_string()),
+            component_instance_id: None,
+            first_seen_at_unix: generated_at_unix,
+            last_seen_at_unix: generated_at_unix,
+            occurrence_count: throttle_total,
+            summary: format!(
+                "The CPU has recorded {throttle_total} thermal-throttle event(s) since boot."
+            ),
+            evidence: json!({ "source": "sys_thermal_throttle" }),
+        });
+    }
+
+    (
+        cpu_throttle_collector_status(
+            generated_at_unix,
+            true,
+            format!("Observed {throttle_total} thermal-throttle event(s) since boot."),
+        ),
+        findings,
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn read_trimmed_file(path: impl AsRef<FsPath>) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
@@ -2096,6 +2397,15 @@ pub(crate) mod test_support {
                 last_error_code: None,
                 detail: "ok".to_string(),
             },
+            HardwareHealthCollectorStatus {
+                collector_id: "edac".to_string(),
+                label: "RAM ECC (EDAC)".to_string(),
+                state: "unavailable".to_string(),
+                available: false,
+                last_collected_at_unix: Some(1),
+                last_error_code: None,
+                detail: "no ECC".to_string(),
+            },
         ];
 
         HardwareHealthReport {
@@ -2136,6 +2446,7 @@ pub(crate) mod test_support {
                 uptime_seconds: Some(100),
                 cumulative_observed_uptime_seconds: 200,
             },
+            memory_ecc: HardwareMemoryEcc::unavailable(),
             collectors,
             findings,
             health_notes: Vec::new(),
@@ -2169,6 +2480,34 @@ mod tests {
             pci_slot: None,
             driver: None,
             smart: None,
+        }
+    }
+
+    #[test]
+    fn memory_ecc_collector_is_internally_consistent() {
+        // Runs on whatever hardware the test host has: must never panic, and the reported
+        // availability must agree with whether counts were actually produced.
+        let (ecc, collector, findings) = collect_memory_ecc(1_700_000_000);
+        assert_eq!(collector.collector_id, "edac");
+        assert_eq!(collector.available, ecc.available);
+        if ecc.available {
+            assert!(ecc.correctable_error_count.is_some());
+            assert!(ecc.uncorrectable_error_count.is_some());
+        } else {
+            assert!(ecc.correctable_error_count.is_none());
+            assert_eq!(ecc.memory_controller_count, 0);
+            assert!(findings.is_empty());
+        }
+    }
+
+    #[test]
+    fn cpu_thermal_throttle_collector_reports_expected_id() {
+        let (collector, findings) = collect_cpu_thermal_throttle(1_700_000_000);
+        assert_eq!(collector.collector_id, "cpu_thermal_throttle");
+        // Findings only appear when throttling has actually been observed and counters are
+        // readable; either way the call must be side-effect-free and non-panicking.
+        if !collector.available {
+            assert!(findings.is_empty());
         }
     }
 

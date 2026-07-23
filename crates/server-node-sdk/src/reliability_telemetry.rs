@@ -1,6 +1,6 @@
 use super::*;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fs;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -9,10 +9,28 @@ const RELIABILITY_TELEMETRY_STATE_FILE: &str = "telemetry/reliability-telemetry-
 const TELEMETRY_SCHEMA_VERSION: u32 = 1;
 const TELEMETRY_HMAC_DOMAIN: &[u8] = b"ironmesh-telemetry-v1";
 
-/// The reduced, pseudonymized payload that would be sent to the central fleet
-/// reliability collector (see `docs/server-node-hardware-reliability-telemetry-strategy.md`,
-/// Section 7). This slice does not implement outbound sending; it only builds and exposes
-/// exactly this payload via a preview endpoint.
+/// Central collector ingest URL. Per doc Section 5.2 the production collector is assumed to live
+/// at `creax.de:44044`; the endpoint path matches `stats-collector-server`'s ingest route.
+/// Overridable via `IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL` (chiefly so tests can point the
+/// sender at a local listener).
+const DEFAULT_COLLECTOR_URL: &str = "https://creax.de:44044/v1/ingest/hardware-reliability";
+/// Default send cadence: rare batching (doc Section 6), well inside the recommended 6-24h band.
+const DEFAULT_SEND_INTERVAL_SECS: u64 = 12 * 60 * 60;
+const SEND_INTERVAL_MIN_SECS: u64 = 6 * 60 * 60;
+const SEND_INTERVAL_MAX_SECS: u64 = 24 * 60 * 60;
+/// How many past sent payloads to retain node-locally for the transparency UI (doc Section 3.3,
+/// "show the last sent payload again"). Bounded so the state file cannot grow without limit.
+const SENT_HISTORY_LIMIT: usize = 5;
+/// Bounded retry budget per send opportunity (doc Section 6: "retried a limited number of times,
+/// never queued unboundedly"). A failed batch is simply dropped until the next tick.
+const SEND_MAX_ATTEMPTS: u32 = 3;
+const SEND_RETRY_BACKOFF_SECS: u64 = 30;
+const SEND_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// The reduced, pseudonymized payload sent to the central fleet reliability collector (see
+/// `docs/server-node-hardware-reliability-telemetry-strategy.md`, Section 7). The same
+/// serialization is exposed unchanged via the preview endpoint, so operators see exactly what the
+/// background sender ([`spawn_reliability_telemetry_sender`]) transmits.
 ///
 /// Every field here is an explicit allow-listed projection of `hardware_health::HardwareHealthReport`.
 /// There is deliberately no `#[serde(flatten)]` or raw passthrough of any node-local struct, so
@@ -68,10 +86,11 @@ pub(crate) struct TelemetryStorageSmart {
     percentage_used: Option<u64>,
 }
 
-/// The node does not collect real EDAC/ECC data yet. This is always emitted with
-/// `available: false` for now; real EDAC collection (reading
-/// `/sys/devices/system/edac/mc/mc*/{ce_count,ue_count}`) is a separate follow-up slice
-/// (doc Section 2.4), not attempted here.
+/// RAM ECC counters projected from the node-local EDAC collector
+/// (`hardware_health::HardwareMemoryEcc`, read from
+/// `/sys/devices/system/edac/mc/mc*/{ce_count,ue_count}`). `available` is `false` on boards
+/// without ECC RAM / a loaded EDAC driver, where the counts are `None` rather than a misleading
+/// zero (doc Section 2.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TelemetryMemoryEcc {
     available: bool,
@@ -132,7 +151,10 @@ pub(crate) fn build_reliability_telemetry_payload(
         })
         .collect();
 
-    let mut collectors: Vec<TelemetryCollectorStatus> = report
+    // Collector availability (including the real `edac` and `cpu_thermal_throttle` collectors) is
+    // now sourced directly from the node-local report, so the central collector sees exactly the
+    // same collector states the operator sees, per the tolerance-first convention in doc Section 7.
+    let collectors: Vec<TelemetryCollectorStatus> = report
         .collectors
         .iter()
         .map(|collector| TelemetryCollectorStatus {
@@ -140,14 +162,6 @@ pub(crate) fn build_reliability_telemetry_payload(
             available: collector.available,
         })
         .collect();
-    // EDAC is not implemented as a `hardware_health` collector at all yet, so it never shows
-    // up in `report.collectors`. Report it explicitly as a known-but-unavailable collector
-    // (rather than omitting it) so the central collector can distinguish "not yet supported"
-    // from "silently missing", consistent with the tolerance-first convention in doc Section 7.
-    collectors.push(TelemetryCollectorStatus {
-        collector_id: "edac".to_string(),
-        available: false,
-    });
 
     ReliabilityTelemetryPayload {
         schema_version: TELEMETRY_SCHEMA_VERSION,
@@ -163,9 +177,9 @@ pub(crate) fn build_reliability_telemetry_payload(
         },
         storage_devices,
         memory_ecc: TelemetryMemoryEcc {
-            available: false,
-            correctable_error_count: None,
-            uncorrectable_error_count: None,
+            available: report.memory_ecc.available,
+            correctable_error_count: report.memory_ecc.correctable_error_count,
+            uncorrectable_error_count: report.memory_ecc.uncorrectable_error_count,
         },
         reliability_findings_summary,
         collectors,
@@ -208,6 +222,32 @@ fn parse_reliability_telemetry_env_flag(value: Option<String>) -> bool {
         .unwrap_or(true)
 }
 
+/// Central collector ingest URL, from env or the built-in default.
+fn collector_url() -> String {
+    std::env::var("IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_COLLECTOR_URL.to_string())
+}
+
+/// Effective send interval, clamped into the doc Section 6 recommended 6-24h band.
+fn send_interval_secs() -> u64 {
+    std::env::var("IRONMESH_RELIABILITY_TELEMETRY_SEND_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(SEND_INTERVAL_MIN_SECS, SEND_INTERVAL_MAX_SECS))
+        .unwrap_or(DEFAULT_SEND_INTERVAL_SECS)
+}
+
+/// One past successful transmission, retained node-locally so the admin UI can re-show exactly
+/// what left the node (doc Section 3.3). `payload` is the full serialized batch as sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SentHistoryEntry {
+    sent_at_unix: u64,
+    payload: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedReliabilityTelemetryState {
     /// Base64-encoded local random salt used to derive `telemetry_subject_id`
@@ -218,6 +258,19 @@ struct PersistedReliabilityTelemetryState {
     /// has explicitly set the toggle via the admin API/UI, which takes precedence over the env
     /// var going forward.
     enabled_override: Option<bool>,
+    /// Unix timestamp of the last successful transmission (doc Section 3.3, "last sent at ...").
+    #[serde(default)]
+    last_sent_at_unix: Option<u64>,
+    /// Human-readable reason the most recent send attempt failed, cleared on the next success.
+    #[serde(default)]
+    last_send_error: Option<String>,
+    /// Content fingerprint of the last successfully sent payload (volatile fields excluded), used
+    /// to skip sends when nothing material changed (doc Section 6 deduplication).
+    #[serde(default)]
+    last_sent_fingerprint: Option<String>,
+    /// Bounded ring of the most recent sent payloads for the transparency UI.
+    #[serde(default)]
+    sent_history: Vec<SentHistoryEntry>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -271,10 +324,58 @@ impl ReliabilityTelemetryRuntime {
 
     pub(crate) fn enabled_source(&self) -> &'static str {
         if self.persisted.enabled_override.is_some() {
-            "override"
+            "admin_override"
         } else {
             "env"
         }
+    }
+
+    pub(crate) fn last_sent_at_unix(&self) -> Option<u64> {
+        self.persisted.last_sent_at_unix
+    }
+
+    pub(crate) fn last_send_error(&self) -> Option<String> {
+        self.persisted.last_send_error.clone()
+    }
+
+    pub(crate) fn sent_history(&self) -> Vec<SentHistoryEntry> {
+        self.persisted.sent_history.clone()
+    }
+
+    fn last_sent_fingerprint(&self) -> Option<&str> {
+        self.persisted.last_sent_fingerprint.as_deref()
+    }
+
+    /// Records a successful transmission: updates the last-sent timestamp/fingerprint, clears any
+    /// prior error, appends to the bounded history ring, and persists.
+    async fn record_send_success(
+        &mut self,
+        sent_at_unix: u64,
+        payload: &ReliabilityTelemetryPayload,
+        fingerprint: String,
+    ) -> Result<()> {
+        self.persisted.last_sent_at_unix = Some(sent_at_unix);
+        self.persisted.last_send_error = None;
+        self.persisted.last_sent_fingerprint = Some(fingerprint);
+        let payload_json = serde_json::to_value(payload)
+            .context("failed to serialize telemetry payload for sent history")?;
+        self.persisted.sent_history.push(SentHistoryEntry {
+            sent_at_unix,
+            payload: payload_json,
+        });
+        let history_len = self.persisted.sent_history.len();
+        if history_len > SENT_HISTORY_LIMIT {
+            self.persisted
+                .sent_history
+                .drain(0..history_len - SENT_HISTORY_LIMIT);
+        }
+        self.persist().await
+    }
+
+    /// Records a failed transmission attempt (doc Section 3.3 surfaces this in the admin UI).
+    async fn record_send_failure(&mut self, error: String) -> Result<()> {
+        self.persisted.last_send_error = Some(error);
+        self.persist().await
     }
 
     /// Persists (or sets to `None`, reverting to the env var default) an explicit admin
@@ -315,13 +416,39 @@ impl ReliabilityTelemetryRuntime {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TelemetrySettingsResponse {
     enabled: bool,
+    enabled_source: &'static str,
+    env_default_enabled: bool,
     telemetry_subject_id: String,
-    source: &'static str,
+    collector_url: String,
+    send_interval_secs: u64,
+    last_sent_at_unix: Option<u64>,
+    last_send_error: Option<String>,
+    sent_history: Vec<SentHistoryEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct UpdateTelemetrySettingsRequest {
     enabled: bool,
+}
+
+/// Builds the settings response from the runtime, deriving the subject id (and, on first use, its
+/// salt) as a side effect. Shared by the GET and PUT handlers so they cannot drift apart.
+async fn build_settings_response(
+    runtime: &mut ReliabilityTelemetryRuntime,
+    node_id: NodeId,
+) -> Result<TelemetrySettingsResponse> {
+    let telemetry_subject_id = runtime.telemetry_subject_id(node_id).await?;
+    Ok(TelemetrySettingsResponse {
+        enabled: runtime.effective_enabled(),
+        enabled_source: runtime.enabled_source(),
+        env_default_enabled: reliability_telemetry_env_enabled(),
+        telemetry_subject_id,
+        collector_url: collector_url(),
+        send_interval_secs: send_interval_secs(),
+        last_sent_at_unix: runtime.last_sent_at_unix(),
+        last_send_error: runtime.last_send_error(),
+        sent_history: runtime.sent_history(),
+    })
 }
 
 pub(crate) async fn telemetry_settings_get(
@@ -336,10 +463,8 @@ pub(crate) async fn telemetry_settings_get(
     };
 
     let mut runtime = state.reliability_telemetry_runtime.lock().await;
-    let enabled = runtime.effective_enabled();
-    let source = runtime.enabled_source();
-    let telemetry_subject_id = match runtime.telemetry_subject_id(state.node_id).await {
-        Ok(id) => id,
+    let response = match build_settings_response(&mut runtime, state.node_id).await {
+        Ok(response) => response,
         Err(err) => {
             warn!(error = %err, "failed to derive telemetry subject id");
             drop(runtime);
@@ -357,19 +482,11 @@ pub(crate) async fn telemetry_settings_get(
         true,
         true,
         "success",
-        json!({ "enabled": enabled, "source": source }),
+        json!({ "enabled": response.enabled, "source": response.enabled_source }),
     )
     .await;
 
-    (
-        StatusCode::OK,
-        Json(TelemetrySettingsResponse {
-            enabled,
-            telemetry_subject_id,
-            source,
-        }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 pub(crate) async fn telemetry_settings_put(
@@ -410,10 +527,8 @@ pub(crate) async fn telemetry_settings_put(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    let enabled = runtime.effective_enabled();
-    let source = runtime.enabled_source();
-    let telemetry_subject_id = match runtime.telemetry_subject_id(state.node_id).await {
-        Ok(id) => id,
+    let response = match build_settings_response(&mut runtime, state.node_id).await {
+        Ok(response) => response,
         Err(err) => {
             warn!(error = %err, "failed to derive telemetry subject id");
             drop(runtime);
@@ -441,19 +556,20 @@ pub(crate) async fn telemetry_settings_put(
         false,
         true,
         "success",
-        json!({ "enabled": enabled, "source": source }),
+        json!({ "enabled": response.enabled, "source": response.enabled_source }),
     )
     .await;
 
-    (
-        StatusCode::OK,
-        Json(TelemetrySettingsResponse {
-            enabled,
-            telemetry_subject_id,
-            source,
-        }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Preview of exactly what the next batch would contain (doc Section 3.3). `payload` is `None`
+/// with an `unavailable_reason` when the hardware-health report has not been collected yet, so the
+/// admin UI can render a friendly "not ready" state instead of treating it as an error.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TelemetryPreviewResponse {
+    payload: Option<ReliabilityTelemetryPayload>,
+    unavailable_reason: Option<String>,
 }
 
 pub(crate) async fn telemetry_preview_get(
@@ -484,10 +600,14 @@ pub(crate) async fn telemetry_preview_get(
         )
         .await;
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "the hardware health report has not been collected yet; retry shortly",
-            })),
+            StatusCode::OK,
+            Json(TelemetryPreviewResponse {
+                payload: None,
+                unavailable_reason: Some(
+                    "the hardware health report has not been collected yet; retry shortly"
+                        .to_string(),
+                ),
+            }),
         )
             .into_response();
     };
@@ -521,7 +641,153 @@ pub(crate) async fn telemetry_preview_get(
     )
     .await;
 
-    (StatusCode::OK, Json(payload)).into_response()
+    (
+        StatusCode::OK,
+        Json(TelemetryPreviewResponse {
+            payload: Some(payload),
+            unavailable_reason: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Content fingerprint of a payload with volatile fields (the wall-clock `generated_at_unix`)
+/// excluded, so an otherwise-identical batch is recognized as "nothing material changed" and
+/// skipped (doc Section 6 deduplication).
+fn telemetry_payload_fingerprint(payload: &ReliabilityTelemetryPayload) -> Result<String> {
+    let mut value = serde_json::to_value(payload)
+        .context("failed to serialize telemetry payload for fingerprinting")?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("generated_at_unix");
+    }
+    // serde_json::Value serializes object keys in sorted order, so the string is canonical.
+    let canonical = value.to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+/// Background sender (doc Section 6): on a rare timer, project the latest hardware-health report
+/// into a reduced pseudonymized batch and POST it to the central collector, unless telemetry is
+/// disabled or nothing material changed since the last successful send.
+pub(crate) fn spawn_reliability_telemetry_sender(state: ServerState) {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(send_interval_secs());
+        let mut ticker = tokio::time::interval(interval);
+        // The first `tick()` completes immediately; consume it so we don't fire a send the instant
+        // the node boots (before the first hardware-health collection has settled).
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            send_reliability_telemetry_once(&state).await;
+        }
+    });
+}
+
+/// One send opportunity. Safe to call directly from tests. Returns whether a batch was actually
+/// transmitted (vs. skipped because disabled/no-report/unchanged).
+async fn send_reliability_telemetry_once(state: &ServerState) -> bool {
+    {
+        let runtime = state.reliability_telemetry_runtime.lock().await;
+        if !runtime.effective_enabled() {
+            return false;
+        }
+    }
+
+    let Some(report) = ({
+        let hw_runtime = state.hardware_health_runtime.lock().await;
+        hw_runtime.report.clone()
+    }) else {
+        return false;
+    };
+
+    let telemetry_subject_id = {
+        let mut runtime = state.reliability_telemetry_runtime.lock().await;
+        match runtime.telemetry_subject_id(state.node_id).await {
+            Ok(id) => id,
+            Err(err) => {
+                warn!(error = %err, "failed to derive telemetry subject id for send");
+                return false;
+            }
+        }
+    };
+
+    let payload = build_reliability_telemetry_payload(&report, telemetry_subject_id, unix_ts());
+    let fingerprint = match telemetry_payload_fingerprint(&payload) {
+        Ok(fingerprint) => fingerprint,
+        Err(err) => {
+            warn!(error = %err, "failed to fingerprint telemetry payload");
+            return false;
+        }
+    };
+
+    {
+        let runtime = state.reliability_telemetry_runtime.lock().await;
+        if runtime.last_sent_fingerprint() == Some(fingerprint.as_str()) {
+            // Nothing material changed since the last successful send; skip to keep baseline load
+            // minimal (doc Section 6).
+            return false;
+        }
+    }
+
+    let url = collector_url();
+    match post_telemetry_batch(&url, &payload).await {
+        Ok(()) => {
+            let sent_at_unix = unix_ts();
+            let mut runtime = state.reliability_telemetry_runtime.lock().await;
+            if let Err(err) = runtime
+                .record_send_success(sent_at_unix, &payload, fingerprint)
+                .await
+            {
+                warn!(error = %err, "failed to persist telemetry send success state");
+            }
+            info!(
+                collector_url = %url,
+                storage_devices = payload.storage_devices.len(),
+                "sent reliability telemetry batch"
+            );
+            true
+        }
+        Err(err) => {
+            let message = err.to_string();
+            let mut runtime = state.reliability_telemetry_runtime.lock().await;
+            if let Err(persist_err) = runtime.record_send_failure(message.clone()).await {
+                warn!(error = %persist_err, "failed to persist telemetry send failure state");
+            }
+            warn!(collector_url = %url, error = %message, "reliability telemetry send failed");
+            false
+        }
+    }
+}
+
+/// POSTs one batch with a bounded retry budget (doc Section 6: limited retries, never an unbounded
+/// queue). The whole batch is dropped after the last attempt fails; the next timer tick will build
+/// a fresh batch from current state rather than replaying a stale one.
+async fn post_telemetry_batch(url: &str, payload: &ReliabilityTelemetryPayload) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(SEND_HTTP_TIMEOUT_SECS))
+        .build()
+        .context("failed to build telemetry http client")?;
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=SEND_MAX_ATTEMPTS {
+        match client
+            .post(url)
+            .json(payload)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_error = Some(anyhow::Error::new(err));
+                if attempt < SEND_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(SEND_RETRY_BACKOFF_SECS)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("telemetry send failed")))
 }
 
 #[cfg(test)]
@@ -601,7 +867,7 @@ mod tests {
         // Reload from disk and confirm both the salt (and thus subject id) and the override
         // survive a restart.
         let mut reloaded = ReliabilityTelemetryRuntime::load(&tmp);
-        assert_eq!(reloaded.enabled_source(), "override");
+        assert_eq!(reloaded.enabled_source(), "admin_override");
         assert!(!reloaded.effective_enabled());
         let subject_id_second = reloaded.telemetry_subject_id(node_id).await.unwrap();
         assert_eq!(subject_id_first, subject_id_second);
@@ -674,5 +940,63 @@ mod tests {
                 .iter()
                 .any(|collector| collector.collector_id == "edac" && !collector.available)
         );
+    }
+
+    fn sample_payload(generated_at_unix: u64) -> ReliabilityTelemetryPayload {
+        let report = hardware_health::test_support::sample_report_for_telemetry_tests();
+        build_reliability_telemetry_payload(&report, "subject".to_string(), generated_at_unix)
+    }
+
+    #[test]
+    fn fingerprint_ignores_generated_at_but_tracks_content_changes() {
+        let a = telemetry_payload_fingerprint(&sample_payload(1_000)).unwrap();
+        let b = telemetry_payload_fingerprint(&sample_payload(2_000)).unwrap();
+        assert_eq!(
+            a, b,
+            "differing only in generated_at_unix must not change fingerprint"
+        );
+
+        let mut changed = sample_payload(1_000);
+        changed.hardware_profile_id = "different-profile".to_string();
+        let c = telemetry_payload_fingerprint(&changed).unwrap();
+        assert_ne!(
+            a, c,
+            "a material content change must change the fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_batch_succeeds_against_a_collector_returning_202() {
+        use axum::Json;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/ingest/hardware-reliability",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let hits = hits_for_route.clone();
+                async move {
+                    // The collector's plausibility contract: object with schema_version + subject.
+                    assert_eq!(body["schema_version"], 1);
+                    assert!(body["telemetry_subject_id"].is_string());
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::ACCEPTED
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/v1/ingest/hardware-reliability");
+        post_telemetry_batch(&url, &sample_payload(1_000))
+            .await
+            .expect("send should succeed against a 202 collector");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

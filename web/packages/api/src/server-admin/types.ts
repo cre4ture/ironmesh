@@ -718,6 +718,34 @@ export type HardwareHealthCurrentResponse = {
   last_error?: string | null;
 };
 
+export type TelemetryEnabledSource = "env" | "admin_override";
+
+export type TelemetrySentHistoryEntry = {
+  sent_at_unix: number;
+  payload: Record<string, unknown>;
+};
+
+export type TelemetrySettingsResponse = {
+  enabled: boolean;
+  enabled_source: TelemetryEnabledSource;
+  env_default_enabled: boolean;
+  telemetry_subject_id?: string | null;
+  collector_url: string;
+  send_interval_secs: number;
+  last_sent_at_unix?: number | null;
+  last_send_error?: string | null;
+  sent_history: TelemetrySentHistoryEntry[];
+};
+
+export type TelemetrySettingsUpdateRequest = {
+  enabled: boolean;
+};
+
+export type TelemetryPreviewResponse = {
+  payload?: Record<string, unknown> | null;
+  unavailable_reason?: string | null;
+};
+
 export type StorageStatsSample = {
   collected_at_unix: number;
   latest_snapshot_id?: string | null;

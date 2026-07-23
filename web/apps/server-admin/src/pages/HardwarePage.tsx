@@ -12,6 +12,7 @@ import { Alert, Badge, Button, Card, Code, Grid, Group, Loader, Stack, Text } fr
 import { useCallback, type ReactNode } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
+import { TelemetryConfigurationCard } from "../components/TelemetryConfigurationCard";
 
 export function HardwarePage() {
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
@@ -322,6 +323,8 @@ export function HardwarePage() {
           <JsonBlock value={response ?? { status: "loading" }} />
         </Stack>
       </Card>
+
+      <TelemetryConfigurationCard canInspect={canInspectHardware} />
     </Stack>
   );
 }

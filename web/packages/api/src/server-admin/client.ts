@@ -67,7 +67,10 @@ import type {
   StoreListRequestOptions,
   StoreListView,
   SetupStatus,
-  SetupTransitionResponse
+  SetupTransitionResponse,
+  TelemetryPreviewResponse,
+  TelemetrySettingsResponse,
+  TelemetrySettingsUpdateRequest
 } from "./types";
 
 type AdminRequestOptions = {
@@ -735,6 +738,33 @@ export async function getHardwareHealth(
   adminTokenOverride?: string
 ): Promise<HardwareHealthCurrentResponse> {
   return fetchAdminJson<HardwareHealthCurrentResponse>(apiV1("/auth/hardware/health"), {
+    adminTokenOverride
+  });
+}
+
+export async function getTelemetrySettings(
+  adminTokenOverride?: string
+): Promise<TelemetrySettingsResponse> {
+  return fetchAdminJson<TelemetrySettingsResponse>(apiV1("/auth/telemetry/settings"), {
+    adminTokenOverride
+  });
+}
+
+export async function updateTelemetrySettings(
+  body: TelemetrySettingsUpdateRequest,
+  adminTokenOverride?: string
+): Promise<TelemetrySettingsResponse> {
+  return fetchAdminJson<TelemetrySettingsResponse>(apiV1("/auth/telemetry/settings"), {
+    method: "PUT",
+    body,
+    adminTokenOverride
+  });
+}
+
+export async function getTelemetryPreview(
+  adminTokenOverride?: string
+): Promise<TelemetryPreviewResponse> {
+  return fetchAdminJson<TelemetryPreviewResponse>(apiV1("/auth/telemetry/preview"), {
     adminTokenOverride
   });
 }
