@@ -1169,28 +1169,28 @@ final class IronmeshBrowserModel: ObservableObject {
                         settings: settings
                     )
                 }.value
-                guard let self, !Task.isCancelled else {
+                guard !Task.isCancelled else {
                     return
                 }
-                self.titleLatencyStatus = initialStatus
+                self?.titleLatencyStatus = initialStatus
 
                 while !Task.isCancelled {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                     let nextStatus = try await Task.detached(priority: .utility) {
                         try remoteSession.titleLatencyStatus(configuration: configuration)
                     }.value
-                    guard let self, !Task.isCancelled else {
+                    guard !Task.isCancelled else {
                         return
                     }
-                    self.titleLatencyStatus = nextStatus
+                    self?.titleLatencyStatus = nextStatus
                 }
             } catch is CancellationError {
                 return
             } catch {
-                guard let self, !Task.isCancelled else {
+                guard !Task.isCancelled else {
                     return
                 }
-                self.titleLatencyStatus = AppleTitleLatencyStatus(
+                self?.titleLatencyStatus = AppleTitleLatencyStatus(
                     state: "failed",
                     error: error.localizedDescription
                 )
