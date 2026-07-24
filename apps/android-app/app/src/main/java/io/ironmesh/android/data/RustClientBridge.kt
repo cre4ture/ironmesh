@@ -108,6 +108,18 @@ object RustClientBridge {
     external fun stopWebUi()
 
     @JvmStatic
+    external fun configureTitleLatencyMonitor(
+        connectionInput: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+        enabled: Boolean,
+        periodSeconds: Long,
+    ): String
+
+    @JvmStatic
+    external fun getTitleLatencyStatus(): String
+
+    @JvmStatic
     external fun getConnectionRouteSnapshot(
         connectionInput: String,
         serverCaPem: String?,

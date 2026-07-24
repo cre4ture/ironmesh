@@ -273,6 +273,11 @@ private struct IronmeshHomeView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Home")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    IronmeshTitleLatencyToolbarItem()
+                }
+            }
         }
         .sheet(isPresented: $showsFilesPicker) {
             IronmeshFilesHandoffPicker { url in
@@ -407,6 +412,11 @@ private struct IronmeshLibraryView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Library")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    IronmeshTitleLatencyToolbarItem()
+                }
+            }
         }
         .sheet(
             isPresented: Binding(
@@ -643,6 +653,67 @@ private struct IronmeshConnectionPathBadge: View {
     }
 }
 
+struct IronmeshTitleLatencyToolbarItem: View {
+    @EnvironmentObject private var model: IronmeshBrowserModel
+
+    var body: some View {
+        if model.titleLatencyStatus.state != "disabled" {
+            Text(label)
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(color)
+                .accessibilityLabel(accessibilityLabel)
+        }
+    }
+
+    private var connectionPrefix: String {
+        switch model.titleLatencyStatus.connectionType {
+        case "direct":
+            return "D"
+        case "relay":
+            return "R"
+        default:
+            return "?"
+        }
+    }
+
+    private var label: String {
+        switch model.titleLatencyStatus.state {
+        case "success":
+            let milliseconds = Int((model.titleLatencyStatus.latencyMs ?? 0).rounded())
+            return "\(connectionPrefix) \(milliseconds) ms"
+        case "pending":
+            return "\(connectionPrefix) ..."
+        default:
+            return "\(connectionPrefix) --"
+        }
+    }
+
+    private var color: Color {
+        if model.titleLatencyStatus.state == "failed" {
+            return .red
+        }
+        switch model.titleLatencyStatus.connectionType {
+        case "direct":
+            return .green
+        case "relay":
+            return .orange
+        default:
+            return .secondary
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch model.titleLatencyStatus.state {
+        case "success":
+            return "\(model.titleLatencyStatus.connectionType) connection latency \(label)"
+        case "pending":
+            return "Measuring \(model.titleLatencyStatus.connectionType) connection latency"
+        default:
+            return "\(model.titleLatencyStatus.connectionType) connection latency unavailable"
+        }
+    }
+}
+
 private struct IronmeshSettingsView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
     @Environment(\.openURL) private var openURL
@@ -695,6 +766,31 @@ private struct IronmeshSettingsView: View {
                         Button("Clear identity material", role: .destructive) {
                             model.clearIdentity()
                         }
+                    }
+                }
+
+                Section("Title latency") {
+                    Toggle(
+                        "Measure connection latency",
+                        isOn: Binding(
+                            get: { model.titleLatencyMonitorSettings.enabled },
+                            set: model.updateTitleLatencyMonitorEnabled
+                        )
+                    )
+
+                    if model.titleLatencyMonitorSettings.enabled {
+                        Stepper(
+                            "Check period: \(model.titleLatencyMonitorSettings.periodSeconds) seconds",
+                            value: Binding(
+                                get: { Int(model.titleLatencyMonitorSettings.periodSeconds) },
+                                set: { model.updateTitleLatencyMonitorPeriodSeconds(UInt64($0)) }
+                            ),
+                            in: 5...300,
+                            step: 5
+                        )
+                        Text("The compact title result uses D for direct and R for relay. The color follows the current route type.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -761,6 +857,11 @@ private struct IronmeshSettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    IronmeshTitleLatencyToolbarItem()
+                }
+            }
         }
         .sheet(isPresented: $showsScanner) {
             IronmeshScannerSheet { payload in

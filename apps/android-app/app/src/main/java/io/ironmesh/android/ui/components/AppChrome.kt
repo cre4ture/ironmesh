@@ -28,10 +28,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import io.ironmesh.android.R
 import io.ironmesh.android.ui.MainSection
+import io.ironmesh.android.data.TitleLatencyProbeStatus
+import kotlin.math.roundToInt
 
 @Composable
 fun IronmeshAppShell(
@@ -39,6 +42,7 @@ fun IronmeshAppShell(
     onSelectSection: (MainSection) -> Unit,
     snackbarHostState: SnackbarHostState,
     deviceLabel: String?,
+    titleLatencyStatus: TitleLatencyProbeStatus,
     onNavigateBack: (() -> Unit)? = null,
     topBarActions: @Composable RowScope.() -> Unit = {},
     content: @Composable (Modifier) -> Unit,
@@ -80,6 +84,7 @@ fun IronmeshAppShell(
                         IronmeshTopBar(
                             selectedSection = selectedSection,
                             deviceLabel = deviceLabel,
+                            titleLatencyStatus = titleLatencyStatus,
                             onNavigateBack = onNavigateBack,
                             actions = topBarActions,
                         )
@@ -101,6 +106,7 @@ fun IronmeshAppShell(
                     IronmeshTopBar(
                         selectedSection = selectedSection,
                         deviceLabel = deviceLabel,
+                        titleLatencyStatus = titleLatencyStatus,
                         onNavigateBack = onNavigateBack,
                         actions = topBarActions,
                     )
@@ -136,6 +142,7 @@ fun IronmeshAppShell(
 private fun IronmeshTopBar(
     selectedSection: MainSection,
     deviceLabel: String?,
+    titleLatencyStatus: TitleLatencyProbeStatus,
     onNavigateBack: (() -> Unit)?,
     actions: @Composable RowScope.() -> Unit,
 ) {
@@ -161,7 +168,41 @@ private fun IronmeshTopBar(
                 }
             }
         },
-        actions = actions,
+        actions = {
+            TitleLatencyIndicator(titleLatencyStatus)
+            actions()
+        },
+    )
+}
+
+@Composable
+private fun TitleLatencyIndicator(status: TitleLatencyProbeStatus) {
+    if (status.state == "disabled") {
+        return
+    }
+
+    val connectionPrefix = when (status.connectionType) {
+        "direct" -> "D"
+        "relay" -> "R"
+        else -> "?"
+    }
+    val text = when (status.state) {
+        "success" -> "${connectionPrefix} ${status.latencyMs?.roundToInt() ?: "?"} ms"
+        "pending" -> "$connectionPrefix ..."
+        else -> "$connectionPrefix --"
+    }
+    val color = when {
+        status.state == "failed" -> MaterialTheme.colorScheme.error
+        status.connectionType == "direct" -> Color(0xFF16835A)
+        status.connectionType == "relay" -> Color(0xFFB85A00)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelSmall,
+        color = color,
+        modifier = Modifier.padding(end = 4.dp),
     )
 }
 

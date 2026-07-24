@@ -68,6 +68,11 @@ struct IronmeshFilesView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Sync")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    IronmeshTitleLatencyToolbarItem()
+                }
+            }
         }
         .sheet(isPresented: $showsFilesPicker) {
             IronmeshFilesHandoffPicker { url in model.noteFilesSelection(url) }

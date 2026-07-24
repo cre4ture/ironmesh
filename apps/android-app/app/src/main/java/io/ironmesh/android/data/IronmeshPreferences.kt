@@ -18,6 +18,7 @@ object IronmeshPreferences {
     private const val PREF_GALLERY_VIEW_MODE = "gallery_view_mode"
     private const val PREF_APP_CONNECTION_STATUS = "app_connection_status"
     private const val PREF_THEME_ACCENT_COLOR = "theme_accent_color"
+    private const val PREF_TITLE_LATENCY_MONITOR_SETTINGS = "title_latency_monitor_settings"
 
     private val moshi: Moshi by lazy {
         Moshi.Builder()
@@ -32,6 +33,10 @@ object IronmeshPreferences {
 
     private val appConnectionStatusAdapter by lazy {
         moshi.adapter(AppConnectionStatus::class.java)
+    }
+
+    private val titleLatencyMonitorSettingsAdapter by lazy {
+        moshi.adapter(TitleLatencyMonitorSettings::class.java)
     }
 
     @Volatile
@@ -133,6 +138,23 @@ object IronmeshPreferences {
 
     fun clearAppConnectionStatus(context: Context) {
         writeAppPreference(context, PREF_APP_CONNECTION_STATUS, null)
+    }
+
+    fun getTitleLatencyMonitorSettings(context: Context): TitleLatencyMonitorSettings {
+        val raw = readAppPreference(context, PREF_TITLE_LATENCY_MONITOR_SETTINGS)
+            ?: return TitleLatencyMonitorSettings()
+        return runCatching {
+            titleLatencyMonitorSettingsAdapter.fromJson(raw)?.normalized()
+                ?: TitleLatencyMonitorSettings()
+        }.getOrDefault(TitleLatencyMonitorSettings())
+    }
+
+    fun setTitleLatencyMonitorSettings(
+        context: Context,
+        settings: TitleLatencyMonitorSettings,
+    ) {
+        val payload = titleLatencyMonitorSettingsAdapter.toJson(settings.normalized())
+        writeAppPreference(context, PREF_TITLE_LATENCY_MONITOR_SETTINGS, payload)
     }
 
     fun getThemeAccentColor(context: Context): String {

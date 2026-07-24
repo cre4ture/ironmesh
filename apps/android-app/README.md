@@ -12,6 +12,7 @@ This is a standalone Kotlin Android app scaffold for local testing of `server-no
 - Open the client Web UI in a browser-powered Custom Tab when available, with fallback to an in-app `WebView`
 - Configure multiple folder-sync profiles (remote prefix <-> local folder)
 - Automatic periodic background folder sync (WorkManager) + manual "Sync Now"
+- Optional Rust-backed title latency monitor with configurable period; compact `D` (direct) or `R` (relay) result in the app bar
 
 ## Open in Android Studio
 

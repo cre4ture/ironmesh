@@ -72,6 +72,11 @@
     <string name="settings_device">Device</string>
     <string name="settings_permissions">Permissions</string>
     <string name="settings_appearance">Appearance</string>
+    <string name="title_latency_monitor_title">Title latency</string>
+    <string name="title_latency_monitor_body">Show a compact direct or relay latency result in the title bar. The check runs in the Rust background monitor.</string>
+    <string name="title_latency_monitor_enable">Measure connection latency</string>
+    <string name="title_latency_monitor_period">Check period</string>
+    <string name="title_latency_monitor_period_value">%1$d seconds</string>
     <string name="settings_storage">Storage and files</string>
     <string name="settings_advanced">Advanced</string>
     <string name="connection_diagnostics">Connection diagnostics</string>

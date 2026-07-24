@@ -70,6 +70,16 @@ int ironmesh_ios_facade_connection_route_snapshot_json(void *handle,
                                                        char **out_json,
                                                        char **out_error);
 
+int ironmesh_ios_facade_configure_title_latency_monitor_json(void *handle,
+                                                              int enabled,
+                                                              uint64_t period_seconds,
+                                                              char **out_json,
+                                                              char **out_error);
+
+int ironmesh_ios_facade_title_latency_status_json(void *handle,
+                                                   char **out_json,
+                                                   char **out_error);
+
 int ironmesh_ios_facade_fetch_bytes(void *handle,
                                     const char *key,
                                     struct IronmeshIosBytes *out_bytes,

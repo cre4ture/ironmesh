@@ -407,6 +407,31 @@ class IronmeshRepository {
         RustClientBridge.stopWebUi()
     }
 
+    fun configureTitleLatencyMonitor(
+        connectionInput: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+        settings: TitleLatencyMonitorSettings,
+    ): TitleLatencyProbeStatus {
+        return decodeJson(
+            RustClientBridge.configureTitleLatencyMonitor(
+                normalizedConnectionInput(connectionInput),
+                serverCaPem,
+                normalizedClientIdentityJson(clientIdentityJson),
+                settings.enabled,
+                settings.normalized().periodSeconds,
+            ),
+            TitleLatencyProbeStatus::class.java,
+        )
+    }
+
+    fun getTitleLatencyStatus(): TitleLatencyProbeStatus {
+        return decodeJson(
+            RustClientBridge.getTitleLatencyStatus(),
+            TitleLatencyProbeStatus::class.java,
+        )
+    }
+
     fun getConnectionRouteSnapshot(
         connectionInput: String,
         serverCaPem: String? = null,

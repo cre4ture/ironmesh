@@ -173,6 +173,21 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.lastRouteSnapshotRefresh, true)
     }
 
+    func testTitleLatencyMonitorForwardsConfiguredPeriod() throws {
+        let ffi = MockFFI()
+        ffi.titleLatencyStatusResponseJSON = #"{"state":"pending","connection_type":"direct"}"#
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: "127.0.0.1:18080"))
+
+        let response = try bridge.configureTitleLatencyMonitorJSON(
+            settings: AppleTitleLatencyMonitorSettings(enabled: true, periodSeconds: 45)
+        )
+
+        XCTAssertEqual(response, ffi.titleLatencyStatusResponseJSON)
+        XCTAssertEqual(ffi.lastTitleLatencyEnabled, true)
+        XCTAssertEqual(ffi.lastTitleLatencyPeriodSeconds, 45)
+    }
+
     func testBridgeMapsStoreIndexOptionsAndRelativeBytesThroughFFI() throws {
         let ffi = MockFFI()
         ffi.storeIndexResponseJSON = """
@@ -263,6 +278,9 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var routeSnapshotResponseJSON = #"{"ranked_indices":[],"endpoints":[]}"#
     var webUIURL = #"{"url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
     var lastRouteSnapshotRefresh: Bool?
+    var lastTitleLatencyEnabled: Bool?
+    var lastTitleLatencyPeriodSeconds: UInt64?
+    var titleLatencyStatusResponseJSON = #"{"state":"disabled","connection_type":"unknown"}"#
 
     func createHandle(
         connectionInput: String,
@@ -388,6 +406,22 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = handle
         lastRouteSnapshotRefresh = refresh
         return routeSnapshotResponseJSON
+    }
+
+    func configureTitleLatencyMonitorJSON(
+        handle: AppleRustHandle,
+        enabled: Bool,
+        periodSeconds: UInt64
+    ) throws -> String {
+        _ = handle
+        lastTitleLatencyEnabled = enabled
+        lastTitleLatencyPeriodSeconds = periodSeconds
+        return titleLatencyStatusResponseJSON
+    }
+
+    func titleLatencyStatusJSON(handle: AppleRustHandle) throws -> String {
+        _ = handle
+        return titleLatencyStatusResponseJSON
     }
 
     func startWebUI(
