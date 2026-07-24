@@ -315,6 +315,44 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(jsonPointer)
     }
 
+    func configureTitleLatencyMonitorJSON(
+        handle: AppleRustHandle,
+        enabled: Bool,
+        periodSeconds: UInt64
+    ) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_configure_title_latency_monitor_json(
+            handle,
+            enabled ? 1 : 0,
+            periodSeconds,
+            &jsonPointer,
+            &errorPointer
+        )
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no title latency status.")
+        }
+        return consumeString(jsonPointer)
+    }
+
+    func titleLatencyStatusJSON(handle: AppleRustHandle) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_title_latency_status_json(
+            handle,
+            &jsonPointer,
+            &errorPointer
+        )
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no title latency status.")
+        }
+        return consumeString(jsonPointer)
+    }
+
     func startWebUI(
         connectionInput: String,
         serverCAPem: String?,

@@ -51,12 +51,68 @@ public protocol AppleManualCBridgeFFI: Sendable {
     ) throws
     func connectionDiagnosticsJSON(handle: AppleRustHandle) throws -> String
     func connectionRouteSnapshotJSON(handle: AppleRustHandle, refresh: Bool) throws -> String
+    func configureTitleLatencyMonitorJSON(
+        handle: AppleRustHandle,
+        enabled: Bool,
+        periodSeconds: UInt64
+    ) throws -> String
+    func titleLatencyStatusJSON(handle: AppleRustHandle) throws -> String
     func startWebUI(
         connectionInput: String,
         serverCAPem: String?,
         clientIdentityJSON: String?
     ) throws -> String
     func stopWebUI() throws
+}
+
+public struct AppleTitleLatencyMonitorSettings: Codable, Equatable, Sendable {
+    public static let defaultPeriodSeconds: UInt64 = 30
+    public static let minimumPeriodSeconds: UInt64 = 5
+    public static let maximumPeriodSeconds: UInt64 = 3_600
+
+    public var enabled: Bool
+    public var periodSeconds: UInt64
+
+    public init(
+        enabled: Bool = false,
+        periodSeconds: UInt64 = AppleTitleLatencyMonitorSettings.defaultPeriodSeconds
+    ) {
+        self.enabled = enabled
+        self.periodSeconds = min(
+            max(periodSeconds, Self.minimumPeriodSeconds),
+            Self.maximumPeriodSeconds
+        )
+    }
+}
+
+public struct AppleTitleLatencyStatus: Codable, Equatable, Sendable {
+    public var state: String
+    public var connectionType: String
+    public var latencyMs: Double?
+    public var checkedAtUnixMs: UInt64?
+    public var error: String?
+
+    public init(
+        state: String = "disabled",
+        connectionType: String = "unknown",
+        latencyMs: Double? = nil,
+        checkedAtUnixMs: UInt64? = nil,
+        error: String? = nil
+    ) {
+        self.state = state
+        self.connectionType = connectionType
+        self.latencyMs = latencyMs
+        self.checkedAtUnixMs = checkedAtUnixMs
+        self.error = error
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case connectionType = "connection_type"
+        case latencyMs = "latency_ms"
+        case checkedAtUnixMs = "checked_at_unix_ms"
+        case error
+    }
 }
 
 private struct AppleWebUiLaunchResponse: Decodable {
@@ -282,6 +338,24 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     public func connectionRouteSnapshotJSON(refresh: Bool) throws -> String {
         try withHandle { handle in
             try ffi.connectionRouteSnapshotJSON(handle: handle, refresh: refresh)
+        }
+    }
+
+    public func configureTitleLatencyMonitorJSON(
+        settings: AppleTitleLatencyMonitorSettings
+    ) throws -> String {
+        try withHandle { handle in
+            try ffi.configureTitleLatencyMonitorJSON(
+                handle: handle,
+                enabled: settings.enabled,
+                periodSeconds: settings.periodSeconds
+            )
+        }
+    }
+
+    public func titleLatencyStatusJSON() throws -> String {
+        try withHandle { handle in
+            try ffi.titleLatencyStatusJSON(handle: handle)
         }
     }
 

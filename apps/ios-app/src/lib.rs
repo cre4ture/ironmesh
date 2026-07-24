@@ -6,7 +6,8 @@ use client_sdk::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
     ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     ObjectHeadInfo, StoreIndexEntry, StoreIndexMediaFilter, StoreIndexRequestOptions,
-    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, VersionGraphSummary,
+    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor,
+    TitleLatencyProbeConfig, TitleLatencyProbeStatus, VersionGraphSummary,
     enroll_client_connection_blocking, normalize_server_base_url,
 };
 use common::StorageObjectMeta;
@@ -27,6 +28,7 @@ pub struct IosStorageApp {
     client: ClientNode,
     client_identity: Option<ClientIdentityMaterial>,
     connection_name: Option<String>,
+    title_latency_monitor: Mutex<TitleLatencyMonitor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,6 +301,7 @@ impl IosStorageApp {
             client,
             client_identity: None,
             connection_name: None,
+            title_latency_monitor: Mutex::new(TitleLatencyMonitor::disabled()),
         })
     }
 
@@ -314,6 +317,7 @@ impl IosStorageApp {
             client,
             client_identity,
             connection_name,
+            title_latency_monitor: Mutex::new(TitleLatencyMonitor::disabled()),
         })
     }
 
@@ -413,6 +417,26 @@ impl IosStorageApp {
         } else {
             self.sdk.connection_route_snapshot()
         }
+    }
+
+    pub fn configure_title_latency_monitor(
+        &self,
+        config: TitleLatencyProbeConfig,
+    ) -> Result<TitleLatencyProbeStatus> {
+        let next_monitor = TitleLatencyMonitor::start(self.sdk.clone(), config)?;
+        let status = next_monitor.status();
+        *self
+            .title_latency_monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_monitor;
+        Ok(status)
+    }
+
+    pub fn title_latency_status(&self) -> TitleLatencyProbeStatus {
+        self.title_latency_monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status()
     }
 
     pub fn store_index_with_options(
@@ -785,6 +809,27 @@ fn connection_route_snapshot_json(handle: *mut c_void, refresh: bool) -> Result<
         .context("failed to serialize Apple connection route snapshot")
 }
 
+#[allow(unsafe_code)]
+fn configure_title_latency_monitor_json(
+    handle: *mut c_void,
+    enabled: bool,
+    period_seconds: u64,
+) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    let status = app.configure_title_latency_monitor(TitleLatencyProbeConfig {
+        enabled,
+        period_seconds,
+    })?;
+    serde_json::to_string(&status).context("failed to serialize Apple title latency status")
+}
+
+#[allow(unsafe_code)]
+fn title_latency_status_json(handle: *mut c_void) -> Result<String> {
+    let app = unsafe { handle_to_app(handle)? };
+    serde_json::to_string(&app.title_latency_status())
+        .context("failed to serialize Apple title latency status")
+}
+
 pub fn enroll_connection_input_json(
     connection_input: impl AsRef<str>,
     device_id_override: Option<&str>,
@@ -991,6 +1036,34 @@ pub extern "C" fn ironmesh_ios_facade_connection_route_snapshot_json(
     run_ffi_string_result(out_json, out_error, || {
         connection_route_snapshot_json(handle, refresh != 0)
     })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_configure_title_latency_monitor_json(
+    handle: *mut c_void,
+    enabled: c_int,
+    period_seconds: u64,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        configure_title_latency_monitor_json(handle, enabled != 0, period_seconds)
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_title_latency_status_json(
+    handle: *mut c_void,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || title_latency_status_json(handle))
 }
 
 #[allow(unsafe_code)]
@@ -1959,6 +2032,34 @@ mod tests {
         ] {
             assert!(endpoint.get(field).is_some(), "missing JSON field {field}");
         }
+
+        ironmesh_ios_facade_free(handle);
+    }
+
+    #[test]
+    fn title_latency_monitor_ffi_returns_disabled_status_without_starting_a_probe() {
+        let addr = spawn_test_server();
+        let handle = create_handle_for_server(addr);
+        let mut json_out = ptr::null_mut();
+        let mut error_out = ptr::null_mut();
+
+        let status = ironmesh_ios_facade_configure_title_latency_monitor_json(
+            handle,
+            0,
+            client_sdk::TITLE_LATENCY_PROBE_DEFAULT_PERIOD_SECONDS,
+            &mut json_out,
+            &mut error_out,
+        );
+
+        assert_eq!(status, FFI_OK);
+        assert!(error_out.is_null());
+        let response: TitleLatencyProbeStatus =
+            serde_json::from_str(&read_string(json_out)).expect("status response should decode");
+        assert_eq!(response.state, client_sdk::TitleLatencyProbeState::Disabled);
+        assert_eq!(
+            response.connection_type,
+            client_sdk::TitleLatencyConnectionType::Unknown
+        );
 
         ironmesh_ios_facade_free(handle);
     }

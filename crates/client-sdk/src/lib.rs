@@ -44,7 +44,10 @@ pub use ironmesh_client::{
 };
 pub use latency_probe::{
     LatencyProbeAssessment, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
-    LatencyProbeSample, LatencyProbeSummary, compare_direct_and_relay_latency,
+    LatencyProbeSample, LatencyProbeSummary, TITLE_LATENCY_PROBE_DEFAULT_PERIOD_SECONDS,
+    TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS, TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS,
+    TitleLatencyConnectionType, TitleLatencyMonitor, TitleLatencyProbeConfig,
+    TitleLatencyProbeState, TitleLatencyProbeStatus, compare_direct_and_relay_latency,
 };
 pub use remote_sync::{
     RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,

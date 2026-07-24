@@ -157,8 +157,9 @@ use client_sdk::{
     ClientConnectionDiagnostics, ClientConnectionDiagnosticsEvent, ClientIdentityMaterial,
     ClientNode, ConnectionBootstrap, EnrolledClientConnection, IronMeshClient,
     StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView,
-    build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    enroll_client_connection_blocking, set_connection_diagnostics_observer,
+    TitleLatencyMonitor, TitleLatencyProbeConfig, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, enroll_client_connection_blocking,
+    set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -1578,6 +1579,46 @@ fn cached_configured_client_node(
     )?))
 }
 
+fn android_title_latency_monitor() -> &'static Mutex<TitleLatencyMonitor> {
+    static MONITOR: OnceLock<Mutex<TitleLatencyMonitor>> = OnceLock::new();
+    MONITOR.get_or_init(|| Mutex::new(TitleLatencyMonitor::disabled()))
+}
+
+fn configure_android_title_latency_monitor(
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+    enabled: bool,
+    period_seconds: u64,
+) -> Result<String> {
+    let config = TitleLatencyProbeConfig {
+        enabled,
+        period_seconds,
+    };
+    config.validate()?;
+
+    let next_monitor = if config.enabled {
+        let client = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        TitleLatencyMonitor::start(client, config)?
+    } else {
+        TitleLatencyMonitor::disabled()
+    };
+    let status = next_monitor.status();
+    *android_title_latency_monitor()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_monitor;
+
+    serde_json::to_string(&status).context("failed to serialize Android title latency status")
+}
+
+fn android_title_latency_status_json() -> Result<String> {
+    let status = android_title_latency_monitor()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .status();
+    serde_json::to_string(&status).context("failed to serialize Android title latency status")
+}
+
 fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("raw") => Ok(Some(StoreIndexView::Raw)),
@@ -1660,6 +1701,87 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 ) {
     if let Err(err) = stop_embedded_web_ui() {
         throw_java_error(&mut env, format!("rust stopWebUi failed: {err:#}"));
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_configureTitleLatencyMonitor(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
+    enabled: jboolean,
+    period_seconds: jlong,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        let period_seconds = u64::try_from(period_seconds)
+            .context("title latency monitor period must be non-negative")?;
+        initialize_android_preferences_bridge(&mut env)?;
+        configure_android_title_latency_monitor(
+            connection_input,
+            server_ca_pem,
+            client_identity_json,
+            enabled != 0,
+            period_seconds,
+        )
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!(
+                        "rust configureTitleLatencyMonitor failed to create java string: {err:#}"
+                    ),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust configureTitleLatencyMonitor failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getTitleLatencyStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match android_title_latency_status_json() {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!("rust getTitleLatencyStatus failed to create java string: {err:#}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust getTitleLatencyStatus failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
     }
 }
 

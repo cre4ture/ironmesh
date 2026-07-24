@@ -41,6 +41,8 @@ separate Files domain backed by the shared enrolled device connection.
   copy emit best-effort working-set hints; they do not promise immediate remote push delivery.
 - Content is materialized on demand. Offline pinning remains the Files app's system-managed
   **Keep Downloaded** action; iOS has no provider-level per-profile eager-retention API.
+- The iOS app shell can optionally run the Rust-backed title latency monitor while the app is
+  executing. Its configurable direct (`D`) or relay (`R`) result is shown in each main navigation bar.
 - File mutations carry File Provider's base version to a server-side preferred-head compare-and-swap.
   Concurrent content edits are preserved under a deterministic visible conflict-copy name. A
   directory deletion is recursive and enabled in Files. A concurrent child mutation may be

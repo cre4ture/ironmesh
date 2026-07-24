@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{IronMeshClient, TransportSessionPoolSnapshot};
@@ -15,6 +17,9 @@ const MAX_LATENCY_PROBE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_LATENCY_PROBE_SERVER_DELAY_MS: u64 = 5_000;
 const MAX_LATENCY_PROBE_PAUSE_MS: u64 = 5_000;
 const LATENCY_PROBE_REQUEST_TIMEOUT_SLACK_MS: u64 = 3_000;
+pub const TITLE_LATENCY_PROBE_DEFAULT_PERIOD_SECONDS: u64 = 30;
+pub const TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS: u64 = 5;
+pub const TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyProbeConfig {
@@ -146,6 +151,207 @@ pub struct LatencyProbeResult {
     pub transport_session_pool: TransportSessionPoolSnapshot,
     pub samples: Vec<LatencyProbeSample>,
     pub summary: LatencyProbeSummary,
+}
+
+/// Settings for the compact latency indicator used by the mobile app shells.
+///
+/// The monitor deliberately uses a single, zero-byte sample so it remains cheap
+/// enough to run periodically without turning the title bar into a benchmark.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TitleLatencyProbeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_title_latency_probe_period_seconds")]
+    pub period_seconds: u64,
+}
+
+impl Default for TitleLatencyProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            period_seconds: default_title_latency_probe_period_seconds(),
+        }
+    }
+}
+
+impl TitleLatencyProbeConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS..=TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS)
+            .contains(&self.period_seconds)
+        {
+            bail!(
+                "period_seconds must be between {TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS} and {TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS}"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_title_latency_probe_period_seconds() -> u64 {
+    TITLE_LATENCY_PROBE_DEFAULT_PERIOD_SECONDS
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleLatencyProbeState {
+    Disabled,
+    Pending,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleLatencyConnectionType {
+    Direct,
+    Relay,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TitleLatencyProbeStatus {
+    pub state: TitleLatencyProbeState,
+    pub connection_type: TitleLatencyConnectionType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl TitleLatencyProbeStatus {
+    fn disabled() -> Self {
+        Self {
+            state: TitleLatencyProbeState::Disabled,
+            connection_type: TitleLatencyConnectionType::Unknown,
+            latency_ms: None,
+            checked_at_unix_ms: None,
+            error: None,
+        }
+    }
+
+    fn pending(connection_type: TitleLatencyConnectionType) -> Self {
+        Self {
+            state: TitleLatencyProbeState::Pending,
+            connection_type,
+            latency_ms: None,
+            checked_at_unix_ms: None,
+            error: None,
+        }
+    }
+}
+
+/// Owns a low-overhead background monitor for one configured client.
+///
+/// Dropping the monitor asks the worker to stop immediately. The worker is not
+/// joined on the caller's thread because an in-flight HTTP request may still be
+/// waiting for its bounded probe timeout.
+pub struct TitleLatencyMonitor {
+    status: Arc<Mutex<TitleLatencyProbeStatus>>,
+    stop_tx: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl TitleLatencyMonitor {
+    pub fn disabled() -> Self {
+        Self {
+            status: Arc::new(Mutex::new(TitleLatencyProbeStatus::disabled())),
+            stop_tx: None,
+            worker: None,
+        }
+    }
+
+    pub fn start(client: IronMeshClient, config: TitleLatencyProbeConfig) -> Result<Self> {
+        config.validate()?;
+        if !config.enabled {
+            return Ok(Self::disabled());
+        }
+
+        let connection_type = title_latency_connection_type(&client);
+        let status = Arc::new(Mutex::new(TitleLatencyProbeStatus::pending(
+            connection_type,
+        )));
+        let worker_status = Arc::clone(&status);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let period = Duration::from_secs(config.period_seconds);
+        let worker = thread::Builder::new()
+            .name("ironmesh-title-latency".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        replace_title_latency_status(
+                            &worker_status,
+                            TitleLatencyProbeStatus {
+                                state: TitleLatencyProbeState::Failed,
+                                connection_type,
+                                latency_ms: None,
+                                checked_at_unix_ms: Some(unix_ts_ms()),
+                                error: Some(format!(
+                                    "failed to start title latency runtime: {error}"
+                                )),
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                loop {
+                    let next_status = runtime.block_on(client.run_title_latency_probe());
+                    replace_title_latency_status(&worker_status, next_status);
+
+                    match stop_rx.recv_timeout(period) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            })?;
+
+        Ok(Self {
+            status,
+            stop_tx: Some(stop_tx),
+            worker: Some(worker),
+        })
+    }
+
+    pub fn status(&self) -> TitleLatencyProbeStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for TitleLatencyMonitor {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        // Dropping a JoinHandle detaches the worker. See the type documentation
+        // above for why this must not wait on an app UI or FFI thread.
+        let _ = self.worker.take();
+    }
+}
+
+fn replace_title_latency_status(
+    status: &Arc<Mutex<TitleLatencyProbeStatus>>,
+    next_status: TitleLatencyProbeStatus,
+) {
+    *status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_status;
+}
+
+fn title_latency_connection_type(client: &IronMeshClient) -> TitleLatencyConnectionType {
+    if client.uses_relay_transport() {
+        TitleLatencyConnectionType::Relay
+    } else {
+        TitleLatencyConnectionType::Direct
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +520,56 @@ impl IronMeshClient {
             samples,
             summary,
         })
+    }
+
+    pub async fn run_title_latency_probe(&self) -> TitleLatencyProbeStatus {
+        let connection_type = title_latency_connection_type(self);
+        let config = LatencyProbeConfig {
+            sample_count: 1,
+            warmup_count: 0,
+            response_bytes: 0,
+            server_delay_ms: 0,
+            pause_between_samples_ms: 0,
+        };
+
+        match self.run_latency_probe(config).await {
+            Ok(result) => {
+                let checked_at_unix_ms = Some(result.generated_at_unix_ms);
+                match result.samples.first() {
+                    Some(sample) if sample.successful => TitleLatencyProbeStatus {
+                        state: TitleLatencyProbeState::Success,
+                        connection_type,
+                        latency_ms: Some(sample.total_duration_ms),
+                        checked_at_unix_ms,
+                        error: None,
+                    },
+                    Some(sample) => TitleLatencyProbeStatus {
+                        state: TitleLatencyProbeState::Failed,
+                        connection_type,
+                        latency_ms: None,
+                        checked_at_unix_ms,
+                        error: sample
+                            .error
+                            .clone()
+                            .or_else(|| Some("title latency probe failed".to_string())),
+                    },
+                    None => TitleLatencyProbeStatus {
+                        state: TitleLatencyProbeState::Failed,
+                        connection_type,
+                        latency_ms: None,
+                        checked_at_unix_ms,
+                        error: Some("title latency probe returned no sample".to_string()),
+                    },
+                }
+            }
+            Err(error) => TitleLatencyProbeStatus {
+                state: TitleLatencyProbeState::Failed,
+                connection_type,
+                latency_ms: None,
+                checked_at_unix_ms: Some(unix_ts_ms()),
+                error: Some(format!("{error:#}")),
+            },
+        }
     }
 }
 
@@ -702,6 +958,56 @@ mod tests {
         .validate()
         .expect_err("zero sample_count should fail");
         assert!(error.to_string().contains("sample_count"));
+    }
+
+    #[test]
+    fn title_latency_probe_config_rejects_out_of_range_periods() {
+        let too_short = TitleLatencyProbeConfig {
+            enabled: true,
+            period_seconds: TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS - 1,
+        };
+        assert!(too_short.validate().is_err());
+
+        let too_long = TitleLatencyProbeConfig {
+            enabled: true,
+            period_seconds: TITLE_LATENCY_PROBE_MAX_PERIOD_SECONDS + 1,
+        };
+        assert!(too_long.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn title_latency_monitor_reports_current_direct_probe_result() {
+        let (base_url, server) = spawn_probe_server().await;
+        let monitor = TitleLatencyMonitor::start(
+            IronMeshClient::from_direct_base_url(base_url),
+            TitleLatencyProbeConfig {
+                enabled: true,
+                period_seconds: TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS,
+            },
+        )
+        .expect("title latency monitor should start");
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = monitor.status();
+                if status.state != TitleLatencyProbeState::Pending {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("title latency monitor should produce a first result");
+
+        assert_eq!(status.state, TitleLatencyProbeState::Success);
+        assert_eq!(status.connection_type, TitleLatencyConnectionType::Direct);
+        assert!(status.latency_ms.is_some());
+        assert!(status.checked_at_unix_ms.is_some());
+        assert!(status.error.is_none());
+
+        drop(monitor);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

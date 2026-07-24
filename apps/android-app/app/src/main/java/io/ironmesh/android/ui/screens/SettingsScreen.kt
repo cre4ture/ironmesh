@@ -20,6 +20,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -58,6 +59,8 @@ fun SettingsScreen(
     onOpenConnectionDiagnostics: () -> Unit,
     onOpenWebConsole: () -> Unit,
     onThemeAccentColorChange: (String) -> Unit,
+    onTitleLatencyMonitorEnabledChange: (Boolean) -> Unit,
+    onTitleLatencyMonitorPeriodSecondsChange: (Long) -> Unit,
     onKeyChange: (String) -> Unit,
     onPayloadChange: (String) -> Unit,
     onPutObject: () -> Unit,
@@ -129,6 +132,18 @@ fun SettingsScreen(
             )
         }
 
+        SectionCard(
+            title = stringResource(R.string.title_latency_monitor_title),
+            supportingText = stringResource(R.string.title_latency_monitor_body),
+        ) {
+            TitleLatencyMonitorSettingsEditor(
+                enabled = state.titleLatencyMonitorSettings.enabled,
+                periodSeconds = state.titleLatencyMonitorSettings.periodSeconds,
+                onEnabledChange = onTitleLatencyMonitorEnabledChange,
+                onPeriodSecondsChange = onTitleLatencyMonitorPeriodSecondsChange,
+            )
+        }
+
         SectionCard(title = stringResource(R.string.settings_storage)) {
             Button(onClick = onOpenFiles) {
                 Text(stringResource(R.string.open_files))
@@ -168,6 +183,76 @@ fun SettingsScreen(
         SectionCard(title = stringResource(R.string.version)) {
             SelectionContainer {
                 Text(BuildConfig.LONG_VERSION)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TitleLatencyMonitorSettingsEditor(
+    enabled: Boolean,
+    periodSeconds: Long,
+    onEnabledChange: (Boolean) -> Unit,
+    onPeriodSecondsChange: (Long) -> Unit,
+) {
+    var pendingPeriodSeconds by remember(periodSeconds) { mutableStateOf(periodSeconds.toFloat()) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.title_latency_monitor_enable),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    text = stringResource(
+                        if (enabled) R.string.enabled else R.string.disabled,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = onEnabledChange,
+            )
+        }
+
+        if (enabled) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = stringResource(R.string.title_latency_monitor_period),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                    Text(
+                        text = stringResource(
+                            R.string.title_latency_monitor_period_value,
+                            pendingPeriodSeconds.roundToInt(),
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Slider(
+                    value = pendingPeriodSeconds,
+                    onValueChange = { value ->
+                        pendingPeriodSeconds = (value / 5f).roundToInt().times(5).toFloat()
+                    },
+                    onValueChangeFinished = {
+                        onPeriodSecondsChange(pendingPeriodSeconds.roundToInt().toLong())
+                    },
+                    valueRange = 5f..300f,
+                    steps = 58,
+                )
             }
         }
     }

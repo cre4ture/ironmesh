@@ -199,6 +199,7 @@ class MainActivity : ComponentActivity() {
                         onSelectSection = vm::selectSection,
                         snackbarHostState = snackbarHostState,
                         deviceLabel = state.deviceAuthState.label,
+                        titleLatencyStatus = state.titleLatencyStatus,
                         onNavigateBack = if (state.selectedSection == MainSection.CONNECTIVITY) {
                             { vm.selectSection(MainSection.SETTINGS) }
                         } else {
@@ -287,6 +288,9 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onOpenWebConsole = onOpenWebConsole,
                                     onThemeAccentColorChange = vm::updateThemeAccentColor,
+                                    onTitleLatencyMonitorEnabledChange = vm::updateTitleLatencyMonitorEnabled,
+                                    onTitleLatencyMonitorPeriodSecondsChange =
+                                        vm::updateTitleLatencyMonitorPeriodSeconds,
                                     onKeyChange = vm::updateKey,
                                     onPayloadChange = vm::updatePayload,
                                     onPutObject = vm::putObject,

@@ -146,6 +146,8 @@ final class IronmeshBrowserModel: ObservableObject {
     @Published var connectionRoutesErrorMessage: String?
     @Published var isRefreshingConnectionRoutes = false
     @Published var webUIPresentation: IronmeshWebUIPresentation?
+    @Published var titleLatencyMonitorSettings = AppleTitleLatencyMonitorSettings()
+    @Published var titleLatencyStatus = AppleTitleLatencyStatus()
 
     let bundleDefaults: IronmeshConnectionDraft
 
@@ -158,12 +160,14 @@ final class IronmeshBrowserModel: ObservableObject {
     private let userDefaults: UserDefaults
     private let draftStorageKey = AppleConnectionSettingsStore.defaultLegacyDraftStateKey
     private let onboardingStorageKey = "IronmeshIosApp.hasCompletedOnboarding"
+    private let titleLatencyMonitorSettingsStorageKey = "IronmeshIosApp.titleLatencyMonitorSettings"
     private let recentActionLimit = 6
 
     private var didActivate = false
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
+    private var titleLatencyStatusTask: Task<Void, Never>?
 
     var isSyncProfileMutationInProgress: Bool {
         syncProfileOperationState.isMutationInProgress
@@ -229,6 +233,13 @@ final class IronmeshBrowserModel: ObservableObject {
             syncProfiles = try self.syncProfileStore.load()
         } catch {
             syncProfilesErrorMessage = error.localizedDescription
+        }
+        if let settingsData = userDefaults.data(forKey: titleLatencyMonitorSettingsStorageKey),
+           let settings = try? JSONDecoder().decode(
+               AppleTitleLatencyMonitorSettings.self,
+               from: settingsData
+           ) {
+            titleLatencyMonitorSettings = settings
         }
     }
 
@@ -330,10 +341,37 @@ final class IronmeshBrowserModel: ObservableObject {
         }
 
         if hasCompletedOnboarding {
+            configureTitleLatencyMonitor()
             refresh()
         } else {
             statusText = "Finish onboarding to start browsing the remote library."
         }
+    }
+
+    func updateTitleLatencyMonitorEnabled(_ enabled: Bool) {
+        updateTitleLatencyMonitorSettings(
+            AppleTitleLatencyMonitorSettings(
+                enabled: enabled,
+                periodSeconds: titleLatencyMonitorSettings.periodSeconds
+            )
+        )
+    }
+
+    func updateTitleLatencyMonitorPeriodSeconds(_ periodSeconds: UInt64) {
+        updateTitleLatencyMonitorSettings(
+            AppleTitleLatencyMonitorSettings(
+                enabled: titleLatencyMonitorSettings.enabled,
+                periodSeconds: periodSeconds
+            )
+        )
+    }
+
+    private func updateTitleLatencyMonitorSettings(_ settings: AppleTitleLatencyMonitorSettings) {
+        titleLatencyMonitorSettings = settings
+        if let encoded = try? JSONEncoder().encode(settings) {
+            userDefaults.set(encoded, forKey: titleLatencyMonitorSettingsStorageKey)
+        }
+        configureTitleLatencyMonitor()
     }
 
     func completeOnboarding() {
@@ -369,6 +407,7 @@ final class IronmeshBrowserModel: ObservableObject {
         statusText = "Onboarding complete. Connecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Completed onboarding", detail: draft.enrollmentSummary)
         refreshDomainState()
+        configureTitleLatencyMonitor()
         reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after onboarding")
     }
 
@@ -404,6 +443,7 @@ final class IronmeshBrowserModel: ObservableObject {
         statusText = "Applied connection settings. Reconnecting to \(draft.normalizedConnectionInput ?? draft.effectiveConnectionInput)."
         addAction("Applied settings", detail: draft.setupSummary)
         refreshDomainState()
+        configureTitleLatencyMonitor()
         reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after reconnecting")
     }
 
@@ -724,6 +764,7 @@ final class IronmeshBrowserModel: ObservableObject {
         statusText = "Restored bundled defaults."
         addAction("Restored defaults", detail: draft.setupSummary)
         refreshDomainState()
+        configureTitleLatencyMonitor()
         if hasCompletedOnboarding, !draft.requiresEnrollment, draft.connectionConfiguration != nil {
             reloadRootAfterConnectionContextChange(actionTitle: "Loaded bundled root")
         } else {
@@ -755,6 +796,7 @@ final class IronmeshBrowserModel: ObservableObject {
         webUIPresentation = nil
         statusText = "Setup cleared. Finish onboarding to reconnect."
         addAction("Cleared setup", detail: "App connection and identity fields were reset.")
+        configureTitleLatencyMonitor()
     }
 
     func clearIdentity() {
@@ -782,6 +824,7 @@ final class IronmeshBrowserModel: ObservableObject {
         invalidateConnectionRouteState()
         clearDirectoryAfterConnectionContextChange()
         addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
+        configureTitleLatencyMonitor()
     }
 
     func applyScannedCode(_ scannedValue: String) {
@@ -858,6 +901,7 @@ final class IronmeshBrowserModel: ObservableObject {
                 lastErrorMessage = nil
                 statusText = "Device enrolled: \(enrollment.deviceID)"
                 addAction("Enrolled device", detail: draft.deviceLabel.nilIfBlank ?? enrollment.deviceID)
+                configureTitleLatencyMonitor()
 
                 if completesOnboarding {
                     hasCompletedOnboarding = true
@@ -1097,6 +1141,63 @@ final class IronmeshBrowserModel: ObservableObject {
         currentPath = ""
     }
 
+    private func configureTitleLatencyMonitor() {
+        titleLatencyStatusTask?.cancel()
+        titleLatencyStatusTask = nil
+
+        let settings = titleLatencyMonitorSettings
+        guard settings.enabled else {
+            titleLatencyStatus = AppleTitleLatencyStatus()
+            let remoteSession = remoteSession
+            Task.detached(priority: .utility) {
+                try? remoteSession.disableTitleLatencyMonitor()
+            }
+            return
+        }
+
+        guard let configuration = draft.connectionConfiguration else {
+            titleLatencyStatus = AppleTitleLatencyStatus()
+            return
+        }
+
+        let remoteSession = remoteSession
+        titleLatencyStatusTask = Task { [weak self] in
+            do {
+                let initialStatus = try await Task.detached(priority: .utility) {
+                    try remoteSession.configureTitleLatencyMonitor(
+                        configuration: configuration,
+                        settings: settings
+                    )
+                }.value
+                guard let self, !Task.isCancelled else {
+                    return
+                }
+                self.titleLatencyStatus = initialStatus
+
+                while !Task.isCancelled {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                    let nextStatus = try await Task.detached(priority: .utility) {
+                        try remoteSession.titleLatencyStatus(configuration: configuration)
+                    }.value
+                    guard let self, !Task.isCancelled else {
+                        return
+                    }
+                    self.titleLatencyStatus = nextStatus
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, !Task.isCancelled else {
+                    return
+                }
+                self.titleLatencyStatus = AppleTitleLatencyStatus(
+                    state: "failed",
+                    error: error.localizedDescription
+                )
+            }
+        }
+    }
+
     private func loadDirectory(request: AppleDirectoryLoadRequest, actionTitle: String) {
         guard let configuration = draft.connectionConfiguration else {
             let message = "A bootstrap bundle or direct route is required."
@@ -1244,6 +1345,35 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         try connectIfNeeded(configuration)
         let json = try bridge.connectionRouteSnapshotJSON(refresh: refresh)
         return try decode(AppleConnectionRouteSnapshot.self, from: json)
+    }
+
+    func configureTitleLatencyMonitor(
+        configuration: AppleConnectionConfiguration,
+        settings: AppleTitleLatencyMonitorSettings
+    ) throws -> AppleTitleLatencyStatus {
+        try connectIfNeeded(configuration)
+        let json = try bridge.configureTitleLatencyMonitorJSON(settings: settings)
+        return try decode(AppleTitleLatencyStatus.self, from: json)
+    }
+
+    func titleLatencyStatus(
+        configuration: AppleConnectionConfiguration
+    ) throws -> AppleTitleLatencyStatus {
+        try connectIfNeeded(configuration)
+        let json = try bridge.titleLatencyStatusJSON()
+        return try decode(AppleTitleLatencyStatus.self, from: json)
+    }
+
+    func disableTitleLatencyMonitor() throws {
+        lock.lock()
+        let hasConnection = configurationKey != nil
+        lock.unlock()
+        guard hasConnection else {
+            return
+        }
+        _ = try bridge.configureTitleLatencyMonitorJSON(
+            settings: AppleTitleLatencyMonitorSettings()
+        )
     }
 
     func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
